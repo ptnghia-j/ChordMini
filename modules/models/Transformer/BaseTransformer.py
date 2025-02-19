@@ -1,0 +1,221 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def positional_encoding(batch_size, n_time, n_feature, zero_pad=False, scale=False, dtype=torch.float32):
+  indices = torch.unsqueeze(torch.arange(n_time), 0).repeat(batch_size, 1) 
+
+  pos = torch.arange(n_time, dtype=dtype).reshape(-1, 1)
+  pos_enc = pos / torch.pow(10000, 2 * torch.arange(0, n_feature, dtype=dtype) / n_feature)
+  pos_enc[:, 0::2] = torch.sin(pos_enc[:, 0::2])
+  pos_enc[:, 1::2] = torch.cos(pos_enc[:, 1::2])
+
+  # exclude the first token
+  if zero_pad:
+    pos_enc = torch.cat([torch.zeros(size=[1, n_feature]), pos_enc[1:, :]], 0)
+
+  outputs = F.embedding(indices, pos_enc)
+
+  if scale:
+    outputs = outputs * (n_feature ** 0.5)
+
+  return outputs
+
+class FeedForward(nn.Module):
+  def __init__(self, n_feature=2048, n_hidden=512, dropout=0.2):
+    super().__init__()
+    self.linear1 = nn.Linear(n_feature, n_hidden)
+    self.linear2 = nn.Linear(n_hidden, n_feature)
+
+    self.dropout = nn.Dropout(dropout)
+    self.norm_layer = nn.LayerNorm(n_feature)
+  
+
+  def forward(self, x):
+    y = self.linear1(x)
+    y = F.relu(y)
+    y = self.dropout(y)
+    y = self.linear2(y)
+    y = self.dropout(y)
+    y = self.norm_layer(y + x) # residual connection and layer normalization
+
+    return y
+  
+class EncoderF(nn.Module):
+  def __init__(self, n_freq, n_group, n_head=8, n_layer=5, dropout=0.2, pr=0.01):
+    super().__init__()
+    assert n_freq % n_group == 0
+
+    self.d_model = d_model = n_freq // n_group
+    self.n_freq = n_freq
+    self.n_group = n_group
+    self.n_layer = n_layer
+    self.pr = pr
+
+    self.attn_layer = nn.ModuleList()
+    self.ff_layer = nn.ModuleList()
+    for _ in range(n_layer):
+      self.attn_layer.append(nn.MultiheadAttention(d_model, n_head, batch_first=True))
+      self.ff_layer.append(FeedForward(n_feature=d_model, dropout=dropout))
+
+    self.dropout = nn.Dropout(dropout)
+    self.fc = nn.Linear(n_freq, n_freq)
+    self.norm_layer = nn.LayerNorm(n_freq)
+
+  def forward(self, x):
+    B, T, F = x.shape
+    x = x.reshape(B * T, self.n_group, self.d_model)
+    pe = positional_encoding(batch_size=x.shape[0], n_time=x.shape[1], n_feature=x.shape[2]).to(x.device)
+    x += pe * self.pr
+
+    for attn, ff in zip(self.attn_layer, self.ff_layer):
+      residual = x
+      x, _ = attn(x, x, x, need_weights=False)
+      x = ff(x + residual)
+    
+    y = x.reshape(B, T, self.n_freq)
+    y = self.dropout(y)
+    y = self.fc(y)
+    y = self.norm_layer(y)
+
+    return y
+
+class EncoderT(nn.Module):
+  def __init__(self, n_freq, n_head=8, n_layer=5, dropout=0.2, pr=0.02):
+    super().__init__()
+    self.n_freq = n_freq
+    self.n_layer = n_layer
+    self.pr = pr
+
+    self.attn_layer = nn.ModuleList()
+    self.ff_layer = nn.ModuleList()
+    for _ in range(n_layer):
+      self.attn_layer.append(nn.MultiheadAttention(n_freq, n_head, batch_first=True))
+      self.ff_layer.append(FeedForward(n_feature=n_freq, dropout=dropout))
+    
+    self.dropout = nn.Dropout(dropout)
+    self.fc = nn.Linear(n_freq, n_freq)
+    self.norm_layer = nn.LayerNorm(n_freq)
+
+  def forward(self, x):
+    B, T, F = x.shape
+    x += positional_encoding(B, T, F) * self.pr
+
+    for attn, ff in zip(self.attn_layer, self.ff_layer):
+      residual = x
+      x, _ = attn(x, x, x, need_weights=False)
+      x = ff(x + residual)
+    
+    x = self.dropout(x)
+    x = self.fc(x)
+    x = self.norm_layer(x)
+
+    return x
+
+class Decoder(nn.Module):
+  def __init__(self, d_model=512, n_head=8, n_layer=5, dropout=0.5, r1=1.0, r2=1.0, wr=1.0, pr=0.01):
+    super().__init__()
+    self.r1 = r1
+    self.r2 = r2
+    self.wr = wr
+    self.n_layer = n_layer
+    self.pr = pr
+
+    self.attn_layer1 = nn.ModuleList()
+    self.attn_layer2 = nn.ModuleList()
+    self.ff_layer = nn.ModuleList()
+    for _ in range(n_layer):
+      self.attn_layer1.append(nn.MultiheadAttention(d_model, n_head, batch_first=True))
+      self.attn_layer2.append(nn.MultiheadAttention(d_model, n_head, batch_first=True))
+      self.ff_layer.append(FeedForward(n_feature=d_model, dropout=dropout))
+    
+    self.dropout = nn.Dropout(dropout)
+    self.fc = nn.Linear(d_model, d_model)
+    self.norm_layer = nn.LayerNorm(d_model)
+
+  def forward(self, x1, x2, weight=None):
+    y = x1 * self.r1 + x2 * self.r2
+    if weight is not None:
+      y += weight * self.wr
+
+    y += positional_encoding(y.shape[0], y.shape[1], y.shape[2]) * self.pr
+
+    for i in range(self.n_layer):
+      residual = y
+      y, _ = self.attn_layer1[i](y, y, y, need_weights=False)
+      y = self.dropout(y)
+      y += residual
+      y = self.norm_layer(y)
+
+      residual = y
+      y, _ = self.attn_layer2[i](y, x2, x2, need_weights=False)
+      y = self.dropout(y)
+      y += residual
+      y = self.norm_layer(y)
+
+
+      y = self.ff_layer[i](y)
+
+    output = self.dropout(y)
+    output = self.fc(output)
+
+    return output, y
+  
+class BaseTransformer(nn.Module):
+  def __init__(self,
+               n_channel=2,
+               n_freq=2048,
+               
+               n_group=16,
+               f_layer=2,
+               f_head=8,
+               f_dropout=0.2,
+               f_pr=0.01,
+               
+               t_layer=2,
+               t_head=4,
+               t_dropout=0.2,
+               t_pr=0.02,
+               
+               d_layer=2,
+               d_head=4,
+               d_dropout=0.5,
+               d_pr=0.02,
+               r1=1.0,
+               r2=1.0,
+               wr=0.2):
+    
+    super().__init__()
+    self.n_channel = n_channel
+    self.encoder_f = nn.ModuleList()
+    self.encoder_t = nn.ModuleList()
+
+    for _ in range(n_channel):
+      self.encoder_f.append(EncoderF(n_freq=n_freq, n_group=n_group, n_head=f_head, n_layer=f_layer, dropout=f_dropout, pr=f_pr))
+      self.encoder_t.append(EncoderT(n_freq=n_freq, n_head=t_head, n_layer=t_layer, dropout=t_dropout, pr=t_pr))
+
+    self.decoder = Decoder(d_model=n_freq, n_head=d_head, n_layer=d_layer, dropout=d_dropout, r1=r1, r2=r2, wr=wr, pr=d_pr)
+
+  def forward(self, x, weight=None):
+    ff, tf = [], []
+
+    for i in range(self.n_channel):
+      x1 = self.encoder_f[i](x[:, i, :, :])
+      x2 = self.encoder_t[i](x[:, i, :, :])
+
+      ff.append(x1)
+      tf.append(x2)
+    
+    y1 = torch.sum(torch.stack(ff, dim=0), dim=0)
+    y2 = torch.sum(torch.stack(tf, dim=0), dim=0)
+    y, w = self.decoder(y1, y2, weight)
+
+    return y, w
+  
+
+if __name__ == '__main__':
+  # Test initialization
+  model = Transformer(n_freq=2048)
+  x = torch.randn(1, 2, 1024, 2048)
+  y, logits = model(x)
+  print(y.shape, logits.shape)
