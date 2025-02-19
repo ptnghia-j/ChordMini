@@ -191,3 +191,5 @@ $RECYCLE.BIN/
 
 # ignore the data folder (for now)
 data/
+
+.qodo
