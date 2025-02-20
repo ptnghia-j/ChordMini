@@ -189,7 +189,7 @@ $RECYCLE.BIN/
 # Linux
 *~
 
-# ignore the data folder (for now)
-data/
+# ignore the data folder (for now) at the root only
+/data/
 
 .qodo
