@@ -1,4 +1,9 @@
+import sys
 import os
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import torch
 from torch.utils.data import DataLoader, random_split
 from functools import partial
@@ -58,6 +63,8 @@ def custom_collate(batch, chord_to_idx):
 # Main training function
 def main():
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
     chroma_dir = os.path.join(project_root, "data", "cross-era_chroma-nnls")
     label_dir  = os.path.join(project_root, "data", "cross-era_chords-chordino")
     
