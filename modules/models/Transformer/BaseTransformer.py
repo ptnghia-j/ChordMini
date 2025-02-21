@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 
 def positional_encoding(batch_size, n_time, n_feature, zero_pad=False, scale=False, dtype=torch.float32):
   indices = torch.unsqueeze(torch.arange(n_time), 0).repeat(batch_size, 1) 
@@ -66,12 +67,14 @@ class EncoderF(nn.Module):
     B, T, F = x.shape
     x = x.reshape(B * T, self.n_group, self.d_model)
     pe = positional_encoding(batch_size=x.shape[0], n_time=x.shape[1], n_feature=x.shape[2]).to(x.device)
-    x += pe * self.pr
+    x = x + pe * self.pr  # use out-of-place addition instead of x += pe * self.pr
 
     for attn, ff in zip(self.attn_layer, self.ff_layer):
       residual = x
-      x, _ = attn(x, x, x, need_weights=False)
-      x = ff(x + residual)
+      def layer_fn(x, residual):
+        out, _ = attn(x, x, x, need_weights=False)
+        return ff(out + residual)
+      x = checkpoint.checkpoint(layer_fn, x, residual, use_reentrant=False)  # fixed: added use_reentrant parameter
     
     y = x.reshape(B, T, self.n_freq)
     y = self.dropout(y)
@@ -99,7 +102,7 @@ class EncoderT(nn.Module):
 
   def forward(self, x):
     B, T, F = x.shape
-    x += positional_encoding(B, T, F) * self.pr
+    x = x + positional_encoding(B, T, F).to(x.device) * self.pr  # out-of-place addition
 
     for attn, ff in zip(self.attn_layer, self.ff_layer):
       residual = x
@@ -113,7 +116,7 @@ class EncoderT(nn.Module):
     return x
 
 class Decoder(nn.Module):
-  def __init__(self, d_model=512, n_head=8, n_layer=5, dropout=0.5, r1=1.0, r2=1.0, wr=1.0, pr=0.01):
+  def __init__(self, d_model=512, n_head=8, n_layer=5, dropout=0.5, r1=1.0, r2=1.0, wr=1.0, pr=0.01, n_class=12):
     super().__init__()
     self.r1 = r1
     self.r2 = r2
@@ -130,27 +133,27 @@ class Decoder(nn.Module):
       self.ff_layer.append(FeedForward(n_feature=d_model, dropout=dropout))
     
     self.dropout = nn.Dropout(dropout)
-    self.fc = nn.Linear(d_model, d_model)
+    self.fc = nn.Linear(d_model, n_class)
     self.norm_layer = nn.LayerNorm(d_model)
 
   def forward(self, x1, x2, weight=None):
     y = x1 * self.r1 + x2 * self.r2
     if weight is not None:
-      y += weight * self.wr
+      y = y + weight * self.wr
 
-    y += positional_encoding(y.shape[0], y.shape[1], y.shape[2]) * self.pr
+    y = y + positional_encoding(y.shape[0], y.shape[1], y.shape[2]).to(y.device) * self.pr  # out-of-place
 
     for i in range(self.n_layer):
       residual = y
       y, _ = self.attn_layer1[i](y, y, y, need_weights=False)
       y = self.dropout(y)
-      y += residual
+      y = y + residual  # out-of-place
       y = self.norm_layer(y)
 
       residual = y
       y, _ = self.attn_layer2[i](y, x2, x2, need_weights=False)
       y = self.dropout(y)
-      y += residual
+      y = y + residual  # out-of-place
       y = self.norm_layer(y)
 
 
@@ -214,8 +217,8 @@ class BaseTransformer(nn.Module):
   
 
 if __name__ == '__main__':
-  # Test initialization
-  model = Transformer(n_freq=2048)
+  # Test initialization using BaseTransformer instead of Transformer
+  model = BaseTransformer(n_freq=2048)
   x = torch.randn(1, 2, 1024, 2048)
   y, logits = model(x)
   print(y.shape, logits.shape)

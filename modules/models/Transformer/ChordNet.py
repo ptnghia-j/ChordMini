@@ -25,12 +25,13 @@ class ChordNet(nn.Module):
     self.dropout = nn.Dropout(dropout)
     self.fc = nn.Linear(n_freq, n_classes)
 
-  def forward(self, x, weight=None):
+  def forward(self, x, weight=None, inference=False):
     o, logits = self.transformer(x, weight)
     o = self.dropout(o)
-    o = self.fc(o)
-    o = o.argmax(dim=-1)
-
+    o = self.fc(o)  # raw logits
+    if inference:
+      # In inference mode, compute predictions
+      o = torch.argmax(o, dim=-1)
     return o, logits
 
 if __name__ == '__main__':
@@ -39,5 +40,9 @@ if __name__ == '__main__':
   print(model)
 
   x = torch.randn(2, 2, 2048, 128)
+  # In training mode (raw logits returned)
   y, weights = model(x)
   print(y.shape, weights.shape)
+  # In inference mode (predictions after argmax)
+  y_pred, _ = model(x, inference=True)
+  print(y_pred.shape)

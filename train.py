@@ -1,6 +1,7 @@
 import sys
 import os
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
+import pandas as pd  # Newly added import
+project_root = os.path.abspath(os.path.dirname(__file__))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
@@ -18,45 +19,32 @@ from modules.training.Schedulers import CosineScheduler  # new import
 # Utility: build chord mapping from dataset
 def build_chord_mapping(dataset):
     chords = set()
-    for sample in dataset:
-        for seg in sample:
-            chords.update(seg["chord_labels"])
+    # Iterate over each unique match_key (each file pair) instead of every segment
+    for match_key in dataset.keys:
+        label_key = dataset.label_keys[match_key]
+        # Read label file only once per file pair
+        label_df = pd.read_csv(dataset.label_f[label_key], header=None)
+        segments = dataset.get_piece(label_df)
+        for seg in segments:
+            # Extract unique chord labels from each segment (assuming column 2 holds the chord label)
+            chord_segment = seg.iloc[:, 2].astype(str).unique().tolist()
+            chords.update(chord_segment)
     chord_to_idx = {chord: idx for idx, chord in enumerate(sorted(chords))}
     return chord_to_idx
 
 # -------------------------
-# Custom collate function: convert each segment to a tensor 
+# Custom collate function: each sample is a single chroma vector; add a time dimension then duplicate channel.
 def custom_collate(batch, chord_to_idx):
     inputs, targets = [], []
-    max_T = 0
-    for item in batch:  # each item is a list of segments
-        for seg in item:
-            # seg["chroma"]: numpy array of shape [T, 12]
-            chroma_tensor = seg["chroma"].clone().detach().float()  # [T, 12]
-            T = chroma_tensor.size(0)
-            if T > max_T:
-                max_T = T
-            # Duplicate channel: now shape becomes [2, T, 12]
-            chroma_tensor = chroma_tensor.unsqueeze(0).repeat(2, 1, 1)
-            inputs.append(chroma_tensor)
-            # Convert chord labels to indices (unknown labels get 0) and create tgt on same device as chroma_tensor
-            tgt = torch.tensor([chord_to_idx.get(lbl, 0) for lbl in seg["chord_labels"]],
-                               dtype=torch.long, device=chroma_tensor.device)
-            targets.append(tgt)
-    # Pad all samples along time dimension to max_T
-    padded_inputs, padded_targets = [], []
-    for inp, tgt in zip(inputs, targets):
-        T = inp.size(1)
-        if T < max_T:
-            pad_size = max_T - T
-            # Pad with zeros for input and -100 (ignore index) for targets using inp.device
-            pad_inp = torch.zeros(inp.size(0), pad_size, inp.size(2), device=inp.device)
-            inp = torch.cat([inp, pad_inp], dim=1)
-            tgt = torch.cat([tgt, torch.full((pad_size,), -100, dtype=torch.long, device=inp.device)])
-        padded_inputs.append(inp)
-        padded_targets.append(tgt)
-    batch_inputs = torch.stack(padded_inputs, dim=0)   # shape: [B, 2, max_T, 12]
-    batch_targets = torch.stack(padded_targets, dim=0)   # shape: [B, max_T]
+    for sample in batch:
+        # sample["chroma"] has shape [12], unsqueeze to [1,12] then duplicate channel -> [2,1,12]
+        chroma_tensor = sample["chroma"].unsqueeze(0).repeat(2, 1, 1)
+        inputs.append(chroma_tensor)
+        tgt = torch.tensor(chord_to_idx.get(sample["chord_label"], 0), dtype=torch.long, device=chroma_tensor.device)
+        targets.append(tgt)
+    batch_inputs = torch.stack(inputs, dim=0)  # shape: [B, 2, 1, 12]
+    # Unsqueeze targets to have shape [B, 1] so that loss function gets matching dimensions
+    batch_targets = torch.stack(targets, dim=0).unsqueeze(1)  # shape: [B, 1]
     return batch_inputs, batch_targets
 
 # -------------------------
@@ -82,8 +70,8 @@ def main():
     
     # Create DataLoaders with our custom collate function.
     collate_fn = partial(custom_collate, chord_to_idx=chord_to_idx)
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)  # lowered batch size to 4
+    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)      # lowered batch size to 4
 
     # Instantiate model: note it now expects input shape [B, 2, T, 12]
     model = ChordNet(n_freq=12, n_group=4, f_head=1, t_head=1, d_head=1)
