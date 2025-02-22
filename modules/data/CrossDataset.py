@@ -12,8 +12,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from modules.utils.device import get_device  # added import
 
-class CrossEraDataset(Dataset):
-    def __init__(self, chroma_dir, label_dir, transform=None, seq_len=5):
+class CrossDataset(Dataset):  # updated class name
+    def __init__(self, chroma_dir, label_dir, transform=None, seq_len=4, chord_mapping=None):  # added chord_mapping
         # Build file dictionaries from directories using all CSV files
         self.chroma_f = {f: os.path.join(chroma_dir, f)
                          for f in os.listdir(chroma_dir) if f.endswith('.csv')}
@@ -23,6 +23,7 @@ class CrossEraDataset(Dataset):
         self.seq_len = seq_len  # added sequence length hyperparameter
         self.samples = []
         self.chord_to_idx = {}
+        self.chord_mapping = chord_mapping  # new member to hold a unified mapping if provided
         self.aggregate_data()
     
     def aggregate_data(self):
@@ -85,10 +86,13 @@ class CrossEraDataset(Dataset):
         self.samples = samples
         
         # ----- Build chord mapping -----
-        chords_set = set(s['chord_label'] for s in self.samples)
-        # Map chords to numbers from 1 to 92 (if fewer than 92 chords are present,
-        # the mapping will cover the available set; missing ones can be integrated later)
-        self.chord_to_idx = {chord: idx+1 for idx, chord in enumerate(sorted(chords_set))}
+        if self.chord_mapping is not None:
+            self.chord_to_idx = self.chord_mapping
+        else:
+            chords_set = set(s['chord_label'] for s in self.samples)
+            # Map chords to numbers from 1 to 92 (if fewer than 92 chords are present,
+            # the mapping will cover the available set; missing ones can be integrated later)
+            self.chord_to_idx = {chord: idx+1 for idx, chord in enumerate(sorted(chords_set))}
         
         # Define evaluation split: reserve 20% for evaluation, 80% for training.
         eval_ratio = 0.2
@@ -96,10 +100,21 @@ class CrossEraDataset(Dataset):
         # Removed erroneous DataLoader return preserving sample order
 
     def get_train_iterator(self, batch_size=128, shuffle=True):
-        # Use the dataset's training subset without shuffling (order is important)
-        train_subset = torch.utils.data.Subset(self, range(self.split_index))
-        return DataLoader(train_subset, batch_size=batch_size, shuffle=False)  # fixed shuffle
-    
+        # Group training indices by piece (training indices: 0 to self.split_index-1)
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for i in range(self.split_index):
+            groups[self.samples[i]['piece']].append(i)
+        pieces = list(groups.keys())
+        if shuffle:
+            import random
+            random.shuffle(pieces)
+        indices = []
+        for piece in pieces:
+            indices.extend(groups[piece])
+        train_subset = torch.utils.data.Subset(self, indices)
+        return DataLoader(train_subset, batch_size=batch_size, shuffle=False)  # order already shuffled by piece
+
     def get_eval_iterator(self, batch_size=128, shuffle=False):
         eval_subset = torch.utils.data.Subset(self, range(self.split_index, len(self.samples)))
         return DataLoader(eval_subset, batch_size=batch_size, shuffle=shuffle)
@@ -126,38 +141,95 @@ class CrossEraDataset(Dataset):
         # Build sequence of chroma vectors with length = self.seq_len and ensure same-piece
         sequence = []
         first_piece = self.samples[idx]['piece']
+        consecutive = 0
         for i in range(self.seq_len):
-            if idx + i < len(self.samples) and self.samples[idx+i]['piece'] == first_piece:
-                sample_i = self.samples[idx+i]
+            if (idx + i < len(self.samples)) and (self.samples[idx + i]['piece'] == first_piece):
+                sample_i = self.samples[idx + i]
                 tensor_i = torch.tensor(sample_i['chroma'], dtype=torch.float)
                 sequence.append(tensor_i)
+                consecutive += 1
             else:
-                # Pad with zeros if sequence shorter than desired length
                 sequence.append(torch.zeros(12, dtype=torch.float))
-        chroma_seq = torch.stack(sequence, dim=0)  # shape: [T, 12]
-        chroma_seq = chroma_seq.to(get_device())
-        # Use the chord index from the last valid sample as target
-        last_sample = self.samples[min(idx+self.seq_len-1, len(self.samples)-1)]
-        chord_idx = self.chord_to_idx.get(last_sample['chord_label'], 0)
-        sample_out = {'chroma': chroma_seq, 'chord_idx': chord_idx, 'chord_label': last_sample['chord_label']}
+        chroma_seq = torch.stack(sequence, dim=0).to(get_device())
+        # If not all frames come from the same piece, mark target as padded (ignore_index)
+        if consecutive < self.seq_len:
+            chord_idx = 0  # reserved for padding
+            chord_label = "PAD"
+        else:
+            last_sample = self.samples[idx + self.seq_len - 1]
+            chord_idx = self.chord_to_idx.get(last_sample['chord_label'], 0)
+            chord_label = last_sample['chord_label']
+        sample_out = {'chroma': chroma_seq, 'chord_idx': chord_idx, 'chord_label': chord_label}
         if self.transform:
             sample_out = self.transform(sample_out)
         return sample_out
 
-# For testing purposes:
+def get_unified_mapping(label_dirs):
+    import pandas as pd, csv
+    chord_set = set()
+    for label_dir in label_dirs:
+        for fname in os.listdir(label_dir):
+            if fname.endswith('.csv'):
+                fpath = os.path.join(label_dir, fname)
+                df = pd.read_csv(fpath, header=None, sep=',', engine='python',
+                                 quoting=csv.QUOTE_NONE, escapechar='\\')
+                df[0] = df[0].replace("Blank", pd.NA).ffill()
+                df.columns = ['piece', 'timestamp', 'chord']
+                chord_set.update(df['chord'].fillna("N").unique())
+    return {chord: idx+1 for idx, chord in enumerate(sorted(chord_set))}
+
 def main():
     import os
-    # Calculate project root: three levels up from this file.
+    import torch
+    from torch.utils.data import DataLoader, ConcatDataset
+    # Initialize distributed processing if available.
+    if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1:
+        import torch.distributed as dist
+        from torch.utils.data.distributed import DistributedSampler
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cpu")
+    # Calculate the project root (three levels up)
     project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    # Original dataset directories.
     chroma_dir = os.path.join(project_root, 'data', 'cross-era_chroma-nnls')
     label_dir = os.path.join(project_root, 'data', 'cross-era_chords-chordino')
+    # New dataset directories.
+    chroma_dir2 = os.path.join(project_root, 'data', 'cross-composer_chroma-nnls')
+    label_dir2 = os.path.join(project_root, 'data', 'cross-composer_chords-chordino')
     
-    dataset = CrossEraDataset(chroma_dir, label_dir)
-    print("Total samples:", len(dataset))
-    count = min(20000, len(dataset))
-    for i in range(count):
-        sample = dataset[i]
-        print(f"Instance {i}: Label: {sample['chord_label']}, Chroma: {sample['chroma']}")
+    # Compute unified chord mapping from both label directories.
+    unified_mapping = get_unified_mapping([label_dir, label_dir2])
+    print("Unified chord mapping (total labels):", len(unified_mapping))
+    print("Unified chord mapping:", unified_mapping)
     
+    # Create individual datasets using the unified mapping.
+    dataset1 = CrossDataset(chroma_dir, label_dir, chord_mapping=unified_mapping)
+    dataset2 = CrossDataset(chroma_dir2, label_dir2, chord_mapping=unified_mapping)
+    
+    # Concatenate datasets vertically.
+    combined_dataset = ConcatDataset([dataset1, dataset2])
+    print("Total combined samples:", len(combined_dataset))
+    
+    # Use DistributedSampler if in distributed mode.
+    if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1:
+        from torch.utils.data.distributed import DistributedSampler
+        sampler = DistributedSampler(combined_dataset, shuffle=False)
+        loader = DataLoader(combined_dataset, batch_size=128, sampler=sampler)
+    else:
+        loader = DataLoader(combined_dataset, batch_size=128, shuffle=False)
+    
+    print("-- Distributed Combined Dataset first 10 samples --")
+    for i in range(10):
+         sample = loader.dataset[i]
+         print(f"Instance {i}: Label: {sample['chord_label']}, Chroma: {sample['chroma']}")
+    
+    # Clean up distributed resources if needed.
+    if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1:
+        import torch.distributed as dist
+        dist.destroy_process_group()
+
 if __name__ == '__main__':
     main()
