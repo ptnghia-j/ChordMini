@@ -4,7 +4,7 @@ from modules.utils.Timer import Timer
 from modules.utils.Animator import Animator
 
 class BaseTrainer:
-    def __init__(self, model, optimizer, scheduler=None, device=None, num_epochs=100, logger=None, use_animator=True, checkpoint_dir="checkpoints", max_grad_norm=1.0):
+    def __init__(self, model, optimizer, scheduler=None, device=None, num_epochs=100, logger=None, use_animator=True, checkpoint_dir="checkpoints", max_grad_norm=1.0, ignore_index=0):
         """
         Args:
             model (torch.nn.Module): The model to train.
@@ -16,6 +16,7 @@ class BaseTrainer:
             use_animator (bool): If True, instantiate an Animator to graph training progress. (Default: True)
             checkpoint_dir (str): Directory to save checkpoints. (Default: "checkpoints")
             max_grad_norm (float): Maximum norm for gradient clipping. (Default: 1.0)
+            ignore_index (int): Index to ignore in the loss computation. (Default: 0)
         """
         self.model = model
         self.optimizer = optimizer
@@ -40,6 +41,7 @@ class BaseTrainer:
         if not os.path.exists(self.checkpoint_dir):
             os.makedirs(self.checkpoint_dir)
         self.max_grad_norm = max_grad_norm
+        self.ignore_index = ignore_index
 
     def train(self, train_loader, val_loader=None):
         # Remove interactive plotting; simply record loss and output final graph.
@@ -100,22 +102,18 @@ class BaseTrainer:
                 print("Animator does not support a final plot method.")
 
     def compute_loss(self, outputs, targets):
-        # If outputs is a tuple, use its first element.
         if isinstance(outputs, tuple):
             outputs = outputs[0]
         if outputs.ndim == 3:
-            # Permute outputs to [B, C, T]
-            outputs = outputs.permute(0, 2, 1)
-            # If targets are a single label per sample (shape [B] or [B,1]), use the last time step.
+            outputs = outputs.permute(0, 2, 1)  # [B, C, T]
             if targets.dim() == 1 or (targets.dim() == 2 and targets.size(1) == 1):
-                outputs = outputs[:, :, -1]  # now shape is [B, C]
+                outputs = outputs[:, :, 0]  # use first timestep; shape [B, C]
             else:
-                # Otherwise, if targets are provided per time step (shape [B, T]),
-                # flatten both the outputs and targets along batch and time dimensions.
                 B, C, T = outputs.shape
                 outputs = outputs.reshape(B * T, C)
                 targets = targets.reshape(B * T)
-        loss_fn = torch.nn.CrossEntropyLoss()
+        # Create loss with ignore_index set to the provided value (e.g. the mapping for "N")
+        loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.ignore_index)
         return loss_fn(outputs, targets)
 
     def validate(self, val_loader):
