@@ -4,7 +4,7 @@ from modules.utils.Timer import Timer
 from modules.utils.Animator import Animator
 
 class BaseTrainer:
-    def __init__(self, model, optimizer, scheduler=None, device=None, num_epochs=100, logger=None, use_animator=True, checkpoint_dir="checkpoints"):
+    def __init__(self, model, optimizer, scheduler=None, device=None, num_epochs=100, logger=None, use_animator=True, checkpoint_dir="checkpoints", max_grad_norm=1.0):
         """
         Args:
             model (torch.nn.Module): The model to train.
@@ -15,6 +15,7 @@ class BaseTrainer:
             logger: Logger for logging messages. (Default: None)
             use_animator (bool): If True, instantiate an Animator to graph training progress. (Default: True)
             checkpoint_dir (str): Directory to save checkpoints. (Default: "checkpoints")
+            max_grad_norm (float): Maximum norm for gradient clipping. (Default: 1.0)
         """
         self.model = model
         self.optimizer = optimizer
@@ -38,6 +39,7 @@ class BaseTrainer:
         self.checkpoint_dir = checkpoint_dir
         if not os.path.exists(self.checkpoint_dir):
             os.makedirs(self.checkpoint_dir)
+        self.max_grad_norm = max_grad_norm
 
     def train(self, train_loader, val_loader=None):
         # Remove interactive plotting; simply record loss and output final graph.
@@ -47,12 +49,17 @@ class BaseTrainer:
             self.timer.reset()
             self.timer.start()
             epoch_loss = 0.0
-            for batch_idx, (inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
+            for batch_idx, batch in enumerate(train_loader):
+                # Extract inputs and targets from dictionary
+                inputs = batch['chroma'].to(self.device)
+                targets = batch['chord_idx'].to(self.device)
                 self.optimizer.zero_grad()
                 outputs = self.model(inputs)
                 loss = self.compute_loss(outputs, targets)
                 loss.backward()
+                # Apply gradient clipping
+                if self.max_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 epoch_loss += loss.item()
                 
@@ -93,13 +100,21 @@ class BaseTrainer:
                 print("Animator does not support a final plot method.")
 
     def compute_loss(self, outputs, targets):
-        # If outputs is a tuple, use the first element.
+        # If outputs is a tuple, use its first element.
         if isinstance(outputs, tuple):
             outputs = outputs[0]
-        # If outputs has shape [B, T, C], permute to [B, C, T].
         if outputs.ndim == 3:
+            # Permute outputs to [B, C, T]
             outputs = outputs.permute(0, 2, 1)
-        # Always use CrossEntropyLoss for raw logits with integer targets.
+            # If targets are a single label per sample (shape [B] or [B,1]), use the last time step.
+            if targets.dim() == 1 or (targets.dim() == 2 and targets.size(1) == 1):
+                outputs = outputs[:, :, -1]  # now shape is [B, C]
+            else:
+                # Otherwise, if targets are provided per time step (shape [B, T]),
+                # flatten both the outputs and targets along batch and time dimensions.
+                B, C, T = outputs.shape
+                outputs = outputs.reshape(B * T, C)
+                targets = targets.reshape(B * T)
         loss_fn = torch.nn.CrossEntropyLoss()
         return loss_fn(outputs, targets)
 
@@ -108,8 +123,9 @@ class BaseTrainer:
         total_loss = 0.0
         with torch.no_grad():
             for batch in val_loader:
-                inputs, targets = batch  # customize extraction based on data loader output
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                # Extract inputs and targets from dictionary
+                inputs = batch['chroma'].to(self.device)
+                targets = batch['chord_idx'].to(self.device)
                 outputs = self.model(inputs)
                 loss = self.compute_loss(outputs, targets)
                 total_loss += loss.item()

@@ -200,6 +200,11 @@ class BaseTransformer(nn.Module):
     self.decoder = Decoder(d_model=n_freq, n_head=d_head, n_layer=d_layer, dropout=d_dropout, r1=r1, r2=r2, wr=wr, pr=d_pr)
 
   def forward(self, x, weight=None):
+    # If input is 3D ([B, T, F]), add a channel dimension; then, if more than one channel is expected, repeat.
+    if x.ndim == 3:
+      x = x.unsqueeze(1)  # shape: [B, 1, T, F]
+      if self.n_channel > 1:
+        x = x.repeat(1, self.n_channel, 1, 1)  # shape: [B, n_channel, T, F]
     ff, tf = [], []
 
     for i in range(self.n_channel):
