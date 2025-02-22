@@ -16,24 +16,25 @@ from modules.training.Trainer import BaseTrainer
 from modules.training.Schedulers import CosineScheduler  # new import
 
 # -------------------------
-# Custom collate function: each sample is a single chroma vector; add a time dimension then duplicate channel.
-def custom_collate(batch):
-    inputs, targets = [], []
-    for sample in batch:
-        # sample["chroma"] has shape [12], unsqueeze to [1,12] then duplicate channel -> [2,1,12]
-        chroma_tensor = sample["chroma"].unsqueeze(0).repeat(2, 1, 1)
-        inputs.append(chroma_tensor)
-        # Use chord_idx already built in the dataset
-        tgt = torch.tensor(sample["chord_idx"], dtype=torch.long, device=chroma_tensor.device)
-        targets.append(tgt)
-    batch_inputs = torch.stack(inputs, dim=0)  # shape: [B, 2, 1, 12]
-    # Unsqueeze targets to have shape [B, 1] so that loss function gets matching dimensions
-    batch_targets = torch.stack(targets, dim=0).unsqueeze(1)  # shape: [B, 1]
-    return batch_inputs, batch_targets
+# Remove or comment out the custom_collate if not used.
+# def custom_collate(batch):
+#     inputs, targets = [], []
+#     for sample in batch:
+#         # sample["chroma"] has shape [12], unsqueeze to [1,12] then duplicate channel -> [2,1,12]
+#         chroma_tensor = sample["chroma"].unsqueeze(0).repeat(2, 1, 1)
+#         inputs.append(chroma_tensor)
+#         # Use chord_idx already built in the dataset
+#         tgt = torch.tensor(sample["chord_idx"], dtype=torch.long, device=chroma_tensor.device)
+#         targets.append(tgt)
+#     batch_inputs = torch.stack(inputs, dim=0)  # shape: [B, 2, 1, 12]
+#     # Unsqueeze targets to have shape [B, 1] so that loss function gets matching dimensions
+#     batch_targets = torch.stack(targets, dim=0).unsqueeze(1)  # shape: [B, 1]
+#     return batch_inputs, batch_targets
 
 # -------------------------
 # Main training function
 def main():
+    import os
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
@@ -44,15 +45,10 @@ def main():
     dataset = CrossEraDataset(chroma_dir, label_dir)
     print("Number of chord classes:", len(dataset.chord_to_idx))
     
-    total = len(dataset)
-    train_len = int(0.8 * total)
-    val_len = total - train_len
-    train_dataset, val_dataset = random_split(dataset, [train_len, val_len])
+    # Use the dataset's iterator methods.
+    train_loader = dataset.get_train_iterator(batch_size=128)
+    val_loader = dataset.get_eval_iterator(batch_size=128)  # added evaluation iterator
     
-    # Create DataLoaders with our custom collate function (no chord mapping needed here).
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, collate_fn=custom_collate)
-    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, collate_fn=custom_collate)
-
     model = ChordNet(n_freq=12, n_group=4, f_head=1, t_head=1, d_head=1)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     
@@ -71,7 +67,6 @@ def main():
     model = model.to(device)  # move model to device
     
     trainer = BaseTrainer(model, optimizer, scheduler=scheduler, num_epochs=num_epochs, device=device)
-
     trainer.train(train_loader, val_loader=val_loader)
 
 if __name__ == '__main__':
