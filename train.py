@@ -70,13 +70,16 @@ def main():
     combined_dataset = ConcatDataset([dataset1, dataset2])
     print("Total combined samples:", len(combined_dataset))
     
-    # Create DistributedSamplers for training and validation.
-    train_sampler = DistributedSampler(combined_dataset)
-    val_sampler = DistributedSampler(combined_dataset, shuffle=False)
-    
-    # Use a standard DataLoader for the combined dataset.
-    train_loader = DataLoader(combined_dataset, batch_size=128, sampler=train_sampler)
-    val_loader = DataLoader(combined_dataset, batch_size=128, sampler=val_sampler)
+    # Create DataLoader using DistributedSampler only if the process group is initialized.
+    if dist.is_initialized():
+        from torch.utils.data.distributed import DistributedSampler
+        train_sampler = DistributedSampler(combined_dataset)
+        val_sampler = DistributedSampler(combined_dataset, shuffle=False)
+        train_loader = DataLoader(combined_dataset, batch_size=128, sampler=train_sampler)
+        val_loader = DataLoader(combined_dataset, batch_size=128, sampler=val_sampler)
+    else:
+        train_loader = DataLoader(combined_dataset, batch_size=128, shuffle=False)
+        val_loader = DataLoader(combined_dataset, batch_size=128, shuffle=False)
     
     # Use a lighter transformer suited for a 12-bin chromagram:
     model = ChordNet(n_freq=12, n_classes=274, n_group=3,   # changed n_group from 4 to 3
@@ -108,7 +111,8 @@ def main():
     trainer.train(train_loader, val_loader=val_loader)
     
     # Clean up distributed resources.
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 if __name__ == '__main__':
     main()
