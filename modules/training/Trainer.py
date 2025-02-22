@@ -22,7 +22,6 @@ class BaseTrainer:
             # Use device of first model parameter if available, else default to CPU.
             device = next(model.parameters()).device if list(model.parameters()) else torch.device('cpu')
         self.device = device
-        print(f"Using device: {self.device}")  # <-- Added line to verify GPU usage
         self.model = self.model.to(self.device)
         if scheduler is None:
             # Create a dummy scheduler that does nothing.
@@ -81,9 +80,17 @@ class BaseTrainer:
             torch.save(self.model.state_dict(), checkpoint_path)
             print(f"Epoch {epoch} complete. Checkpoint saved to {checkpoint_path}")
         
-        # After training, output a final static graph.
+        # After training, output a final static graph if available.
         if self.animator:
-            self.animator.plot()
+            if hasattr(self.animator, "plot"):
+                self.animator.plot()
+            elif hasattr(self.animator, "fig"):
+                # If Animator has a figure attribute, use pyplot to show the stored figure.
+                import matplotlib.pyplot as plt
+                plt.ioff()
+                self.animator.fig.show()
+            else:
+                print("Animator does not support a final plot method.")
 
     def compute_loss(self, outputs, targets):
         # If outputs is a tuple, use the first element.
@@ -146,3 +153,5 @@ class BaseTrainer:
                 print(f"Training on {torch.cuda.device_count()} GPUs.")
             self.train(train_loader, val_loader)
             self.model = self.model.module
+
+# End of file
