@@ -118,9 +118,18 @@ class BaseTrainer:
         if outputs.ndim == 3:
             outputs = outputs.mean(dim=1)
         
+        # Diagnostic: Check for NaNs in outputs and targets
+        if torch.isnan(outputs).any():
+            self._log("NaN detected in model outputs")
+        if torch.isnan(targets).any():
+            self._log("NaN detected in targets")
+        
         loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.ignore_index)
         loss = loss_fn(outputs, targets)
-    
+        
+        if torch.isnan(loss):
+            self._log(f"NaN loss computed. Outputs: {outputs} | Targets: {targets}")
+        
         return loss
 
     def validate(self, val_loader):

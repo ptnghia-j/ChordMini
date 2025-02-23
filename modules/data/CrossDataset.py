@@ -139,36 +139,30 @@ class CrossDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
-        """
-        Returns a sequence of chroma vectors of length seq_len.
-        If consecutive samples do not come from the same piece, the missing frames are padded.
-        """
+        # Modified to always assign the chord of the first sample
+        # and remove unnecessary variables.
+        first_sample = self.samples[idx]
+        first_chord = first_sample['chord_label'].strip('"')
         sequence = []
-        first_piece = self.samples[idx]['piece']
-        consecutive = 0
-
-        for i in range(self.seq_len):
-            if (idx + i < len(self.samples)) and (self.samples[idx + i]['piece'] == first_piece):
-                sample_i = self.samples[idx + i]
-                tensor_i = torch.tensor(sample_i['chroma'], dtype=torch.float)
-                sequence.append(tensor_i)
-                consecutive += 1
-            else:
-                sequence.append(torch.zeros(12, dtype=torch.float))
+        i = 0
+        while (
+            i < self.seq_len and 
+            (idx + i) < len(self.samples) and 
+            self.samples[idx + i]['piece'] == first_sample['piece'] and 
+            self.samples[idx + i]['chord_label'].strip('"') == first_chord
+        ):
+            sequence.append(torch.tensor(self.samples[idx + i]['chroma'], dtype=torch.float))
+            i += 1
+        while i < self.seq_len:
+            sequence.append(torch.zeros(12, dtype=torch.float))
+            i += 1
         chroma_seq = torch.stack(sequence, dim=0).to(get_device())
-
-        if consecutive < self.seq_len:
-            # For incomplete sequences, assign the default ignore label "N"
-            chord_idx = self.chord_to_idx.get("N", 1)
-            chord_label = "N"
-        else:
-            last_sample = self.samples[idx + self.seq_len - 1]
-            # Strip extra quotation marks from the chord label to match the mapping
-            chord_label_clean = last_sample['chord_label'].strip('"')
-            chord_idx = self.chord_to_idx[chord_label_clean]
-            chord_label = chord_label_clean
-
-        sample_out = {'chroma': chroma_seq, 'chord_idx': chord_idx, 'chord_label': chord_label}
+        
+        sample_out = {
+            'chroma': chroma_seq,
+            'chord_idx': self.chord_to_idx[first_chord],
+            'chord_label': first_chord
+        }
         if self.transform:
             sample_out = self.transform(sample_out)
         return sample_out

@@ -1,68 +1,78 @@
-import argparse
 import os
+import sys
+import random
 import torch
-import pandas as pd
+from torch.utils.data import DataLoader, ConcatDataset, Sampler
 from modules.models.Transformer.ChordNet import ChordNet
 from modules.utils.device import get_device
+from modules.data.CrossDataset import CrossDataset, get_unified_mapping
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+# Remove previous CSV testing functions...
+# ...existing code removed...
+
+# Sampler helper.
+class ListSampler(Sampler):
+    def __init__(self, indices):
+        self.indices = indices
+    def __iter__(self):
+        return iter(self.indices)
+    def __len__(self):
+        return len(self.indices)
+
+# Updated partition_test_set helper using a 90-10 split.
+def partition_test_set(concat_dataset):
+    test_indices = []
+    offset = 0
+    for ds in concat_dataset.datasets:
+        # Use last 10% for evaluation.
+        test_start = int(len(ds) * 0.9)
+        test_indices.extend(range(offset + test_start, offset + len(ds)))
+        offset += len(ds)
+    return test_indices
 
 def load_model(checkpoint_path, device):
+    # Use the same parameters as training.
     model = ChordNet(n_freq=12, n_classes=274, n_group=3,
                      f_layer=2, f_head=4,
                      t_layer=2, t_head=4,
                      d_layer=2, d_head=4,
-                     dropout=0.2)
+                     dropout=0.3)
     state_dict = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state_dict, strict=True)
     model.to(device)
     model.eval()
     return model
 
-def run_inference(model, input_tensor):
-    with torch.no_grad():
-        predictions, _ = model(input_tensor, inference=True)
-    return predictions
+class Tester:
+    def __init__(self, model, test_loader, device):
+        self.model = model
+        self.test_loader = test_loader
+        self.device = device
 
-def load_chroma_from_csv(csv_path, device):
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"CSV file not found at {csv_path}")
-    df = pd.read_csv(csv_path)
-    chroma_columns = df.columns[2:]
-    # Loading chroma process: extracting full time series from CSV
-    chroma_array = df[chroma_columns].astype(float).values  # shape: [T, 12]
-    seq_len = 4
-    sequences = []
-    for i in range(len(chroma_array) - seq_len + 1):
-        seq = chroma_array[i:i+seq_len]
-        seq_tensor = torch.tensor(seq, dtype=torch.float32, device=device)
-        sequences.append(seq_tensor)
-    if len(sequences) == 0:
-        seq_tensor = torch.tensor(chroma_array[0], dtype=torch.float32, device=device).unsqueeze(0).repeat(seq_len,1)
-        sequences.append(seq_tensor)
-    batch = torch.stack(sequences, dim=0)  # [B, seq_len, 12]
-    batch = batch.unsqueeze(1).repeat(1, 2, 1, 1)  # [B, 2, seq_len, 12]
-    return batch
+    def evaluate(self):
+        self.model.eval()
+        all_preds = []
+        all_targets = []
+        with torch.no_grad():
+            for batch in self.test_loader:
+                inputs = batch['chroma'].to(self.device)
+                targets = batch['chord_idx'].to(self.device)
+                preds = self.model.predict(inputs)
+                all_preds.extend(preds.cpu().numpy())
+                all_targets.extend(targets.cpu().numpy())
+        accuracy = accuracy_score(all_targets, all_preds)
+        precision = precision_score(all_targets, all_preds, average='weighted', zero_division=0)
+        recall = recall_score(all_targets, all_preds, average='weighted', zero_division=0)
+        f1 = f1_score(all_targets, all_preds, average='weighted', zero_division=0)
+        print(f"Test Accuracy: {accuracy:.4f}")
+        print(f"Test Precision: {precision:.4f}")
+        print(f"Test Recall: {recall:.4f}")
+        print(f"Test F1 Score: {f1:.4f}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Predict chord classes using ChordNet")
-    parser.add_argument("checkpoint", type=str, help="Path to model checkpoint")
-    parser.add_argument("csv_file", type=str, help="Path to CSV file with chroma features")
-    parser.add_argument("--output", type=str, help="Output CSV file for predictions")
-    args = parser.parse_args()
-    device = get_device()
-    model = load_model(args.checkpoint, device)
-    input_tensor = load_chroma_from_csv(args.csv_file, device)
-    predictions = run_inference(model, input_tensor)
-    if args.output:
-        if os.path.isdir(args.output):
-            output_path = os.path.join(args.output, "predictions.csv")
-        else:
-            output_path = args.output
-        predictions_np = predictions.cpu().numpy()
-        df = pd.DataFrame(predictions_np)
-        df.to_csv(output_path, index=False)
-        print("Predictions saved to:", output_path)
-    else:
-        print("Predictions:", predictions)
+    # ...existing dataset and checkpoint initialization removed...
+    print("Test phase is integrated into training. Please run train.py to perform evaluation.")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
