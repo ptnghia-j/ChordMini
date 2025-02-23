@@ -212,7 +212,10 @@ def init_distributed() -> torch.device:
         return torch.device("cpu")
 
 def main():
-    device = init_distributed()
+    # The following init_distributed() call is only used if distributed processing is enabled.
+    # device = init_distributed()
+    device = get_device()
+
     # Calculate the project root (three levels up from this file)
     project_root = Path(__file__).resolve().parents[2]
 
@@ -235,13 +238,8 @@ def main():
     combined_dataset = ConcatDataset([dataset1, dataset2])
     print("Total combined samples:", len(combined_dataset))
 
-    # Use DistributedSampler if in distributed mode.
-    if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1:
-        from torch.utils.data.distributed import DistributedSampler
-        sampler = DistributedSampler(combined_dataset, shuffle=False)
-        loader = DataLoader(combined_dataset, batch_size=128, sampler=sampler)
-    else:
-        loader = DataLoader(combined_dataset, batch_size=128, shuffle=False)
+    # Always use standard DataLoader.
+    loader = DataLoader(combined_dataset, batch_size=128, shuffle=False)
 
     # Debug: print first few samples.
     print("-- Distributed Combined Dataset first 10 samples --")
@@ -249,10 +247,7 @@ def main():
         sample = loader.dataset[i]
         print(f"Instance {i}: Label: {sample['chord_label']}, Chroma: {sample['chroma']}")
 
-    # Clean up distributed resources if needed.
-    if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1:
-        import torch.distributed as dist
-        dist.destroy_process_group()
+    # Remove distributed cleanup since it is no longer used.
 
 if __name__ == '__main__':
     main()
