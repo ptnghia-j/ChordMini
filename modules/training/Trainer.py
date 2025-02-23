@@ -77,8 +77,7 @@ class BaseTrainer:
                 loss = self.compute_loss(outputs, targets)
                 loss.backward()
                 # Apply gradient clipping
-                if self.max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 epoch_loss += loss.item()
                 
