@@ -1,13 +1,18 @@
 import argparse
+import os
 import torch
 import pandas as pd
-import os  # added: import os
 from modules.models.Transformer.ChordNet import ChordNet
 from modules.utils.device import get_device
 
 def load_model(checkpoint_path, device):
-    model = ChordNet(n_freq=12, n_group=4, f_head=1, t_head=1, d_head=1)
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    model = ChordNet(n_freq=12, n_classes=274, n_group=3,
+                     f_layer=2, f_head=4,
+                     t_layer=2, t_head=4,
+                     d_layer=2, d_head=4,
+                     dropout=0.2)
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(state_dict, strict=True)
     model.to(device)
     model.eval()
     return model
@@ -18,47 +23,46 @@ def run_inference(model, input_tensor):
     return predictions
 
 def load_chroma_from_csv(csv_path, device):
-    if not os.path.exists(csv_path):  # added: check if file exists
+    if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV file not found at {csv_path}")
-    # Assumes CSV columns: Filename, Time (seconds), Chroma_A, Chroma_A#, ... Chroma_G#
     df = pd.read_csv(csv_path)
-    chroma_columns = df.columns[2:] # adjust if necessary
-    inputs = []
-    for _, row in df.iterrows():
-        # Convert the chroma values to a list of floats
-        chroma_data = row[chroma_columns].astype(float).tolist()
-        # Create tensor of shape [1, 12]
-        chroma_tensor = torch.tensor(chroma_data, dtype=torch.float32, device=device).unsqueeze(0)
-        # Expand dims: duplicate channel and add time dimension to get shape [2, 1, 12]
-        chroma_tensor = chroma_tensor.unsqueeze(0).repeat(2, 1, 1)
-        inputs.append(chroma_tensor)
-    # Stack to form batch: [batch_size, 2, 1, 12]
-    return torch.stack(inputs, dim=0)
+    chroma_columns = df.columns[2:]
+    # Loading chroma process: extracting full time series from CSV
+    chroma_array = df[chroma_columns].astype(float).values  # shape: [T, 12]
+    seq_len = 4
+    sequences = []
+    for i in range(len(chroma_array) - seq_len + 1):
+        seq = chroma_array[i:i+seq_len]
+        seq_tensor = torch.tensor(seq, dtype=torch.float32, device=device)
+        sequences.append(seq_tensor)
+    if len(sequences) == 0:
+        seq_tensor = torch.tensor(chroma_array[0], dtype=torch.float32, device=device).unsqueeze(0).repeat(seq_len,1)
+        sequences.append(seq_tensor)
+    batch = torch.stack(sequences, dim=0)  # [B, seq_len, 12]
+    batch = batch.unsqueeze(1).repeat(1, 2, 1, 1)  # [B, 2, seq_len, 12]
+    return batch
 
 def main():
-    parser = argparse.ArgumentParser(description="Predict chord classes for every instance in a CSV file using ChordNet")
-    parser.add_argument("checkpoint", type=str, help="Path to the model checkpoint (e.g. checkpoints/model_epoch_5.pth)")
-    parser.add_argument("csv_file", type=str, help="Path to the CSV file containing chroma features (e.g. mhwgo_nnls_chromagram.csv)")
-    parser.add_argument("--output", type=str, help="Path to the output CSV file for predictions")  # added: optional output argument
+    parser = argparse.ArgumentParser(description="Predict chord classes using ChordNet")
+    parser.add_argument("checkpoint", type=str, help="Path to model checkpoint")
+    parser.add_argument("csv_file", type=str, help="Path to CSV file with chroma features")
+    parser.add_argument("--output", type=str, help="Output CSV file for predictions")
     args = parser.parse_args()
-    device = get_device()  # added: get device
-    model = load_model(args.checkpoint, device)  # added: load model
-    input_tensor = load_chroma_from_csv(args.csv_file, device)  # added: load chroma input
-    predictions = run_inference(model, input_tensor)  # added: run inference
-    
+    device = get_device()
+    model = load_model(args.checkpoint, device)
+    input_tensor = load_chroma_from_csv(args.csv_file, device)
+    predictions = run_inference(model, input_tensor)
     if args.output:
-        import os  # Ensure os is imported
-        # If output path is a directory, append default filename
         if os.path.isdir(args.output):
             output_path = os.path.join(args.output, "predictions.csv")
         else:
             output_path = args.output
-        predictions_np = predictions.cpu().numpy()  # convert predictions to numpy array
-        df = pd.DataFrame(predictions_np)  # create DataFrame from predictions
-        df.to_csv(output_path, index=False)  # write DataFrame to CSV
-        print("Predictions saved to:", output_path)  # output saved message
+        predictions_np = predictions.cpu().numpy()
+        df = pd.DataFrame(predictions_np)
+        df.to_csv(output_path, index=False)
+        print("Predictions saved to:", output_path)
     else:
-        print("Predictions:", predictions)  # added: output predictions
+        print("Predictions:", predictions)
 
 if __name__ == "__main__":
     main()

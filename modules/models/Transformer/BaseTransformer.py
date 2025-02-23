@@ -165,61 +165,39 @@ class Decoder(nn.Module):
     return output, y
   
 class BaseTransformer(nn.Module):
-  def __init__(self,
-               n_channel=2,
-               n_freq=2048,
-               
-               n_group=16,
-               f_layer=2,
-               f_head=8,
-               f_dropout=0.2,
-               f_pr=0.01,
-               
-               t_layer=2,
-               t_head=4,
-               t_dropout=0.2,
-               t_pr=0.02,
-               
-               d_layer=2,
-               d_head=4,
-               d_dropout=0.5,
-               d_pr=0.02,
-               r1=1.0,
-               r2=1.0,
-               wr=0.2):
+    def __init__(self, n_channel=2, n_freq=2048, n_group=16,
+                 f_layer=2, f_head=8, f_dropout=0.2, f_pr=0.01,
+                 t_layer=2, t_head=4, t_dropout=0.2, t_pr=0.02,
+                 d_layer=2, d_head=4, d_dropout=0.5, d_pr=0.02,
+                 r1=1.0, r2=1.0, wr=0.2):
+        super().__init__()
+        self.n_channel = n_channel
+        self.encoder_f = nn.ModuleList()
+        self.encoder_t = nn.ModuleList()
+        for _ in range(n_channel):
+            self.encoder_f.append(EncoderF(n_freq=n_freq, n_group=n_group, n_head=f_head, 
+                                            n_layer=f_layer, dropout=f_dropout, pr=f_pr))
+            self.encoder_t.append(EncoderT(n_freq=n_freq, n_head=t_head, n_layer=t_layer, 
+                                            dropout=t_dropout, pr=t_pr))
+        self.decoder = Decoder(d_model=n_freq, n_head=d_head, n_layer=d_layer, 
+                               dropout=d_dropout, r1=r1, r2=r2, wr=wr, pr=d_pr)
     
-    super().__init__()
-    self.n_channel = n_channel
-    self.encoder_f = nn.ModuleList()
-    self.encoder_t = nn.ModuleList()
-
-    for _ in range(n_channel):
-      self.encoder_f.append(EncoderF(n_freq=n_freq, n_group=n_group, n_head=f_head, n_layer=f_layer, dropout=f_dropout, pr=f_pr))
-      self.encoder_t.append(EncoderT(n_freq=n_freq, n_head=t_head, n_layer=t_layer, dropout=t_dropout, pr=t_pr))
-
-    self.decoder = Decoder(d_model=n_freq, n_head=d_head, n_layer=d_layer, dropout=d_dropout, r1=r1, r2=r2, wr=wr, pr=d_pr)
-
-  def forward(self, x, weight=None):
-    # If input is 3D ([B, T, F]), add a channel dimension; then, if more than one channel is expected, repeat.
-    if x.ndim == 3:
-      x = x.unsqueeze(1)  # shape: [B, 1, T, F]
-      if self.n_channel > 1:
-        x = x.repeat(1, self.n_channel, 1, 1)  # shape: [B, n_channel, T, F]
-    ff, tf = [], []
-
-    for i in range(self.n_channel):
-      x1 = self.encoder_f[i](x[:, i, :, :])
-      x2 = self.encoder_t[i](x[:, i, :, :])
-
-      ff.append(x1)
-      tf.append(x2)
-    
-    y1 = torch.sum(torch.stack(ff, dim=0), dim=0)
-    y2 = torch.sum(torch.stack(tf, dim=0), dim=0)
-    y, w = self.decoder(y1, y2, weight)
-
-    return y, w
-  
+    def forward(self, x, weight=None):
+        # Ensure input is [B, n_channel, T, F]
+        if x.ndim == 3:
+            x = x.unsqueeze(1)  # [B, 1, T, F]
+            if self.n_channel > 1:
+                x = x.repeat(1, self.n_channel, 1, 1)  # [B, n_channel, T, F]
+        ff, tf = [], []
+        for i in range(self.n_channel):
+            x1 = self.encoder_f[i](x[:, i, :, :])
+            x2 = self.encoder_t[i](x[:, i, :, :])
+            ff.append(x1)
+            tf.append(x2)
+        y1 = torch.sum(torch.stack(ff, dim=0), dim=0)
+        y2 = torch.sum(torch.stack(tf, dim=0), dim=0)
+        y, w = self.decoder(y1, y2, weight)
+        return y, w
 
 if __name__ == '__main__':
   # Test initialization using BaseTransformer instead of Transformer
