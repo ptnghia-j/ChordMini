@@ -43,18 +43,35 @@ class BaseTrainer:
         self.max_grad_norm = max_grad_norm
         self.ignore_index = ignore_index
 
+    def _log(self, message):
+        # Helper for logging messages.
+        if self.logger:
+            self.logger.info(message)
+        else:
+            print(message)
+
+    def _process_batch(self, batch):
+        # Factor out extraction of inputs and targets.
+        inputs = batch['chroma'].to(self.device)
+        targets = batch['chord_idx'].to(self.device)
+        return inputs, targets
+
+    def _save_checkpoint(self, epoch):
+        # Helper to save checkpoint after each epoch.
+        checkpoint_path = os.path.join(self.checkpoint_dir, f"model_epoch_{epoch}.pth")
+        torch.save(self.model.state_dict(), checkpoint_path)
+        self._log(f"Epoch {epoch} complete. Checkpoint saved to {checkpoint_path}")
+
     def train(self, train_loader, val_loader=None):
         # Remove interactive plotting; simply record loss and output final graph.
         self.model.train()
         for epoch in range(1, self.num_epochs + 1):
-            print(f"Epoch {epoch}/{self.num_epochs} - Starting training")
+            self._log(f"Epoch {epoch}/{self.num_epochs} - Starting training")
             self.timer.reset()
             self.timer.start()
             epoch_loss = 0.0
             for batch_idx, batch in enumerate(train_loader):
-                # Extract inputs and targets from dictionary
-                inputs = batch['chroma'].to(self.device)
-                targets = batch['chord_idx'].to(self.device)
+                inputs, targets = self._process_batch(batch)
                 self.optimizer.zero_grad()
                 outputs = self.model(inputs)
                 loss = self.compute_loss(outputs, targets)
@@ -66,15 +83,11 @@ class BaseTrainer:
                 epoch_loss += loss.item()
                 
                 if batch_idx % 10 == 0:
-                    print(f"Epoch {epoch} Batch {batch_idx}/{len(train_loader)} - Loss: {loss.item():.4f}")
+                    self._log(f"Epoch {epoch} Batch {batch_idx}/{len(train_loader)} - Loss: {loss.item():.4f}")
             
             self.timer.stop()
             avg_loss = epoch_loss / len(train_loader)
-            message = f"Epoch {epoch}/{self.num_epochs}: Loss = {avg_loss:.4f}, Time = {self.timer.elapsed_time():.2f} sec"
-            if self.logger:
-                self.logger.info(message)
-            else:
-                print(message)
+            self._log(f"Epoch {epoch}/{self.num_epochs}: Loss = {avg_loss:.4f}, Time = {self.timer.elapsed_time():.2f} sec")
             
             if self.animator:
                 # Record the average loss for later static plotting.
@@ -85,9 +98,7 @@ class BaseTrainer:
             self.scheduler.step()
             
             # Save checkpoint at end of each epoch.
-            checkpoint_path = os.path.join(self.checkpoint_dir, f"model_epoch_{epoch}.pth")
-            torch.save(self.model.state_dict(), checkpoint_path)
-            print(f"Epoch {epoch} complete. Checkpoint saved to {checkpoint_path}")
+            self._save_checkpoint(epoch)
         
         # After training, output a final static graph if available.
         if self.animator:
@@ -99,22 +110,19 @@ class BaseTrainer:
                 plt.ioff()
                 self.animator.fig.show()
             else:
-                print("Animator does not support a final plot method.")
+                self._log("Animator does not support a final plot method.")
 
     def compute_loss(self, outputs, targets):
+        # When the model returns multiple outputs, we only need the first (logits) for loss computation.
         if isinstance(outputs, tuple):
             outputs = outputs[0]
         if outputs.ndim == 3:
-            outputs = outputs.permute(0, 2, 1)  # [B, C, T]
-            if targets.dim() == 1 or (targets.dim() == 2 and targets.size(1) == 1):
-                outputs = outputs[:, :, 0]  # use first timestep; shape [B, C]
-            else:
-                B, C, T = outputs.shape
-                outputs = outputs.reshape(B * T, C)
-                targets = targets.reshape(B * T)
-        # Create loss with ignore_index set to the provided value (e.g. the mapping for "N")
+            outputs = outputs.mean(dim=1)
+        
         loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.ignore_index)
-        return loss_fn(outputs, targets)
+        loss = loss_fn(outputs, targets)
+    
+        return loss
 
     def validate(self, val_loader):
         self.model.eval()
@@ -122,16 +130,12 @@ class BaseTrainer:
         with torch.no_grad():
             for batch in val_loader:
                 # Extract inputs and targets from dictionary
-                inputs = batch['chroma'].to(self.device)
-                targets = batch['chord_idx'].to(self.device)
+                inputs, targets = self._process_batch(batch)
                 outputs = self.model(inputs)
                 loss = self.compute_loss(outputs, targets)
                 total_loss += loss.item()
         avg_loss = total_loss / len(val_loader)
-        if self.logger:
-            self.logger.info(f"Validation Loss: {avg_loss:.4f}")
-        else:
-            print(f"Validation Loss: {avg_loss:.4f}")
+        self._log(f"Validation Loss: {avg_loss:.4f}")
         self.model.train()
 
     def save_checkpoint(self, path):
@@ -167,5 +171,3 @@ class BaseTrainer:
                 print(f"Training on {torch.cuda.device_count()} GPUs.")
             self.train(train_loader, val_loader)
             self.model = self.model.module
-
-# End of file
