@@ -1,6 +1,5 @@
 import sys
 import os
-import platform
 import csv
 import torch
 import pandas as pd
@@ -10,7 +9,6 @@ from modules.data.CrossDataset import CrossDataset
 from modules.models.Transformer.ChordNet import ChordNet
 from modules.training.Trainer import BaseTrainer
 from modules.training.Schedulers import CosineScheduler
-import torch.cuda.amp  # added for mixed precision
 
 def get_unified_mapping(label_dirs):
     chord_set = set()
@@ -34,8 +32,7 @@ def get_unified_mapping(label_dirs):
     return {chord: idx+1 for idx, chord in enumerate(sorted(chord_set))}
 
 def main():
-    # Removed distributed initialization; use DataParallel instead.
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
     if project_root not in sys.path:
@@ -51,7 +48,7 @@ def main():
     dataset2 = CrossDataset(chroma_dir2, label_dir2, chord_mapping=unified_mapping)
     combined_dataset = ConcatDataset([dataset1, dataset2])
     print("Total combined samples:", len(combined_dataset))
-    # Use standard DataLoader instead of distributed samplers.
+    # Use standard DataLoader.
     train_loader = DataLoader(combined_dataset, batch_size=128, shuffle=True, num_workers=2)
     val_loader   = DataLoader(combined_dataset, batch_size=128, shuffle=False, num_workers=2)
     
@@ -61,7 +58,7 @@ def main():
                      d_layer=2, d_head=4, 
                      dropout=0.5)
     model = model.to(device)
-    # Wrap the model with DataParallel if multiple GPUs are available.
+    # Wrap model with DataParallel if multiple GPUs are available.
     if torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
     
@@ -70,13 +67,10 @@ def main():
     num_epochs = 5
     scheduler = CosineScheduler(optimizer, max_update=num_epochs, base_lr=0.01,
                                 final_lr=0.00001, warmup_steps=warmup_steps, warmup_begin_lr=0.001)
-    # Create amp grad scaler if CUDA is available
-    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None  # for AMP
-    # Pass use_amp and scaler to the trainer (ensure BaseTrainer supports these parameters)
+   
     trainer = BaseTrainer(model, optimizer, scheduler=scheduler,
                           num_epochs=num_epochs, device=device,
-                          ignore_index=unified_mapping["N"],
-                          use_amp=True, scaler=scaler)
+                          ignore_index=unified_mapping["N"])
     trainer.train(train_loader, val_loader=val_loader)
     
 if __name__ == '__main__':

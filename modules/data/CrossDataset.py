@@ -18,20 +18,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # Helper to load CSV with options and common processing.
 def read_csv_file(fpath: Path, columns, extra_process=None):
-    # Loading file process: try to use cudf for speed; otherwise, fallback to pandas.
-    try:
-        import cudf
-        df = cudf.read_csv(str(fpath), header=None, sep=',', 
-                           quoting=csv.QUOTE_NONE, escapechar='\\')
-        df[0] = df[0].replace("", None).ffill()
-        df.columns = columns
-        df = df.to_pandas()  # Convert to pandas for further processing.
-    except ImportError:
-        df = pd.read_csv(str(fpath), header=None, sep=',', engine='c',
-                         quoting=csv.QUOTE_NONE, escapechar='\\',
-                         dtype={0: str}, low_memory=False)
-        df[0] = df[0].replace("", pd.NA).ffill()
-        df.columns = columns
+    # Always use pandas for CSV reading.
+    df = pd.read_csv(str(fpath), header=None, sep=',', engine='c',
+                     quoting=csv.QUOTE_NONE, escapechar='\\',
+                     dtype={0: str}, low_memory=False)
+    df[0] = df[0].replace("", pd.NA).ffill()
+    df.columns = columns
     if extra_process is not None:
         df = extra_process(df)
     return df
@@ -198,24 +190,9 @@ def get_unified_mapping(label_dirs: list) -> dict:
                 chord_set.update({str(chord).strip('"') for chord in df['chord'].fillna("N").unique()})
     return {chord: idx + 1 for idx, chord in enumerate(sorted(chord_set))}
 
-def init_distributed() -> torch.device:
-    """
-    Initializes distributed processing if applicable and returns the device.
-    """
-    if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1:
-        import torch.distributed as dist
-        from torch.utils.data.distributed import DistributedSampler
-        dist.init_process_group(backend="nccl")
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        return torch.device("cuda", local_rank)
-    else:
-        return torch.device("cpu")
-
 def main():
-    # The following init_distributed() call is only used if distributed processing is enabled.
-    # device = init_distributed()
+    # Removed distributed initialization.
     device = get_device()
-
     # Calculate the project root (three levels up from this file)
     project_root = Path(__file__).resolve().parents[2]
 
@@ -242,12 +219,10 @@ def main():
     loader = DataLoader(combined_dataset, batch_size=128, shuffle=False)
 
     # Debug: print first few samples.
-    print("-- Distributed Combined Dataset first 10 samples --")
+    print("-- Combined Dataset first 10 samples --")
     for i in range(min(10, len(loader.dataset))):
         sample = loader.dataset[i]
         print(f"Instance {i}: Label: {sample['chord_label']}, Chroma: {sample['chroma']}")
-
-    # Remove distributed cleanup since it is no longer used.
 
 if __name__ == '__main__':
     main()
