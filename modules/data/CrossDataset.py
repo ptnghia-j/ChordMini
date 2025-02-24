@@ -28,6 +28,9 @@ def read_csv_file(fpath: Path, columns, extra_process=None):
         df = extra_process(df)
     return df
 
+def clean_chord_label(label: str) -> str:
+    return label.strip().strip('"')
+
 def load_chroma(fpath: Path) -> pd.DataFrame:
     # Load chroma CSV file; columns: piece, timestamp, and 12 pitch values.
     columns = ['piece', 'timestamp'] + [f'pitch_{i}' for i in range(12)]
@@ -39,7 +42,10 @@ def load_chord(fpath: Path) -> pd.DataFrame:
         df['timestamp'] = df['timestamp'] + 0.1
         return df
     columns = ['piece', 'timestamp', 'chord']
-    return read_csv_file(fpath, columns, extra_process=shift_timestamp)
+    df = read_csv_file(fpath, columns, extra_process=shift_timestamp)
+    # Clean chord column values early on.
+    df['chord'] = df['chord'].fillna("N").apply(clean_chord_label)
+    return df
 
 class CrossDataset(Dataset):
     """
@@ -79,16 +85,26 @@ class CrossDataset(Dataset):
         chroma_df = pd.concat(chroma_dfs, ignore_index=True).sort_values(['piece', 'timestamp'])
         chord_df = pd.concat(chord_dfs, ignore_index=True).sort_values(['piece', 'timestamp'])
         samples = []
+        # Initialize counter for logging chord distribution
+        log_counter = 0
         for piece, chroma_group in chroma_df.groupby('piece'):
             chroma_group = chroma_group.sort_values('timestamp')
             chords_piece = chord_df[chord_df['piece'] == piece].sort_values('timestamp')
-            merged = pd.merge_asof(chroma_group, chords_piece, on='timestamp', direction='backward')
-            merged['chord'] = merged['chord'].fillna("N")
+            merged = pd.merge_asof(chroma_group, chords_piece,
+                                   on='timestamp',
+                                   direction='nearest',
+                                   tolerance=0.2)
+            merged['chord'] = merged['chord'].ffill().fillna("N").infer_objects(copy=False).apply(clean_chord_label)
+            if log_counter < 10:
+                print(f"Chord distribution for {piece}:")
+                print(merged['chord'].value_counts())
+                log_counter += 1
             for row in merged.itertuples(index=False):
+                chroma_vector = [getattr(row, f'pitch_{i}') for i in range(12)]
                 samples.append({
                     'piece': piece,
                     'timestamp': row.timestamp,
-                    'chroma': [getattr(row, f'pitch_{i}') for i in range(12)],
+                    'chroma': chroma_vector,
                     'chord_label': row.chord
                 })
         self.samples = samples
@@ -139,29 +155,25 @@ class CrossDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
-        # Modified to always assign the chord of the first sample
-        # and remove unnecessary variables.
-        first_sample = self.samples[idx]
-        first_chord = first_sample['chord_label'].strip('"')
+        # Instead of forcing same chord for the whole sequence, we build a consecutive sequence.
         sequence = []
-        i = 0
-        while (
-            i < self.seq_len and 
-            (idx + i) < len(self.samples) and 
-            self.samples[idx + i]['piece'] == first_sample['piece'] and 
-            self.samples[idx + i]['chord_label'].strip('"') == first_chord
-        ):
-            sequence.append(torch.tensor(self.samples[idx + i]['chroma'], dtype=torch.float))
-            i += 1
-        while i < self.seq_len:
-            sequence.append(torch.zeros(12, dtype=torch.float))
-            i += 1
+        chord_labels = []
+        for i in range(self.seq_len):
+            if (idx + i) < len(self.samples) and self.samples[idx + i]['piece'] == self.samples[idx]['piece']:
+                sample_i = self.samples[idx + i]
+                sequence.append(torch.tensor(sample_i['chroma'], dtype=torch.float))
+                chord_labels.append(sample_i['chord_label'].strip('"'))
+            else:
+                sequence.append(torch.zeros(12, dtype=torch.float))
+        # Use majority vote among the chord labels in the sequence.
+        from collections import Counter
+        most_common = Counter(chord_labels).most_common(1)[0][0]
         chroma_seq = torch.stack(sequence, dim=0).to(get_device())
         
         sample_out = {
             'chroma': chroma_seq,
-            'chord_idx': self.chord_to_idx[first_chord],
-            'chord_label': first_chord
+            'chord_idx': self.chord_to_idx[most_common],
+            'chord_label': most_common
         }
         if self.transform:
             sample_out = self.transform(sample_out)
