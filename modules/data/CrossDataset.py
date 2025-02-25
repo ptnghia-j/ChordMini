@@ -37,32 +37,38 @@ def load_chroma(fpath: Path) -> pd.DataFrame:
     return read_csv_file(fpath, columns)
 
 def load_chord(fpath: Path) -> pd.DataFrame:
-    # Load chord CSV file; shift timestamp by +0.1 sec.
     def shift_timestamp(df):
         df['timestamp'] = df['timestamp'] + 0.1
         return df
     columns = ['piece', 'timestamp', 'chord']
     df = read_csv_file(fpath, columns, extra_process=shift_timestamp)
-    # Clean chord column values early on.
     df['chord'] = df['chord'].fillna("N").apply(clean_chord_label)
     return df
 
 class CrossDataset(Dataset):
     """
-    Custom dataset that aggregates chroma and chord CSV files.
-    It merges chroma rows with chord events and builds a unified chord mapping.
+    CrossEraDataset for cross-era data.
+    This dataset combines chroma vectors (0.1-second instances with 12 pitch values)
+    with chord labels expanded from chord change files.
+    Each sequence is a contiguous set of chroma vectors with their corresponding chord labels.
+    The parameter "stride" controls the step between segments:
+      - stride == seq_len: non-overlapping segments.
+      - stride < seq_len: overlapping segments.
     """
     def __init__(self, chroma_dir: str, label_dir: str, transform=None,
-                 seq_len: int = 4, chord_mapping: dict = None):
+                 seq_len: int = 4, chord_mapping: dict = None, stride: int = None):
         self.chroma_dir = Path(chroma_dir)
         self.label_dir = Path(label_dir)
         self.transform = transform
         self.seq_len = seq_len
+        # NEW: Use provided stride or default to seq_len (non-overlapping)
+        self.stride = stride if stride is not None else seq_len
         self.chord_mapping = chord_mapping
         self.samples = []
         self.chord_to_idx = {}
         self._build_file_dicts()
         self.aggregate_data()
+        self.ignore_index = self.chord_to_idx.get("N", 0)
 
     def _build_file_dicts(self):
         self.chroma_f = {f: self.chroma_dir / f for f in os.listdir(self.chroma_dir)
@@ -71,34 +77,20 @@ class CrossDataset(Dataset):
                         if f.endswith('.csv')}
 
     def aggregate_data(self):
-        """
-        Aggregates and merges data from chroma and chord files.
-        1. Reads all chroma files and chord files concurrently.
-        2. Merges chroma with chord events for each piece.
-        3. Builds a chord mapping from the collected chord labels.
-        4. Splits data into training (80%) and evaluation (20%).
-        """
-        # Reads files concurrently, merges chroma and chord events per piece.
         with ThreadPoolExecutor() as executor:
             chroma_dfs = list(executor.map(load_chroma, self.chroma_f.values()))
             chord_dfs = list(executor.map(load_chord, self.label_f.values()))
         chroma_df = pd.concat(chroma_dfs, ignore_index=True).sort_values(['piece', 'timestamp'])
         chord_df = pd.concat(chord_dfs, ignore_index=True).sort_values(['piece', 'timestamp'])
         samples = []
-        # Initialize counter for logging chord distribution
         log_counter = 0
         for piece, chroma_group in chroma_df.groupby('piece'):
             chroma_group = chroma_group.sort_values('timestamp')
             chords_piece = chord_df[chord_df['piece'] == piece].sort_values('timestamp')
             merged = pd.merge_asof(chroma_group, chords_piece,
                                    on='timestamp',
-                                   direction='nearest',
-                                   tolerance=0.2)
-            merged['chord'] = merged['chord'].ffill().fillna("N").infer_objects(copy=False).apply(clean_chord_label)
-            if log_counter < 10:
-                print(f"Chord distribution for {piece}:")
-                print(merged['chord'].value_counts())
-                log_counter += 1
+                                   direction='backward')
+            merged['chord'] = merged['chord'].ffill().fillna("N")
             for row in merged.itertuples(index=False):
                 chroma_vector = [getattr(row, f'pitch_{i}') for i in range(12)]
                 samples.append({
@@ -112,14 +104,28 @@ class CrossDataset(Dataset):
             self.chord_to_idx = self.chord_mapping
         else:
             chords_set = {s['chord_label'] for s in self.samples}
-            self.chord_to_idx = {chord: idx + 1 for idx, chord in enumerate(sorted(chords_set))}
+            self.chord_to_idx = {chord: idx for idx, chord in enumerate(sorted(chords_set))}
         eval_ratio = 0.2
         self.split_index = int(len(self.samples) * (1 - eval_ratio))
+        # NEW: Compute segment indices for each contiguous block using stride.
+        # Instead of just storing the start index, store a (start, end) tuple, where "end" is the index at which the piece ends.
+        self.segment_indices = []
+        current_piece = None
+        current_start = 0
+        for i, sample in enumerate(self.samples):
+            if sample['piece'] != current_piece:
+                if current_piece is not None:
+                    block_length = i - current_start
+                    for j in range(0, block_length, self.stride):
+                        self.segment_indices.append((current_start + j, i))
+                current_piece = sample['piece']
+                current_start = i
+        if current_piece is not None:
+            block_length = len(self.samples) - current_start
+            for j in range(0, block_length, self.stride):
+                self.segment_indices.append((current_start + j, len(self.samples)))
 
     def get_train_iterator(self, batch_size: int = 128, shuffle: bool = True) -> DataLoader:
-        """
-        Returns a DataLoader for the training set grouped by piece.
-        """
         groups = defaultdict(list)
         for i in range(self.split_index):
             groups[self.samples[i]['piece']].append(i)
@@ -132,17 +138,10 @@ class CrossDataset(Dataset):
         return DataLoader(train_subset, batch_size=batch_size, shuffle=False)
 
     def get_eval_iterator(self, batch_size: int = 128, shuffle: bool = False) -> DataLoader:
-        """
-        Returns a DataLoader for the evaluation set.
-        """
         eval_subset = Subset(self, range(self.split_index, len(self.samples)))
         return DataLoader(eval_subset, batch_size=batch_size, shuffle=shuffle)
 
     def get_batch_scheduler(self, batch_size: int):
-        """
-        Yields batches in order, grouping samples by piece.
-        Each yielded batch contains only samples from a single piece.
-        """
         groups = defaultdict(list)
         for sample in self.samples:
             groups[sample['piece']].append(sample)
@@ -152,28 +151,34 @@ class CrossDataset(Dataset):
                 yield samples[i: i + batch_size]
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.segment_indices)
 
     def __getitem__(self, idx: int) -> dict:
-        # Instead of forcing same chord for the whole sequence, we build a consecutive sequence.
+        seg_start, seg_end = self.segment_indices[idx]
         sequence = []
-        chord_labels = []
+        label_seq = []
         for i in range(self.seq_len):
-            if (idx + i) < len(self.samples) and self.samples[idx + i]['piece'] == self.samples[idx]['piece']:
-                sample_i = self.samples[idx + i]
-                sequence.append(torch.tensor(sample_i['chroma'], dtype=torch.float))
-                chord_labels.append(sample_i['chord_label'].strip('"'))
+            pos = seg_start + i
+            if pos < seg_end:
+                sample_i = self.samples[pos]
+                ch_vec = torch.tensor(sample_i['chroma'], dtype=torch.float)
+                if torch.all(ch_vec == 0):
+                    label_seq.append(self.chord_to_idx.get("N", self.ignore_index))
+                else:
+                    label_seq.append(self.chord_to_idx[sample_i['chord_label'].strip('"')])
+                sequence.append(ch_vec)
             else:
+                # Pad missing samples.
                 sequence.append(torch.zeros(12, dtype=torch.float))
-        # Use majority vote among the chord labels in the sequence.
-        from collections import Counter
-        most_common = Counter(chord_labels).most_common(1)[0][0]
+                label_seq.append(self.chord_to_idx.get("N", self.ignore_index))
         chroma_seq = torch.stack(sequence, dim=0).to(get_device())
-        
+        # Compute the majority label over this segment.
+        from collections import Counter
+        target = Counter(label_seq).most_common(1)[0][0]
         sample_out = {
-            'chroma': chroma_seq,
-            'chord_idx': self.chord_to_idx[most_common],
-            'chord_label': most_common
+            'chroma': chroma_seq,         # (seq_len, 12)
+            'chord_idx': target,          # scalar majority label
+            'chord_label': self.samples[seg_start]['chord_label']  # representative label
         }
         if self.transform:
             sample_out = self.transform(sample_out)
@@ -194,7 +199,9 @@ def get_unified_mapping(label_dirs: list) -> dict:
                 df[0] = df[0].replace("", pd.NA).ffill()
                 df.columns = ['piece', 'timestamp', 'chord']
                 chord_set.update({str(chord).strip('"') for chord in df['chord'].fillna("N").unique()})
-    return {chord: idx + 1 for idx, chord in enumerate(sorted(chord_set))}
+    mapping = {chord: idx for idx, chord in enumerate(sorted(chord_set))}
+    print("Unified chord mapping (Mapping from chord labels to indices):", mapping)  # NEW: Log the mapping
+    return mapping
 
 def main():
     # Removed distributed initialization.
