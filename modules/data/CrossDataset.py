@@ -100,6 +100,8 @@ class CrossDataset(Dataset):
                     'chroma': chroma_vector,
                     'chord_label': row.chord
                 })
+        # Filter out samples with all-zero chroma and chord label "N"
+        samples = [s for s in samples if not (all(float(val)==0 for val in s['chroma']) and s['chord_label'] == "N")]
         self.samples = samples
         if self.chord_mapping is not None:
             self.chord_to_idx = self.chord_mapping
