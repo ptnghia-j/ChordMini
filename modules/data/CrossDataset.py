@@ -90,7 +90,8 @@ class CrossDataset(Dataset):
             merged = pd.merge_asof(chroma_group, chords_piece,
                                    on='timestamp',
                                    direction='backward')
-            merged['chord'] = merged['chord'].ffill().fillna("N").infer_objects(copy=False)
+            # Convert to string type first, then perform operations
+            merged['chord'] = merged['chord'].astype(str).ffill().fillna("N")
             for row in merged.itertuples(index=False):
                 chroma_vector = [getattr(row, f'pitch_{i}') for i in range(12)]
                 samples.append({
@@ -200,7 +201,6 @@ def get_unified_mapping(label_dirs: list) -> dict:
                 df.columns = ['piece', 'timestamp', 'chord']
                 chord_set.update({str(chord).strip('"') for chord in df['chord'].fillna("N").unique()})
     mapping = {chord: idx for idx, chord in enumerate(sorted(chord_set))}
-    print("Unified chord mapping (Mapping from chord labels to indices):", mapping)  # NEW: Log the mapping
     return mapping
 
 def main():
