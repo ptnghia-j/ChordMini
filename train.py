@@ -4,8 +4,6 @@ import torch
 import pandas as pd
 from torch.utils.data import DataLoader, ConcatDataset, Sampler   # <-- Added Sampler import
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score  # <-- For testing
-import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
 
 from modules.utils.device import get_device
 from modules.data.CrossDataset import CrossDataset, get_unified_mapping
@@ -15,13 +13,16 @@ from modules.training.Schedulers import CosineScheduler
 # NEW: import AudioDatasetLoader from our new dataset module
 # from modules.data.AudioProcessingDataset import AudioDatasetLoader
 
-# New testing helper: partition_test_set using 90-10 split.
+# NEW: Update partition_test_set to use each dataset's test_indices.
 def partition_test_set(concat_dataset):
     test_indices = []
     offset = 0
     for ds in concat_dataset.datasets:
-        test_start = int(len(ds) * 0.9)
-        test_indices.extend(range(offset + test_start, offset + len(ds)))
+        if hasattr(ds, 'test_indices'):
+            test_indices.extend([offset + i for i in ds.test_indices])
+        else:
+            test_start = int(len(ds) * 0.9)
+            test_indices.extend(range(offset + test_start, offset + len(ds)))
         offset += len(ds)
     return test_indices
 
@@ -61,14 +62,11 @@ class Tester:
         print(f"Test F1 Score: {f1:.4f}")
 
 def main():
-    # Distributed training setup
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        dist.init_process_group(backend='nccl')
-        local_rank = int(os.environ['LOCAL_RANK'])
-        device = torch.device(f"cuda:{local_rank}")
-    else:
-        device = get_device()
-        local_rank = None
+    device = get_device()
+    # Enable cuDNN benchmarking for optimized GPU kernels if using CUDA.
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+    local_rank = None  # no distributed training
     
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
     if project_root not in sys.path:
@@ -86,15 +84,13 @@ def main():
     combined_dataset = ConcatDataset([dataset1, dataset2])
     print("Total combined samples:", len(combined_dataset))
     
-    # Use DistributedSampler if in distributed mode
-    if local_rank is not None:
-        train_sampler = DistributedSampler(combined_dataset, shuffle=True)
-        val_sampler   = DistributedSampler(combined_dataset, shuffle=False)
-        train_loader  = DataLoader(combined_dataset, batch_size=128, sampler=train_sampler, pin_memory=True)
-        val_loader    = DataLoader(combined_dataset, batch_size=128, sampler=val_sampler, pin_memory=True)
-    else:
-        train_loader = DataLoader(combined_dataset, batch_size=128, shuffle=True, pin_memory=True)
-        val_loader   = DataLoader(combined_dataset, batch_size=128, shuffle=False, pin_memory=True)
+    # Update DataLoader creation to always use standard DataLoader:
+    train_loader = DataLoader(ConcatDataset([dataset1.get_train_iterator(batch_size=128, shuffle=True).dataset,
+                                              dataset2.get_train_iterator(batch_size=128, shuffle=True).dataset]),
+                              batch_size=128, shuffle=True, pin_memory=True)
+    val_loader   = DataLoader(ConcatDataset([dataset1.get_eval_iterator(batch_size=128, shuffle=False).dataset,
+                                              dataset2.get_eval_iterator(batch_size=128, shuffle=False).dataset]),
+                              batch_size=128, shuffle=False, pin_memory=True)
     
     # Debug: Print sample batch from training set
     print("=== Debug: Training set sample ===")
@@ -121,11 +117,35 @@ def main():
         model = torch.nn.DataParallel(model)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
-    warmup_steps = 1
-    num_epochs = 5
+    warmup_steps = 3
+    num_epochs = 20
     scheduler = CosineScheduler(optimizer, max_update=num_epochs, base_lr=0.001,
                                 final_lr=0.000001, warmup_steps=warmup_steps, warmup_begin_lr=0.00001)
    
+    from collections import Counter
+    import matplotlib.pyplot as plt
+
+    # NEW: Print chord label set and distribution before training (non-interactive)
+    dist_counter = Counter()
+    for ds in [dataset1, dataset2]:
+        dist_counter.update([s['chord_label'] for s in ds.samples])
+    chord_set = sorted(dist_counter.keys())
+    print("Chord label set:", chord_set)
+    print("Chord distribution:", dist_counter)
+
+    # Plot using index instead of chord label
+    indices = list(range(len(chord_set)))
+    counts = [dist_counter[ch] for ch in chord_set]
+    plt.figure(figsize=(12, 6))
+    plt.bar(indices, counts, align='center')
+    plt.xlabel("Chord Index")
+    plt.ylabel("Count")
+    plt.title("Chord Label Distribution")
+    plt.xticks(indices)  # set x-axis ticks to indices
+    plt.tight_layout()
+    plt.savefig("chord_distribution.png")  # Save image in current working directory
+    plt.close()
+
     trainer = BaseTrainer(model, optimizer, scheduler=scheduler,
                           num_epochs=num_epochs, device=device,
                           ignore_index=unified_mapping["N"])
