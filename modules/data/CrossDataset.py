@@ -163,10 +163,17 @@ class CrossDataset(Dataset):
             if pos < seg_end:
                 sample_i = self.samples[pos]
                 ch_vec = torch.tensor(sample_i['chroma'], dtype=torch.float)
-                if torch.all(ch_vec == 0):
+                chord_label = sample_i['chord_label'].strip('"')
+                # Handle 'nan' values by treating them as 'N' (no chord)
+                if chord_label == 'nan' or torch.all(ch_vec == 0):
                     label_seq.append(self.chord_to_idx.get("N", self.ignore_index))
                 else:
-                    label_seq.append(self.chord_to_idx[sample_i['chord_label'].strip('"')])
+                    try:
+                        label_seq.append(self.chord_to_idx[chord_label])
+                    except KeyError:
+                        # If chord label not found, use the ignore_index
+                        print(f"Warning: Unknown chord label '{chord_label}', using ignore_index")
+                        label_seq.append(self.ignore_index)
                 sequence.append(ch_vec)
             else:
                 # Pad missing samples.
