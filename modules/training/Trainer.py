@@ -1,5 +1,6 @@
 import os
 import torch
+import torch.cuda.amp  # NEW: Import AMP
 from modules.utils.Timer import Timer
 from modules.utils.Animator import Animator
 
@@ -42,6 +43,8 @@ class BaseTrainer:
             os.makedirs(self.checkpoint_dir)
         self.max_grad_norm = max_grad_norm
         self.ignore_index = ignore_index
+        # NEW: Initialize GradScaler if using CUDA.
+        self.scaler = torch.cuda.amp.GradScaler() if self.device.type == "cuda" else None
 
     def _log(self, message):
         # Helper for logging messages.
@@ -73,12 +76,21 @@ class BaseTrainer:
             for batch_idx, batch in enumerate(train_loader):
                 inputs, targets = self._process_batch(batch)
                 self.optimizer.zero_grad()
-                outputs = self.model(inputs)
-                loss = self.compute_loss(outputs, targets)
-                loss.backward()
-                # Apply gradient clipping
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.optimizer.step()
+                # NEW: Use AMP autocast when possible.
+                with torch.cuda.amp.autocast(enabled=(self.device.type=='cuda')):
+                    outputs = self.model(inputs)
+                    loss = self.compute_loss(outputs, targets)
+                # NEW: Scale loss and backpropagation.
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    self.optimizer.step()
                 epoch_loss += loss.item()
                 
                 if batch_idx % 10 == 0:
@@ -174,19 +186,3 @@ class BaseTrainer:
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         if self.logger:
             self.logger.info(f"Checkpoint loaded from {path}")
-
-    def train_multi_gpu(self, train_loader, val_loader=None):
-        if torch.cuda.device_count() < 2:
-            if self.logger:
-                self.logger.info("Multiple GPUs not detected. Falling back to single GPU training.")
-            else:
-                print("Multiple GPUs not detected. Falling back to single GPU training.")
-            self.train(train_loader, val_loader)
-        else:
-            self.model = torch.nn.DataParallel(self.model)
-            if self.logger:
-                self.logger.info(f"Training on {torch.cuda.device_count()} GPUs.")
-            else:
-                print(f"Training on {torch.cuda.device_count()} GPUs.")
-            self.train(train_loader, val_loader)
-            self.model = self.model.module

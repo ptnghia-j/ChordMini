@@ -69,6 +69,16 @@ class CrossDataset(Dataset):
         self._build_file_dicts()
         self.aggregate_data()
         self.ignore_index = self.chord_to_idx.get("N", 0)
+        # NEW: Compute mutually exclusive segment indices split for 8-1-1 using segment_indices length.
+        total_segs = len(self.segment_indices)
+        self.train_indices = list(range(0, int(total_segs * 0.8)))
+        self.eval_indices  = list(range(int(total_segs * 0.8), int(total_segs * 0.9)))
+        self.test_indices  = list(range(int(total_segs * 0.9), total_segs))
+        if self.chord_mapping is not None:
+            self.chord_to_idx = self.chord_mapping
+        else:
+            chords_set = {s['chord_label'] for s in self.samples}
+            self.chord_to_idx = {chord: idx for idx, chord in enumerate(sorted(chords_set))}
 
     def _build_file_dicts(self):
         self.chroma_f = {f: self.chroma_dir / f for f in os.listdir(self.chroma_dir)
@@ -108,8 +118,6 @@ class CrossDataset(Dataset):
         else:
             chords_set = {s['chord_label'] for s in self.samples}
             self.chord_to_idx = {chord: idx for idx, chord in enumerate(sorted(chords_set))}
-        eval_ratio = 0.2
-        self.split_index = int(len(self.samples) * (1 - eval_ratio))
         # NEW: Compute segment indices for each contiguous block using stride.
         # Instead of just storing the start index, store a (start, end) tuple, where "end" is the index at which the piece ends.
         self.segment_indices = []
@@ -129,20 +137,13 @@ class CrossDataset(Dataset):
                 self.segment_indices.append((current_start + j, len(self.samples)))
 
     def get_train_iterator(self, batch_size: int = 128, shuffle: bool = True) -> DataLoader:
-        groups = defaultdict(list)
-        for i in range(self.split_index):
-            groups[self.samples[i]['piece']].append(i)
-        pieces = list(groups.keys())
-        if shuffle:
-            import random
-            random.shuffle(pieces)
-        indices = [i for piece in pieces for i in groups[piece]]
-        train_subset = Subset(self, indices)
-        return DataLoader(train_subset, batch_size=batch_size, shuffle=False)
+        # Use precomputed train_indices.
+        from torch.utils.data import Subset
+        return DataLoader(Subset(self, self.train_indices), batch_size=batch_size, shuffle=shuffle)
 
     def get_eval_iterator(self, batch_size: int = 128, shuffle: bool = False) -> DataLoader:
-        eval_subset = Subset(self, range(self.split_index, len(self.samples)))
-        return DataLoader(eval_subset, batch_size=batch_size, shuffle=shuffle)
+        from torch.utils.data import Subset
+        return DataLoader(Subset(self, self.eval_indices), batch_size=batch_size, shuffle=shuffle)
 
     def get_batch_scheduler(self, batch_size: int):
         groups = defaultdict(list)
