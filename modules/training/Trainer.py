@@ -145,9 +145,12 @@ class BaseTrainer:
                     self._log(f"[DEBUG] Validation batch targets: {targets}")
                     first_batch = False
                 outputs = self.model(inputs)
-                # NEW: Debug print for outputs shape and a sample of values.
-                if first_batch is False:
-                    self._log(f"[DEBUG] Model outputs shape: {outputs.shape}")
+                # NEW: Check if outputs is a tuple
+                if isinstance(outputs, tuple):
+                    out_shape = outputs[0].shape
+                else:
+                    out_shape = outputs.shape
+                self._log(f"[DEBUG] Model outputs shape: {out_shape}")
                 loss = self.compute_loss(outputs, targets)
                 total_loss += loss.item()
         avg_loss = total_loss / len(val_loader)
