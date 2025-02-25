@@ -90,7 +90,7 @@ class CrossDataset(Dataset):
             merged = pd.merge_asof(chroma_group, chords_piece,
                                    on='timestamp',
                                    direction='backward')
-            merged['chord'] = merged['chord'].ffill().fillna("N")
+            merged['chord'] = merged['chord'].ffill().fillna("N").infer_objects(copy=False)
             for row in merged.itertuples(index=False):
                 chroma_vector = [getattr(row, f'pitch_{i}') for i in range(12)]
                 samples.append({
@@ -231,11 +231,11 @@ def main():
     # Always use standard DataLoader.
     loader = DataLoader(combined_dataset, batch_size=128, shuffle=False)
 
-    # Debug: print first few samples.
-    print("-- Combined Dataset first 10 samples --")
-    for i in range(min(10, len(loader.dataset))):
+    # Debug: print first 100 samples.
+    print("-- Combined Dataset first 100 samples --")
+    for i in range(min(100, len(loader.dataset))):
         sample = loader.dataset[i]
-        print(f"Instance {i}: Label: {sample['chord_label']}, Chroma: {sample['chroma']}")
+        print(f"Instance {i}: Chroma tensor: {sample['chroma']}, Chord Mapping: {sample['chord_idx']}")
 
 if __name__ == '__main__':
     main()
