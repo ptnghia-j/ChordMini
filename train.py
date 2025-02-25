@@ -13,7 +13,7 @@ from modules.models.Transformer.ChordNet import ChordNet
 from modules.training.Trainer import BaseTrainer
 from modules.training.Schedulers import CosineScheduler
 # NEW: import AudioDatasetLoader from our new dataset module
-from modules.data.AudioProcessingDataset import AudioDatasetLoader
+# from modules.data.AudioProcessingDataset import AudioDatasetLoader
 
 # New testing helper: partition_test_set using 90-10 split.
 def partition_test_set(concat_dataset):
@@ -90,11 +90,11 @@ def main():
     if local_rank is not None:
         train_sampler = DistributedSampler(combined_dataset, shuffle=True)
         val_sampler   = DistributedSampler(combined_dataset, shuffle=False)
-        train_loader  = DataLoader(combined_dataset, batch_size=128, sampler=train_sampler)
-        val_loader    = DataLoader(combined_dataset, batch_size=128, sampler=val_sampler)
+        train_loader  = DataLoader(combined_dataset, batch_size=128, sampler=train_sampler, pin_memory=True)
+        val_loader    = DataLoader(combined_dataset, batch_size=128, sampler=val_sampler, pin_memory=True)
     else:
-        train_loader = DataLoader(combined_dataset, batch_size=128, shuffle=True)
-        val_loader   = DataLoader(combined_dataset, batch_size=128, shuffle=False)
+        train_loader = DataLoader(combined_dataset, batch_size=128, shuffle=True, pin_memory=True)
+        val_loader   = DataLoader(combined_dataset, batch_size=128, shuffle=False, pin_memory=True)
     
     # Debug: Print sample batch from training set
     print("=== Debug: Training set sample ===")
@@ -134,7 +134,7 @@ def main():
     # Automatically run the testing phase after training.
     print("Starting testing phase.")
     test_indices = partition_test_set(combined_dataset)
-    test_loader = DataLoader(combined_dataset, batch_size=128, sampler=ListSampler(test_indices))
+    test_loader = DataLoader(combined_dataset, batch_size=128, sampler=ListSampler(test_indices), pin_memory=True)
     
     # Debug: Print sample batch from test set
     print("=== Debug: Test set sample ===")
