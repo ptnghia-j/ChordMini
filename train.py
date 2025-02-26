@@ -107,10 +107,10 @@ def main():
     elif torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5, betas=(0.9, 0.98), eps=1e-6)
-    warmup_steps = 5  # increased warmup steps for better warmup (approx. 25% of epochs)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, betas=(0.9, 0.98), eps=1e-6)
+    warmup_steps = 10  # increased warmup steps for a gentler start
     num_epochs = 20
-    scheduler = CosineScheduler(optimizer, max_update=num_epochs, base_lr=3e-5,
+    scheduler = CosineScheduler(optimizer, max_update=num_epochs, base_lr=1e-5,
                                 final_lr=1e-6, warmup_steps=warmup_steps, warmup_begin_lr=1e-6)
    
     from collections import Counter
