@@ -109,7 +109,7 @@ def main():
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, betas=(0.9, 0.98), eps=1e-6)
     warmup_steps = 10  # increased warmup steps for a gentler start
-    num_epochs = 20
+    num_epochs = 50
     scheduler = CosineScheduler(optimizer, max_update=num_epochs, base_lr=1e-5,
                                 final_lr=1e-6, warmup_steps=warmup_steps, warmup_begin_lr=1e-6)
    
