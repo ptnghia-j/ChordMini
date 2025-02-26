@@ -5,7 +5,7 @@ from modules.utils.Timer import Timer
 from modules.utils.Animator import Animator
 
 class BaseTrainer:
-    def __init__(self, model, optimizer, scheduler=None, device=None, num_epochs=100, logger=None, use_animator=True, checkpoint_dir="checkpoints", max_grad_norm=1.0, ignore_index=0):
+    def __init__(self, model, optimizer, scheduler=None, device=None, num_epochs=100, logger=None, use_animator=True, checkpoint_dir="checkpoints", max_grad_norm=1.0, ignore_index=0, class_weights=None):  # NEW: add class_weights parameter
         """
         Args:
             model (torch.nn.Module): The model to train.
@@ -18,6 +18,7 @@ class BaseTrainer:
             checkpoint_dir (str): Directory to save checkpoints. (Default: "checkpoints")
             max_grad_norm (float): Maximum norm for gradient clipping. (Default: 1.0)
             ignore_index (int): Index to ignore in the loss computation. (Default: 0)
+            class_weights (list, optional): Weights for each class in the loss computation. (Default: None)
         """
         self.model = model
         self.optimizer = optimizer
@@ -43,7 +44,11 @@ class BaseTrainer:
             os.makedirs(self.checkpoint_dir)
         self.max_grad_norm = max_grad_norm
         self.ignore_index = ignore_index
-        # NEW: Initialize GradScaler if using CUDA.
+        # NEW: Add assignment of class_weights.
+        if class_weights is not None:
+            self.class_weights = class_weights
+        else:
+            self.class_weights = [1.0] * len(self.model.class_weights)  # Default to equal weights if not provided.
         self.scaler = torch.cuda.amp.GradScaler() if self.device.type == "cuda" else None
 
     def _log(self, message):
@@ -66,21 +71,18 @@ class BaseTrainer:
         self._log(f"Epoch {epoch} complete. Checkpoint saved to {checkpoint_path}")
 
     def train(self, train_loader, val_loader=None):
-        # Remove interactive plotting; simply record loss and output final graph.
         self.model.train()
         for epoch in range(1, self.num_epochs + 1):
             self._log(f"Epoch {epoch}/{self.num_epochs} - Starting training")
-            self.timer.reset()
-            self.timer.start()
+            self.timer.reset(); self.timer.start()
             epoch_loss = 0.0
             for batch_idx, batch in enumerate(train_loader):
                 inputs, targets = self._process_batch(batch)
                 self.optimizer.zero_grad()
-                # NEW: Use AMP autocast when possible.
-                with torch.cuda.amp.autocast(enabled=(self.device.type=='cuda')):
+                # NEW: Use torch.amp.autocast with device_type.
+                with torch.amp.autocast(device_type='cuda', enabled=(self.device.type=='cuda')):
                     outputs = self.model(inputs)
                     loss = self.compute_loss(outputs, targets)
-                # NEW: Scale loss and backpropagation.
                 if self.scaler is not None:
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.optimizer)
@@ -92,23 +94,16 @@ class BaseTrainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                 epoch_loss += loss.item()
-                
                 if batch_idx % 10 == 0:
                     self._log(f"Epoch {epoch} Batch {batch_idx}/{len(train_loader)} - Loss: {loss.item():.4f}")
-            
             self.timer.stop()
             avg_loss = epoch_loss / len(train_loader)
             self._log(f"Epoch {epoch}/{self.num_epochs}: Loss = {avg_loss:.4f}, Time = {self.timer.elapsed_time():.2f} sec")
-            
             if self.animator:
-                # Record the average loss for later static plotting.
                 self.animator.add(epoch, avg_loss)
-            
             if val_loader is not None:
                 self.validate(val_loader)
             self.scheduler.step()
-            
-            # Save checkpoint at end of each epoch.
             self._save_checkpoint(epoch)
         
         # After training, output a final static graph if available.
@@ -136,7 +131,9 @@ class BaseTrainer:
         if torch.isnan(targets).any():
             self._log("NaN detected in targets")
         
-        loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.ignore_index)
+        # NEW: Use weighted cross entropy loss with the computed class weights.
+        weight_tensor = torch.tensor(self.class_weights, device=self.device)
+        loss_fn = torch.nn.CrossEntropyLoss(weight=weight_tensor, ignore_index=self.ignore_index)
         loss = loss_fn(outputs, targets)
         
         if torch.isnan(loss):

@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
 
 from modules.utils.device import get_device
+from modules.utils.chord_normalization import normalize_chord  # NEW: import normalization function
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,9 +29,6 @@ def read_csv_file(fpath: Path, columns, extra_process=None):
         df = extra_process(df)
     return df
 
-def clean_chord_label(label: str) -> str:
-    return label.strip().strip('"')
-
 def load_chroma(fpath: Path) -> pd.DataFrame:
     # Load chroma CSV file; columns: piece, timestamp, and 12 pitch values.
     columns = ['piece', 'timestamp'] + [f'pitch_{i}' for i in range(12)]
@@ -42,7 +40,12 @@ def load_chord(fpath: Path) -> pd.DataFrame:
         return df
     columns = ['piece', 'timestamp', 'chord']
     df = read_csv_file(fpath, columns, extra_process=shift_timestamp)
-    df['chord'] = df['chord'].fillna("N").apply(clean_chord_label)
+    df['chord'] = df['chord'].fillna("N").apply(normalize_chord)
+    # NEW: Check for 'nan' labels originating from the CSV file.
+    # print(f"[DEBUG] {fpath}: Checking for 'nan' labels in chord column.")
+    n_nan = (df['chord'] == 'nan').sum()
+    if n_nan > 0:
+        print(f"[DEBUG] {fpath}: Found {n_nan} occurrences of 'nan' in chord labels.")
     return df
 
 class CrossDataset(Dataset):
@@ -93,15 +96,15 @@ class CrossDataset(Dataset):
         chroma_df = pd.concat(chroma_dfs, ignore_index=True).sort_values(['piece', 'timestamp'])
         chord_df = pd.concat(chord_dfs, ignore_index=True).sort_values(['piece', 'timestamp'])
         samples = []
-        log_counter = 0
         for piece, chroma_group in chroma_df.groupby('piece'):
             chroma_group = chroma_group.sort_values('timestamp')
             chords_piece = chord_df[chord_df['piece'] == piece].sort_values('timestamp')
             merged = pd.merge_asof(chroma_group, chords_piece,
                                    on='timestamp',
                                    direction='backward')
-            # Convert to string type first, then perform operations
             merged['chord'] = merged['chord'].astype(str).ffill().fillna("N")
+            # NEW: Normalize labels using the normalize_chord function
+            merged['chord'] = merged['chord'].apply(normalize_chord)
             for row in merged.itertuples(index=False):
                 chroma_vector = [getattr(row, f'pitch_{i}') for i in range(12)]
                 samples.append({
@@ -110,15 +113,11 @@ class CrossDataset(Dataset):
                     'chroma': chroma_vector,
                     'chord_label': row.chord
                 })
-        # Filter out samples with all-zero chroma and chord label "N"
-        samples = [s for s in samples if not (all(float(val)==0 for val in s['chroma']) and s['chord_label'] == "N")]
+        # NEW: Eliminate any sample with label "N" or where chroma is all zeros.
+        samples = [s for s in samples if s['chord_label'] != "N" and not all(float(val)==0 for val in s['chroma'])]
         self.samples = samples
-        if self.chord_mapping is not None:
-            self.chord_to_idx = self.chord_mapping
-        else:
-            chords_set = {s['chord_label'] for s in self.samples}
-            self.chord_to_idx = {chord: idx for idx, chord in enumerate(sorted(chords_set))}
-        # NEW: Compute segment indices for each contiguous block using stride.
+
+        # Compute segment indices for each contiguous block using stride.
         # Instead of just storing the start index, store a (start, end) tuple, where "end" is the index at which the piece ends.
         self.segment_indices = []
         current_piece = None
@@ -138,11 +137,9 @@ class CrossDataset(Dataset):
 
     def get_train_iterator(self, batch_size: int = 128, shuffle: bool = True) -> DataLoader:
         # Use precomputed train_indices.
-        from torch.utils.data import Subset
         return DataLoader(Subset(self, self.train_indices), batch_size=batch_size, shuffle=shuffle)
 
     def get_eval_iterator(self, batch_size: int = 128, shuffle: bool = False) -> DataLoader:
-        from torch.utils.data import Subset
         return DataLoader(Subset(self, self.eval_indices), batch_size=batch_size, shuffle=shuffle)
 
     def get_batch_scheduler(self, batch_size: int):
@@ -166,30 +163,27 @@ class CrossDataset(Dataset):
             if pos < seg_end:
                 sample_i = self.samples[pos]
                 ch_vec = torch.tensor(sample_i['chroma'], dtype=torch.float)
-                chord_label = sample_i['chord_label'].strip('"')
-                # Handle 'nan' values by treating them as 'N' (no chord)
+                # NEW: Normalize the chord label from the sample using normalize_chord.
+                chord_label = normalize_chord(sample_i['chord_label'])
                 if chord_label == 'nan' or torch.all(ch_vec == 0):
                     label_seq.append(self.chord_to_idx.get("N", self.ignore_index))
                 else:
                     try:
                         label_seq.append(self.chord_to_idx[chord_label])
                     except KeyError:
-                        # If chord label not found, use the ignore_index
                         print(f"Warning: Unknown chord label '{chord_label}', using ignore_index")
                         label_seq.append(self.ignore_index)
                 sequence.append(ch_vec)
             else:
-                # Pad missing samples.
                 sequence.append(torch.zeros(12, dtype=torch.float))
                 label_seq.append(self.chord_to_idx.get("N", self.ignore_index))
-        chroma_seq = torch.stack(sequence, dim=0).to(get_device())
-        # Compute the majority label over this segment.
+        chroma_seq = torch.stack(sequence, dim=0)
         from collections import Counter
         target = Counter(label_seq).most_common(1)[0][0]
         sample_out = {
-            'chroma': chroma_seq,         # (seq_len, 12)
-            'chord_idx': target,          # scalar majority label
-            'chord_label': self.samples[seg_start]['chord_label']  # representative label
+            'chroma': chroma_seq,
+            'chord_idx': target,
+            'chord_label': self.samples[seg_start]['chord_label']
         }
         if self.transform:
             sample_out = self.transform(sample_out)
@@ -198,6 +192,12 @@ class CrossDataset(Dataset):
 def get_unified_mapping(label_dirs: list) -> dict:
     """
     Creates a unified chord mapping from a list of label directories.
+    The keys are normalized by:
+      - Removing surrounding quotes and extra whitespace.
+      - Converting to lower-case.
+      - Converting "nan" or "n" to "N" (the no-chord indicator).
+      - For simple majors (e.g., "c_maj"), removing the "_maj" suffix.
+      - For simple minors (e.g., "c_min"), converting to the more compact "cm".
     """
     chord_set = set()
     for label_dir in label_dirs:
@@ -205,11 +205,15 @@ def get_unified_mapping(label_dirs: list) -> dict:
         for fname in os.listdir(label_dir):
             if fname.endswith('.csv'):
                 fpath = label_dir / fname
-                df = pd.read_csv(str(fpath), header=None, sep=',', engine='c',
-                                 quoting=csv.QUOTE_NONE, escapechar='\\')
+                df = pd.read_csv(
+                    str(fpath), header=None, sep=',', engine='c',
+                    quoting=csv.QUOTE_NONE, escapechar='\\'
+                )
                 df[0] = df[0].replace("", pd.NA).ffill()
                 df.columns = ['piece', 'timestamp', 'chord']
-                chord_set.update({str(chord).strip('"') for chord in df['chord'].fillna("N").unique()})
+                # Apply normalization to each chord label.
+                chord_set.update({normalize_chord(chord) for chord in df['chord'].fillna("N").unique()})
+    chord_set.add("N")
     mapping = {chord: idx for idx, chord in enumerate(sorted(chord_set))}
     return mapping
 
