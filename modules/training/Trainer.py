@@ -94,7 +94,7 @@ class BaseTrainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                 epoch_loss += loss.item()
-                if batch_idx % 10 == 0:
+                if batch_idx % 100 == 0:
                     self._log(f"Epoch {epoch} Batch {batch_idx}/{len(train_loader)} - Loss: {loss.item():.4f}")
             self.timer.stop()
             avg_loss = epoch_loss / len(train_loader)
