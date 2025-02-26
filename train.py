@@ -4,6 +4,8 @@ import torch
 import pandas as pd
 from torch.utils.data import DataLoader, ConcatDataset, Sampler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from collections import Counter
+import matplotlib.pyplot as plt
 
 from modules.utils.device import get_device
 from modules.data.CrossDataset import CrossDataset, get_unified_mapping
@@ -112,9 +114,6 @@ def main():
     num_epochs = 50
     scheduler = CosineScheduler(optimizer, max_update=num_epochs, base_lr=1e-5,
                                 final_lr=1e-6, warmup_steps=warmup_steps, warmup_begin_lr=1e-6)
-   
-    from collections import Counter
-    import matplotlib.pyplot as plt
 
     dist_counter = Counter()
     for ds in [dataset1, dataset2]:

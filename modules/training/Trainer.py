@@ -144,22 +144,22 @@ class BaseTrainer:
     def validate(self, val_loader):
         self.model.eval()
         total_loss = 0.0
-        first_batch = True  # debug flag for printing validation targets and predictions
+        # first_batch = True  # debug flag for printing validation targets and predictions
         with torch.no_grad():
             for batch in val_loader:
                 inputs, targets = self._process_batch(batch)
                 # NEW: Debug print shapes and values from the first validation batch.
-                if first_batch:
-                    self._log(f"[DEBUG] Validation batch - inputs shape: {inputs.shape}, targets shape: {targets.shape}")
-                    self._log(f"[DEBUG] Validation batch targets: {targets}")
-                    first_batch = False
+                # if first_batch:
+                #     self._log(f"[DEBUG] Validation batch - inputs shape: {inputs.shape}, targets shape: {targets.shape}")
+                #     self._log(f"[DEBUG] Validation batch targets: {targets}")
+                #     first_batch = False
                 outputs = self.model(inputs)
                 # NEW: Check if outputs is a tuple
-                if isinstance(outputs, tuple):
-                    out_shape = outputs[0].shape
-                else:
-                    out_shape = outputs.shape
-                self._log(f"[DEBUG] Model outputs shape: {out_shape}")
+                # if isinstance(outputs, tuple):
+                #     out_shape = outputs[0].shape
+                # else:
+                #     out_shape = outputs.shape
+                # self._log(f"[DEBUG] Model outputs shape: {out_shape}")
                 loss = self.compute_loss(outputs, targets)
                 total_loss += loss.item()
         avg_loss = total_loss / len(val_loader)
