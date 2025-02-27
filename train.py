@@ -123,8 +123,8 @@ def main():
     unified_keys = sorted(unified_mapping, key=lambda k: unified_mapping[k])
     total_samples = sum(dist_counter.values())
     num_classes = len(unified_keys)
-    # Apply log scaling to class weights to prevent instability
-    class_weights = [np.log1p(total_samples / dist_counter.get(ch, 1)) for ch in unified_keys]
+    # Apply log scaling to class weights to prevent instability and ensure float32 dtype
+    class_weights = np.array([np.log1p(total_samples / dist_counter.get(ch, 1)) for ch in unified_keys], dtype=np.float32)
     print("Computed class weights:", class_weights)
     
     # Replace chord_set with unified_keys for plotting.
