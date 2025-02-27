@@ -48,7 +48,11 @@ class Tester:
                 inputs = batch['chroma'].to(self.device)
                 targets = batch['chord_idx'].to(self.device)
                 preds = self.model.predict(inputs)
-                all_preds.extend(preds.cpu().numpy())
+                # Ensure predictions are 1-dimensional.
+                preds = preds.cpu().numpy()
+                if preds.ndim > 1:
+                    preds = preds.argmax(axis=1)
+                all_preds.extend(preds)
                 all_targets.extend(targets.cpu().numpy())
         accuracy = accuracy_score(all_targets, all_preds)
         precision = precision_score(all_targets, all_preds, average='weighted', zero_division=0)
