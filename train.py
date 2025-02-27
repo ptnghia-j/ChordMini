@@ -2,6 +2,7 @@ import sys
 import os
 import torch
 import pandas as pd
+import numpy as np
 from torch.utils.data import DataLoader, ConcatDataset, Sampler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from collections import Counter
@@ -122,7 +123,8 @@ def main():
     unified_keys = sorted(unified_mapping, key=lambda k: unified_mapping[k])
     total_samples = sum(dist_counter.values())
     num_classes = len(unified_keys)
-    class_weights = [total_samples / (num_classes * dist_counter.get(ch, 1)) for ch in unified_keys]
+    # Apply log scaling to class weights to prevent instability
+    class_weights = [np.log1p(total_samples / dist_counter.get(ch, 1)) for ch in unified_keys]
     print("Computed class weights:", class_weights)
     
     # Replace chord_set with unified_keys for plotting.
