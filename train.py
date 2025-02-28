@@ -13,6 +13,7 @@ from modules.data.CrossDataset import CrossDataset, get_unified_mapping
 from modules.models.Transformer.ChordNet import ChordNet
 from modules.training.Trainer import BaseTrainer
 from modules.training.Schedulers import CosineScheduler
+from modules.utils.chord_metrics import weighted_chord_symbol_recall
 
 def partition_test_set(concat_dataset):
     test_indices = []
@@ -35,33 +36,107 @@ class ListSampler(Sampler):
         return len(self.indices)
 
 class Tester:
-    def __init__(self, model, test_loader, device):
+    def __init__(self, model, test_loader, device, unified_mapping=None):
         self.model = model
         self.test_loader = test_loader
         self.device = device
+        # Store mapping to inspect predictions
+        self.unified_mapping = unified_mapping
+        self.idx_to_chord = {v: k for k, v in unified_mapping.items()} if unified_mapping else None
+
     def evaluate(self):
         self.model.eval()
         all_preds = []
         all_targets = []
+        
+        # Debug counters
+        pred_counter = Counter()
+        target_counter = Counter()
+        
         with torch.no_grad():
-            for batch in self.test_loader:
+            for batch_idx, batch in enumerate(self.test_loader):
                 inputs = batch['chroma'].to(self.device)
                 targets = batch['chord_idx'].to(self.device)
+                
+                # Debug first few batches
+                if batch_idx == 0:
+                    print(f"DEBUG: Input shape: {inputs.shape}, target shape: {targets.shape}")
+                    print(f"DEBUG: First few targets: {targets[:10]}")
+                
+                # Get raw logits before prediction
+                logits, _ = self.model(inputs)
+                
+                # Check if logits have reasonable values
+                if batch_idx == 0:
+                    print(f"DEBUG: Logits shape: {logits.shape}")
+                    print(f"DEBUG: Logits mean: {logits.mean().item()}, std: {logits.std().item()}")
+                    print(f"DEBUG: First batch sample logits (max 5 values): {logits[0, :5]}")
+                
+                # Get predictions
                 preds = self.model.predict(inputs)
-                # Ensure predictions are 1-dimensional.
-                preds = preds.cpu().numpy()
-                if preds.ndim > 1:
-                    preds = preds.argmax(axis=1)
-                all_preds.extend(preds)
-                all_targets.extend(targets.cpu().numpy())
+                
+                # Convert and store
+                preds_np = preds.cpu().numpy()
+                if preds_np.ndim > 1:
+                    preds_np = preds_np.argmax(axis=1)
+                
+                targets_np = targets.cpu().numpy()
+                
+                # Count distribution
+                pred_counter.update(preds_np)
+                target_counter.update(targets_np)
+                
+                all_preds.extend(preds_np)
+                all_targets.extend(targets_np)
+                
+                # Debug first batch predictions vs targets
+                if batch_idx == 0:
+                    print(f"DEBUG: First batch - Predictions: {preds_np[:10]}")
+                    print(f"DEBUG: First batch - Targets: {targets_np[:10]}")
+        
+        # Print distribution statistics
+        print("\nDEBUG: Target Distribution (top 10):")
+        for idx, count in target_counter.most_common(10):
+            chord_name = self.idx_to_chord.get(idx, "Unknown") if self.idx_to_chord else str(idx)
+            print(f"Target {idx} ({chord_name}): {count} occurrences ({count/len(all_targets)*100:.2f}%)")
+            
+        print("\nDEBUG: Prediction Distribution (top 10):")
+        for idx, count in pred_counter.most_common(10):
+            chord_name = self.idx_to_chord.get(idx, "Unknown") if self.idx_to_chord else str(idx)
+            print(f"Prediction {idx} ({chord_name}): {count} occurrences ({count/len(all_preds)*100:.2f}%)")
+        
+        # Calculate metrics
         accuracy = accuracy_score(all_targets, all_preds)
         precision = precision_score(all_targets, all_preds, average='weighted', zero_division=0)
         recall = recall_score(all_targets, all_preds, average='weighted', zero_division=0)
         f1 = f1_score(all_targets, all_preds, average='weighted', zero_division=0)
+        
+        # Calculate WCSR if we have the mapping
+        wcsr = 0.0
+        if self.idx_to_chord:
+            wcsr = weighted_chord_symbol_recall(all_targets, all_preds, self.idx_to_chord)
+            print(f"\nWeighted Chord Symbol Recall (WCSR): {wcsr:.4f}")
+        
+        # Print confusion matrix for most common chords (top 10)
+        if len(target_counter) > 1:
+            print("\nAnalyzing most common predictions vs targets:")
+            top_chords = [idx for idx, _ in target_counter.most_common(10)]
+            for true_idx in top_chords:
+                true_chord = self.idx_to_chord.get(true_idx, str(true_idx))
+                pred_indices = [p for t, p in zip(all_targets, all_preds) if t == true_idx]
+                if pred_indices:
+                    pred_counts = Counter(pred_indices)
+                    most_common_pred = pred_counts.most_common(1)[0][0]
+                    most_common_pred_chord = self.idx_to_chord.get(most_common_pred, str(most_common_pred))
+                    accuracy_for_chord = pred_counts.get(true_idx, 0) / len(pred_indices)
+                    print(f"True: {true_chord} -> Most common prediction: {most_common_pred_chord} (Accuracy: {accuracy_for_chord:.2f})")
+        
+        print(f"\nTest Metrics:")
         print(f"Test Accuracy: {accuracy:.4f}")
         print(f"Test Precision: {precision:.4f}")
         print(f"Test Recall: {recall:.4f}")
         print(f"Test F1 Score: {f1:.4f}")
+        print(f"Weighted Chord Symbol Recall: {wcsr:.4f}")
 
 def main():
     device = get_device()
@@ -170,7 +245,7 @@ def main():
     print("Test Chroma tensor:", test_batch['chroma'])
     print("Test labels:", test_batch['chord_idx'])
     
-    tester = Tester(model, test_loader, device)
+    tester = Tester(model, test_loader, device, unified_mapping=unified_mapping)
     tester.evaluate()
     
 if __name__ == '__main__':
