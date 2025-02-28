@@ -44,7 +44,7 @@ class CosineScheduler(_LRScheduler):
         self.final_lr = final_lr
         self.warmup_steps = warmup_steps
         self.warmup_begin_lr = warmup_begin_lr
-        self.max_steps = self.max_update - self.warmup_steps
+        self.max_steps = max(1, self.max_update - self.warmup_steps)
         super().__init__(optimizer, last_epoch)
     
     def get_warmup_lr(self, epoch):

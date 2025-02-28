@@ -114,11 +114,11 @@ def main():
     elif torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, betas=(0.9, 0.98), eps=1e-6)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.98), eps=1e-6)
     warmup_steps = 10  # increased warmup steps for a gentler start
     num_epochs = 50
-    scheduler = CosineScheduler(optimizer, max_update=num_epochs, base_lr=1e-5,
-                                final_lr=1e-6, warmup_steps=warmup_steps, warmup_begin_lr=1e-6)
+    scheduler = CosineScheduler(optimizer, max_update=num_epochs, base_lr=1e-3,
+                                final_lr=1e-6, warmup_steps=warmup_steps, warmup_begin_lr=1e-5)
 
     dist_counter = Counter()
     for ds in [dataset1, dataset2]:
@@ -127,23 +127,34 @@ def main():
     unified_keys = sorted(unified_mapping, key=lambda k: unified_mapping[k])
     total_samples = sum(dist_counter.values())
     num_classes = len(unified_keys)
-    # Apply log scaling to class weights to prevent instability and ensure float32 dtype
-    class_weights = np.array([np.log1p(total_samples / dist_counter.get(ch, 1)) for ch in unified_keys], dtype=np.float32)
+    
+    # NEW FEATURE: Print total chord instances and each chord's distribution.
+    print("Total chord instances:", total_samples)
+    for ch in unified_keys:
+        ratio = dist_counter[ch] / total_samples * 100
+        print(f"Chord: {ch}, Count: {dist_counter[ch]}, Percentage: {ratio:.4f}%")
+    dropped = [ch for ch in unified_keys if (dist_counter[ch] / total_samples) < 0.001 and ch != "N"]
+    if dropped:
+        print("Dropping chords due to low distribution (<0.1%):", dropped)
+    
+    # OLD code for plotting distribution (commented out)
+    # indices = list(range(len(unified_keys)))
+    # counts = [dist_counter[ch] for ch in unified_keys]
+    # plt.figure(figsize=(12, 6))
+    # plt.bar(indices, counts, align='center')
+    # plt.xlabel("Chord Index")
+    # plt.ylabel("Count")
+    # plt.title("Chord Label Distribution")
+    # plt.xticks(indices)
+    # plt.tight_layout()
+    # plt.savefig("chord_distribution.png")
+    # plt.close()
+    
+    # Apply log scaling to class weights and set to zero for dropped chords; ensure float32 dtype
+    class_weights = np.array([0.0 if ch in dropped else np.log1p(total_samples / dist_counter.get(ch, 1))
+                              for ch in unified_keys], dtype=np.float32)
     print("Computed class weights:", class_weights)
     
-    # Replace chord_set with unified_keys for plotting.
-    indices = list(range(len(unified_keys)))
-    counts = [dist_counter[ch] for ch in unified_keys]
-    plt.figure(figsize=(12, 6))
-    plt.bar(indices, counts, align='center')
-    plt.xlabel("Chord Index")
-    plt.ylabel("Count")
-    plt.title("Chord Label Distribution")
-    plt.xticks(indices)
-    plt.tight_layout()
-    plt.savefig("chord_distribution.png")
-    plt.close()
-
     trainer = BaseTrainer(model, optimizer, scheduler=scheduler,
                           num_epochs=num_epochs, device=device,
                           ignore_index=unified_mapping["N"],
