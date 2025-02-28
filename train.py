@@ -230,10 +230,16 @@ def main():
                               for ch in unified_keys], dtype=np.float32)
     print("Computed class weights:", class_weights)
     
+    # Create idx_to_chord mapping for the loss function
+    idx_to_chord = {v: k for k, v in unified_mapping.items()}
+    
+    # Create the trainer with chord-aware loss
     trainer = BaseTrainer(model, optimizer, scheduler=scheduler,
                           num_epochs=num_epochs, device=device,
                           ignore_index=unified_mapping["N"],
-                          class_weights=class_weights)
+                          class_weights=class_weights,
+                          idx_to_chord=idx_to_chord,
+                          use_chord_aware_loss=False)  # Use chord-aware loss
     trainer.train(train_loader, val_loader=val_loader)
     
     print("Starting testing phase.")

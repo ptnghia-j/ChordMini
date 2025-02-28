@@ -5,7 +5,7 @@ from modules.utils.Timer import Timer
 from modules.utils.Animator import Animator
 
 class BaseTrainer:
-    def __init__(self, model, optimizer, scheduler=None, device=None, num_epochs=100, logger=None, use_animator=True, checkpoint_dir="checkpoints", max_grad_norm=1.0, ignore_index=0, class_weights=None):  # NEW: add class_weights parameter
+    def __init__(self, model, optimizer, scheduler=None, device=None, num_epochs=100, logger=None, use_animator=True, checkpoint_dir="checkpoints", max_grad_norm=1.0, ignore_index=0, class_weights=None, idx_to_chord=None, use_chord_aware_loss=False):  # Added idx_to_chord and use_chord_aware_loss
         """
         Args:
             model (torch.nn.Module): The model to train.
@@ -19,6 +19,8 @@ class BaseTrainer:
             max_grad_norm (float): Maximum norm for gradient clipping. (Default: 1.0)
             ignore_index (int): Index to ignore in the loss computation. (Default: 0)
             class_weights (list, optional): Weights for each class in the loss computation. (Default: None)
+            idx_to_chord (dict, optional): Mapping from index to chord. (Default: None)
+            use_chord_aware_loss (bool): If True, use chord-aware loss function. (Default: False)
         """
         self.model = model
         self.optimizer = optimizer
@@ -50,6 +52,22 @@ class BaseTrainer:
         else:
             self.class_weights = [1.0] * len(self.model.class_weights)  # Default to equal weights if not provided.
         self.scaler = torch.cuda.amp.GradScaler() if self.device.type == "cuda" else None
+        self.idx_to_chord = idx_to_chord
+        self.use_chord_aware_loss = use_chord_aware_loss
+        
+        # Initialize loss function
+        if self.use_chord_aware_loss and self.idx_to_chord:
+            from modules.training.ChordLoss import ChordAwareLoss
+            self._log("Using chord-aware loss function")
+            self.loss_fn = ChordAwareLoss(
+                idx_to_chord=self.idx_to_chord,
+                ignore_index=self.ignore_index,
+                class_weights=self.class_weights,
+                device=self.device
+            )
+        else:
+            weight_tensor = torch.tensor(self.class_weights, device=self.device) if class_weights is not None else None
+            self.loss_fn = torch.nn.CrossEntropyLoss(weight=weight_tensor, ignore_index=self.ignore_index)
 
     def _log(self, message):
         # Helper for logging messages.
@@ -131,10 +149,8 @@ class BaseTrainer:
         if torch.isnan(targets).any():
             self._log("NaN detected in targets")
         
-        # NEW: Use weighted cross entropy loss with the computed class weights.
-        weight_tensor = torch.tensor(self.class_weights, device=self.device)
-        loss_fn = torch.nn.CrossEntropyLoss(weight=weight_tensor, ignore_index=self.ignore_index)
-        loss = loss_fn(outputs, targets)
+        # Use the initialized loss function
+        loss = self.loss_fn(outputs, targets)
         
         if torch.isnan(loss):
             self._log(f"NaN loss computed. Outputs: {outputs} | Targets: {targets}")
