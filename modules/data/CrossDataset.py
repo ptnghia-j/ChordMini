@@ -71,17 +71,23 @@ class CrossDataset(Dataset):
         self.chord_to_idx = {}
         self._build_file_dicts()
         self.aggregate_data()
-        self.ignore_index = self.chord_to_idx.get("N", 0)
+        # Modify how ignore_index is set
+        if self.chord_mapping is not None:
+            self.chord_to_idx = self.chord_mapping
+            # Set ignore_index to the value for "N" or to the maximum index + 1
+            self.ignore_index = self.chord_mapping.get("N", len(self.chord_mapping))
+        else:
+            chords_set = {s['chord_label'] for s in self.samples}
+            self.chord_to_idx = {chord: idx for idx, chord in enumerate(sorted(chords_set))}
+            # When building our own mapping, put "N" at the end
+            if "N" not in self.chord_to_idx:
+                self.chord_to_idx["N"] = len(self.chord_to_idx)
+            self.ignore_index = self.chord_to_idx["N"]
         # NEW: Compute mutually exclusive segment indices split for 8-1-1 using segment_indices length.
         total_segs = len(self.segment_indices)
         self.train_indices = list(range(0, int(total_segs * 0.8)))
         self.eval_indices  = list(range(int(total_segs * 0.8), int(total_segs * 0.9)))
         self.test_indices  = list(range(int(total_segs * 0.9), total_segs))
-        if self.chord_mapping is not None:
-            self.chord_to_idx = self.chord_mapping
-        else:
-            chords_set = {s['chord_label'] for s in self.samples}
-            self.chord_to_idx = {chord: idx for idx, chord in enumerate(sorted(chords_set))}
 
     def _build_file_dicts(self):
         self.chroma_f = {f: self.chroma_dir / f for f in os.listdir(self.chroma_dir)
@@ -115,6 +121,10 @@ class CrossDataset(Dataset):
                 })
         # NEW: Eliminate any sample with label "N" or where chroma is all zeros.
         samples = [s for s in samples if s['chord_label'] != "N" and not all(float(val)==0 for val in s['chroma'])]
+# Eliminate any sample with label "N", chroma all zeros, or label "nan"
+        samples = [s for s in samples if s['chord_label'] != "N" 
+                  and not all(float(val)==0 for val in s['chroma'])
+                  and s['chord_label'] != "nan"]
         self.samples = samples
 
         # Compute segment indices for each contiguous block using stride.
@@ -166,7 +176,8 @@ class CrossDataset(Dataset):
                 # NEW: Normalize the chord label from the sample using normalize_chord.
                 chord_label = normalize_chord(sample_i['chord_label'])
                 if chord_label == 'nan' or torch.all(ch_vec == 0):
-                    label_seq.append(self.chord_to_idx.get("N", self.ignore_index))
+                    # Use proper ignore_index instead of assuming "N" is at index 0
+                    label_seq.append(self.ignore_index)
                 else:
                     try:
                         label_seq.append(self.chord_to_idx[chord_label])
@@ -176,7 +187,8 @@ class CrossDataset(Dataset):
                 sequence.append(ch_vec)
             else:
                 sequence.append(torch.zeros(12, dtype=torch.float))
-                label_seq.append(self.chord_to_idx.get("N", self.ignore_index))
+                # Use proper ignore_index
+                label_seq.append(self.ignore_index)
         chroma_seq = torch.stack(sequence, dim=0)
         from collections import Counter
         target = Counter(label_seq).most_common(1)[0][0]
@@ -213,8 +225,15 @@ def get_unified_mapping(label_dirs: list) -> dict:
                 df.columns = ['piece', 'timestamp', 'chord']
                 # Apply normalization to each chord label.
                 chord_set.update({normalize_chord(chord) for chord in df['chord'].fillna("N").unique()})
-    chord_set.add("N")
-    mapping = {chord: idx for idx, chord in enumerate(sorted(chord_set))}
+    # Add "N" but ensure it's not given index 0 by sorting the set without "N" first
+    mapping = {}
+    chords_without_n = sorted([c for c in chord_set if c != "N"])
+    idx = 0
+    for chord in chords_without_n:
+        mapping[chord] = idx
+        idx += 1
+    # Now add "N" at the end with the highest index
+    mapping["N"] = idx
     return mapping
 
 def main():

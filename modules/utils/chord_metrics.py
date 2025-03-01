@@ -6,20 +6,41 @@ def parse_chord(chord_str):
     if chord_str == "N":
         return None, None
     
-    # Basic parsing - assumes format like "C", "Cm", "G7", "Bb_maj7", etc.
+    # Handle different notation formats
     if "_" in chord_str:
+        # Handle underscore notation (e.g., 'c_maj_maj7', 'c_min_min7')
         parts = chord_str.split("_")
         root = parts[0]
         quality = "_".join(parts[1:])
     else:
-        # For simple formats like "C", "Cm", "G7"
-        root = chord_str[0]
-        if len(chord_str) > 1 and chord_str[1] in ["#", "b"]:
-            root += chord_str[1]
-            quality = chord_str[2:] if len(chord_str) > 2 else "maj"
+        # Extract root note (special case for sharps)
+        if len(chord_str) > 1 and chord_str[1] == "#":
+            root = chord_str[:2]
+            quality_start = 2
         else:
-            quality = chord_str[1:] if len(chord_str) > 1 else "maj"
-            
+            root = chord_str[0]
+            quality_start = 1
+        
+        # Extract quality
+        quality = chord_str[quality_start:] if len(chord_str) > quality_start else "maj"
+        
+        # Convert empty quality to "maj" (e.g., "c" -> "c", "maj")
+        if not quality:
+            quality = "maj"
+    
+    # Normalize quality
+    quality_mapping = {
+        "": "maj",
+        "m": "min",
+        "dim": "dim",
+        "aug": "aug",
+        "maj7": "maj7",
+        "m7": "min7",
+        "7": "7",
+        "dim7": "dim7"
+    }
+    quality = quality_mapping.get(quality, quality)
+    
     return root, quality
 
 def calculate_root_similarity(root1, root2):
@@ -27,22 +48,28 @@ def calculate_root_similarity(root1, root2):
     if root1 is None or root2 is None:
         return 0.0
     
-    # Simplified circle of fifths distances
-    notes = ["C", "G", "D", "A", "E", "B", "F#", "C#", "G#", "D#", "A#", "F"]
-    # Handle equivalents (e.g., F# = Gb)
+    # Comprehensive circle of fifths with enharmonic equivalents
+    notes_circle = ["C", "G", "D", "A", "E", "B", "F#", "C#", "G#", "D#", "A#", "F"]
+    
+    # Map for enharmonic equivalents (case-insensitive)
     equivalents = {
-        "Gb": "F#", "Db": "C#", "Ab": "G#", "Eb": "D#", "Bb": "A#"
+        "Gb": "F#", "Db": "C#", "Ab": "G#", "Eb": "D#", "Bb": "A#",
+        "gb": "f#", "db": "c#", "ab": "g#", "eb": "d#", "bb": "a#"
     }
     
-    # Normalize roots
+    # Normalize to uppercase for comparison
+    root1 = root1.upper()
+    root2 = root2.upper()
+    
+    # Map enharmonic equivalents
     root1 = equivalents.get(root1, root1)
     root2 = equivalents.get(root2, root2)
     
-    if root1 not in notes or root2 not in notes:
+    if root1 not in notes_circle or root2 not in notes_circle:
         return 0.5  # Default if roots not in our circle
     
     # Calculate distance in circle of fifths
-    idx1, idx2 = notes.index(root1), notes.index(root2)
+    idx1, idx2 = notes_circle.index(root1), notes_circle.index(root2)
     distance = min(abs(idx1 - idx2), 12 - abs(idx1 - idx2))
     
     # Convert to similarity (0-1)
@@ -53,24 +80,31 @@ def calculate_quality_similarity(quality1, quality2):
     if quality1 is None or quality2 is None:
         return 0.0
     
-    # Define chord quality groups
-    major_like = ["maj", "maj7", "maj9", "6", "69", "maj13"]
-    minor_like = ["m", "min", "m7", "min7", "m9", "min9", "m11", "m13"]
-    dominant_like = ["7", "9", "13", "7b9", "7#9", "7b5", "7#5", "7b13"]
-    diminished_like = ["dim", "dim7", "m7b5", "°", "ø"]
-    augmented_like = ["aug", "+", "+7"]
+    # Comprehensive chord quality groups that match the dataset
+    major_like = ["maj", "maj7", "maj_maj7", "6", "6/9", "add9", "maj9", "maj13"]
+    minor_like = ["min", "m", "m6", "m7", "min7", "min_min7", "m9", "m11", "m13"]
+    dominant_like = ["7", "9", "13", "7b9", "7#9", "7b5", "7#5", "maj_min7"]
+    diminished_like = ["dim", "dim7", "dim_dim7", "dim_min7", "m7b5", "°", "ø"]
+    augmented_like = ["aug", "_aug"]
     
-    # Find which groups the qualities belong to
-    groups1, groups2 = [], []
-    for group_name, group in [
-        ("major", major_like), ("minor", minor_like), 
-        ("dominant", dominant_like), ("diminished", diminished_like),
-        ("augmented", augmented_like)
-    ]:
-        if quality1 in group:
-            groups1.append(group_name)
-        if quality2 in group:
-            groups2.append(group_name)
+    # Map each quality to its group(s)
+    def get_groups(quality):
+        groups = []
+        if quality in major_like or quality.endswith("maj7"):
+            groups.append("major")
+        if quality in minor_like or quality.startswith("min_") or quality.startswith("m"):
+            groups.append("minor")
+        if quality in dominant_like or quality.endswith("7") and not quality.endswith("maj7") and not quality.endswith("min7") and not quality.endswith("dim7"):
+            groups.append("dominant")
+        if quality in diminished_like or "dim" in quality:
+            groups.append("diminished")
+        if quality in augmented_like or "aug" in quality:
+            groups.append("augmented")
+        return groups
+    
+    # Get groups for both qualities
+    groups1 = get_groups(quality1)
+    groups2 = get_groups(quality2)
     
     # Exact match
     if quality1 == quality2:
@@ -80,7 +114,7 @@ def calculate_quality_similarity(quality1, quality2):
     if any(g in groups1 and g in groups2 for g in ["major", "minor", "dominant", "diminished", "augmented"]):
         return 0.8
     
-    # Related families (e.g., major and dominant)
+    # Related families
     related_pairs = [
         ("major", "dominant"), ("minor", "diminished")
     ]
