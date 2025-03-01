@@ -7,7 +7,7 @@ class ChordNet(nn.Module):
                  f_layer=5, f_head=8,
                  t_layer=5, t_head=8,
                  d_layer=5, d_head=8,
-                 dropout=0.2, *args, **kwargs):
+                 dropout=0.2, ignore_index=None, *args, **kwargs):
         super().__init__()
         self.transformer = BaseTransformer(n_freq=n_freq, n_group=n_group,
                                            f_layer=f_layer, f_head=f_head, f_dropout=dropout,
@@ -15,11 +15,19 @@ class ChordNet(nn.Module):
                                            d_layer=d_layer, d_head=d_head, d_dropout=dropout)
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(n_freq, n_classes)
+        self.ignore_index = ignore_index
 
     def forward(self, x, weight=None):
         o, logits = self.transformer(x, weight)
         o = self.dropout(o)
         logits = self.fc(o)
+        
+        # Apply a penalty to the ignore_index if specified
+        if self.ignore_index is not None and self.ignore_index < logits.shape[-1]:
+            penalty_mask = torch.zeros_like(logits)
+            penalty_mask[..., self.ignore_index] = -10.0  # Large negative bias
+            logits = logits + penalty_mask
+            
         return logits, o
 
     def predict(self, x, weight=None):

@@ -182,7 +182,8 @@ def main():
                      f_layer=2, f_head=4, 
                      t_layer=2, t_head=4, 
                      d_layer=2, d_head=4, 
-                     dropout=0.3).to(device)
+                     dropout=0.3,
+                     ignore_index=unified_mapping.get("N")).to(device)  # Pass ignore_index directly
     
     if local_rank is not None:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
@@ -201,33 +202,28 @@ def main():
     # Use the keys from unified_mapping (ensuring order) rather than dist_counter keys.
     unified_keys = sorted(unified_mapping, key=lambda k: unified_mapping[k])
     total_samples = sum(dist_counter.values())
-    num_classes = len(unified_keys)
     
     # NEW FEATURE: Print total chord instances and each chord's distribution.
     print("Total chord instances:", total_samples)
     for ch in unified_keys:
         ratio = dist_counter[ch] / total_samples * 100
         print(f"Chord: {ch}, Count: {dist_counter[ch]}, Percentage: {ratio:.4f}%")
-    dropped = [ch for ch in unified_keys if (dist_counter[ch] / total_samples) < 0.001 and ch != "N"]
-    if dropped:
-        print("Dropping chords due to low distribution (<0.1%):", dropped)
     
-    # OLD code for plotting distribution (commented out)
-    # indices = list(range(len(unified_keys)))
-    # counts = [dist_counter[ch] for ch in unified_keys]
-    # plt.figure(figsize=(12, 6))
-    # plt.bar(indices, counts, align='center')
-    # plt.xlabel("Chord Index")
-    # plt.ylabel("Count")
-    # plt.title("Chord Label Distribution")
-    # plt.xticks(indices)
-    # plt.tight_layout()
-    # plt.savefig("chord_distribution.png")
-    # plt.close()
+    # FIXED: Include N in dropped chords if it has 0 count
+    dropped = [ch for ch in unified_keys if ((dist_counter[ch] / total_samples) < 0.001 or dist_counter[ch] == 0)]
+    if dropped:
+        print("Dropping chords due to low distribution (<0.1%) or zero count:", dropped)
     
     # Apply log scaling to class weights and set to zero for dropped chords; ensure float32 dtype
-    class_weights = np.array([0.0 if ch in dropped else np.log1p(total_samples / dist_counter.get(ch, 1))
-                              for ch in unified_keys], dtype=np.float32)
+    class_weights = np.array([0.0 if ch in dropped else np.log1p(total_samples / max(dist_counter.get(ch, 1), 1))
+                             for ch in unified_keys], dtype=np.float32)
+    
+    # Set extra high penalty for N class
+    n_index = unified_mapping.get("N")
+    if n_index is not None and n_index < len(class_weights):
+        class_weights[n_index] = -100.0  # Strong negative weight to heavily discourage N prediction
+        print(f"Setting special penalty for N class at index {n_index}")
+        
     print("Computed class weights:", class_weights)
     
     # Create idx_to_chord mapping for the loss function
@@ -236,7 +232,7 @@ def main():
     # Create the trainer with chord-aware loss
     trainer = BaseTrainer(model, optimizer, scheduler=scheduler,
                           num_epochs=num_epochs, device=device,
-                          ignore_index=unified_mapping["N"],
+                          ignore_index=unified_mapping.get("N", len(unified_mapping)),  # Use the correct index for "N"
                           class_weights=class_weights,
                           idx_to_chord=idx_to_chord,
                           use_chord_aware_loss=False)  # Use chord-aware loss
@@ -253,6 +249,6 @@ def main():
     
     tester = Tester(model, test_loader, device, unified_mapping=unified_mapping)
     tester.evaluate()
-    
+
 if __name__ == '__main__':
     main()
