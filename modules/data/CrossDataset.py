@@ -173,7 +173,6 @@ class CrossDataset(Dataset):
             if pos < seg_end:
                 sample_i = self.samples[pos]
                 ch_vec = torch.tensor(sample_i['chroma'], dtype=torch.float)
-                # NEW: Normalize the chord label from the sample using normalize_chord.
                 chord_label = normalize_chord(sample_i['chord_label'])
                 if chord_label == 'nan' or torch.all(ch_vec == 0):
                     # Use proper ignore_index instead of assuming "N" is at index 0
@@ -182,18 +181,22 @@ class CrossDataset(Dataset):
                     try:
                         label_seq.append(self.chord_to_idx[chord_label])
                     except KeyError:
-                        print(f"Warning: Unknown chord label '{chord_label}', using ignore_index")
+                        # Only warn once per chord
+                        if not hasattr(self, '_warned_chords'):
+                            self._warned_chords = set()
+                        if chord_label not in self._warned_chords:
+                            print(f"Warning: Unknown chord label '{chord_label}', using ignore_index")
+                            self._warned_chords.add(chord_label)
                         label_seq.append(self.ignore_index)
                 sequence.append(ch_vec)
             else:
                 sequence.append(torch.zeros(12, dtype=torch.float))
-                # Use proper ignore_index
                 label_seq.append(self.ignore_index)
-        chroma_seq = torch.stack(sequence, dim=0)
+        
         from collections import Counter
         target = Counter(label_seq).most_common(1)[0][0]
         sample_out = {
-            'chroma': chroma_seq,
+            'chroma': torch.stack(sequence, dim=0),
             'chord_idx': target,
             'chord_label': self.samples[seg_start]['chord_label']
         }

@@ -105,6 +105,13 @@ class Tester:
             chord_name = self.idx_to_chord.get(idx, "Unknown") if self.idx_to_chord else str(idx)
             print(f"Prediction {idx} ({chord_name}): {count} occurrences ({count/len(all_preds)*100:.2f}%)")
         
+        # NEW: Print complete test set chord distribution
+        print("\nComplete Test Set Chord Distribution:")
+        full_distribution = Counter(all_targets)
+        for chord_idx in sorted(full_distribution):
+            chord_name = self.idx_to_chord.get(chord_idx, str(chord_idx))
+            print(f"Chord {chord_idx} ({chord_name}): {full_distribution[chord_idx]} occurrences")
+        
         # Calculate metrics
         accuracy = accuracy_score(all_targets, all_preds)
         precision = precision_score(all_targets, all_preds, average='weighted', zero_division=0)
@@ -210,10 +217,10 @@ def main():
         print(f"Chord: {ch}, Count: {dist_counter[ch]}, Percentage: {ratio:.4f}%")
     
     # FIXED: Include N in dropped chords if it has 0 count
-    dropped = [ch for ch in unified_keys if ((dist_counter[ch] / total_samples) < 0.001 or dist_counter[ch] == 0)]
-    if dropped:
-        print("Dropping chords due to low distribution (<0.1%) or zero count:", dropped)
-    
+    # dropped = [ch for ch in unified_keys if ((dist_counter[ch] / total_samples) < 0.001 or dist_counter[ch] == 0)]
+    # if dropped:
+    #     print("Dropping chords due to low distribution (<0.1%) or zero count:", dropped)
+    dropped = []
     # Apply log scaling to class weights and set to zero for dropped chords; ensure float32 dtype
     class_weights = np.array([0.0 if ch in dropped else np.log1p(total_samples / max(dist_counter.get(ch, 1), 1))
                              for ch in unified_keys], dtype=np.float32)
@@ -235,7 +242,14 @@ def main():
                           ignore_index=unified_mapping.get("N", len(unified_mapping)),  # Use the correct index for "N"
                           class_weights=class_weights,
                           idx_to_chord=idx_to_chord,
-                          use_chord_aware_loss=False)  # Use chord-aware loss
+                          use_chord_aware_loss=True)  # Use chord-aware loss
+    
+    # NEW: Print complete chord distribution before training starts.
+    print("Final Chord Distribution in Training Set:")
+    for ch in unified_keys:
+        ratio = dist_counter[ch] / total_samples * 100
+        print(f"Chord: {ch}, Count: {dist_counter[ch]}, Percentage: {ratio:.2f}%")
+    
     trainer.train(train_loader, val_loader=val_loader)
     
     print("Starting testing phase.")
