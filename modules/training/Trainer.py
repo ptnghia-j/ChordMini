@@ -5,7 +5,6 @@ from modules.utils.Timer import Timer
 from modules.utils.Animator import Animator
 import matplotlib.pyplot as plt  # For plotting loss history
 from tqdm import tqdm  # Import tqdm for progress tracking
-import numpy as np  # Add this import for np.array([])
 
 class BaseTrainer:
     def __init__(self, model, optimizer, scheduler=None, device=None, num_epochs=100, logger=None, use_animator=True, checkpoint_dir="checkpoints", max_grad_norm=1.0, ignore_index=0, class_weights=None, idx_to_chord=None, use_chord_aware_loss=False):  # Added idx_to_chord and use_chord_aware_loss
@@ -77,11 +76,9 @@ class BaseTrainer:
             weight_tensor = torch.tensor(self.class_weights, device=self.device) if class_weights is not None else None
             self.loss_fn = torch.nn.CrossEntropyLoss(weight=weight_tensor, ignore_index=self.ignore_index)
         
-        # Add lists to track losses and accuracies across epochs
+        # Add lists to track losses across epochs
         self.train_losses = []
         self.val_losses = []
-        self.train_accuracies = []
-        self.val_accuracies = []
 
     def _log(self, message):
         # Helper for logging messages.
@@ -112,8 +109,6 @@ class BaseTrainer:
             self._log(f"Epoch {epoch}/{self.num_epochs} - Starting training")
             self.timer.reset(); self.timer.start()
             epoch_loss = 0.0
-            all_train_preds = []
-            all_train_targets = []
             
             # Use tqdm for progress tracking
             with tqdm(total=len(train_loader), desc=f"Epoch {epoch}", unit="batch") as progress_bar:
@@ -122,12 +117,8 @@ class BaseTrainer:
                     inputs, targets = self._process_batch(batch)
                     
                     # Optimize the training step
-                    loss, batch_preds = self._training_step(inputs, targets)
+                    loss = self._training_step(inputs, targets)
                     epoch_loss += loss
-                    
-                    # Track predictions and targets for accuracy
-                    all_train_preds.append(batch_preds.detach().cpu())
-                    all_train_targets.append(targets.detach().cpu())
                     
                     # Update progress bar less frequently
                     if batch_idx % 10 == 0:
@@ -138,30 +129,21 @@ class BaseTrainer:
                     if batch_idx % log_interval == 0:
                         self._log(f"Epoch {epoch} Batch {batch_idx}/{len(train_loader)} - Loss: {loss:.4f}")
             
-            # Calculate epoch metrics
             self.timer.stop()
             avg_loss = epoch_loss / len(train_loader)
             self.train_losses.append(avg_loss)
             
-            # Calculate training accuracy
-            train_preds = torch.cat(all_train_preds)
-            train_targets = torch.cat(all_train_targets)
-            train_accuracy = (train_preds == train_targets).float().mean().item()
-            self.train_accuracies.append(train_accuracy)
-            
-            self._log(f"Epoch {epoch}/{self.num_epochs}: Loss = {avg_loss:.4f}, Accuracy = {train_accuracy:.4f}, Time = {self.timer.elapsed_time():.2f} sec")
+            self._log(f"Epoch {epoch}/{self.num_epochs}: Loss = {avg_loss:.4f}, Time = {self.timer.elapsed_time():.2f} sec")
             if self.animator:
                 self.animator.add(epoch, avg_loss)
             
             # Optionally skip validation on some epochs to speed up training
             if val_loader is not None and (epoch % 1 == 0 or epoch == self.num_epochs):
-                val_loss, val_accuracy = self.validate(val_loader)
+                val_loss = self.validate(val_loader)
                 self.val_losses.append(val_loss)
-                self.val_accuracies.append(val_accuracy)
             elif val_loader is not None:
-                # Just append the previous values to maintain list length
+                # Just append the previous value to maintain list length
                 self.val_losses.append(self.val_losses[-1] if self.val_losses else 0.0)
-                self.val_accuracies.append(self.val_accuracies[-1] if self.val_accuracies else 0.0)
                 
             self.scheduler.step()
             
@@ -171,8 +153,7 @@ class BaseTrainer:
         
         # After training completes
         self._print_loss_history()
-        self._plot_training_history()
-        plt.show()  # Display the final plot
+        self._plot_loss_history()
     
     def _training_step(self, inputs, targets):
         """Optimized single training step."""
@@ -194,19 +175,7 @@ class BaseTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
             self.optimizer.step()
         
-        # Calculate predictions for accuracy tracking
-        with torch.no_grad():
-            if isinstance(outputs, tuple):
-                logits = outputs[0]
-            else:
-                logits = outputs
-            
-            if logits.ndim == 3:
-                logits = logits.mean(dim=1)
-                
-            preds = torch.argmax(logits, dim=1)
-            
-        return loss.item(), preds
+        return loss.item()
     
     def validate(self, val_loader):
         """Optimized validation function."""
@@ -298,9 +267,6 @@ class BaseTrainer:
         # Process final results
         if pre_allocated:
             # We already have everything in a single tensor on the right device
-            # Calculate accuracy before moving to CPU
-            val_accuracy = (all_preds[:batch_start_idx] == all_targets[:batch_start_idx]).float().mean().item()
-            
             # Only move to CPU for analysis at the end
             all_preds_np = all_preds[:batch_start_idx].cpu().numpy()
             all_targets_np = all_targets[:batch_start_idx].cpu().numpy()
@@ -309,37 +275,27 @@ class BaseTrainer:
             if all_preds_list:
                 all_preds_tensor = torch.cat(all_preds_list)
                 all_targets_tensor = torch.cat(all_targets_list)
-                
-                # Calculate accuracy
-                val_accuracy = (all_preds_tensor == all_targets_tensor).float().mean().item()
-                
                 all_preds_np = all_preds_tensor.cpu().numpy()
                 all_targets_np = all_targets_tensor.cpu().numpy()
             else:
                 # Handle empty case
                 all_preds_np = all_targets_np = np.array([])
-                val_accuracy = 0.0
         
         # Calculate metrics
         avg_loss = total_loss / len(val_loader)
-        self._log(f"Validation Loss: {avg_loss:.4f}, Accuracy: {val_accuracy:.4f}")
+        self._log(f"Validation Loss: {avg_loss:.4f}")
         
         # Analyze results conditionally
         if self.idx_to_chord and len(all_targets_np) > 0:
             self._analyze_validation_results(all_targets_np, all_preds_np)
         
         self.model.train()
-        return avg_loss, val_accuracy
+        return avg_loss
     
     def _analyze_validation_results(self, all_targets, all_preds):
         """Separate method for analysis to keep validation loop clean."""
         from collections import Counter
         
-        # Only perform analysis if we have actual data
-        if len(all_targets) == 0:
-            self._log("No validation data to analyze")
-            return
-            
         # Count distributions
         target_counter = Counter(all_targets)
         pred_counter = Counter(all_preds)
@@ -379,15 +335,8 @@ class BaseTrainer:
     def compute_loss(self, outputs, targets):
         if isinstance(outputs, tuple):
             outputs = outputs[0]
-        
-        # For sequence data, reshape to treat each time step separately
         if outputs.ndim == 3:
-            # Reshape from [batch, seq_len, num_classes] to [batch*seq_len, num_classes]
-            batch_size, seq_len, num_classes = outputs.shape
-            outputs = outputs.reshape(-1, num_classes)
-            
-            # Expand targets to match each time step
-            targets = targets.unsqueeze(1).expand(-1, seq_len).reshape(-1)
+            outputs = outputs.mean(dim=1)
         
         # Diagnostic: Check for NaNs in outputs and targets
         if torch.isnan(outputs).any():
@@ -395,6 +344,7 @@ class BaseTrainer:
         if torch.isnan(targets).any():
             self._log("NaN detected in targets")
         
+        # NEW: Add masking to avoid predicting ignore_index
         # Apply a penalty for predicting ignore_index class
         if self.ignore_index < outputs.shape[1]:
             # Create a mask for the ignore_index logits
@@ -421,51 +371,31 @@ class BaseTrainer:
             for epoch, loss in enumerate(self.val_losses, 1):
                 self._log(f"Epoch {epoch}: Validation Loss = {loss:.6f}")
     
-    def _plot_training_history(self):
-        """Plot training history with loss and accuracy."""
+    def _plot_loss_history(self):
+        """Plot the training and validation loss history."""
         try:
-            # Create a figure with two subplots (loss and accuracy)
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
-            
+            plt.figure(figsize=(10, 6))
             epochs = range(1, len(self.train_losses) + 1)
+            plt.plot(epochs, self.train_losses, 'b-', label='Training Loss')
             
-            # Plot loss
-            ax1.plot(epochs, self.train_losses, 'b-', label='Training Loss')
             if self.val_losses:
-                ax1.plot(epochs, self.val_losses, 'r-', label='Validation Loss')
-            ax1.set_ylabel('Loss')
-            ax1.set_title('Training and Validation Loss')
-            ax1.legend()
-            ax1.grid(True)
-            
-            # Plot accuracy
-            ax2.plot(epochs, self.train_accuracies, 'g-', label='Training Accuracy')
-            if self.val_accuracies:
-                ax2.plot(epochs, self.val_accuracies, 'm-', label='Validation Accuracy')
-            ax2.set_ylabel('Accuracy')
-            ax2.set_xlabel('Epochs')
-            ax2.set_title('Training and Validation Accuracy')
-            ax2.legend()
-            ax2.grid(True)
-            
-            # Adjust layout and spacing
-            plt.tight_layout()
+                plt.plot(epochs, self.val_losses, 'r-', label='Validation Loss')
+                
+            plt.title('Loss History')
+            plt.xlabel('Epochs')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.grid(True)
             
             # Save the plot
-            history_plot_path = os.path.join(self.checkpoint_dir, "training_history.png")
-            plt.savefig(history_plot_path)
-            self._log(f"Training history plot saved to {history_plot_path}")
+            loss_plot_path = os.path.join(self.checkpoint_dir, "loss_history.png")
+            plt.savefig(loss_plot_path)
+            self._log(f"Loss history plot saved to {loss_plot_path}")
             
-            # Return the figure for display (won't close it)
-            return fig
-            
+            # Close the plot to free memory
+            plt.close()
         except Exception as e:
-            self._log(f"Error plotting training history: {str(e)}")
-            return None
-
-    # This method no longer used, we'll use _plot_training_history instead
-    def _plot_loss_history(self):
-        pass
+            self._log(f"Error plotting loss history: {str(e)}")
 
     def save_checkpoint(self, path):
         checkpoint = {
@@ -484,6 +414,23 @@ class BaseTrainer:
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         if self.logger:
             self.logger.info(f"Checkpoint loaded from {path}")
+
+    def _display_final_plots(self):
+        """Display final training plots after training completes."""
+        try:
+            if self.animator:
+                # If Animator supports a direct plot method
+                if hasattr(self.animator, "plot"):
+                    self.animator.plot()
+                # If Animator has a figure attribute
+                elif hasattr(self.animator, "fig"):
+                    plt.figure(self.animator.fig.number)
+                    plt.show()
+                    plt.close()
+                else:
+                    self._log("Animator does not support a final plot method.")
+        except Exception as e:
+            self._log(f"Error displaying final plots: {str(e)}")
 
     def save_model(self, path=None):
         """
