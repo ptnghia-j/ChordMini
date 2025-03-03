@@ -77,9 +77,6 @@ class Tester:
                 
                 # Convert and store
                 preds_np = preds.cpu().numpy()
-                if preds_np.ndim > 1:
-                    preds_np = preds_np.argmax(axis=1)
-                
                 targets_np = targets.cpu().numpy()
                 
                 # Count distribution
@@ -198,8 +195,8 @@ def main():
         model = torch.nn.DataParallel(model)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.98), eps=1e-6)
-    warmup_steps = 10  # increased warmup steps for a gentler start
-    num_epochs = 50
+    warmup_steps = 2  # increased warmup steps for a gentler start
+    num_epochs = 20
     scheduler = CosineScheduler(optimizer, max_update=num_epochs, base_lr=1e-3,
                                 final_lr=1e-6, warmup_steps=warmup_steps, warmup_begin_lr=1e-5)
 
@@ -217,10 +214,10 @@ def main():
         print(f"Chord: {ch}, Count: {dist_counter[ch]}, Percentage: {ratio:.4f}%")
     
     # FIXED: Include N in dropped chords if it has 0 count
-    # dropped = [ch for ch in unified_keys if ((dist_counter[ch] / total_samples) < 0.001 or dist_counter[ch] == 0)]
-    # if dropped:
-    #     print("Dropping chords due to low distribution (<0.1%) or zero count:", dropped)
-    dropped = []
+    dropped = [ch for ch in unified_keys if ((dist_counter[ch] / total_samples) < 0.001 or dist_counter[ch] == 0)]
+    if dropped:
+        print("Dropping chords due to low distribution (<0.1%) or zero count:", dropped)
+    # dropped = []
     # Apply log scaling to class weights and set to zero for dropped chords; ensure float32 dtype
     class_weights = np.array([0.0 if ch in dropped else np.log1p(total_samples / max(dist_counter.get(ch, 1), 1))
                              for ch in unified_keys], dtype=np.float32)
@@ -242,7 +239,7 @@ def main():
                           ignore_index=unified_mapping.get("N", len(unified_mapping)),  # Use the correct index for "N"
                           class_weights=class_weights,
                           idx_to_chord=idx_to_chord,
-                          use_chord_aware_loss=True)  # Use chord-aware loss
+                          use_chord_aware_loss=False)  # Use chord-aware loss
     
     # NEW: Print complete chord distribution before training starts.
     print("Final Chord Distribution in Training Set:")

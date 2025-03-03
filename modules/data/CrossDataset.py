@@ -119,12 +119,8 @@ class CrossDataset(Dataset):
                     'chroma': chroma_vector,
                     'chord_label': row.chord
                 })
-        # NEW: Eliminate any sample with label "N" or where chroma is all zeros.
-        samples = [s for s in samples if s['chord_label'] != "N" and not all(float(val)==0 for val in s['chroma'])]
-# Eliminate any sample with label "N", chroma all zeros, or label "nan"
-        samples = [s for s in samples if s['chord_label'] != "N" 
-                  and not all(float(val)==0 for val in s['chroma'])
-                  and s['chord_label'] != "nan"]
+    
+        samples = [s for s in samples if s['chord_label'] not in ["N", "nan"] and not all(float(val)==0 for val in s['chroma'])]
         self.samples = samples
 
         # Compute segment indices for each contiguous block using stride.
@@ -174,20 +170,20 @@ class CrossDataset(Dataset):
                 sample_i = self.samples[pos]
                 ch_vec = torch.tensor(sample_i['chroma'], dtype=torch.float)
                 chord_label = normalize_chord(sample_i['chord_label'])
-                if chord_label == 'nan' or torch.all(ch_vec == 0):
-                    # Use proper ignore_index instead of assuming "N" is at index 0
+                # if chord_label == 'nan' or torch.all(ch_vec == 0):
+                #     # Use proper ignore_index instead of assuming "N" is at index 0
+                #     label_seq.append(self.ignore_index)
+                # else:
+                try:
+                    label_seq.append(self.chord_to_idx[chord_label])
+                except KeyError:
+                    # Only warn once per chord
+                    if not hasattr(self, '_warned_chords'):
+                        self._warned_chords = set()
+                    if chord_label not in self._warned_chords:
+                        print(f"Warning: Unknown chord label '{chord_label}', using ignore_index")
+                        self._warned_chords.add(chord_label)
                     label_seq.append(self.ignore_index)
-                else:
-                    try:
-                        label_seq.append(self.chord_to_idx[chord_label])
-                    except KeyError:
-                        # Only warn once per chord
-                        if not hasattr(self, '_warned_chords'):
-                            self._warned_chords = set()
-                        if chord_label not in self._warned_chords:
-                            print(f"Warning: Unknown chord label '{chord_label}', using ignore_index")
-                            self._warned_chords.add(chord_label)
-                        label_seq.append(self.ignore_index)
                 sequence.append(ch_vec)
             else:
                 sequence.append(torch.zeros(12, dtype=torch.float))

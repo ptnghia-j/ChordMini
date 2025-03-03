@@ -2,6 +2,8 @@ import sys
 import os
 # Add project root to sys.path so that absolute imports work
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+import torch.optim as optim
+import matplotlib.pyplot as plt
 
 import math
 import torch
@@ -68,8 +70,6 @@ class CosineScheduler(_LRScheduler):
 
 # Test code for each scheduler using Animator.
 if __name__ == '__main__':
-    import torch.optim as optim
-    import matplotlib.pyplot as plt
 
     # Create a dummy optimizer with one parameter.
     param = [torch.nn.Parameter(torch.tensor(1.0))]
