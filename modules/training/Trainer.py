@@ -101,60 +101,55 @@ class BaseTrainer:
 
     def train(self, train_loader, val_loader=None):
         self.model.train()
-        
-        # Disable debug logging for every batch to improve speed
-        log_interval = max(1, len(train_loader) // 10)  # Log approximately 10 times per epoch
+        log_interval = max(1, len(train_loader) // 10)  # ...existing code...
         
         for epoch in range(1, self.num_epochs + 1):
             self._log(f"Epoch {epoch}/{self.num_epochs} - Starting training")
             self.timer.reset(); self.timer.start()
             epoch_loss = 0.0
             
-            # Use tqdm for progress tracking
-            with tqdm(total=len(train_loader), desc=f"Epoch {epoch}", unit="batch") as progress_bar:
+            num_batches = len(train_loader)
+            update_interval = max(1, num_batches // 100)
+            
+            with tqdm(total=num_batches, desc=f"Epoch {epoch}", unit="batch") as progress_bar:
                 for batch_idx, batch in enumerate(train_loader):
-                    # Process batch faster by moving operations to GPU in one go
                     inputs, targets = self._process_batch(batch)
-                    
-                    # Optimize the training step
                     loss = self._training_step(inputs, targets)
                     epoch_loss += loss
                     
-                    # Update progress bar less frequently
                     if batch_idx % 10 == 0:
                         progress_bar.set_postfix({'loss': f"{loss:.4f}"})
                     progress_bar.update(1)
                     
-                    # Only log at intervals to reduce overhead
                     if batch_idx % log_interval == 0:
-                        self._log(f"Epoch {epoch} Batch {batch_idx}/{len(train_loader)} - Loss: {loss:.4f}")
+                        self._log(f"Epoch {epoch} Batch {batch_idx}/{num_batches} - Loss: {loss:.4f}")
+                    
+                    # Update scheduler frequently with a fractional epoch value.
+                    if (batch_idx + 1) % update_interval == 0 or (batch_idx + 1) == num_batches:
+                        frac_epoch = (epoch - 1) + (batch_idx + 1) / num_batches
+                        self.scheduler.step(frac_epoch)
             
             self.timer.stop()
-            avg_loss = epoch_loss / len(train_loader)
+            avg_loss = epoch_loss / num_batches
             self.train_losses.append(avg_loss)
             
             self._log(f"Epoch {epoch}/{self.num_epochs}: Loss = {avg_loss:.4f}, Time = {self.timer.elapsed_time():.2f} sec")
             if self.animator:
                 self.animator.add(epoch, avg_loss)
             
-            # Optionally skip validation on some epochs to speed up training
             if val_loader is not None and (epoch % 1 == 0 or epoch == self.num_epochs):
                 val_loss = self.validate(val_loader)
                 self.val_losses.append(val_loss)
             elif val_loader is not None:
-                # Just append the previous value to maintain list length
                 self.val_losses.append(self.val_losses[-1] if self.val_losses else 0.0)
-                
-            self.scheduler.step()
             
-            # Only save checkpoint at intervals or final epoch
+            # Removed the scheduler.step() call previously located here.
             if epoch % 5 == 0 or epoch == self.num_epochs:
                 self._save_checkpoint(epoch)
         
-        # After training completes
         self._print_loss_history()
         self._plot_loss_history()
-    
+
     def _training_step(self, inputs, targets):
         """Optimized single training step."""
         self.optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
