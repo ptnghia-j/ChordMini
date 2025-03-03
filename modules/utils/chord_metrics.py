@@ -102,8 +102,8 @@ def chord_similarity(chord1, chord2):
     # Calculate similarities
     root_sim = calculate_root_similarity(root1, root2)
     quality_sim = calculate_quality_similarity(quality1, quality2)
-    # Weight root 40% and quality 60%
-    return ((0.4 * root_sim) + (0.6 * quality_sim))
+    # Weight root 60% and quality 40%
+    return ((0.6 * root_sim) + (0.4 * quality_sim))
 def weighted_chord_symbol_recall(y_true, y_pred, idx_to_chord):
     """
     Calculate Weighted Chord Symbol Recall (WCSR)
