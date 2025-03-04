@@ -146,6 +146,8 @@ class BaseTrainer:
             # Removed the scheduler.step() call previously located here.
             if epoch % 5 == 0 or epoch == self.num_epochs:
                 self._save_checkpoint(epoch)
+            
+            self.scheduler.step()
         
         self._print_loss_history()
         self._plot_loss_history()

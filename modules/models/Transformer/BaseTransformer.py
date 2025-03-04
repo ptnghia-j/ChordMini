@@ -199,7 +199,7 @@ class BaseTransformer(nn.Module):
         y2 = torch.sum(torch.stack(tf, dim=0), dim=0)
         y, w = self.decoder(y1, y2, weight)
         return y, w
-
+    
 if __name__ == '__main__':
   # Test initialization using BaseTransformer instead of Transformer
   model = BaseTransformer(n_freq=2048)

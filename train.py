@@ -195,8 +195,8 @@ def main():
         model = torch.nn.DataParallel(model)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.98), eps=1e-6)
-    warmup_steps = 1  # increased warmup steps for a gentler start
-    num_epochs = 5
+    warmup_steps = 3  # increased warmup steps for a gentler start
+    num_epochs = 20
     scheduler = CosineScheduler(optimizer, max_update=num_epochs, base_lr=1e-3,
                                 final_lr=1e-6, warmup_steps=warmup_steps, warmup_begin_lr=1e-5)
 
