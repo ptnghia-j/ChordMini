@@ -214,19 +214,19 @@ def main():
         print(f"Chord: {ch}, Count: {dist_counter[ch]}, Percentage: {ratio:.4f}%")
     
     # FIXED: Include N in dropped chords if it has 0 count
-    dropped = [ch for ch in unified_keys if ((dist_counter[ch] / total_samples) < 0.001 or dist_counter[ch] == 0)]
-    if dropped:
-        print("Dropping chords due to low distribution (<0.1%) or zero count:", dropped)
-    # dropped = []
+    # dropped = [ch for ch in unified_keys if ((dist_counter[ch] / total_samples) < 0.0005 or dist_counter[ch] == 0)]
+    # if dropped:
+    #     print("Dropping chords due to low distribution (<0.05%) or zero count:", dropped)
+    dropped = []
     # Apply log scaling to class weights and set to zero for dropped chords; ensure float32 dtype
     class_weights = np.array([0.0 if ch in dropped else np.log1p(total_samples / max(dist_counter.get(ch, 1), 1))
                              for ch in unified_keys], dtype=np.float32)
     
     # Set extra high penalty for N class
-    n_index = unified_mapping.get("N")
-    if n_index is not None and n_index < len(class_weights):
-        class_weights[n_index] = -100.0  # Strong negative weight to heavily discourage N prediction
-        print(f"Setting special penalty for N class at index {n_index}")
+    # n_index = unified_mapping.get("N")
+    # if n_index is not None and n_index < len(class_weights):
+    #     class_weights[n_index] = -100.0  # Strong negative weight to heavily discourage N prediction
+    #     print(f"Setting special penalty for N class at index {n_index}")
         
     print("Computed class weights:", class_weights)
     
