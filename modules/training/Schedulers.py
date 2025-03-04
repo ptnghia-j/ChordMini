@@ -86,7 +86,7 @@ if __name__ == '__main__':
         lr_history = []
         for epoch in range(num_epochs):
             lr_history.append(optimizer.param_groups[0]['lr'])
-            scheduler.step()
+            # scheduler.step()
         animator = Animator(xlabel='Epoch', ylabel='Learning Rate', legend=[title],
                             xlim=(0, num_epochs), ylim=(0, initial_lr*1.1), figsize=(5, 3))
         for epoch, lr in enumerate(lr_history):
