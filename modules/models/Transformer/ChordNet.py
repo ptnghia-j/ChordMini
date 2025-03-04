@@ -22,11 +22,11 @@ class ChordNet(nn.Module):
         o = self.dropout(o)
         logits = self.fc(o)
         
-        # Apply a penalty to the ignore_index if specified
-        if self.ignore_index is not None and self.ignore_index < logits.shape[-1]:
-            penalty_mask = torch.zeros_like(logits)
-            penalty_mask[..., self.ignore_index] = -10.0  # Large negative bias
-            logits = logits + penalty_mask
+        # # Apply a penalty to the ignore_index if specified
+        # if self.ignore_index is not None and self.ignore_index < logits.shape[-1]:
+        #     penalty_mask = torch.zeros_like(logits)
+        #     penalty_mask[..., self.ignore_index] = -10.0  # Large negative bias
+        #     logits = logits + penalty_mask
             
         return logits, o
 
