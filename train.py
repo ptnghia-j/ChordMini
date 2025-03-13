@@ -13,7 +13,7 @@ from modules.data.CrossDataset import CrossDataset, get_unified_mapping
 from modules.models.Transformer.ChordNet import ChordNet
 from modules.training.Trainer import BaseTrainer
 from modules.training.Schedulers import CosineScheduler
-from modules.utils.chord_metrics import weighted_chord_symbol_recall
+from modules.utils.mir_eval_modules import root_majmin_score_calculation, large_voca_score_calculation
 
 def partition_test_set(concat_dataset):
     test_indices = []
@@ -219,7 +219,9 @@ def main():
     #     print("Dropping chords due to low distribution (<0.05%) or zero count:", dropped)
     dropped = []
     # Apply log scaling to class weights and set to zero for dropped chords; ensure float32 dtype
-    class_weights = np.array([0.0 if ch in dropped else np.log1p(total_samples / max(dist_counter.get(ch, 1), 1))
+    # class_weights = np.array([0.0 if ch in dropped else np.log1p(total_samples / max(dist_counter.get(ch, 1), 1))
+    #                          for ch in unified_keys], dtype=np.float32)
+    class_weights = np.array([0.0 if ch in dropped else total_samples / max(dist_counter.get(ch, 1), 1)
                              for ch in unified_keys], dtype=np.float32)
     
     # Set extra high penalty for N class

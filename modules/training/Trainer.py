@@ -7,7 +7,11 @@ import matplotlib.pyplot as plt  # For plotting loss history
 from tqdm import tqdm  # Import tqdm for progress tracking
 
 class BaseTrainer:
-    def __init__(self, model, optimizer, scheduler=None, device=None, num_epochs=100, logger=None, use_animator=True, checkpoint_dir="checkpoints", max_grad_norm=1.0, ignore_index=0, class_weights=None, idx_to_chord=None, use_chord_aware_loss=False):  # Added idx_to_chord and use_chord_aware_loss
+    def __init__(self, model, optimizer, scheduler=None, device=None, num_epochs=100, 
+                 logger=None, use_animator=True, checkpoint_dir="checkpoints", 
+                 max_grad_norm=1.0, class_weights=None, 
+                 idx_to_chord=None,
+                 normalization=None):  # Removed use_chord_aware_loss parameter
         """
         Args:
             model (torch.nn.Module): The model to train.
@@ -19,10 +23,9 @@ class BaseTrainer:
             use_animator (bool): If True, instantiate an Animator to graph training progress. (Default: True)
             checkpoint_dir (str): Directory to save checkpoints. (Default: "checkpoints")
             max_grad_norm (float): Maximum norm for gradient clipping. (Default: 1.0)
-            ignore_index (int): Index to ignore in the loss computation. (Default: 0)
             class_weights (list, optional): Weights for each class in the loss computation. (Default: None)
             idx_to_chord (dict, optional): Mapping from index to chord. (Default: None)
-            use_chord_aware_loss (bool): If True, use chord-aware loss function. (Default: False)
+            normalization (dict, optional): Dict with 'mean' and 'std' for input normalization. (Default: None)
         """
         self.model = model
         self.optimizer = optimizer
@@ -47,34 +50,22 @@ class BaseTrainer:
         if not os.path.exists(self.checkpoint_dir):
             os.makedirs(self.checkpoint_dir)
         self.max_grad_norm = max_grad_norm
-        self.ignore_index = ignore_index
-        # NEW: Add assignment of class_weights.
         if class_weights is not None:
-            self.class_weights = class_weights
             # Set weight for ignore_index to 0 to avoid predicting it
-            if ignore_index < len(self.class_weights):
-                self.class_weights[ignore_index] = 0.0
+            self.class_weights = class_weights
         else:
             self.class_weights = [1.0] * model.fc.out_features  # Default to equal weights
-            if ignore_index < len(self.class_weights):
-                self.class_weights[ignore_index] = 0.0
+
         self.scaler = torch.cuda.amp.GradScaler() if self.device.type == "cuda" else None
         self.idx_to_chord = idx_to_chord
-        self.use_chord_aware_loss = use_chord_aware_loss
         
-        # Initialize loss function
-        if self.use_chord_aware_loss and self.idx_to_chord:
-            from modules.training.ChordLoss import ChordAwareLoss
-            self._log("Using chord-aware loss function")
-            self.loss_fn = ChordAwareLoss(
-                idx_to_chord=self.idx_to_chord,
-                ignore_index=self.ignore_index,
-                class_weights=self.class_weights,
-                device=self.device
-            )
-        else:
-            weight_tensor = torch.tensor(self.class_weights, device=self.device) if class_weights is not None else None
-            self.loss_fn = torch.nn.CrossEntropyLoss(weight=weight_tensor, ignore_index=self.ignore_index)
+        # Store normalization parameters
+        self.normalization = normalization
+        
+        # Always use standard cross entropy loss
+        self._log("Using standard cross entropy loss")
+        weight_tensor = torch.tensor(self.class_weights, device=self.device) if class_weights is not None else None
+        self.loss_fn = torch.nn.CrossEntropyLoss(weight=weight_tensor)
         
         # Add lists to track losses across epochs
         self.train_losses = []
@@ -89,7 +80,14 @@ class BaseTrainer:
 
     def _process_batch(self, batch):
         # Factor out extraction of inputs and targets.
-        inputs = batch['chroma'].to(self.device)
+        # Check for 'spectro' key (used in SynthDataset) or fall back to 'chroma' key
+        if 'spectro' in batch:
+            inputs = batch['spectro'].to(self.device)
+        elif 'chroma' in batch:
+            inputs = batch['chroma'].to(self.device)
+        else:
+            raise KeyError("Batch dictionary must contain either 'spectro' or 'chroma' key")
+            
         targets = batch['chord_idx'].to(self.device)
         return inputs, targets
 
@@ -156,11 +154,16 @@ class BaseTrainer:
         """Optimized single training step."""
         self.optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
         
+        # Apply normalization if specified
+        if self.normalization:
+            inputs = (inputs - self.normalization['mean']) / self.normalization['std']
+        
         # Use AMP for mixed precision training
         with torch.amp.autocast(device_type='cuda', enabled=(self.device.type=='cuda')):
             outputs = self.model(inputs)
             loss = self.compute_loss(outputs, targets)
-        
+        # Convert loss to float32 to avoid precision issues when logging
+        loss_value = loss.float().item()  
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -171,9 +174,8 @@ class BaseTrainer:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
             self.optimizer.step()
-        
-        return loss.item()
-    
+        return loss_value
+
     def validate(self, val_loader):
         """Optimized validation function."""
         self.model.eval()
@@ -218,6 +220,10 @@ class BaseTrainer:
             for batch_idx, batch in enumerate(tqdm(val_loader, desc="Validation", leave=False)):
                 inputs, targets = self._process_batch(batch)
                 
+                # Apply normalization if specified
+                if self.normalization:
+                    inputs = (inputs - self.normalization['mean']) / self.normalization['std']
+                
                 # Fast forward pass with device-appropriate mixed precision
                 device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
                 with torch.amp.autocast(device_type=device_type, enabled=(self.device.type in ['cuda', 'mps'])):
@@ -239,7 +245,7 @@ class BaseTrainer:
                 # Track batch loss
                 total_loss += loss.item()
                 
-                # Debug info only for first batch
+                # DEBUG info only for first batch
                 if first_batch:
                     # Only move a small portion to CPU for debug printing
                     debug_preds = preds[:10].cpu().numpy()
@@ -292,16 +298,13 @@ class BaseTrainer:
     def _analyze_validation_results(self, all_targets, all_preds):
         """Separate method for analysis to keep validation loop clean."""
         from collections import Counter
-        
-        # Count distributions
         target_counter = Counter(all_targets)
         pred_counter = Counter(all_preds)
         
-        # Print distribution statistics
         self._log("\nDEBUG: Target Distribution (top 10):")
         total_samples = len(all_targets)
         for idx, count in target_counter.most_common(10):
-            chord_name = self.idx_to_chord.get(idx, "Unknown") 
+            chord_name = self.idx_to_chord.get(idx, "Unknown")
             self._log(f"Target {idx} ({chord_name}): {count} occurrences ({count/total_samples*100:.2f}%)")
             
         self._log("\nDEBUG: Prediction Distribution (top 10):")
@@ -309,13 +312,6 @@ class BaseTrainer:
             chord_name = self.idx_to_chord.get(idx, "Unknown") if self.idx_to_chord else str(idx)
             self._log(f"Prediction {idx} ({chord_name}): {count} occurrences ({count/total_samples*100:.2f}%)")
         
-        # Calculate WCSR if we have the mapping
-        if self.idx_to_chord:
-            from modules.utils.chord_metrics import weighted_chord_symbol_recall
-            wcsr = weighted_chord_symbol_recall(all_targets, all_preds, self.idx_to_chord)
-            self._log(f"\nWeighted Chord Symbol Recall (WCSR): {wcsr:.4f}")
-            
-        # Print confusion matrix for most common chords
         if len(target_counter) > 1:
             self._log("\nAnalyzing most common predictions vs targets:")
             top_chords = [idx for idx, _ in target_counter.most_common(10)]
@@ -341,16 +337,11 @@ class BaseTrainer:
         if torch.isnan(targets).any():
             self._log("NaN detected in targets")
         
-        # NEW: Add masking to avoid predicting ignore_index
-        # Apply a penalty for predicting ignore_index class
-        if self.ignore_index < outputs.shape[1]:
-            # Create a mask for the ignore_index logits
-            ignore_mask = torch.zeros_like(outputs)
-            ignore_mask[:, self.ignore_index] = -10.0  # Apply a penalty
-            outputs = outputs + ignore_mask
-        
         # Use the initialized loss function
         loss = self.loss_fn(outputs, targets)
+        
+        # Ensure loss is non-negative (critical fix)
+        loss = torch.clamp(loss, min=0.0)
         
         if torch.isnan(loss):
             self._log(f"NaN loss computed. Outputs: {outputs} | Targets: {targets}")
@@ -451,7 +442,6 @@ class BaseTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'class_weights': self.class_weights,
-            'ignore_index': self.ignore_index
         }, path)
         
         self._log(f"Model saved to {path}")

@@ -1,0 +1,38 @@
+# Student model configuration
+# Training hyperparameters
+training:
+  batch_size: 64
+  max_epochs: 50
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  betas: [0.9, 0.98]
+  epsilon: 1.0e-9
+  early_stopping_patience: 9
+  seq_len: 108
+  seq_stride: 54
+  save_checkpoint_interval: 5
+  min_lr: 5.0e-6
+  lr_decay_factor: 0.95
+# Model hyperparameters
+model:
+  n_group: 4          # GroupNorm groups - adjusted to work with n_freq=144
+  f_layer: 3          # Frequency attention layers - increased to better match BTC
+  f_head: 6           # Frequency attention heads - increased for more capacity
+  t_layer: 3          # Temporal attention layers - increased to better match BTC
+  t_head: 6           # Temporal attention heads - increased for more capacity
+  d_layer: 3          # Decoder layers - increased to better match BTC bidirectional capability
+  d_head: 6           # Decoder heads - increased for more capacity
+  dropout: 0.3        # Dropout rate - kept the same
+  use_chord_aware_loss: false
+# Data paths
+paths:
+  spec_dir: "data/synth/spectrograms"
+  label_dir: "data/synth/labels"
+  checkpoints_dir: "checkpoints"
+
+# Miscellaneous
+misc:
+  seed: 42
+  use_cuda: true
+  logging_level: 1
+  augmentation_enabled: false
