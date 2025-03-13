@@ -1,20 +1,20 @@
 # Core dependencies
-torch>=1.10.0
-numpy>=1.20.0
-matplotlib>=3.4.0
+torch>=1.8.0
+numpy>=1.19.0
+matplotlib>=3.3.0
 
 # Scientific and ML libraries
-scikit-learn>=1.0.0
-scipy>=1.7.0
+scikit-learn>=0.24.0
+scipy>=1.6.0
 
 # Audio processing
-librosa>=0.9.0  # For audio feature extraction and manipulation
+librosa>=0.8.0  # For audio feature extraction and manipulation
 
 # Visualization and progress tracking
 tqdm>=4.62.0
 
 # Optimization and utilities
-pandas>=1.3.0  # For data handling
+pandas>=1.2.0  # For data handling
 tensorboard>=2.8.0  # For monitoring training
 joblib>=1.1.0  # For parallel processing
 

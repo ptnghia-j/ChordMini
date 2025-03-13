@@ -94,7 +94,11 @@ class ChordAwareLoss(nn.Module):
             weighted_loss = weighted_loss * class_weights_per_sample
             
         # Return mean loss over batch
-        return weighted_loss.mean()
+        weighted_loss = weighted_loss.mean()
+        
+        # Ensure loss is non-negative
+        weighted_loss = torch.clamp(weighted_loss, min=0.0)
+        return weighted_loss
 
 class SoftLabelLoss(nn.Module):
     """
@@ -139,15 +143,11 @@ class SoftLabelLoss(nn.Module):
         return soft_labels
         
     def forward(self, logits, targets):
-        batch_size, num_classes = logits.shape
-        
-        # Generate soft labels
-        soft_labels = self.generate_soft_labels(targets, num_classes)
-        
-        # Apply softmax to get probability distribution
+        # Generate soft labels from targets using your similarity matrix
+        soft_labels = self.generate_soft_labels(targets, logits.size(-1))
         log_probs = F.log_softmax(logits, dim=1)
-        
-        # KL divergence loss between predictions and soft labels
+        # Compute KL divergence loss between predicted log-probs and soft label distribution
         loss = F.kl_div(log_probs, soft_labels, reduction='batchmean')
-        
+        # Clamp loss to ensure it stays non-negative
+        loss = torch.clamp(loss, min=0.0)
         return loss

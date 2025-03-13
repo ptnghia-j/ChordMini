@@ -140,6 +140,15 @@ class Decoder(nn.Module):
   def forward(self, x1, x2, weight=None):
     y = x1 * self.r1 + x2 * self.r2
     if weight is not None:
+      # Fix: Properly reshape weight for broadcasting if dimensions don't match
+      if weight.dim() < y.dim():
+        # Adjust weight tensor shape to match y's dimensions for proper broadcasting
+        # This handles the case when weight is [B, T] and needs to be [B, T, d_model]
+        for _ in range(y.dim() - weight.dim()):
+          weight = weight.unsqueeze(-1)
+        # If weight doesn't have the same last dimension as y, expand it
+        if weight.shape[-1] == 1 and y.shape[-1] > 1:
+          weight = weight.expand(-1, -1, y.shape[-1])
       y = y + weight * self.wr
 
     y = y + positional_encoding(y.shape[0], y.shape[1], y.shape[2]).to(get_device()) * self.pr  # out-of-place
@@ -156,7 +165,6 @@ class Decoder(nn.Module):
       y = self.dropout(y)
       y = y + residual  # out-of-place
       y = self.norm_layer(y)
-
 
       y = self.ff_layer[i](y)
 
@@ -188,13 +196,35 @@ class BaseTransformer(nn.Module):
         if x.ndim == 3:
             x = x.unsqueeze(1)  # [B, 1, T, F]
             if self.n_channel > 1:
-                x = x.repeat(1, self.n_channel, 1, 1)  # [B, n_channel, T, F]
-        ff, tf = [], []
-        for i in range(self.n_channel):
-            x1 = self.encoder_f[i](x[:, i, :, :])
-            x2 = self.encoder_t[i](x[:, i, :, :])
-            ff.append(x1)
-            tf.append(x2)
+                # Duplicate the single channel to match expected n_channel
+                x = x.expand(-1, self.n_channel, -1, -1)  # [B, n_channel, T, F]
+        
+        # Handle case where we have fewer channels than expected
+        actual_channels = x.shape[1]
+        if actual_channels < self.n_channel:
+            # Warning: input has fewer channels than the model expects
+            # Use only the available channels
+            ff, tf = [], []
+            for i in range(actual_channels):
+                x1 = self.encoder_f[i](x[:, i, :, :])
+                x2 = self.encoder_t[i](x[:, i, :, :])
+                ff.append(x1)
+                tf.append(x2)
+            
+            # For missing channels, use zeros
+            for i in range(actual_channels, self.n_channel):
+                # Use the first channel shape as reference
+                ff.append(torch.zeros_like(ff[0]))
+                tf.append(torch.zeros_like(tf[0]))
+        else:
+            # Normal case - we have enough channels
+            ff, tf = [], []
+            for i in range(self.n_channel):
+                x1 = self.encoder_f[i](x[:, i, :, :])
+                x2 = self.encoder_t[i](x[:, i, :, :])
+                ff.append(x1)
+                tf.append(x2)
+                
         y1 = torch.sum(torch.stack(ff, dim=0), dim=0)
         y2 = torch.sum(torch.stack(tf, dim=0), dim=0)
         y, w = self.decoder(y1, y2, weight)

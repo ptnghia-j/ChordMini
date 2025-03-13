@@ -1,475 +1,571 @@
-import os
-import argparse
-import logging
-import csv
-from typing import Optional
-
-import torch
-import torchaudio
-import matplotlib.pyplot as plt
 import numpy as np
-from scipy.optimize import nnls
-import zipfile
-import shutil
+import librosa
+import os
+from scipy import linalg
+from scipy.optimize import nnls  # Add this import for the NNLS function
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# Constants similar to the C++ implementation
+nBPS = 3  # bins per semitone
+nNote = 84 * nBPS  # number of notes
+MIDI_basenote = 21  # MIDI number for lowest note (A0)
 
+# Windows for weighting treble and bass ranges
+treblewindow = np.concatenate((np.zeros(12), 
+                              np.ones(24) * 0.5, 
+                              np.ones(24), 
+                              np.ones(24) * 0.5))
+treblewindow = treblewindow[:84]
 
-def get_device() -> torch.device:
+def cospuls(x, centre, width):
     """
-    Returns the appropriate torch.device by considering CUDA, MPS (for Apple Silicon), or CPU.
+    Cosine pulse function centered at 'centre' with given width
     """
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        logging.info("Using CUDA device.")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-        logging.info("Using MPS device (Apple Silicon).")
-    else:
-        device = torch.device("cpu")
-        logging.info("Using CPU device.")
-    return device
+    recipwidth = 1.0 / width
+    abs_diff = abs(x - centre)
+    if abs_diff <= 0.5 * width:
+        return np.cos((x - centre) * 2 * np.pi * recipwidth) * 0.5 + 0.5
+    return 0.0
 
+def pitchCospuls(x, centre, binsperoctave):
+    """
+    Pitch-scaled cosine pulse function
+    """
+    warpedf = -binsperoctave * (np.log2(centre) - np.log2(x))
+    out = cospuls(warpedf, 0.0, 2.0)
+    # Scale to correct for note density
+    c = np.log(2.0) / binsperoctave
+    return out / (c * x) if x > 0 else 0.0
 
-class AudioProcessor:
-    def __init__(
-        self,
-        file_path: str,
-        sample_rate: int = 22050,
-        n_fft: int = 1024,
-        hop_length: int = 256,
-        n_mels: int = 128,
-        device: Optional[torch.device] = None,
-    ) -> None:
-        """
-        Initialize the audio processor with processing parameters.
+def specialConvolution(convolvee, kernel):
+    """
+    Special convolution as defined in the C++ code
+    """
+    len_convolvee = len(convolvee)
+    len_kernel = len(kernel)
+    
+    Z = np.zeros(len_convolvee)
+    
+    # Main convolution part
+    for n in range(len_kernel - 1, len_convolvee):
+        s = 0.0
+        for m in range(len_kernel):
+            s += convolvee[n-m] * kernel[m]
+        Z[n - len_kernel//2] = s
+    
+    # Fill upper and lower pads
+    for n in range(len_kernel//2):
+        Z[n] = Z[len_kernel//2]
+    
+    for n in range(len_convolvee, len_convolvee + len_kernel//2):
+        Z[n - len_kernel//2] = Z[len_convolvee - len_kernel//2 - 1]
+    
+    return Z
+
+def logFreqMatrix(sample_rate, blocksize):
+    """
+    Calculate matrix that maps from magnitude spectrum to pitch-scale spectrum
+    """
+    binspersemitone = nBPS
+    minoctave = 0
+    maxoctave = 7
+    oversampling = 80
+    
+    # Linear frequency vector
+    fft_f = np.array([i * (sample_rate / blocksize) for i in range(blocksize//2)])
+    fft_width = sample_rate * 2.0 / blocksize
+    
+    # Linear oversampled frequency vector
+    oversampled_f = np.array([i * ((sample_rate / blocksize) / oversampling) for i in range(oversampling * blocksize//2)])
+    
+    # Pitch-spaced frequency vector
+    minMIDI = 21 + minoctave * 12
+    maxMIDI = 21 + maxoctave * 12
+    oob = 1.0 / binspersemitone
+    
+    cq_f = []
+    for i in range(minMIDI, maxMIDI):
+        for k in range(binspersemitone):
+            cq_f.append(440 * (2.0 ** (0.083333333333 * (i + oob * k - 69))))
+    cq_f.append(440 * (2.0 ** (0.083333 * (maxMIDI - 69))))
+    
+    cq_f = np.array(cq_f)
+    nFFT = len(fft_f)
+    
+    # FFT activation
+    fft_activation = []
+    for iOS in range(2 * oversampling):
+        cosp = cospuls(oversampled_f[iOS], fft_f[1], fft_width)
+        fft_activation.append(cosp)
+    
+    # Create the log frequency matrix
+    outmatrix = np.zeros((nFFT, len(cq_f)))
+    
+    for iFFT in range(1, nFFT):
+        curr_start = oversampling * iFFT - oversampling
+        curr_end = oversampling * iFFT + oversampling
         
-        Args:
-            file_path (str): Path to the audio file.
-            sample_rate (int): Desired sample rate for audio.
-            n_fft (int): FFT window size.
-            hop_length (int): Hop length for STFT.
-            n_mels (int): Number of mel bins.
-            device (torch.device, optional): Device to run processing on.
-                Defaults to auto-detection (CUDA, MPS, or CPU).
-        """
-        self.file_path = file_path
-        self.sample_rate = sample_rate
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.n_mels = n_mels
-        self.device = device if device is not None else get_device()
+        for iCQ in range(len(cq_f)):
+            if (cq_f[iCQ] * (2.0 ** 0.084) + fft_width > fft_f[iFFT] and 
+                cq_f[iCQ] * (2.0 ** (-0.084 * 2)) - fft_width < fft_f[iFFT]):
+                
+                for iOS in range(curr_start, curr_end):
+                    if iOS < len(oversampled_f):
+                        cq_activation = pitchCospuls(oversampled_f[iOS], cq_f[iCQ], binspersemitone * 12)
+                        outmatrix[iFFT, iCQ] += cq_activation * fft_activation[iOS - curr_start]
+    
+    # Convert to sparse format
+    kernel_value = []
+    kernel_fft_index = []
+    kernel_note_index = []
+    
+    for iNote in range(len(cq_f)):
+        for iFFT in range(nFFT):
+            if outmatrix[iFFT, iNote] > 0:
+                # Only include indices that are within the valid range for nNote
+                if iNote < nNote:
+                    kernel_value.append(outmatrix[iFFT, iNote])
+                    kernel_fft_index.append(iFFT)
+                    kernel_note_index.append(iNote)
+    
+    return kernel_value, kernel_fft_index, kernel_note_index
 
-    def load_audio(self) -> torch.Tensor:
-        """
-        Load audio from file, handle multi-channel (using first channel) and resample if necessary.
-
-        Returns:
-            torch.Tensor: Audio waveform of shape [1, time] on the specified device.
-        
-        Raises:
-            FileNotFoundError: If the audio file does not exist.
-        """
-        if not os.path.exists(self.file_path):
-            raise FileNotFoundError(f"Audio file not found: {self.file_path}")
-        
-        waveform, sr = torchaudio.load(self.file_path)
-        logging.info(f"Loaded audio with sample rate {sr} and shape {waveform.shape}")
-
-        # Use only the first channel if multiple channels exist.
-        if waveform.size(0) > 1:
-            waveform = waveform[0].unsqueeze(0)
-            logging.info("Multiple channels detected. Using the first channel only.")
-
-        # Resample if source sample rate doesn't match desired sample rate
-        if sr != self.sample_rate:
-            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.sample_rate)
-            waveform = resampler(waveform)
-            logging.info(f"Resampled audio from {sr} Hz to {self.sample_rate} Hz.")
-
-        return waveform.to(self.device)
-
-    def compute_stft(self, waveform: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the Short-Time Fourier Transform (STFT) of the waveform.
-
-        Args:
-            waveform (torch.Tensor): Input audio waveform of shape [1, time].
-
-        Returns:
-            torch.Tensor: Complex STFT with shape [freq_bins, time] for the first channel.
-        
-        Raises:
-            Exception: If STFT computation fails.
-        """
-        try:
-            stft = torch.stft(
-                waveform,
-                n_fft=self.n_fft,
-                hop_length=self.hop_length,
-                return_complex=True
-            )
-            # Squeeze channel dimension if present
-            stft = stft.squeeze(0)
-            logging.info(f"Computed STFT with shape {stft.shape}")
-            return stft
-        except Exception as e:
-            logging.error(f"Error computing STFT: {e}")
-            raise
-
-    def extract_chroma(self, waveform: torch.Tensor) -> torch.Tensor:
-        """
-        Approximate chroma extraction using a mel spectrogram approximation.
-        For MPS devices, temporarily move data to CPU for this transform.
-        
-        Args:
-            waveform (torch.Tensor): Input audio waveform of shape [1, time].
-
-        Returns:
-            torch.Tensor: Chroma matrix of shape [12, time_frames] (on CPU).
-        
-        Raises:
-            Exception: If chroma extraction fails.
-        """
-        try:
-            # If on MPS, use CPU for torchaudio transforms since MPS support is incomplete.
-            if self.device.type == "mps":
-                logging.info("Using CPU for mel spectrogram computation due to MPS limitations.")
-                waveform_for_transform = waveform.cpu()
-                transform_device = torch.device("cpu")
-            else:
-                waveform_for_transform = waveform
-                transform_device = self.device
-
-            window_fn = lambda win_length: torch.ones(win_length, device=transform_device)
-            melspec_transform = torchaudio.transforms.MelSpectrogram(
-                sample_rate=self.sample_rate,
-                n_fft=self.n_fft,
-                hop_length=self.hop_length,
-                n_mels=self.n_mels,
-                window_fn=window_fn
-            )
-            mel_spec = melspec_transform(waveform_for_transform)  # shape: [1, n_mels, time_frames]
-            logging.info(f"Mel spectrogram computed with shape {mel_spec.shape}")
-
-            # Convert amplitude to decibels for visualization
-            mel_spec_db = torchaudio.transforms.AmplitudeToDB(top_db=80)(mel_spec)
+def dictionaryMatrix(s_param=0.7):
+    """
+    Create a dictionary matrix for note mapping
+    """
+    binspersemitone = nBPS
+    minoctave = 0
+    maxoctave = 7
+    
+    # Pitch-spaced frequency vector
+    minMIDI = 21 + minoctave * 12 - 1
+    maxMIDI = 21 + maxoctave * 12
+    oob = 1.0 / binspersemitone
+    
+    cq_f = []
+    for i in range(minMIDI, maxMIDI):
+        for k in range(binspersemitone):
+            cq_f.append(440 * (2.0 ** (0.083333333333 * (i + oob * k - 69))))
+    cq_f.append(440 * (2.0 ** (0.083333 * (maxMIDI - 69))))
+    
+    dm = np.zeros((nNote, 12 * (maxoctave - minoctave)))
+    
+    for iOut in range(12 * (maxoctave - minoctave)):
+        for iHarm in range(1, 21):
+            floatbin = ((iOut + 1) * binspersemitone + 1) + binspersemitone * 12 * np.log2(iHarm)
+            curr_amp = s_param ** (iHarm - 1)
             
-            # Approximate chroma by grouping mel bins into 12 pitch classes
-            n_chroma = 12
-            time_frames = mel_spec_db.shape[2]
-            chroma = torch.zeros(n_chroma, time_frames)
-            bins_per_chroma = self.n_mels // n_chroma
+            for iNote in range(nNote):
+                if abs(iNote + 1.0 - floatbin) < 2:
+                    dm[iNote, iOut] += cospuls(iNote + 1.0, floatbin, binspersemitone + 0.0) * curr_amp
+    
+    return dm
 
-            # Extract the first (and only) channel of the mel spectrogram
-            mel_db = mel_spec_db[0]  # shape: [n_mels, time_frames]
-            for i in range(n_chroma):
-                start = i * bins_per_chroma
-                end = self.n_mels if i == n_chroma - 1 else start + bins_per_chroma
-                chroma[i, :] = mel_db[start:end, :].mean(dim=0)
-            logging.info(f"Extracted chroma features with shape {chroma.shape}")
-            return chroma  # returning on CPU
-        except Exception as e:
-            logging.error(f"Error extracting chroma: {e}")
-            raise
-
-    def visualize_chroma(self, chroma: torch.Tensor, output_path: Optional[str] = None) -> None:
+class NNLSChroma:
+    def __init__(self, sample_rate=44100, blocksize=16384, stepsize=2048):
         """
-        Visualize chroma features using matplotlib. If output_path is provided,
-        the visualization is saved to that file.
-
-        Args:
-            chroma (torch.Tensor): Chroma matrix of shape [12, time_frames].
-            output_path (str, optional): File path to save the visualization image.
+        Initialize the NNLS Chroma extractor
         
-        Raises:
-            Exception: If visualization fails.
+        Parameters:
+        -----------
+        sample_rate : int
+            Sample rate of the audio signal (default: 44100)
+        blocksize : int
+            Frame length for FFT (default: 16384)
+        stepsize : int
+            Hop size between frames (default: 2048)
         """
-        try:
-            plt.figure(figsize=(10, 4))
-            plt.imshow(chroma.cpu(), aspect="auto", origin="lower", cmap="viridis")
-            plt.title("Chroma Visualization")
-            plt.xlabel("Time Frames")
-            plt.ylabel("Chroma Bins")
-            plt.colorbar(format="%+2.0f dB")
-            plt.tight_layout()
-            if output_path:
-                plt.savefig(output_path)
-                logging.info(f"Chroma visualization saved to {output_path}")
-            plt.show()
-            plt.close()  # Explicitly close the figure to release resources.
-        except Exception as e:
-            logging.error(f"Error during chroma visualization: {e}")
-            raise
+        self.sample_rate = sample_rate
+        self.blocksize = blocksize
+        self.stepsize = stepsize
+        
+        # Parameters
+        self.whitening = 1.0
+        self.s = 0.7  # Spectral shape parameter (0.6 to 0.9 in the paper)
+        self.doNormalizeChroma = 3  # L2 norm
+        self.tuneLocal = 0.0  # global tuning
+        self.boostN = 0.1
+        self.useNNLS = 1.0
+        self.rollon = 0.0
+        
+        # Pre-processing method as described in the paper:
+        # 0: original - no pre-processing
+        # 1: subtraction - subtract the background spectrum 
+        # 2: standardization - subtract background and divide by running std dev
+        self.preprocessing_method = 0
+        
+        # Create the dictionary matrix and log freq matrix
+        self.dict = dictionaryMatrix(self.s)
+        self.kernel_value, self.kernel_fft_index, self.kernel_note_index = logFreqMatrix(
+            self.sample_rate, self.blocksize)
+        
+        # For tuning estimation
+        self.sinvalues = np.sin(2 * np.pi * (np.arange(nBPS) / nBPS))
+        self.cosvalues = np.cos(2 * np.pi * (np.arange(nBPS) / nBPS))
+        
+        # Make hamming window of length 1/2 octave
+        hamwinlength = nBPS * 6 + 1
+        hamwinsum = 0
+        hw = []
+        for i in range(hamwinlength):
+            hw_val = 0.54 - 0.46 * np.cos((2 * np.pi * i) / (hamwinlength - 1))
+            hw.append(hw_val)
+            hamwinsum += hw_val
+        self.hw = np.array(hw) / hamwinsum
+        
+        # Initialize tuning
+        self.mean_tunings = np.zeros(nBPS)
+        self.local_tunings = np.zeros(nBPS)
+        self.local_tuning = []
+        self.frame_count = 0
+        self.log_spectrum = []
+    
+    def process_frame(self, fft_data):
+        """
+        Process a single FFT frame
+        """
+        self.frame_count += 1
+        
+        # Extract magnitude from FFT data
+        magnitude = np.sqrt(fft_data[0:self.blocksize//2, 0]**2 + fft_data[0:self.blocksize//2, 1]**2)
+        
+        # Apply rollon if needed
+        if self.rollon > 0:
+            energysum = np.sum(magnitude**2)
+            cumenergy = 0
+            for i in range(2, self.blocksize//2):
+                cumenergy += magnitude[i]**2
+                if cumenergy < energysum * self.rollon / 100:
+                    magnitude[i-2] = 0
+                else:
+                    break
+        
+        # Note magnitude mapping using pre-calculated matrix
+        nm = np.zeros(nNote)
+        
+        for i, k_val in enumerate(self.kernel_value):
+            # Add safety check to prevent index out of bounds
+            if self.kernel_note_index[i] < nNote and self.kernel_fft_index[i] < len(magnitude):
+                nm[self.kernel_note_index[i]] += magnitude[self.kernel_fft_index[i]] * k_val
+        
+        one_over_N = 1.0 / self.frame_count
+        
+        # Update means of complex tuning variables
+        self.mean_tunings *= float(self.frame_count - 1) * one_over_N
+        
+        for iTone in range(0, round(nNote * 0.62 / nBPS) * nBPS + 1, nBPS):
+            self.mean_tunings += nm[iTone:iTone+nBPS] * one_over_N
+            
+            ratioOld = 0.997
+            self.local_tunings *= ratioOld
+            self.local_tunings += nm[iTone:iTone+nBPS] * (1 - ratioOld)
+        
+        # Local tuning
+        localTuningImag = np.sum(self.local_tunings * self.sinvalues)
+        localTuningReal = np.sum(self.local_tunings * self.cosvalues)
+        
+        normalisedtuning = np.arctan2(localTuningImag, localTuningReal) / (2 * np.pi)
+        self.local_tuning.append(normalisedtuning)
+        
+        # Store log spectrum
+        self.log_spectrum.append(nm)
+        
+        return nm
+    
+    def extract_chroma(self):
+        """
+        Extract chromagram features from processed frames
+        """
+        if len(self.log_spectrum) == 0:
+            return None
+        
+        # Calculate tuning
+        meanTuningImag = np.sum(self.mean_tunings * self.sinvalues)
+        meanTuningReal = np.sum(self.mean_tunings * self.cosvalues)
+        
+        normalisedtuning = np.arctan2(meanTuningImag, meanTuningReal) / (2 * np.pi)
+        intShift = int(np.floor(normalisedtuning * 3))
+        floatShift = normalisedtuning * 3 - intShift
+        
+        # Process each frame
+        tuned_log_spectrum = []
+        
+        for frame_idx, log_frame in enumerate(self.log_spectrum):
+            # Apply tuning
+            if self.tuneLocal:
+                intShift = int(np.floor(self.local_tuning[frame_idx] * 3))
+                floatShift = self.local_tuning[frame_idx] * 3 - intShift
+            
+            # Create tuned log frame
+            tuned_frame = np.zeros_like(log_frame)
+            tuned_frame[:2] = 0  # set lower edge to zero
+            
+            # Interpolate inner bins
+            for k in range(2, len(log_frame) - 3):
+                if k + intShift < len(log_frame) and k + intShift + 1 < len(log_frame):
+                    tuned_frame[k] = log_frame[k + intShift] * (1 - floatShift) + log_frame[k + intShift + 1] * floatShift
+            
+            tuned_frame[-3:] = 0  # upper edge
+            
+            # Apply pre-processing as described in the paper
+            if self.preprocessing_method > 0:
+                # Calculate the running mean (background spectrum)
+                # Using octave-wide Hamming-windowed neighborhood (+-18 bins = 6 semitones)
+                running_mean = specialConvolution(tuned_frame, self.hw)
+                
+                # For standardization (method 2), calculate running standard deviation
+                if self.preprocessing_method == 2:
+                    running_std = np.zeros_like(tuned_frame)
+                    for i in range(nNote):
+                        running_std[i] = (tuned_frame[i] - running_mean[i]) ** 2
+                    running_std = specialConvolution(running_std, self.hw)
+                    running_std = np.sqrt(running_std)
+                
+                # Apply the pre-processing as per equation (2) in the paper
+                for i in range(nNote):
+                    if tuned_frame[i] - running_mean[i] > 0:
+                        if self.preprocessing_method == 1:  # subtraction
+                            tuned_frame[i] = tuned_frame[i] - running_mean[i]
+                        elif self.preprocessing_method == 2:  # standardization
+                            if running_std[i] > 0:
+                                tuned_frame[i] = (tuned_frame[i] - running_mean[i]) / running_std[i]
+                            else:
+                                tuned_frame[i] = 0
+                    else:
+                        tuned_frame[i] = 0
+                    
+            tuned_log_spectrum.append(tuned_frame)
+        
+        # Extract semitone spectrum and chromagram
+        chromagrams = []
+        
+        for tuned_frame in tuned_log_spectrum:
+            chroma = np.zeros(12)
+            
+            if self.useNNLS == 0:
+                # Simple mapping approach - just copy the centre bin of every semitone
+                for iNote in range(nBPS//2 + 2, nNote - nBPS//2, nBPS):
+                    semitone_idx = (iNote - (nBPS//2 + 2)) // nBPS
+                    chroma[semitone_idx % 12] += tuned_frame[iNote]
+            else:
+                # Use NNLS approach as described in the paper
+                # Create semitone spectrum with indices that have energy
+                semitone_spectrum = np.zeros(84)
+                signif_index = []
+                
+                for index, iNote in enumerate(range(nBPS//2 + 2, nNote - nBPS//2, nBPS)):
+                    curr_val = 0
+                    for iBPS in range(-nBPS//2, nBPS//2 + 1):
+                        if iNote + iBPS < len(tuned_frame):
+                            curr_val += tuned_frame[iNote + iBPS]
+                    
+                    if curr_val > 0:
+                        signif_index.append(index)
+                
+                if signif_index:
+                    try:
+                        # Create dictionary for NNLS
+                        curr_dict = np.zeros((nNote, len(signif_index)))
+                        
+                        for i, note_idx in enumerate(signif_index):
+                            curr_dict[:, i] = self.dict[:, note_idx % 12]
+                        
+                        # Add a small regularization term to prevent singular matrix
+                        reg_lambda = 1e-10
+                        
+                        # Solve NNLS with robust error handling
+                        try:
+                            x, _ = nnls(curr_dict, tuned_frame)
+                        except np.linalg.LinAlgError:
+                            # If we get a singular matrix, try with more regularization
+                            try:
+                                # Add a small identity component to make the matrix better conditioned
+                                curr_dict = curr_dict + np.random.normal(0, reg_lambda, curr_dict.shape)
+                                x, _ = nnls(curr_dict, tuned_frame)
+                            except:
+                                # If still failing, fall back to simple method
+                                x = np.zeros(len(signif_index))
+                                for i, note_idx in enumerate(signif_index):
+                                    x[i] = tuned_frame[nBPS//2 + 2 + note_idx * nBPS]
+                        
+                        # Map back to semitone spectrum
+                        for i, note_idx in enumerate(signif_index):
+                            if note_idx < len(semitone_spectrum):
+                                semitone_spectrum[note_idx] = x[i]
+                                if note_idx % 12 < len(chroma) and note_idx < len(treblewindow):
+                                    chroma[note_idx % 12] += x[i] * treblewindow[note_idx]
+                    except Exception as e:
+                        print(f"Error in NNLS processing: {e}")
+                        # Fall back to simple method if anything goes wrong
+                        for index, iNote in enumerate(range(nBPS//2 + 2, nNote - nBPS//2, nBPS)):
+                            if iNote < len(tuned_frame):
+                                semitone_idx = (iNote - (nBPS//2 + 2)) // nBPS
+                                if semitone_idx % 12 < len(chroma) and semitone_idx < len(treblewindow):
+                                    chroma[semitone_idx % 12] += tuned_frame[iNote] * treblewindow[semitone_idx]
+            
+            # Normalize chroma if needed
+            if self.doNormalizeChroma > 0:
+                if self.doNormalizeChroma == 1:  # max norm
+                    max_val = np.max(chroma)
+                    if max_val > 0:
+                        chroma /= max_val
+                elif self.doNormalizeChroma == 2:  # L1 norm
+                    sum_val = np.sum(chroma)
+                    if sum_val > 0:
+                        chroma /= sum_val
+                elif self.doNormalizeChroma == 3:  # L2 norm
+                    sum_squared = np.sum(chroma**2)
+                    if sum_squared > 0:
+                        chroma /= np.sqrt(sum_squared)
+            
+            chromagrams.append(chroma)
+        
+        return np.array(chromagrams)
+    
+    def extract_features(self, audio_data, sr=None):
+        """
+        Extract NNLS chroma features from audio data
+        
+        Parameters:
+        -----------
+        audio_data : numpy array
+            Audio signal (mono)
+        sr : int, optional
+            Sample rate of the audio data. If not provided, uses the class's sample_rate.
+            
+        Returns:
+        --------
+        chromagram : numpy array
+            Matrix of chroma features (n_frames x 12)
+        """
+        # Use provided sample rate if given
+        if sr is not None:
+            self.sample_rate = sr
+            
+        # Reset state
+        self.log_spectrum = []
+        self.local_tuning = []
+        self.mean_tunings = np.zeros(nBPS)
+        self.local_tunings = np.zeros(nBPS)
+        self.frame_count = 0
+        
+        # Compute STFT
+        stft = librosa.stft(
+            audio_data,
+            n_fft=self.blocksize,
+            hop_length=self.stepsize,
+            window='hamming',  # Use Hamming window as specified in the paper
+            center=True
+        )
+        
+        # Convert to complex array
+        complex_stft = stft.T
+        real_part = np.real(complex_stft)
+        imag_part = np.imag(complex_stft)
+        
+        # Format as needed for our algorithm
+        fft_data = np.zeros((len(complex_stft), self.blocksize//2, 2))
+        fft_data[:, :, 0] = real_part[:, :self.blocksize//2]
+        fft_data[:, :, 1] = imag_part[:, :self.blocksize//2]
+        
+        # Process each frame
+        for i in range(len(fft_data)):
+            self.process_frame(fft_data[i])
+        
+        # Extract chroma features
+        return self.extract_chroma()
 
-
-def save_labels_to_csv(file_name: str, chroma: torch.Tensor, sample_rate: int, hop_length: int, csv_output: str) -> None:
+def extract_chroma(audio_path, hop_size=2048, output_csv=None, preprocessing_method=1):
     """
-    Save the processed audio labels (chroma features with timestamps) to a CSV file.
-    Each row corresponds to a time frame.
+    Extract chromagram from audio file using librosa's built-in functions
     
-    The CSV columns are:
-      Filename, Time (seconds), Chroma_A, Chroma_A#, Chroma_B, Chroma_C, Chroma_C#, 
-      Chroma_D, Chroma_D#, Chroma_E, Chroma_F, Chroma_F#, Chroma_G, Chroma_G#
-    
-    Args:
-        file_name (str): The audio file name.
-        chroma (torch.Tensor): Chroma matrix of shape [12, time_frames].
-        sample_rate (int): The sample rate used for processing.
-        hop_length (int): Hop length used for the STFT/Mel spectrogram.
-        csv_output (str): Path to save the CSV file.
-    """
-    time_frames = chroma.shape[1]
-    header = [
-        "Filename", "Time (seconds)", "Chroma_A", "Chroma_A#", "Chroma_B", "Chroma_C",
-        "Chroma_C#", "Chroma_D", "Chroma_D#", "Chroma_E", "Chroma_F", "Chroma_F#",
-        "Chroma_G", "Chroma_G#"
-    ]
-    
-    with open(csv_output, mode="w", newline="") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(header)
-        # Loop over each time frame and write chroma values along with corresponding timestamp.
-        for i in range(time_frames):
-            timestamp = (i * hop_length) / sample_rate
-            # Extract chroma values for this column from the tensor and convert to a list of rounded floats.
-            chroma_values = [round(float(chroma[chroma_idx, i]), 4) for chroma_idx in range(12)]
-            row = [file_name, f"{timestamp:.5f}"] + chroma_values
-            writer.writerow(row)
-    logging.info(f"Chroma labels saved to CSV: {csv_output}")
-
-
-def compute_chromagram_nnls(waveform: torch.Tensor, sample_rate: int, window_size: int = 8192, step_size: int = 4410, n_classes: int = 10) -> np.ndarray:
-    """
-    Compute a chromagram using NNLS approximate transcription.
-    
-    Args:
-        waveform (torch.Tensor): Audio waveform of shape [1, time].
-        sample_rate (int): Sample rate.
-        window_size (int): FFT window size (default: 8192 samples).
-        step_size (int): Hop size (default: 4410 samples; ~10 Hz resolution).
-        n_classes (int): Number of classes/chroma bins (default: 10).
-    
+    Parameters:
+    -----------
+    audio_path : str
+        Path to the audio file
+    hop_size : int, optional
+        Hop size in samples (default: 2048)
+    output_csv : str, optional
+        Path to save the CSV output file. If None, will not save to CSV.
+    preprocessing_method : int, optional
+        Pre-processing method: 0=none, 1=subtraction (default), 2=standardization
+        
     Returns:
-        np.ndarray: Chromagram with shape [n_classes, num_frames].
-    
-    Note: For demonstration, random non-negative templates serve as basis functions.
-          In a production system, template matrices should be derived from reference data.
+    --------
+    timestamps : numpy array
+        Array of timestamps for each frame
+    chromagram : numpy array
+        Matrix of chroma features (n_frames x 12)
     """
-    # Convert waveform to a 1D numpy array
-    audio = waveform.squeeze().cpu().numpy()
-    num_samples = len(audio)
+    # Load the audio file
+    print(f"Loading audio file: {audio_path}")
+    y, sr = librosa.load(audio_path, sr=22050)  # Standard sample rate
     
-    # Segment audio
-    frames = []
-    for start in range(0, num_samples - window_size + 1, step_size):
-        frame = audio[start:start + window_size]
-        frames.append(frame)
-    frames = np.stack(frames, axis=0)  # shape: [num_frames, window_size]
+    # Set parameters for feature extraction
+    n_fft = 4096  # FFT window size
     
-    # Compute magnitude spectrum for each frame using FFT along last axis.
-    fft_magnitudes = np.abs(np.fft.rfft(frames, axis=1))  # shape: [num_frames, freq_bins]
+    # Extract chromagram using librosa
+    print(f"Extracting chromagram...")
     
-    num_frames, freq_bins = fft_magnitudes.shape
-    # For NNLS, prepare a basis matrix (templates) of shape [n_classes, freq_bins]
-    # Here we use random non-negative templates for demonstration.
-    np.random.seed(0)
-    templates = np.abs(np.random.randn(n_classes, freq_bins))
-    
-    # For each frame, solve NNLS for activations.
-    chromagram = np.zeros((n_classes, num_frames))
-    for i in range(num_frames):
-        # Solve: templates^T * x ≈ fft_magnitudes[i]
-        coeffs, _ = nnls(templates.T, fft_magnitudes[i])
-        chromagram[:, i] = coeffs
-    return chromagram
-
-def save_chromagram_to_csv(chromagram: np.ndarray, file_name: str, csv_output: str, sample_rate: int, hop_length: int) -> None:
-    """
-    Save a chromagram (shape: [n_classes, num_frames]) as a CSV file.
-    
-    The CSV will have one row per time frame with the following columns:
-      Filename, Time (seconds), Chroma_A, Chroma_A#, Chroma_B, Chroma_C, Chroma_C#, 
-      Chroma_D, Chroma_D#, Chroma_E, Chroma_F, Chroma_F#, Chroma_G, Chroma_G#
-      
-    Args:
-        chromagram (np.ndarray): Chromagram of shape [n_classes, num_frames].
-        file_name (str): Audio filename (e.g., "mhwgo.mp3").
-        csv_output (str): Path to save the CSV file.
-        sample_rate (int): Sample rate used for processing.
-        hop_length (int): Hop length used in processing.
-    """
-    # Transpose chromagram so that rows correspond to time frames
-    chroma_t = chromagram.T  # shape: [num_frames, n_classes]
-    num_frames, n_classes = chroma_t.shape
-    # Header: first column is filename, second is timestamp, then one column per chroma (expecting n_classes==12)
-    header = ["Filename", "Time (seconds)"] + [f"Chroma_{i+1}" for i in range(n_classes)]
-    
-    with open(csv_output, mode="w", newline="") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(header)
-        for i in range(num_frames):
-            timestamp = (i * hop_length) / sample_rate
-            row = [file_name, f"{timestamp:.5f}"] + [f"{chroma_t[i, j]:.4f}" for j in range(n_classes)]
-            writer.writerow(row)
-    logging.info(f"Chromagram for {file_name} saved to CSV: {csv_output}")
-
-def compute_nnls_chroma(audio: torch.Tensor, sample_rate: int, n_fft: int = 4096, 
-                          hop_length: int = 2048, n_log_bins: int = 256, s_method: str = 'LS') -> np.ndarray:
-    """
-    Compute NNLS chroma features following the algorithm described:
-      1. Resample to 11025 Hz if needed.
-      2. Compute the DFT (magnitude spectrum) with given n_fft and hop_length.
-      3. Map the magnitude spectrum to a log-frequency spectrogram with n_log_bins using linear interpolation.
-      4. Create a note dictionary E of idealised tone profiles over 84 tones (7 octaves) using 
-         linearly-spaced s parameters (if s_method == 'LS') otherwise constant s.
-      5. For each frame, solve the NNLS problem Y ≈ E x (with x ≥ 0).
-      6. Map the 84-tone NNLS transcription to a 12-bin chromagram by summing activations per semitone.
-      7. Normalize each chroma vector by dividing by its maximum value.
-    
-    Returns:
-        np.ndarray: Chromagram of shape [12, num_frames].
-    """
-    # Step 1: Resample audio if needed.
-    target_sr = 11025
-    if sample_rate != target_sr:
-        resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_sr)
-        audio = resampler(audio)
-        sample_rate = target_sr
-
-    # Step 2: Compute STFT
-    stft = torch.stft(audio, n_fft=n_fft, hop_length=hop_length, return_complex=True)
-    magnitude = torch.abs(stft).squeeze(0)  # shape: [freq_bins, num_frames]
-    magnitude = magnitude.cpu().numpy()
-
-    # Step 3: Map linear frequency to log-frequency bins.
-    num_freq_bins = magnitude.shape[0]
-    freqs = np.linspace(0, sample_rate/2, num_freq_bins)
-    # Define target log-frequency bins from A0 (27.5 Hz) to ~3322 Hz
-    target_log_bins = np.linspace(np.log2(27.5), np.log2(3322), n_log_bins)
-    log_freqs = np.log2(freqs + 1e-6)
-    Y = np.zeros((n_log_bins, magnitude.shape[1]))
-    # For each frame, interpolate the magnitude spectrum to the log-frequency bins.
-    for t in range(magnitude.shape[1]):
-        Y[:, t] = np.interp(target_log_bins, log_freqs, magnitude[:, t])
-
-    # Step 4: (Optional pre-processing: here we use the original representation.)
-    Y_processed = Y
-
-    # Step 5: Create note dictionary E.
-    num_tones = 84  # seven octaves, 12 semitones per octave
-    E = np.zeros((n_log_bins, num_tones))
-    if s_method == 'LS':
-        s_values = np.linspace(0.9, 0.6, num_tones)
+    # Choose extraction method based on preprocessing_method
+    if preprocessing_method == 0:
+        # Basic chromagram with no preprocessing
+        chromagram = librosa.feature.chroma_stft(
+            y=y, sr=sr, n_fft=n_fft, hop_length=hop_size, norm=None
+        )
     else:
-        s_values = np.full(num_tones, 0.9)
-    # Compute fundamental frequencies for the 84 tones from A0 (27.5 Hz) upward.
-    fundamentals = 27.5 * (2 ** (np.arange(num_tones) / 12.0))
-    log_fundamentals = np.log2(fundamentals)
-    for i in range(num_tones):
-        # Here we create a Gaussian-like profile centered at the tone's log-frequency.
-        E[:, i] = np.exp(-0.5 * ((target_log_bins - log_fundamentals[i])**2) / (0.1**2))
-        E[:, i] /= E[:, i].sum() + 1e-6
-
-    # Step 6: Solve NNLS for each frame to get activation matrix X of shape [84, num_frames].
-    num_frames = Y_processed.shape[1]
-    X = np.zeros((num_tones, num_frames))
-    for t in range(num_frames):
-        X[:, t], _ = nnls(E, Y_processed[:, t])
+        # With harmonic separation for better chord detection
+        y_harmonic = librosa.effects.harmonic(y=y, margin=4.0)
+        
+        if preprocessing_method == 1:  # Subtraction method
+            # Use CQT-based chromagram for better pitch detection
+            chromagram = librosa.feature.chroma_cqt(
+                y=y_harmonic, sr=sr, hop_length=hop_size
+            )
+            
+            # Apply log transformation and subtract median
+            chromagram = np.log1p(chromagram)
+            chromagram = chromagram - np.median(chromagram, axis=1, keepdims=True)
+            chromagram = np.maximum(chromagram, 0.0)  # Keep only positive values
+            
+        elif preprocessing_method == 2:  # Standardization
+            # NNLS chromagram for improved chord extraction
+            chromagram = librosa.feature.chroma_cens(
+                y=y_harmonic, sr=sr, hop_length=hop_size
+            )
+            
+            # Standardize features
+            chromagram = (chromagram - np.mean(chromagram, axis=1, keepdims=True)) / (
+                np.std(chromagram, axis=1, keepdims=True) + 1e-8
+            )
+            chromagram = np.maximum(chromagram, 0.0)  # Keep only positive values
     
-    # Step 7: Map the 84-tone transcription to a 12-bin chromagram by summing over octaves.
-    chroma = np.zeros((12, num_frames))
-    for i in range(num_tones):
-        chroma[i % 12, :] += X[i, :]
+    # Rotate the chromagram to shift from C-based to A-based (rotate by 3 positions)
+    # This changes C->C#->D->D#->E->F->F#->G->G#->A->A#->B to A->A#->B->C->C#->D->D#->E->F->F#->G->G#
+    chromagram = np.roll(chromagram, 3, axis=0)
     
-    # Step 8: Normalize each chroma vector.
-    chroma = chroma / (np.max(chroma, axis=0, keepdims=True) + 1e-6)
-    return chroma
-
-def parse_args() -> argparse.Namespace:
-    """
-    Parse command-line arguments for audio processing.
+    # Transpose to get [n_frames, 12] shape
+    chromagram = chromagram.T
     
-    Returns:
-        argparse.Namespace: Parsed arguments.
-    """
-    parser = argparse.ArgumentParser(
-        description="Audio to Chroma Vector Processing using PyTorch Audio"
-    )
-    parser.add_argument("audio_path", type=str, help="Path to the input audio file")
-    parser.add_argument("--sample_rate", type=int, default=22050, help="Target sample rate (default: 22050)")
-    parser.add_argument("--n_fft", type=int, default=1024, help="FFT window size (default: 1024)")
-    parser.add_argument("--hop_length", type=int, default=256, help="Hop length (default: 256)")
-    parser.add_argument("--n_mels", type=int, default=128, help="Number of mel bins (default: 128)")
-    parser.add_argument("--output_image", type=str, default=None, help="Path to save the chroma visualization image (optional)")
-    parser.add_argument("--output_csv", type=str, default=None, help="Path to save the CSV file with audio labels (optional)")
-    parser.add_argument("--output_zip", type=str, default="chromagram_features.zip", help="Output zip filename for CSVs")
-    return parser.parse_args()
-
-
-def main() -> None:
-    """
-    Main execution: load audio, compute STFT, extract chroma, visualize features, and optionally save labels to CSV.
-    """
-    args = parse_args()
-
-    processor = AudioProcessor(
-        file_path=args.audio_path,
-        sample_rate=args.sample_rate,
-        n_fft=args.n_fft,
-        hop_length=args.hop_length,
-        n_mels=args.n_mels
-    )
-
-    try:
-        waveform = processor.load_audio()
-    except Exception as e:
-        logging.error(f"Failed to load audio: {e}")
-        return
-
-    try:
-        stft = processor.compute_stft(waveform)
-        logging.info(f"STFT computed with shape: {stft.shape}")
-    except Exception as e:
-        logging.error(f"Failed to compute STFT: {e}")
-        return
-
-    try:
-        chroma = processor.extract_chroma(waveform)
-        logging.info(f"Chroma extracted with shape: {chroma.shape}")
-    except Exception as e:
-        logging.error(f"Failed to extract chroma features: {e}")
-        return
-
-    # Save labels to CSV if requested.
-    if args.output_csv:
-        try:
-            file_name = os.path.basename(args.audio_path)
-            save_labels_to_csv(file_name, chroma, args.sample_rate, args.hop_length, args.output_csv)
-        except Exception as e:
-            logging.error(f"Failed to save labels to CSV: {e}")
-
-    try:
-        processor.visualize_chroma(chroma, output_path=args.output_image)
-    except Exception as e:
-        logging.error(f"Failed to visualize chroma features: {e}")
-
-    # Compute chromagram with NNLS parameters.
-    chroma_nnls = compute_chromagram_nnls(waveform, sample_rate=processor.sample_rate, window_size=8192, step_size=4410, n_classes=10)
-    logging.info(f"Computed chromagram shape: {chroma_nnls.shape}")
-    file_name = os.path.basename(args.audio_path)
-    # Instead of zipping, save the chromagram directly as a CSV.
-    save_chromagram_to_csv(chroma_nnls, file_name, args.output_zip, processor.sample_rate, processor.hop_length)
-
-    # Compute NNLS-based chroma features using the proposed algorithm.
-    nnls_chroma = compute_nnls_chroma(waveform, sample_rate=processor.sample_rate, 
-                                      n_fft=4096, hop_length=2048, n_log_bins=256, s_method='LS')
-    logging.info(f"Computed NNLS chroma shape: {nnls_chroma.shape}")
-    file_name = os.path.basename(args.audio_path)
-    # Save the NNLS chroma directly as a CSV (using our CSV-saving function).
-    save_chromagram_to_csv(nnls_chroma, file_name, args.output_zip, processor.sample_rate, 2048)
-    logging.info("NNLS chroma processing complete.")
-
-if __name__ == "__main__":
-    main()
+    # Calculate timestamps
+    timestamps = librosa.times_like(chromagram, sr=sr, hop_length=hop_size)
+    
+    # Save to CSV if output_csv is provided
+    if output_csv is not None:
+        # Get the filename for the CSV header
+        filename = os.path.basename(audio_path)
+        
+        print(f"Writing CSV to: {output_csv}")
+        with open(output_csv, 'w') as f:
+            # Write header row with filename in first column
+            f.write(f'"{filename}",Time,A,A#,B,C,C#,D,D#,E,F,F#,G,G#\n')
+            
+            # Write each row with timestamp and chroma values
+            for i, (time, chroma) in enumerate(zip(timestamps, chromagram)):
+                # Format with precision but without scientific notation
+                chroma_str = [f"{c:.7f}" if c >= 0.0001 else "0" for c in chroma]
+                f.write(f',{time:.7f},{",".join(chroma_str)}\n')
+        
+        print(f"Completed! CSV saved to {output_csv}")
+    
+    return timestamps, chromagram
