@@ -30,81 +30,112 @@ spec:
             - sh
             - -c
             - |
-              set -ex  # Added -x for more verbose output
-              echo "Starting init container for student model training..."
-              echo "Checking volume mounts:"
-              ls -la /mnt/storage
-              ls -la /data
+              set -e
+              echo "Starting init container for data preparation..."
               
-              apk update && apk add --no-cache git curl unzip python3 py3-pip
-              
-              # Clone repository only if it does not exist
+              apk update && apk add --no-cache git curl unzip python3 py3-pip wget
+
+              # Clone repository if it doesn't exist
               if [ ! -d /mnt/storage/ChordMini ]; then
-                echo "Cloning GitLab repository..."
+                echo "Cloning repository..."
                 git clone https://gitlab.com/ptnghia-j/ChordMini /mnt/storage/ChordMini
-              else
-                echo "Repository already exists. Skipping clone."
               fi
               
-              # Create directories for synthesized data
-              mkdir -p /mnt/storage/ChordMini/data/synth_spec
-              mkdir -p /mnt/storage/ChordMini/data/synth_labels
+              # Create directories for FMA dataset and synthesized data
+              mkdir -p /mnt/storage/ChordMini/data/fma_medium
+              mkdir -p /mnt/storage/ChordMini/data/synth/spectrograms
+              mkdir -p /mnt/storage/ChordMini/data/synth/labels
               
-              # Install gdown for Google Drive downloads
-              pip3 install gdown
-              
-              # Download synthesized data from Google Drive using the provided link
-              echo "Downloading synthesized data..."
-              cd /data
-              echo "Downloading synthesized data archive..."
-              gdown --id 16ehPDWywPx7VUiCw0FqppDUqEOEezh43 -O synth_data.zip
-              
-              echo "Extracting synthesized data..."
-              mkdir -p /data/synth_data
-              unzip -o /data/synth_data.zip -d /data/synth_data/
-              
-              # Copy synthesized data to project directory (adjust paths as needed)
-              if [ -d /data/synth_data/spec ]; then
-                cp -r /data/synth_data/spec/* /mnt/storage/ChordMini/data/synth_spec/
-              elif [ -d /data/synth_data/spectrograms ]; then
-                cp -r /data/synth_data/spectrograms/* /mnt/storage/ChordMini/data/synth_spec/
-              else
-                echo "Warning: Could not find spectrogram directory in the archive"
-                find /data/synth_data -type d | head -10
+              # Download FMA Medium dataset if not already downloaded
+              echo "Checking for FMA Medium dataset..."
+              if [ ! -f /data/fma_medium.zip ] && [ ! -d /mnt/storage/ChordMini/data/fma_medium/000 ]; then
+                echo "Downloading FMA Medium dataset..."
+                cd /data
+                wget -O fma_medium.zip https://os.unil.cloud.switch.ch/fma/fma_medium.zip || \
+                  curl -L -o fma_medium.zip https://os.unil.cloud.switch.ch/fma/fma_medium.zip
+                
+                echo "Extracting dataset..."
+                mkdir -p /data/fma_extract
+                unzip -q /data/fma_medium.zip -d /data/fma_extract
+                
+                # Move extracted files to the expected location
+                echo "Moving files to data directory..."
+                if [ -d /data/fma_extract/fma_medium ]; then
+                  mv /data/fma_extract/fma_medium/* /mnt/storage/ChordMini/data/fma_medium/
+                else
+                  # Try different folder structure
+                  find /data/fma_extract -name "*.mp3" -exec cp {} /mnt/storage/ChordMini/data/fma_medium/ \;
+                fi
+                
+                rm -rf /data/fma_extract
               fi
               
-              if [ -d /data/synth_data/labels ]; then
-                cp -r /data/synth_data/labels/* /mnt/storage/ChordMini/data/synth_labels/
-              else
-                echo "Warning: Could not find labels directory in the archive"
-                find /data/synth_data -type d | head -10
-              fi
+              # Create teacher model directory if needed
+              mkdir -p /mnt/storage/ChordMini/modules/models/Teacher/BTC/test
               
-              echo "Listing downloaded data:"
-              ls -la /mnt/storage/ChordMini/data/synth_spec/
-              ls -la /mnt/storage/ChordMini/data/synth_labels/
-              
-              # Create necessary config directory if it doesn't exist
-              mkdir -p /mnt/storage/ChordMini/config
-              
-              # Create a basic config file for student model if it doesn't exist
-              if [ ! -f /mnt/storage/ChordMini/config/student_config.yaml ]; then
-                echo "No student config file found. Please provide one at ./config/student_config.yaml."
-              fi
-              echo "Student model data and config ready."
+              echo "Data preparation ready."
           resources:
             requests:
               cpu: 1
-              memory: "1Gi"
-            limits:
-              cpu: 1
               memory: "2Gi"
+            limits:
+              cpu: 2
+              memory: "4Gi"
           volumeMounts:
             - name: storage
               mountPath: /mnt/storage
             - name: storage
               mountPath: /data
       containers:
+        - name: teacher-labeler
+          image: pytorch/pytorch:1.9.0-cuda11.1-cudnn8-runtime
+          workingDir: /mnt/storage/ChordMini
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PYTHONPATH
+              value: /mnt/storage/ChordMini
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "Teacher model container started"
+              
+              # Install dependencies
+              apt-get update && apt-get install -y libsndfile1 ffmpeg
+              pip install --no-cache-dir -r requirements.txt
+              pip install --no-cache-dir matplotlib tqdm pyyaml librosa
+              
+              # Download teacher model checkpoint if not present
+              mkdir -p modules/models/Teacher/BTC/test
+              if [ ! -f modules/models/Teacher/BTC/test/btc_model_large_voca.pt ]; then
+                echo "Downloading teacher model checkpoint..."
+                pip install gdown
+                cd modules/models/Teacher/BTC/test
+                gdown --id 1vPYY9nYkUMor14R-YHg-8Cm_YcMtvoS- -O btc_model_large_voca.pt
+                cd /mnt/storage/ChordMini
+              fi
+              
+              # Run teacher model to extract spectrograms and labels
+              echo "Running teacher model to extract spectrograms and labels..."
+              python -m modules.models.Teacher.BTC.spectrogram_labeler --audio_dir=./data/fma_medium --save_dir=./data/synth --voca=true
+              
+              echo "Teacher model processing complete."
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: storage
+              mountPath: /mnt/storage
+            - name: storage
+              mountPath: /data
+        
         - name: student-trainer
           image: pytorch/pytorch:1.9.0-cuda11.1-cudnn8-runtime
           workingDir: /mnt/storage/ChordMini
@@ -116,43 +147,31 @@ spec:
             - sh
             - -c
             - |
-              set -ex  # Added for verbosity
-              echo "Main container for student model started"
-              echo "Current directory:" && pwd
-              echo "Listing directory contents:" && ls -la
-              echo "Testing GPU:"
-              nvidia-smi || echo "No GPU detected"
+              set -e
+              echo "Student model training container started"
               
-              if [ ! -d "./venv" ]; then
-                  echo "Creating virtual environment..."
-                  python -m venv venv
-              fi
-              . ./venv/bin/activate
+              # Install dependencies
+              apt-get update && apt-get install -y libsndfile1
+              pip install --no-cache-dir -r requirements.txt
+              pip install --no-cache-dir matplotlib tqdm pyyaml librosa
               
-              echo "Installing required packages if needed..."
-              if [ ! -f /tmp/packages_installed ]; then
-                  echo "Upgrading pip first..."
-                  pip install --upgrade pip
-                  echo "Installing remaining requirements..."
-                  pip install --no-cache-dir -r /mnt/storage/ChordMini/requirements.txt || echo "Some requirements may not have installed correctly"
-                  pip install --no-cache-dir matplotlib tqdm pyyaml
-                  touch /tmp/packages_installed
-              else
-                  echo "Required packages already installed."
-              fi
+              # Create checkpoint directory
+              mkdir -p checkpoints/student
               
-              mkdir -p /mnt/storage/ChordMini/logs
-              mkdir -p /mnt/storage/ChordMini/checkpoints/student
+              # Check data is available
+              echo "Checking synthesized data:"
+              find ./data/synth/spectrograms -type f | wc -l
+              find ./data/synth/labels -type f | wc -l
               
-              export PYTHONPATH=/mnt/storage/ChordMini:$PYTHONPATH
-              nvidia-smi
+              # Run spectrogram dimension check
+              echo "Checking spectrogram dimensions..."
+              python check_spectrogram_dim.py
               
-              echo "Checking for synthesized data:"
-              ls -la /mnt/storage/ChordMini/data/synth_spec
-              ls -la /mnt/storage/ChordMini/data/synth_labels
-              
+              # Train the student model using existing config
               echo "Starting student model training..."
-              python train_student.py --config ./config/student_config.yaml --save_dir ./checkpoints/student || echo "Training script failed with exit code $?"
+              python train_student.py --config ./config/student_config.yaml --save_dir ./checkpoints/student
+              
+              echo "Training complete."
           resources:
             requests:
               cpu: "2"
@@ -167,7 +186,8 @@ spec:
               mountPath: /mnt/storage
             - name: storage
               mountPath: /data
+          
       volumes:
         - name: storage
           persistentVolumeClaim:
-            claimName: temporary-storage-2
+            claimName: temporary-storage

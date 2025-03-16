@@ -78,13 +78,32 @@ class SynthDataset(Dataset):
                     if label_file.exists():
                         self._process_file_pair(spec_file, label_file)
         
-        print(f"Loaded {len(self.samples)} valid samples")
+        # Report on spectrogram dimensions to help identify CQT vs STFT
+        if self.samples:
+            # Analyze the first sample to get frequency dimension
+            first_spec = self.samples[0]['spectro']
+            freq_dim = first_spec.shape[-1] if len(first_spec.shape) > 0 else 0
+            spec_type = "CQT (Constant-Q Transform)" if freq_dim <= 256 else "STFT"
+            print(f"Loaded {len(self.samples)} valid samples")
+            print(f"Spectrogram frequency dimension: {freq_dim} (likely {spec_type})")
+        else:
+            print("No samples loaded. Check your data paths.")
         
     def _process_file_pair(self, spec_file, label_file):
         """Process a pair of spectrogram and label files"""
         # Load spectrogram
         try:
             spec = np.load(spec_file)
+            
+            # Check for NaN values and log warning if found
+            if np.isnan(spec).any():
+                print(f"Warning: NaN values found in {spec_file}")
+                # Replace NaNs with zeros for stability
+                spec = np.nan_to_num(spec, nan=0.0)
+            
+            # Check for extreme values
+            if np.abs(spec).max() > 1000:
+                print(f"Warning: Extreme values found in {spec_file}. Max abs value: {np.abs(spec).max()}")
             
             # Load label file
             chord_labels = self._parse_label_file(label_file)
@@ -102,6 +121,13 @@ class SynthDataset(Dataset):
                     'spectro': spec[t],
                     'chord_label': chord_label
                 })
+                
+            # Log the first file's dimensions in detail
+            if len(self.samples) <= time_frames:  # This must be the first file processed
+                print(f"First spectrogram shape: {spec.shape}")
+                print(f"Example frame dimensions: {self.samples[0]['spectro'].shape}")
+                print(f"First sample chord: {self.samples[0]['chord_label']}")
+                
         except Exception as e:
             print(f"Error processing {spec_file} and {label_file}: {e}")
     

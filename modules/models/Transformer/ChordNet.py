@@ -9,20 +9,31 @@ class ChordNet(nn.Module):
                  f_layer=5, f_head=8,
                  t_layer=5, t_head=8,
                  d_layer=5, d_head=8,
-                 dropout=0.2, *args, **kwargs):
+                 dropout=0.2, ignore_index=None, *args, **kwargs):
         super().__init__()
-
-        # Ensure n_group is set to 12 to match the frequency dimension of 144
-        # 144/12 = 12, which matches the frequency dimension we're seeing in the error
-        n_group = 12  # Explicitly override n_group to 12
+        
+        # CQT vs STFT handling
+        # For CQT input (typically n_freq=144), we want n_group=12 to get actual_feature_dim=12
+        # For STFT input (typically n_freq=2048), the provided n_group would be used
+        is_cqt = n_freq <= 256  # Simple heuristic to detect CQT input
+        if is_cqt:
+            # For CQT spectrograms, we override n_group to make dimensions work
+            n_group = 12
+            print(f"Detected CQT input (n_freq={n_freq}), setting n_group={n_group}")
+        else:
+            print(f"Using standard STFT configuration with n_freq={n_freq}, n_group={n_group}")
 
         # Calculate the actual feature dimension that will come out of the transformer
-        actual_feature_dim = n_freq // n_group  # This will be 12 for n_freq=144, n_group=12
+        actual_feature_dim = n_freq // n_group
+        print(f"Actual feature dimension: {actual_feature_dim}")
+        
+        # Ensure n_freq is divisible by n_group
+        assert n_freq % n_group == 0, f"n_freq ({n_freq}) must be divisible by n_group ({n_group})"
 
         self.transformer = BaseTransformer(
             n_channel=1,  # Explicitly specify we only need 1 channel for ChordNet
             n_freq=n_freq,
-            n_group=n_group,  # Use the fixed value of n_group=12
+            n_group=n_group,
             f_layer=f_layer,
             f_head=f_head,
             f_dropout=dropout,
@@ -34,9 +45,10 @@ class ChordNet(nn.Module):
             d_dropout=dropout
         )
         self.dropout = nn.Dropout(dropout)
-
-        # Fix: Use the correct feature dimension for the output linear layer
-        self.fc = nn.Linear(actual_feature_dim, n_classes)  # Now expects [batch, 12] instead of [batch, 144]
+        
+        # Use the correct feature dimension for the output linear layer
+        self.fc = nn.Linear(actual_feature_dim, n_classes)
+        self.ignore_index = ignore_index
 
     def forward(self, x, targets=None, weight=None):
         # For SynthDataset, input is [batch_size, time_steps, freq_bins]
@@ -57,7 +69,7 @@ class ChordNet(nn.Module):
         # Return loss if targets are provided
         loss = None
         if targets is not None:
-            criterion = nn.CrossEntropyLoss()
+            criterion = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
             # Handle different dimensions (batch vs sequence)
             if logits.ndim == 3 and targets.ndim == 1:
                 # For sequence data, average across time dimension
