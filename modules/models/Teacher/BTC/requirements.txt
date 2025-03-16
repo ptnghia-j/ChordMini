@@ -1,0 +1,9 @@
+pyyaml
+mir_eval
+pretty_midi
+torch
+numpy
+pyrubberband
+librosa
+matplotlib
+PySoundFile
