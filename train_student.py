@@ -4,6 +4,7 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader, Sampler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from modules.utils.mir_eval_modules import root_majmin_score_calculation, large_voca_score_calculation
 from collections import Counter
 from modules.utils.device import get_device
 from modules.data.SynthDataset import SynthDataset
@@ -11,7 +12,6 @@ from modules.models.Transformer.ChordNet import ChordNet
 from modules.training.StudentTrainer import StudentTrainer
 from modules.utils import logger
 from modules.utils.hparams import HParams
-from modules.utils.mir_eval_modules import root_majmin_score_calculation, large_voca_score_calculation
 import argparse
 
 class ListSampler(Sampler):
@@ -93,12 +93,6 @@ class Tester:
         recall = recall_score(all_targets, all_preds, average='weighted', zero_division=0)
         f1 = f1_score(all_targets, all_preds, average='weighted', zero_division=0)
         
-        # Calculate WCSR if we have the mapping
-        wcsr = 0.0
-        if self.idx_to_chord:
-            wcsr = weighted_chord_symbol_recall(all_targets, all_preds, self.idx_to_chord)
-            logger.info(f"\nWeighted Chord Symbol Recall (WCSR): {wcsr:.4f}")
-        
         # Print confusion matrix for most common chords (top 10)
         if len(target_counter) > 1:
             logger.info("\nAnalyzing most common predictions vs targets:")
@@ -118,7 +112,6 @@ class Tester:
         logger.info(f"Test Precision: {precision:.4f}")
         logger.info(f"Test Recall: {recall:.4f}")
         logger.info(f"Test F1 Score: {f1:.4f}")
-        logger.info(f"Weighted Chord Symbol Recall: {wcsr:.4f}")
 
 def main():
     # Parse command line arguments
@@ -129,6 +122,8 @@ def main():
                         help='Random seed (overrides config value)')
     parser.add_argument('--save_dir', type=str, default=None, 
                         help='Directory to save checkpoints (overrides config value)')
+    parser.add_argument('--model', type=str, default='ChordNet', 
+                        help='Model type for evaluation')
     args = parser.parse_args()
     
     # Load configuration from YAML
@@ -204,28 +199,55 @@ def main():
     train_batch = next(iter(train_loader))
     logger.info(f"Training spectrogram tensor shape: {train_batch['spectro'].shape}")
     
-    # Define target dimensions to match the teacher BTC model
-    n_freq = 144
-    n_classes = 170
-    
-    # Get actual frequency dimension from data
+    # Determine if we're using CQT or STFT based on frequency dimension
     actual_freq_dim = train_batch['spectro'].shape[-1]
+    logger.info(f"Detected frequency dimension in data: {actual_freq_dim}")
     
-    logger.info(f"Actual frequency dimension in data: {actual_freq_dim}")
-    logger.info(f"Expected frequency dimension: {n_freq}")
+    # For CQT, frequency dimension is typically around 144
+    # For STFT, it's typically much higher (e.g., 1024 or 2048)
+    is_cqt = actual_freq_dim <= 256
     
-    # Check if there's a mismatch and warn
-    if n_freq != actual_freq_dim:
-        logger.warning(f"WARNING: Mismatch between configured n_freq ({n_freq}) and actual spectrogram frequency dimension ({actual_freq_dim})!")
-        logger.warning(f"Using the actual dimension from the data instead: {actual_freq_dim}")
-        n_freq = actual_freq_dim
+    if is_cqt:
+        logger.info(f"Detected Constant-Q Transform (CQT) input with {actual_freq_dim} frequency bins")
+    else:
+        logger.info(f"Detected STFT input with {actual_freq_dim} frequency bins")
+        
+    # Set the frequency dimension to match the actual data
+    n_freq = actual_freq_dim
     
-    logger.info(f"Output classes: {n_classes} to match teacher model")
+    # Default n_classes from config or 122
+    n_classes = config.model.get('n_classes', 122)
+    
+    # Get the number of unique chords in our dataset for the output layer
+    num_unique_chords = len(chord_mapping)
+    if num_unique_chords > n_classes:
+        logger.warning(f"WARNING: Dataset has {num_unique_chords} unique chords, but model is configured for {n_classes} classes!")
+        logger.warning(f"Increasing n_classes to match dataset: {num_unique_chords}")
+        n_classes = num_unique_chords
+    logger.info(f"Output classes: {n_classes}")
+    
+    # Determine n_group based on frequency dimension for CQT vs STFT
+    # For CQT, we'll use n_group=12 to get actual_feature_dim=12 (for 144 bins)
+    # For STFT, we'll use the config value or default to 32
+    n_group = 12 if is_cqt else config.model.get('n_group', 32)
+    
+    # Ensure n_freq is divisible by n_group
+    if n_freq % n_group != 0:
+        # Find a suitable n_group that divides n_freq
+        for candidate in [12, 16, 24, 32, 48]:
+            if n_freq % candidate == 0:
+                n_group = candidate
+                break
+        logger.warning(f"Adjusted n_group to {n_group} to ensure n_freq ({n_freq}) is divisible")
+    
+    # Log the feature dimensions
+    actual_feature_dim = n_freq // n_group
+    logger.info(f"Using n_group={n_group}, resulting in actual feature dimension: {actual_feature_dim}")
     
     model = ChordNet(
         n_freq=n_freq, 
         n_classes=n_classes, 
-        n_group=config.model['n_group'],
+        n_group=n_group,
         f_layer=config.model['f_layer'], 
         f_head=config.model['f_head'], 
         t_layer=config.model['t_layer'], 
@@ -240,7 +262,7 @@ def main():
     logger.info("Model configuration:")
     logger.info(f"  n_freq: {n_freq}")
     logger.info(f"  n_classes: {n_classes}")
-    logger.info(f"  n_group: {config.model['n_group']}")
+    logger.info(f"  n_group: {n_group}")
     logger.info(f"  f_layer: {config.model['f_layer']}")
     logger.info(f"  f_head: {config.model['f_head']}")
     logger.info(f"  t_layer: {config.model['t_layer']}")
@@ -341,6 +363,32 @@ def main():
     # Evaluate on test set using the Tester class
     tester = Tester(model, test_loader, device, idx_to_chord=idx_to_chord)
     tester.evaluate()
+    
+   
+    score_metrics = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
+    dataset_length = len(synth_dataset.samples)
+    if dataset_length < 3:
+        logger.info("Not enough validation samples to compute chord metrics.")
+    else:
+        split = dataset_length // 3
+        valid_dataset1 = synth_dataset.samples[:split]
+        valid_dataset2 = synth_dataset.samples[split:2*split]
+        valid_dataset3 = synth_dataset.samples[2*split:]
+        score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
+            valid_dataset=valid_dataset1, config=config, model=model, model_type=args.model, mean=mean, std=std, device=device)
+        score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
+            valid_dataset=valid_dataset2, config=config, model=model, model_type=args.model, mean=mean, std=std, device=device)
+        score_list_dict3, song_length_list3, average_score_dict3 = large_voca_score_calculation(
+            valid_dataset=valid_dataset3, config=config, model=model, model_type=args.model, mean=mean, std=std, device=device)
+        for m in score_metrics:
+            avg = (np.sum(song_length_list1) * average_score_dict1[m] +
+                   np.sum(song_length_list2) * average_score_dict2[m] +
+                   np.sum(song_length_list3) * average_score_dict3[m]) / (
+                   np.sum(song_length_list1) + np.sum(song_length_list2) + np.sum(song_length_list3))
+            logger.info(f"==== {m} score 1 is {average_score_dict1[m]:.4f}")
+            logger.info(f"==== {m} score 2 is {average_score_dict2[m]:.4f}")
+            logger.info(f"==== {m} score 3 is {average_score_dict3[m]:.4f}")
+            logger.info(f"==== {m} mix average score is {avg:.4f}")
     
     # Save the final model
     save_path = os.path.join(checkpoints_dir, "student_model_final.pth")
