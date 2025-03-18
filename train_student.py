@@ -62,13 +62,13 @@ class Tester:
                 # Get predictions
                 preds = self.model.predict(inputs)
                 
-                # Convert and store
-                preds_np = preds.cpu().numpy()
-                targets_np = targets.cpu().numpy()
+                # Convert and store (flatten to ensure hashable types)
+                preds_np = preds.cpu().numpy().flatten()
+                targets_np = targets.cpu().numpy().flatten()
                 
-                # Count distribution
-                pred_counter.update(preds_np)
-                target_counter.update(targets_np)
+                # Count distribution using flat lists
+                pred_counter.update(preds_np.tolist())
+                target_counter.update(targets_np.tolist())
                 
                 all_preds.extend(preds_np)
                 all_targets.extend(targets_np)
