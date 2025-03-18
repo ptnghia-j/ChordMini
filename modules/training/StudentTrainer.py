@@ -229,31 +229,43 @@ class StudentTrainer(BaseTrainer):
                     logits = outputs[0]
                 else:
                     logits = outputs
-                    
-                # Flatten time dimension if needed
-                if logits.ndim == 3:  # [batch, time, classes]
-                    batch_size, seq_len, num_classes = logits.shape
-                    # Average over time dimension
-                    logits = logits.mean(dim=1)  # [batch, classes]
                 
-                # Ensure targets are properly shaped
-                if targets.ndim > 1:
-                    if targets.shape[1] > 1:
-                        # If targets are [batch, time], we need to take the majority vote
-                        targets = torch.mode(targets, dim=1)[0]
-                    else:
-                        # If targets are [batch, 1], we just squeeze
-                        targets = targets.squeeze(1)
+                # Check for shape mismatch and adjust accordingly
+                if logits.dim() > targets.dim():
+                    # If logits have more dimensions than targets
+                    if logits.dim() == 3:  # [batch, time, classes]
+                        # Average over time dimension if targets don't have time dimension
+                        if targets.dim() == 1:
+                            logits = logits.mean(dim=1)  # [batch, classes]
+                        elif targets.dim() == 2 and targets.shape[1] == 1:
+                            # If targets are [batch, 1], we squeeze
+                            targets = targets.squeeze(1)
+                            logits = logits.mean(dim=1)
+                        elif targets.dim() == 2 and targets.shape[1] > 1:
+                            # Need more sophisticated handling for multi-frame targets
+                            # For now, take majority vote across time
+                            if targets.shape[1] == logits.shape[1]:
+                                # Keep both dimensions but reshape for loss
+                                batch_size, seq_len = targets.shape
+                                # No need to flatten - compute metrics per frame
+                                targets_flat = targets.view(-1)
+                                logits_flat = logits.view(-1, logits.size(-1))
+                                # Compute loss on flattened data
+                                loss = self.loss_fn(logits_flat, targets_flat)
+                                # Get predictions
+                                preds = logits_flat.argmax(dim=1)
+                                # Track metrics
+                                val_correct += (preds == targets_flat).sum().item()
+                                val_total += targets_flat.size(0)
+                                val_loss += loss.item()
+                                continue  # Skip the rest of the loop for this special case
+                            else:
+                                # If time dimensions don't match, take majority vote
+                                targets = torch.mode(targets, dim=1)[0]
+                                logits = logits.mean(dim=1)
                 
-                # Calculate loss (use focal loss if enabled)
-                if self.use_focal_loss:
-                    loss = self.focal_loss(
-                        logits, 
-                        targets,
-                        alpha=torch.tensor(self.class_weights, device=self.device) if hasattr(self, 'class_weights') else None
-                    )
-                else:
-                    loss = self.loss_fn(logits, targets)
+                # Calculate loss
+                loss = self.loss_fn(logits, targets)
                 val_loss += loss.item()
                 
                 # Get predictions
@@ -301,34 +313,58 @@ class StudentTrainer(BaseTrainer):
                 else:
                     logits = outputs
                 
-                # Ensure targets are properly shaped
-                if targets.ndim > 1:
-                    if targets.shape[1] > 1:
-                        # If targets are [batch, time], we need to take the majority vote
-                        targets = torch.mode(targets, dim=1)[0]
-                    else:
-                        # If targets are [batch, 1], we just squeeze
-                        targets = targets.squeeze(1)
+                # Check for shape mismatch and adjust accordingly
+                if logits.dim() > targets.dim():
+                    # If logits have more dimensions than targets
+                    if logits.dim() == 3:  # [batch, time, classes]
+                        # Average over time dimension if targets don't have time dimension
+                        if targets.dim() == 1:
+                            logits = logits.mean(dim=1)  # [batch, classes]
+                        elif targets.dim() == 2 and targets.shape[1] == 1:
+                            # If targets are [batch, 1], we squeeze
+                            targets = targets.squeeze(1)
+                            logits = logits.mean(dim=1)
+                        elif targets.dim() == 2 and targets.shape[1] > 1:
+                            # Need more sophisticated handling for multi-frame targets
+                            # For now, take majority vote across time
+                            if targets.shape[1] == logits.shape[1]:
+                                # Keep both dimensions but reshape for loss
+                                batch_size, seq_len = targets.shape
+                                # Flatten for loss calculation
+                                targets_flat = targets.reshape(-1)
+                                logits_flat = logits.reshape(-1, logits.size(-1))
+                                # Compute loss on flattened data
+                                loss = self.loss_fn(logits_flat, targets_flat)
+                                # For metrics, get predictions on flattened data
+                                preds = logits_flat.argmax(dim=1)
+                                train_correct += (preds == targets_flat).sum().item()
+                                train_total += targets_flat.size(0)
+                                epoch_loss += loss.item()
+                                # Backward pass
+                                loss.backward()
+                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                                self.optimizer.step()
+                                
+                                # Log progress
+                                if batch_idx % 20 == 0:
+                                    self._log(f"Epoch {epoch}/{self.num_epochs} | Batch {batch_idx}/{len(train_loader)} | "
+                                            f"Loss: {loss.item():.4f}")
+                                
+                                # Skip the rest of the loop for this special case
+                                continue
+                            else:
+                                # If time dimensions don't match, take majority vote
+                                targets = torch.mode(targets, dim=1)[0]
+                                logits = logits.mean(dim=1)
                 
-                # Only use the logits for loss calculation
-                if self.use_focal_loss:
-                    loss = self.focal_loss(
-                        logits, 
-                        targets, 
-                        alpha=torch.tensor(self.class_weights, device=self.device) if hasattr(self, 'class_weights') else None
-                    )
-                else:
-                    loss = self.loss_fn(logits, targets)
+                # Only use the logits for loss calculation - now properly shaped
+                loss = self.loss_fn(logits, targets)
                 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 
                 # Track metrics
-                # Handle temporal data for prediction
-                if logits.ndim == 3:
-                    logits = logits.mean(dim=1)
-                
                 preds = logits.argmax(dim=1)
                 train_correct += (preds == targets).sum().item()
                 train_total += targets.size(0)
