@@ -464,7 +464,7 @@ def main():
         d_layer=config.model['d_layer'], 
         d_head=config.model['d_head'], 
         dropout=config.model['dropout'],
-        ignore_index=chord_mapping.get("N")
+        #ignore_index=chord_mapping.get("N")
     ).to(device)
     
     # Log model configuration for transparency

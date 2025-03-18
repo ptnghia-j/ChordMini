@@ -1,5 +1,6 @@
 import os
 import torch
+import numpy as np
 from modules.training.Trainer import BaseTrainer
 
 class StudentTrainer(BaseTrainer):
@@ -20,6 +21,10 @@ class StudentTrainer(BaseTrainer):
         
         # Now that logger is initialized, we can pad class weights
         if class_weights is not None and hasattr(model, 'fc') and hasattr(model.fc, 'out_features'):
+            # Handle class imbalance - modify weights before padding
+            if idx_to_chord is not None:
+                class_weights = self._adjust_weights_for_no_chord(class_weights, idx_to_chord)
+            
             expected_classes = model.fc.out_features
             self._log(f"Padding class weights from {len(class_weights)} to {expected_classes}")
             padded_weights = self._pad_class_weights(class_weights, expected_classes)
@@ -42,7 +47,83 @@ class StudentTrainer(BaseTrainer):
         # Best model tracking
         self.best_model_path = os.path.join(self.checkpoint_dir, "student_model_best.pth")
         self.chord_mapping = None
+        
+        # Enable focal loss (optional)
+        self.use_focal_loss = False
+        if self.use_focal_loss:
+            self._log("Using Focal Loss to handle class imbalance")
     
+    def _adjust_weights_for_no_chord(self, weights, idx_to_chord):
+        """Adjust weights to handle 'N' (no chord) class imbalance"""
+        n_chord_idx = None
+        
+        # Find the index that corresponds to "N" chord
+        for idx, chord in idx_to_chord.items():
+            if chord == "N":
+                n_chord_idx = idx
+                break
+        
+        if n_chord_idx is not None and n_chord_idx < len(weights):
+            self._log(f"Adjusting weights for 'N' (no chord) at index {n_chord_idx}")
+            
+            # Reduce weight for "N" class to prevent model collapse to majority class
+            weights = np.array(weights, dtype=np.float32)
+            
+            # Option 1: Reduce "N" class weight by a factor (e.g., 0.5)
+            n_weight_factor = 0.5
+            weights[n_chord_idx] *= n_weight_factor
+            
+            # Option 2: Boost all other classes to compensate for "N" dominance
+            boost_factor = 1.5
+            non_n_mask = np.ones_like(weights, dtype=bool)
+            non_n_mask[n_chord_idx] = False
+            weights[non_n_mask] *= boost_factor
+            
+            self._log(f"Modified 'N' class weight: {weights[n_chord_idx]:.4f} (reduced by factor {n_weight_factor})")
+            self._log(f"Boosted other classes by factor {boost_factor}")
+            
+            # Normalize weights to maintain overall scale
+            if weights.sum() > 0:
+                orig_sum = len(weights)  # Original sum (equal weights would be 1.0 each)
+                weights = weights * (orig_sum / weights.sum())
+                
+        return weights
+    
+    def focal_loss(self, logits, targets, gamma=2.0, alpha=None):
+        """
+        Compute focal loss to focus more on hard examples.
+        
+        Args:
+            logits: Predicted logits from the model
+            targets: True class labels
+            gamma: Focusing parameter (default: 2.0)
+            alpha: Optional class weights
+            
+        Returns:
+            Focal loss value
+        """
+        if gamma == 0.0:
+            return self.loss_fn(logits, targets)
+        
+        # Get class probabilities
+        probs = torch.nn.functional.softmax(logits, dim=1)
+        
+        # Get probability for the target class
+        batch_size = logits.size(0)
+        p_t = probs[torch.arange(batch_size), targets]
+        
+        # Calculate focal weight
+        focal_weight = (1 - p_t) ** gamma
+        
+        # Use standard cross entropy but weighted by focal weight
+        ce_loss = torch.nn.functional.cross_entropy(
+            logits, targets, weight=alpha, reduction='none')
+        
+        # Apply the focal weight
+        focal_loss = focal_weight * ce_loss
+        
+        return focal_loss.mean()
+
     def _pad_class_weights(self, weights, expected_length):
         """Pad class weights to match the expected number of classes."""
         if len(weights) == expected_length:
@@ -143,25 +224,44 @@ class StudentTrainer(BaseTrainer):
                 # Forward pass
                 outputs = self.model(inputs)
                 
-                # Calculate loss
-                loss = self.compute_loss(outputs, targets)
-                
-                # Get predictions
+                # Handle temporal data - reshape if needed
                 if isinstance(outputs, tuple):
                     logits = outputs[0]
                 else:
                     logits = outputs
                     
-                # Handle temporal data
-                if logits.ndim == 3:
-                    logits = logits.mean(dim=1)
-                    
+                # Flatten time dimension if needed
+                if logits.ndim == 3:  # [batch, time, classes]
+                    batch_size, seq_len, num_classes = logits.shape
+                    # Average over time dimension
+                    logits = logits.mean(dim=1)  # [batch, classes]
+                
+                # Ensure targets are properly shaped
+                if targets.ndim > 1:
+                    if targets.shape[1] > 1:
+                        # If targets are [batch, time], we need to take the majority vote
+                        targets = torch.mode(targets, dim=1)[0]
+                    else:
+                        # If targets are [batch, 1], we just squeeze
+                        targets = targets.squeeze(1)
+                
+                # Calculate loss (use focal loss if enabled)
+                if self.use_focal_loss:
+                    loss = self.focal_loss(
+                        logits, 
+                        targets,
+                        alpha=torch.tensor(self.class_weights, device=self.device) if hasattr(self, 'class_weights') else None
+                    )
+                else:
+                    loss = self.loss_fn(logits, targets)
+                val_loss += loss.item()
+                
+                # Get predictions
                 preds = logits.argmax(dim=1)
                 
                 # Track metrics
                 val_correct += (preds == targets).sum().item()
                 val_total += targets.size(0)
-                val_loss += loss.item()
         
         # Calculate average metrics
         avg_loss = val_loss / len(val_loader)
@@ -194,19 +294,38 @@ class StudentTrainer(BaseTrainer):
                 self.optimizer.zero_grad(set_to_none=True)
                 
                 outputs = self.model(inputs)
-                loss = self.compute_loss(outputs, targets)
+                
+                # Handle temporal data - reshape if needed
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]
+                else:
+                    logits = outputs
+                
+                # Ensure targets are properly shaped
+                if targets.ndim > 1:
+                    if targets.shape[1] > 1:
+                        # If targets are [batch, time], we need to take the majority vote
+                        targets = torch.mode(targets, dim=1)[0]
+                    else:
+                        # If targets are [batch, 1], we just squeeze
+                        targets = targets.squeeze(1)
+                
+                # Only use the logits for loss calculation
+                if self.use_focal_loss:
+                    loss = self.focal_loss(
+                        logits, 
+                        targets, 
+                        alpha=torch.tensor(self.class_weights, device=self.device) if hasattr(self, 'class_weights') else None
+                    )
+                else:
+                    loss = self.loss_fn(logits, targets)
                 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 
                 # Track metrics
-                if isinstance(outputs, tuple):
-                    logits = outputs[0]
-                else:
-                    logits = outputs
-                
-                # Handle temporal data
+                # Handle temporal data for prediction
                 if logits.ndim == 3:
                     logits = logits.mean(dim=1)
                 
@@ -275,7 +394,7 @@ class StudentTrainer(BaseTrainer):
         if os.path.exists(self.best_model_path):
             checkpoint = torch.load(self.best_model_path)
             self.model.load_state_dict(checkpoint['model_state_dict'])
-            self._log(f"Loaded best model from epoch {checkpoint['epoch']+1} with validation accuracy {checkpoint['accuracy']:.4f}")
+            self._log(f"Loaded best model from epoch {checkpoint['epoch']} with validation accuracy {checkpoint['accuracy']:.4f}")
             return True
         else:
             self._log("No best model found to load.")
