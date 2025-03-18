@@ -17,7 +17,8 @@ class ChordNet(nn.Module):
         # For STFT input (typically n_freq=2048), the provided n_group would be used
         is_cqt = n_freq <= 256  # Simple heuristic to detect CQT input
         if is_cqt:
-            # For CQT spectrograms, we override n_group to make dimensions work
+            # Note: forcing n_group=12 when using CQT leads to an actual feature dimension of 144/12 = 12.
+            # For better performance you might reconsider this setting.
             n_group = 12
             print(f"Detected CQT input (n_freq={n_freq}), setting n_group={n_group}")
         else:

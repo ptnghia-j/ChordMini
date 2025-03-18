@@ -350,7 +350,6 @@ def main():
     except Exception as e:
         logger.error(f"Error loading dataset: {e}")
         logger.error("Check that the data directories contain valid spectrogram and label files.")
-        # Show directory contents to help with debugging
         logger.info("\nDirectory contents:")
         logger.info(f"Spectrogram directory ({synth_spec_dir}):")
         try:
@@ -379,8 +378,10 @@ def main():
                 logger.info(f"  Files in {subdir}: {files}")
         except Exception as e:
             logger.info(f"  Could not list directory contents: {e}")
-        
-        raise
+    
+    # Set n_classes based directly on the chord mapping so they always match
+    n_classes = len(chord_mapping)
+    logger.info(f"n_classes: {n_classes} based on dataset.")
     
     # Load synthesized dataset with the chord mapping
     synth_dataset = SynthDataset(
@@ -424,8 +425,6 @@ def main():
         n_freq = config.model.get('n_freq', 144)
         logger.info(f"Using default frequency dimension: {n_freq}")
     
-    # Default n_classes from config or 122
-    n_classes = config.model.get('n_classes', 122)
     
     # Get the number of unique chords in our dataset for the output layer
     num_unique_chords = len(chord_mapping)
