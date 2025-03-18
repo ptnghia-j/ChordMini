@@ -1,7 +1,7 @@
 # Student model configuration
 # Training hyperparameters
 training:
-  batch_size: 64
+  batch_size: 128
   max_epochs: 50
   learning_rate: 1.0e-4
   weight_decay: 1.0e-5
@@ -10,7 +10,7 @@ training:
   early_stopping_patience: 9
   seq_len: 108
   seq_stride: 54
-  save_checkpoint_interval: 5
+  save_checkpoint_interval: 10
   min_lr: 5.0e-6
   lr_decay_factor: 0.95
 # Model hyperparameters
@@ -26,8 +26,8 @@ model:
   use_chord_aware_loss: false
 # Data paths
 paths:
-  spec_dir: "data/synth/spectrograms"
-  label_dir: "data/synth/labels"
+  spec_dir: "/mnt/storage/data/synth/spectrograms"  # Updated to absolute path on remote storage
+  label_dir: "/mnt/storage/data/synth/labels"         # Updated to absolute path on remote storage
   checkpoints_dir: "checkpoints"
 
 # Miscellaneous

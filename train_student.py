@@ -154,15 +154,19 @@ def main():
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
     
-    # Set paths
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
-        
-    # Path to synthesized data
-    synth_spec_dir = os.path.join(project_root, config.paths['spec_dir'])
-    synth_label_dir = os.path.join(project_root, config.paths['label_dir'])
-    
+    # Set paths: if config.paths[...] are absolute, use them directly
+    spec_dir_config = config.paths['spec_dir']
+    if os.path.isabs(spec_dir_config):
+        synth_spec_dir = spec_dir_config
+    else:
+        synth_spec_dir = os.path.join(project_root, spec_dir_config)
+
+    label_dir_config = config.paths['label_dir']
+    if os.path.isabs(label_dir_config):
+        synth_label_dir = label_dir_config
+    else:
+        synth_label_dir = os.path.join(project_root, label_dir_config)
+
     logger.info(f"Loading data from:")
     logger.info(f"  Spectrograms: {synth_spec_dir}")
     logger.info(f"  Labels: {synth_label_dir}")

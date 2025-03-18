@@ -6,122 +6,47 @@ metadata:
   labels:
     app: chord-student-training
 spec:
-  backoffLimit: 1              
+  backoffLimit: 2
   template:
     metadata:
       labels:
         app: chord-student-training
     spec:
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-                - key: nvidia.com/gpu.product
-                  operator: In
-                  values:
-                  - NVIDIA-GeForce-RTX-3090
       restartPolicy: Never
+      tolerations:
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 86400
+        - key: "node.kubernetes.io/unreachable"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 86400
       initContainers:
-        - name: download-code-and-data
+        - name: clone-repo
           image: alpine:3.16
           imagePullPolicy: IfNotPresent
           command:
             - sh
             - -c
             - |
-              set -ex  # Added -x for more verbose output
-              echo "Starting init container for student model training..."
-              echo "Checking volume mounts:"
-              ls -la /mnt/storage
-              ls -la /data
-              
-              apk update && apk add --no-cache git curl unzip python3 py3-pip
-              
-              # Clone repository only if it does not exist
-              if [ ! -d /mnt/storage/ChordMini ]; then
-                echo "Cloning GitLab repository..."
-                git clone https://gitlab.com/ptnghia-j/ChordMini /mnt/storage/ChordMini
+              set -ex
+              echo "Installing git..."
+              apk update && apk add --no-cache git
+              echo "Checking for existing project repository..."
+              if [ ! -d "/mnt/storage/ChordMini" ]; then
+                echo "Cloning repository..."
+                git clone https://gitlab.com/ptnghia-j/ChordMini.git /mnt/storage/ChordMini || {
+                  echo "ERROR: Failed to clone repository"
+                  exit 1
+                }
               else
-                echo "Repository already exists. Skipping clone."
+                echo "Repository already exists."
               fi
-              
-              # Create directories for synthesized data
-              mkdir -p /mnt/storage/ChordMini/data/synth/spectrograms
-              mkdir -p /mnt/storage/ChordMini/data/synth/labels
-              
-              # Install gdown for Google Drive downloads
-              pip3 install gdown
-              
-              # Download synthesized data only if not already present
-              cd /data
-              if [ ! -f synth_data.zip ]; then
-                echo "Downloading synthesized data archive..."
-                gdown --id 16ehPDWywPx7VUiCw0FqppDUqEOEezh43 -O synth_data.zip
-              else
-                echo "Synthesized data archive already exists, skipping download."
-              fi
-              
-              # Extract data only if the target directories are empty
-              if [ ! "$(ls -A /mnt/storage/ChordMini/data/synth/spectrograms)" ]; then
-                echo "Extracting synthesized data..."
-                unzip -o synth_data.zip -d /data/synth_temp/
-                # Check if archive has a top-level "synth" folder
-                if [ -d /data/synth_temp/synth ]; then
-                  echo "Archive contains 'synth' folder. Moving its subdirectories."
-                  if [ -d /data/synth_temp/synth/spectrograms ]; then
-                    mv /data/synth_temp/synth/spectrograms/* /mnt/storage/ChordMini/data/synth/spectrograms/
-                  else
-                    echo "Warning: 'synth/spectrograms' not found."
-                  fi
-                  if [ -d /data/synth_temp/synth/labels ]; then
-                    mv /data/synth_temp/synth/labels/* /mnt/storage/ChordMini/data/synth/labels/
-                  else
-                    echo "Warning: 'synth/labels' not found."
-                  fi
-                else
-                  # Fallback: check for top-level directories
-                  if [ -d /data/synth_temp/spectrograms ]; then
-                    mv /data/synth_temp/spectrograms/* /mnt/storage/ChordMini/data/synth/spectrograms/
-                  else
-                    echo "Warning: Could not find top-level 'spectrograms' directory in the archive"
-                    find /data/synth_temp -type d | head -10
-                  fi
-                  if [ -d /data/synth_temp/labels ]; then
-                    mv /data/synth_temp/labels/* /mnt/storage/ChordMini/data/synth/labels/
-                  else
-                    echo "Warning: Could not find top-level 'labels' directory in the archive"
-                    find /data/synth_temp -type d | head -10
-                  fi
-                fi
-              else
-                echo "Synthesized data already extracted, skipping extraction."
-              fi
-              
-              echo "Listing downloaded data:"
-              ls -la /mnt/storage/ChordMini/data/synth/spectrograms/
-              ls -la /mnt/storage/ChordMini/data/synth/labels/
-              
-              # Create necessary config directory if it doesn't exist
-              mkdir -p /mnt/storage/ChordMini/config
-              
-              # Create a basic config file for student model if it doesn't exist
-              if [ ! -f /mnt/storage/ChordMini/config/student_config.yaml ]; then
-                echo "No student config file found. Please provide one at ./config/student_config.yaml."
-              fi
-              echo "Student model data and config ready."
-          resources:
-            requests:
-              cpu: 1
-              memory: "1Gi"
-            limits:
-              cpu: 1
-              memory: "2Gi"
+              exit 0
           volumeMounts:
             - name: storage
               mountPath: /mnt/storage
-            - name: storage
-              mountPath: /data
       containers:
         - name: student-trainer
           image: pytorch/pytorch:1.9.0-cuda11.1-cudnn8-runtime
@@ -134,45 +59,39 @@ spec:
             - sh
             - -c
             - |
-              set -ex  # Added for verbosity
-              echo "Main container for student model started"
-              echo "Current directory:" && pwd
-              echo "Listing directory contents:" && ls -la
-              echo "Testing GPU:"
-              nvidia-smi || echo "No GPU detected"
-              echo "Installing system dependency: libsndfile"
-              apt-get update && apt-get install -y libsndfile1
-              echo "System dependency libsndfile installed."
-              if [ ! -d "./venv" ]; then
-                  echo "Creating virtual environment..."
-                  python -m venv venv
-              fi
-              . ./venv/bin/activate
+              set -ex
+              echo "=== Student model training container started ==="
               
-              echo "Installing required packages if needed..."
-              if [ ! -f /tmp/packages_installed ]; then
-                  echo "Upgrading pip first..."
-                  pip install --upgrade pip
-                  echo "Installing remaining requirements..."
-                  pip install --no-cache-dir -r /mnt/storage/ChordMini/requirements.txt || echo "Some requirements may not have installed correctly"
-                  pip install --no-cache-dir matplotlib tqdm pyyaml
-                  touch /tmp/packages_installed
-              else
-                  echo "Required packages already installed."
+              # Install necessary system packages
+              apt-get update && apt-get install -y libsndfile1 || { echo "ERROR: Failed to install system dependencies"; exit 1; }
+              
+              # Create a minimal requirements.txt if missing
+              if [ ! -f requirements.txt ]; then
+                echo "Creating minimal requirements.txt"
+                echo "numpy==1.22.0" > requirements.txt
+                echo "librosa>=0.8.0" >> requirements.txt
+                echo "torch>=1.9.0" >> requirements.txt
+                echo "tqdm>=4.62.0" >> requirements.txt
+                echo "scikit-learn>=1.0.0" >> requirements.txt
               fi
               
-              mkdir -p /mnt/storage/ChordMini/logs
-              mkdir -p /mnt/storage/ChordMini/checkpoints/student
+              pip install --no-cache-dir -r requirements.txt || { echo "WARNING: Some requirements may have failed"; }
+              pip install --no-cache-dir matplotlib tqdm pyyaml librosa scikit-learn || { echo "ERROR: Failed to install additional Python packages"; exit 1; }
               
-              export PYTHONPATH=/mnt/storage/ChordMini:$PYTHONPATH
-              nvidia-smi
+              # Verify that spectrograms and labels exist in the extracted location
+              SPEC_COUNT=$(find ./data/synth/spectrograms -type f -name "*.npy" | wc -l)
+              LABEL_COUNT=$(find ./data/synth/labels -type f -name "*.lab" | wc -l)
+              echo "Found $SPEC_COUNT spectrogram files and $LABEL_COUNT label files"
+              if [ "$SPEC_COUNT" -eq 0 ] || [ "$LABEL_COUNT" -eq 0 ]; then
+                echo "ERROR: Missing spectrograms or labels for training"
+                exit 1
+              fi
               
-              echo "Checking for synthesized data:"
-              ls -la /mnt/storage/ChordMini/data/synth/spectrograms
-              ls -la /mnt/storage/ChordMini/data/synth/labels
+              # Run the student training script with the provided student config.
+              echo "Starting student training..."
+              PYTHONPATH=/mnt/storage/ChordMini python train_student.py --config ./config/student_config.yaml --save_dir ./checkpoints/student
               
-              echo "Starting student model training..."
-              python train_student.py --config ./config/student_config.yaml --save_dir ./checkpoints/student || echo "Training script failed with exit code $?"
+              echo "=== Student model training complete ==="
           resources:
             requests:
               cpu: "2"
@@ -185,8 +104,6 @@ spec:
           volumeMounts:
             - name: storage
               mountPath: /mnt/storage
-            - name: storage
-              mountPath: /data
       volumes:
         - name: storage
           persistentVolumeClaim:

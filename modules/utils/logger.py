@@ -64,6 +64,10 @@ def warn(msg, *args, **kwargs):
     _logger.warning('W ' + project_name + ' ' + _log_prefix() + msg, *args, **kwargs)
 
 
+def warning(msg, *args, **kwargs):
+    warn(msg, *args, **kwargs)
+
+
 def error(msg, *args, **kwargs):
     _logger.error('E ' + project_name + ' ' + _log_prefix() + msg, *args, **kwargs)
 

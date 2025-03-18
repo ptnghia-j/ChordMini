@@ -178,23 +178,21 @@ class SynthDataset(Dataset):
         
         for i in range(self.seq_len):
             pos = seg_start + i
-            if pos < seg_end:
+            if pos < len(self.samples):
                 sample_i = self.samples[pos]
                 spec_vec = torch.tensor(sample_i['spectro'], dtype=torch.float)
                 chord_label = sample_i['chord_label']
                 label_seq.append(self.chord_to_idx[chord_label])
                 sequence.append(spec_vec)
             else:
+                # Pad with zeros and a default label (here, using 0)
                 sequence.append(torch.zeros_like(spec_vec))
-                label_seq.append(0)  # or another default value if needed
+                label_seq.append(0)
         
-        # Use the most common chord as target
-        target = Counter(label_seq).most_common(1)[0][0]
-        
+        # Changed: Return full frame-level label sequence instead of majority vote
         sample_out = {
-            'spectro': torch.stack(sequence, dim=0),
-            'chord_idx': target,
-            'chord_label': self.samples[seg_start]['chord_label']
+            'spectro': torch.stack(sequence, dim=0),       # [seq_len, feature_dim]
+            'chord_idx': torch.tensor(label_seq, dtype=torch.long)  # [seq_len]
         }
         
         return sample_out
