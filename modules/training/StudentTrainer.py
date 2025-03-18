@@ -124,6 +124,59 @@ class StudentTrainer(BaseTrainer):
         
         return focal_loss.mean()
 
+    def distillation_loss(self, student_logits, teacher_logits, targets, temperature=2.0, alpha=0.7):
+        """
+        Combine a KL divergence loss between softened teacher and student predictions with
+        a label-smoothed cross entropy loss on the pseudo-labels.
+        
+        Args:
+            student_logits (Tensor): Student raw outputs.
+            teacher_logits (Tensor): Teacher soft targets.
+            targets (Tensor): Pseudo-labels.
+            temperature (float): Temperature for softening.
+            alpha (float): Weighting factor between distillation and cross entropy.
+        Returns:
+            Combined loss.
+        """
+        import torch.nn.functional as F
+        
+        # Soft targets: apply temperature scaling
+        student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
+        teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
+        kl_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (temperature ** 2)
+        
+        # Label-smoothed cross entropy
+        smoothing = 0.1
+        confidence = 1.0 - smoothing
+        log_probs = F.log_softmax(student_logits, dim=1)
+        nll_loss = -log_probs.gather(dim=1, index=targets.unsqueeze(1)).squeeze(1)
+        smooth_loss = -log_probs.mean(dim=1)
+        ce_loss = confidence * nll_loss + smoothing * smooth_loss
+        
+        return alpha * kl_loss + (1 - alpha) * ce_loss
+
+    def label_smoothed_loss(self, logits, targets, smoothing=0.1):
+        """
+        Compute label-smoothed cross entropy loss.
+        
+        Args:
+            logits (Tensor): Student predictions.
+            targets (Tensor): Pseudo-labels.
+            smoothing (float): Smoothing factor.
+        
+        Returns:
+            Scalar loss.
+        """
+        import torch.nn.functional as F
+        n_classes = logits.size(-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        with torch.no_grad():
+            # Construct soft targets
+            true_dist = torch.full_like(log_probs, smoothing / (n_classes - 1))
+            true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - smoothing)
+        loss = torch.mean(torch.sum(-true_dist * log_probs, dim=-1))
+        return loss
+
     def _pad_class_weights(self, weights, expected_length):
         """Pad class weights to match the expected number of classes."""
         if len(weights) == expected_length:
