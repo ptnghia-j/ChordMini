@@ -26,8 +26,20 @@ model:
   use_chord_aware_loss: false
 # Data paths
 paths:
-  spec_dir: "/mnt/storage/data/synth/spectrograms"   # Absolute path to spectrograms
-  label_dir: "/mnt/storage/data/synth/labels"        # Absolute path to labels
+  # Storage root path - can be changed to point to different data storage locations
+  storage_root: "/mnt/storage"
+  
+  # Data paths - can be absolute or relative to storage_root
+  # If a path starts with "/", it's treated as absolute, otherwise relative to storage_root
+  spec_dir: "data/synth/spectrograms"    # Will be resolved as {storage_root}/data/synth/spectrograms
+  label_dir: "data/synth/labels"         # Will be resolved as {storage_root}/data/synth/labels
+  
+  # Alternative paths (used as fallbacks if primary paths don't have data)
+  # Set to empty string or remove to disable
+  alt_spec_dir: ""
+  alt_label_dir: ""
+  
+  # Output paths
   checkpoints_dir: "checkpoints"
 
 # Miscellaneous

@@ -13,6 +13,8 @@ from modules.training.StudentTrainer import StudentTrainer
 from modules.utils import logger
 from modules.utils.hparams import HParams
 import argparse
+import glob
+from pathlib import Path
 
 class ListSampler(Sampler):
     def __init__(self, indices):
@@ -113,6 +115,78 @@ class Tester:
         logger.info(f"Test Recall: {recall:.4f}")
         logger.info(f"Test F1 Score: {f1:.4f}")
 
+def count_files_in_subdirectories(directory, file_pattern):
+    """Count files in a directory and all its subdirectories matching a pattern."""
+    if not os.path.exists(directory):
+        return 0
+        
+    count = 0
+    # Count files directly in the directory
+    for file in glob.glob(os.path.join(directory, file_pattern)):
+        if os.path.isfile(file):
+            count += 1
+    
+    # Count files in subdirectories
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.endswith(file_pattern[1:]):  # Strip the * from pattern
+                count += 1
+                
+    return count
+
+def find_sample_files(directory, file_pattern, max_samples=5):
+    """Find sample files in a directory and all its subdirectories matching a pattern."""
+    if not os.path.exists(directory):
+        return []
+        
+    samples = []
+    # Find files in all subdirectories
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.endswith(file_pattern[1:]):  # Strip the * from pattern
+                samples.append(os.path.join(root, file))
+                if len(samples) >= max_samples:
+                    return samples
+    return samples
+
+def resolve_path(path, storage_root=None, project_root=None):
+    """
+    Resolve a path that could be absolute, relative to storage_root, or relative to project_root.
+    
+    Args:
+        path (str): The path to resolve
+        storage_root (str): The storage root path
+        project_root (str): The project root path
+    
+    Returns:
+        str: The resolved absolute path
+    """
+    if not path:
+        return None
+        
+    # If it's already absolute, return it directly
+    if os.path.isabs(path):
+        return path
+        
+    # Try as relative to storage_root first
+    if storage_root:
+        storage_path = os.path.join(storage_root, path)
+        if os.path.exists(storage_path):
+            return storage_path
+    
+    # Then try as relative to project_root
+    if project_root:
+        project_path = os.path.join(project_root, path)
+        if os.path.exists(project_path):
+            return project_path
+            
+    # If neither exists but a storage_root was specified, prefer that resolution
+    if storage_root:
+        return os.path.join(storage_root, path)
+        
+    # Otherwise default to project_root resolution
+    return os.path.join(project_root, path) if project_root else path
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Train a chord recognition student model using synthesized data")
@@ -124,6 +198,8 @@ def main():
                         help='Directory to save checkpoints (overrides config value)')
     parser.add_argument('--model', type=str, default='ChordNet', 
                         help='Model type for evaluation')
+    parser.add_argument('--storage_root', type=str, default=None,
+                        help='Root directory for data storage (overrides config value)')
     args = parser.parse_args()
     
     # Load configuration from YAML
@@ -135,6 +211,9 @@ def main():
     
     if args.save_dir is not None:
         config.paths['checkpoints_dir'] = args.save_dir
+        
+    if args.storage_root is not None:
+        config.paths['storage_root'] = args.storage_root
     
     # Set random seed for reproducibility
     if hasattr(config.misc, 'seed'):
@@ -158,53 +237,100 @@ def main():
     project_root = os.path.dirname(os.path.abspath(__file__))
     logger.info(f"Project root: {project_root}")
     
-    # Set paths: if config.paths[...] are absolute, use them directly
-    spec_dir_config = config.paths['spec_dir']
-    if os.path.isabs(spec_dir_config):
-        synth_spec_dir = spec_dir_config
-    else:
-        synth_spec_dir = os.path.join(project_root, spec_dir_config)
-
-    label_dir_config = config.paths['label_dir']
-    if os.path.isabs(label_dir_config):
-        synth_label_dir = label_dir_config
-    else:
-        synth_label_dir = os.path.join(project_root, label_dir_config)
+    # Get storage root from config
+    storage_root = config.paths.get('storage_root', None)
+    logger.info(f"Storage root: {storage_root}")
+    
+    # Resolve paths using the new function
+    # First, try to get spec_dir and label_dir from config
+    spec_dir_config = config.paths.get('spec_dir', 'data/synth/spectrograms')
+    label_dir_config = config.paths.get('label_dir', 'data/synth/labels')
+    
+    # Resolve the primary paths
+    synth_spec_dir = resolve_path(spec_dir_config, storage_root, project_root)
+    synth_label_dir = resolve_path(label_dir_config, storage_root, project_root)
+    
+    # Set up alternative paths if available
+    alt_spec_dir = config.paths.get('alt_spec_dir', None)
+    alt_label_dir = config.paths.get('alt_label_dir', None)
+    
+    if alt_spec_dir:
+        alt_spec_dir = resolve_path(alt_spec_dir, storage_root, project_root)
+    if alt_label_dir:
+        alt_label_dir = resolve_path(alt_label_dir, storage_root, project_root)
 
     # Create directories if they don't exist
     os.makedirs(synth_spec_dir, exist_ok=True)
     os.makedirs(synth_label_dir, exist_ok=True)
     
-    # Check if directories exist and contain files
-    spec_count = len([f for f in os.listdir(synth_spec_dir) if os.path.isfile(os.path.join(synth_spec_dir, f))])
-    label_count = len([f for f in os.listdir(synth_label_dir) if os.path.isfile(os.path.join(synth_label_dir, f))])
+    # Check if directories exist and contain files (including in subdirectories)
+    spec_count = count_files_in_subdirectories(synth_spec_dir, "*.npy")
+    label_count = count_files_in_subdirectories(synth_label_dir, "*.lab")
+    
+    # Find sample files to verify we're finding files correctly
+    spec_samples = find_sample_files(synth_spec_dir, "*.npy", 5)
+    label_samples = find_sample_files(synth_label_dir, "*.lab", 5)
     
     logger.info(f"Loading data from:")
     logger.info(f"  Spectrograms: {synth_spec_dir} ({spec_count} files)")
+    if spec_samples:
+        logger.info(f"  Example spectrogram files: {spec_samples}")
     logger.info(f"  Labels: {synth_label_dir} ({label_count} files)")
+    if label_samples:
+        logger.info(f"  Example label files: {label_samples}")
     
-    # Fail early if no data is found
+    # Try alternative paths if specified and primary paths don't have files
+    if (spec_count == 0 or label_count == 0) and (alt_spec_dir or alt_label_dir):
+        logger.info(f"Primary paths don't have enough data. Checking alternative paths...")
+        
+        if alt_spec_dir:
+            alt_spec_count = count_files_in_subdirectories(alt_spec_dir, "*.npy")
+            logger.info(f"  Alt spectrograms path: {alt_spec_dir} ({alt_spec_count} files)")
+            if alt_spec_count > 0 and spec_count == 0:
+                synth_spec_dir = alt_spec_dir
+                spec_count = alt_spec_count
+                logger.info(f"  Using alternative spectrogram path: {synth_spec_dir}")
+                
+        if alt_label_dir:
+            alt_label_count = count_files_in_subdirectories(alt_label_dir, "*.lab")
+            logger.info(f"  Alt labels path: {alt_label_dir} ({alt_label_count} files)")
+            if alt_label_count > 0 and label_count == 0:
+                synth_label_dir = alt_label_dir
+                label_count = alt_label_count
+                logger.info(f"  Using alternative label path: {synth_label_dir}")
+    
+    # Try one last fallback - check common locations
+    if spec_count == 0 or label_count == 0:
+        # Check common paths
+        common_paths = [
+            "/mnt/storage/data/synth/spectrograms",
+            "/mnt/storage/data/synth/labels",
+            os.path.join(project_root, "data/synth/spectrograms"),
+            os.path.join(project_root, "data/synth/labels")
+        ]
+        
+        logger.info(f"Still missing data. Checking common paths as last resort...")
+        for path in common_paths:
+            if "spectrogram" in path and spec_count == 0 and os.path.exists(path):
+                count = count_files_in_subdirectories(path, "*.npy")
+                if count > 0:
+                    logger.info(f"  Found {count} spectrogram files at {path}")
+                    synth_spec_dir = path
+                    spec_count = count
+                    break
+                    
+        for path in common_paths:
+            if "label" in path and label_count == 0 and os.path.exists(path):
+                count = count_files_in_subdirectories(path, "*.lab")
+                if count > 0:
+                    logger.info(f"  Found {count} label files at {path}")
+                    synth_label_dir = path
+                    label_count = count
+                    break
+    
+    # Final check - fail if we still don't have data
     if spec_count == 0 or label_count == 0:
         raise RuntimeError(f"ERROR: Missing spectrogram or label files. Found {spec_count} spectrogram files and {label_count} label files.")
-    
-    # Check in subdirectories if no files are found at the top level
-    if spec_count == 0:
-        subdirs = [d for d in os.listdir(synth_spec_dir) if os.path.isdir(os.path.join(synth_spec_dir, d))]
-        if subdirs:
-            logger.info(f"No spectrogram files found at top level. Found subdirectories: {subdirs}")
-            for subdir in subdirs:
-                subdir_path = os.path.join(synth_spec_dir, subdir)
-                subdir_files = len([f for f in os.listdir(subdir_path) if os.path.isfile(os.path.join(subdir_path, f))])
-                logger.info(f"  Subdir {subdir}: {subdir_files} files")
-    
-    if label_count == 0:
-        subdirs = [d for d in os.listdir(synth_label_dir) if os.path.isdir(os.path.join(synth_label_dir, d))]
-        if subdirs:
-            logger.info(f"No label files found at top level. Found subdirectories: {subdirs}")
-            for subdir in subdirs:
-                subdir_path = os.path.join(synth_label_dir, subdir)
-                subdir_files = len([f for f in os.listdir(subdir_path) if os.path.isfile(os.path.join(subdir_path, f))])
-                logger.info(f"  Subdir {subdir}: {subdir_files} files")
     
     # Build a chord mapping from the synthesized data
     try:
@@ -228,15 +354,31 @@ def main():
         logger.info("\nDirectory contents:")
         logger.info(f"Spectrogram directory ({synth_spec_dir}):")
         try:
-            logger.info(f"  Files: {os.listdir(synth_spec_dir)[:10]}")
-        except Exception:
-            logger.info("  Could not list directory contents")
+            # Try to find subdirectories
+            subdirs = [d for d in os.listdir(synth_spec_dir) if os.path.isdir(os.path.join(synth_spec_dir, d))]
+            logger.info(f"  Subdirectories: {subdirs[:10]}")
+            
+            # Check for files in first few subdirectories
+            for subdir in subdirs[:3]:
+                subdir_path = os.path.join(synth_spec_dir, subdir)
+                files = os.listdir(subdir_path)[:10]
+                logger.info(f"  Files in {subdir}: {files}")
+        except Exception as e:
+            logger.info(f"  Could not list directory contents: {e}")
         
         logger.info(f"Label directory ({synth_label_dir}):")
         try:
-            logger.info(f"  Files: {os.listdir(synth_label_dir)[:10]}")
-        except Exception:
-            logger.info("  Could not list directory contents")
+            # Try to find subdirectories
+            subdirs = [d for d in os.listdir(synth_label_dir) if os.path.isdir(os.path.join(synth_label_dir, d))]
+            logger.info(f"  Subdirectories: {subdirs[:10]}")
+            
+            # Check for files in first few subdirectories
+            for subdir in subdirs[:3]:
+                subdir_path = os.path.join(synth_label_dir, subdir)
+                files = os.listdir(subdir_path)[:10]
+                logger.info(f"  Files in {subdir}: {files}")
+        except Exception as e:
+            logger.info(f"  Could not list directory contents: {e}")
         
         raise
     
@@ -390,9 +532,14 @@ def main():
         std = 1.0
         logger.warning("Could not calculate mean and std, using defaults")
     
-    # Create our StudentTrainer (with class weights padding)
-    checkpoints_dir = os.path.join(project_root, config.paths['checkpoints_dir'])
+    # Resolve checkpoints directory path
+    checkpoints_dir_config = config.paths.get('checkpoints_dir', 'checkpoints')
+    checkpoints_dir = resolve_path(checkpoints_dir_config, storage_root, project_root)
     os.makedirs(checkpoints_dir, exist_ok=True)
+    
+    logger.info(f"Checkpoints will be saved to: {checkpoints_dir}")
+    
+    # Create our StudentTrainer (with class weights padding)
     trainer = StudentTrainer(
         model, 
         optimizer,
