@@ -48,35 +48,75 @@ class SynthDataset(Dataset):
         
     def _load_data(self):
         """Load all spectrogram and label files"""
+        # Check if directories exist
+        if not self.spec_dir.exists():
+            print(f"WARNING: Spectrogram directory does not exist: {self.spec_dir}")
+        if not self.label_dir.exists():
+            print(f"WARNING: Label directory does not exist: {self.label_dir}")
+        
         # Find all subdirectories (like '000', '001', etc.)
-        subdirs = [d for d in self.spec_dir.iterdir() if d.is_dir()]
+        subdirs = [d for d in self.spec_dir.iterdir() if d.is_dir()] if self.spec_dir.exists() else []
+        
+        print(f"Found {len(subdirs)} subdirectories in {self.spec_dir}")
         
         if not subdirs:
+            print("No subdirectories found. Searching for files directly in the main directory...")
             # If no subdirectories, search directly in the main directory
-            spec_files = list(self.spec_dir.glob("*_spec.npy"))
+            spec_files = list(self.spec_dir.glob("*.npy")) if self.spec_dir.exists() else []
+            print(f"Found {len(spec_files)} .npy files in main directory")
+            
             for spec_file in spec_files:
-                base_name = spec_file.stem.replace("_spec", "")
-                label_file = self.label_dir / f"{base_name}.lab"
+                base_name = spec_file.stem
+                if base_name.endswith("_spec"):
+                    base_name = base_name.replace("_spec", "")
+                    
+                # Try several label file naming patterns
+                potential_label_files = [
+                    self.label_dir / f"{base_name}.lab",
+                    self.label_dir / f"{base_name}_lab.lab"
+                ]
                 
-                if label_file.exists():
-                    self._process_file_pair(spec_file, label_file)
+                for label_file in potential_label_files:
+                    if label_file.exists():
+                        self._process_file_pair(spec_file, label_file)
+                        break
         else:
             # Process each subdirectory
             for subdir in subdirs:
+                print(f"Processing subdirectory: {subdir.name}")
                 spec_subdir = self.spec_dir / subdir.name
                 label_subdir = self.label_dir / subdir.name
                 
-                if not spec_subdir.exists() or not label_subdir.exists():
+                if not label_subdir.exists():
+                    print(f"WARNING: Label subdirectory does not exist: {label_subdir}")
                     continue
-                    
+                
                 # Find all spectrogram files in this subdirectory
-                spec_files = list(spec_subdir.glob("*_spec.npy"))
+                spec_files = list(spec_subdir.glob("*.npy"))
+                print(f"  Found {len(spec_files)} spectrogram files in {subdir.name}")
+                
                 for spec_file in spec_files:
-                    base_name = spec_file.stem.replace("_spec", "")
-                    label_file = label_subdir / f"{base_name}.lab"
+                    # Try multiple patterns for base name extraction
+                    base_name = spec_file.stem
+                    if base_name.endswith("_spec"):
+                        base_name = base_name.replace("_spec", "")
                     
-                    if label_file.exists():
-                        self._process_file_pair(spec_file, label_file)
+                    # Try different label file naming patterns
+                    potential_label_files = [
+                        label_subdir / f"{base_name}.lab",
+                        label_subdir / f"{base_name}_lab.lab",
+                        # Add more patterns if needed
+                    ]
+                    
+                    label_found = False
+                    for label_file in potential_label_files:
+                        if label_file.exists():
+                            self._process_file_pair(spec_file, label_file)
+                            label_found = True
+                            break
+                    
+                    if not label_found:
+                        print(f"WARNING: No matching label file found for {spec_file}")
         
         # Report on spectrogram dimensions to help identify CQT vs STFT
         if self.samples:
@@ -109,23 +149,50 @@ class SynthDataset(Dataset):
             chord_labels = self._parse_label_file(label_file)
             
             # Ensure the spectrogram and labels have matching length
-            time_frames = spec.shape[0]  # Assuming shape is (time, features)
+            time_frames = spec.shape[0] if len(spec.shape) > 1 else 1  # Assuming shape is (time, features)
             
             # Add to samples
-            for t in range(time_frames):
-                # Find the chord label for this time frame
-                frame_time = t * 0.1  # Assuming 0.1s per frame
-                chord_label = self._find_chord_at_time(chord_labels, frame_time)
+            if len(spec.shape) <= 1:
+                # Handle single frame spectrograms
+                chord_label = self._find_chord_at_time(chord_labels, 0.0)
                 
+                # Make sure the chord label exists in the mapping
+                if self.chord_mapping is None:
+                    if chord_label not in self.chord_to_idx:
+                        self.chord_to_idx[chord_label] = len(self.chord_to_idx)
+                elif chord_label not in self.chord_mapping:
+                    print(f"Warning: Unknown chord label {chord_label} found in {label_file}")
+                    # Skip this sample if we can't map it
+                    return
+                    
                 self.samples.append({
-                    'spectro': spec[t],
+                    'spectro': spec,
                     'chord_label': chord_label
                 })
+            else:
+                # Handle multi-frame spectrograms
+                for t in range(time_frames):
+                    # Find the chord label for this time frame
+                    frame_time = t * 0.1  # Assuming 0.1s per frame
+                    chord_label = self._find_chord_at_time(chord_labels, frame_time)
+                    
+                    # Make sure the chord label exists in the mapping
+                    if self.chord_mapping is None:
+                        if chord_label not in self.chord_to_idx:
+                            self.chord_to_idx[chord_label] = len(self.chord_to_idx)
+                    elif chord_label not in self.chord_mapping:
+                        print(f"Warning: Unknown chord label {chord_label} found in {label_file}")
+                        chord_label = "N"  # Default to no-chord
+                        
+                    self.samples.append({
+                        'spectro': spec[t],
+                        'chord_label': chord_label
+                    })
                 
             # Log the first file's dimensions in detail
             if len(self.samples) <= time_frames:  # This must be the first file processed
                 print(f"First spectrogram shape: {spec.shape}")
-                print(f"Example frame dimensions: {self.samples[0]['spectro'].shape}")
+                print(f"Example frame dimensions: {self.samples[0]['spectro'].shape if len(spec.shape) > 1 else spec.shape}")
                 print(f"First sample chord: {self.samples[0]['chord_label']}")
                 
         except Exception as e:
@@ -134,27 +201,47 @@ class SynthDataset(Dataset):
     def _parse_label_file(self, label_file):
         """Parse a label file into a list of (start_time, end_time, chord) tuples"""
         result = []
-        with open(label_file, 'r') as f:
-            for line in f:
-                if line.strip():
-                    parts = line.strip().split()
-                    if len(parts) >= 3:
-                        start_time = float(parts[0])
-                        end_time = float(parts[1])
-                        chord = parts[2]
-                        result.append((start_time, end_time, chord))
+        try:
+            with open(label_file, 'r') as f:
+                for line in f:
+                    if line.strip():
+                        parts = line.strip().split()
+                        if len(parts) >= 3:
+                            start_time = float(parts[0])
+                            end_time = float(parts[1])
+                            chord = parts[2]
+                            result.append((start_time, end_time, chord))
+        except Exception as e:
+            print(f"Error parsing label file {label_file}: {e}")
+            
         return result
     
     def _find_chord_at_time(self, chord_labels, time):
         """Find the chord label at a specific time point"""
+        if not chord_labels:
+            return "N"  # Return no-chord for empty label files
+            
         for start, end, chord in chord_labels:
             if start <= time < end:
                 return chord
+                
+        # If we have chord labels but time is out of bounds
+        if chord_labels and time >= chord_labels[-1][1]:
+            # Use the last chord if the time exceeds the end
+            return chord_labels[-1][2]
+            
         return "N"  # No chord found
     
     def _generate_segments(self):
         """Generate sequence segments from the loaded samples"""
+        if not self.samples:
+            print("WARNING: No samples to generate segments from")
+            return
+            
         if len(self.samples) <= self.seq_len:
+            print(f"WARNING: Not enough samples ({len(self.samples)}) to create segments of length {self.seq_len}")
+            # Create at least one segment using the available samples
+            self.segment_indices.append((0, len(self.samples)))
             return
             
         # Generate segments with stride
@@ -172,24 +259,36 @@ class SynthDataset(Dataset):
         return len(self.segment_indices)
     
     def __getitem__(self, idx):
+        if not self.segment_indices:
+            raise IndexError("Dataset is empty - no segments available")
+            
         seg_start, seg_end = self.segment_indices[idx]
         sequence = []
         label_seq = []
         
-        for i in range(self.seq_len):
-            pos = seg_start + i
-            if pos < len(self.samples):
-                sample_i = self.samples[pos]
+        # Get the shape of a sample spectrogram to use for padding
+        first_spec = self.samples[0]['spectro']
+        
+        for i in range(seg_start, seg_end):
+            if i < len(self.samples):
+                sample_i = self.samples[i]
                 spec_vec = torch.tensor(sample_i['spectro'], dtype=torch.float)
                 chord_label = sample_i['chord_label']
-                label_seq.append(self.chord_to_idx[chord_label])
+                
+                # Handle case where chord_label might not be in mapping
+                chord_idx = self.chord_to_idx.get(chord_label, self.chord_to_idx.get("N", 0))
+                label_seq.append(chord_idx)
                 sequence.append(spec_vec)
             else:
                 # Pad with zeros and a default label (here, using 0)
-                sequence.append(torch.zeros_like(spec_vec))
-                label_seq.append(0)
+                if not sequence:
+                    padding_shape = first_spec.shape
+                else:
+                    padding_shape = sequence[-1].shape
+                sequence.append(torch.zeros(padding_shape, dtype=torch.float))
+                label_seq.append(self.chord_to_idx.get("N", 0))
         
-        # Changed: Return full frame-level label sequence instead of majority vote
+        # Return full frame-level label sequence instead of majority vote
         sample_out = {
             'spectro': torch.stack(sequence, dim=0),       # [seq_len, feature_dim]
             'chord_idx': torch.tensor(label_seq, dtype=torch.long)  # [seq_len]
@@ -199,6 +298,16 @@ class SynthDataset(Dataset):
     
     def get_train_iterator(self, batch_size=128, shuffle=True):
         """Get a DataLoader for the training set"""
+        if not self.train_indices:
+            print("WARNING: No training segments available")
+            # Return an empty dataset
+            return DataLoader(
+                SynthSegmentSubset(self, []),
+                batch_size=batch_size,
+                shuffle=shuffle,
+                pin_memory=True
+            )
+            
         return DataLoader(
             SynthSegmentSubset(self, self.train_indices),
             batch_size=batch_size,
@@ -208,6 +317,16 @@ class SynthDataset(Dataset):
     
     def get_eval_iterator(self, batch_size=128, shuffle=False):
         """Get a DataLoader for the evaluation set"""
+        if not self.eval_indices:
+            print("WARNING: No evaluation segments available")
+            # Return an empty dataset
+            return DataLoader(
+                SynthSegmentSubset(self, []),
+                batch_size=batch_size,
+                shuffle=shuffle,
+                pin_memory=True
+            )
+            
         return DataLoader(
             SynthSegmentSubset(self, self.eval_indices),
             batch_size=batch_size,
@@ -217,6 +336,16 @@ class SynthDataset(Dataset):
     
     def get_test_iterator(self, batch_size=128, shuffle=False):
         """Get a DataLoader for the test set"""
+        if not self.test_indices:
+            print("WARNING: No test segments available")
+            # Return an empty dataset
+            return DataLoader(
+                SynthSegmentSubset(self, []),
+                batch_size=batch_size,
+                shuffle=shuffle,
+                pin_memory=True
+            )
+            
         return DataLoader(
             SynthSegmentSubset(self, self.test_indices),
             batch_size=batch_size,
@@ -235,6 +364,8 @@ class SynthSegmentSubset(Dataset):
         return len(self.indices)
     
     def __getitem__(self, idx):
+        if idx >= len(self.indices):
+            raise IndexError(f"Index {idx} out of range for dataset with {len(self.indices)} indices")
         return self.dataset[self.indices[idx]]
 
 
@@ -254,8 +385,7 @@ def analyze_chord_distribution(dataset):
     """Analyze and print chord distribution from dataset"""
     chord_counter = Counter()
     
-    for i in range(len(dataset)):
-        sample = dataset[i]
+    for sample in dataset.samples:
         chord_counter[sample['chord_label']] += 1
     
     total = sum(chord_counter.values())
