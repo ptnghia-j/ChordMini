@@ -26,8 +26,8 @@ model:
   use_chord_aware_loss: false
 # Data paths
 paths:
-  spec_dir: "/mnt/storage/data/synth/spectrograms"  # Updated to absolute path on remote storage
-  label_dir: "/mnt/storage/data/synth/labels"         # Updated to absolute path on remote storage
+  spec_dir: "./data/synth/spectrograms"   # Relative path that will be resolved from project root
+  label_dir: "./data/synth/labels"        # Relative path that will be resolved from project root
   checkpoints_dir: "checkpoints"
 
 # Miscellaneous
