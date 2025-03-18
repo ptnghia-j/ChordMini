@@ -47,6 +47,65 @@ spec:
           volumeMounts:
             - name: storage
               mountPath: /mnt/storage
+        - name: data-check
+          image: alpine:3.16
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -ex
+              echo "Checking data directory structure..."
+              
+              # Locate the spectrogram and label directories
+              PROJ_ROOT="/mnt/storage/ChordMini"
+              echo "Project root: $PROJ_ROOT"
+              
+              # Create the data directories if they don't exist
+              mkdir -p "/mnt/storage/data/synth/spectrograms"
+              mkdir -p "/mnt/storage/data/synth/labels"
+              
+              # Create symlinks from project directory to actual data location if needed
+              mkdir -p "$PROJ_ROOT/data/synth"
+              
+              # Check if symlinks already exist
+              if [ -L "$PROJ_ROOT/data/synth/spectrograms" ]; then
+                echo "Symlink for spectrograms already exists"
+              else
+                ln -sf "/mnt/storage/data/synth/spectrograms" "$PROJ_ROOT/data/synth/spectrograms"
+                echo "Created symlink for spectrograms"
+              fi
+              
+              if [ -L "$PROJ_ROOT/data/synth/labels" ]; then
+                echo "Symlink for labels already exists"
+              else
+                ln -sf "/mnt/storage/data/synth/labels" "$PROJ_ROOT/data/synth/labels"
+                echo "Created symlink for labels"
+              fi
+              
+              # Check for spectrogram files in the main and alternate locations
+              echo "---- Checking for spectrogram files ----"
+              find "/mnt/storage/data/synth" -name "*.npy" | head -10
+              find "$PROJ_ROOT/data/synth" -name "*.npy" | head -10
+              
+              # Check for label files in the main and alternate locations
+              echo "---- Checking for label files ----"
+              find "/mnt/storage/data/synth" -name "*.lab" | head -10 
+              find "$PROJ_ROOT/data/synth" -name "*.lab" | head -10
+              
+              # Verify there are some relevant files (but allow training to proceed regardless)
+              echo "Checking if there are data files to process..."
+              SPEC_COUNT=$(find "/mnt/storage/data/synth" -type f -name "*.npy" | wc -l)
+              LABEL_COUNT=$(find "/mnt/storage/data/synth" -type f -name "*.lab" | wc -l)
+              echo "Found $SPEC_COUNT spectrogram files and $LABEL_COUNT label files"
+              if [ "$SPEC_COUNT" -eq 0 ] || [ "$LABEL_COUNT" -eq 0 ]; then
+                echo "WARNING: No data files found. Training may fail."
+              else
+                echo "Data files found. Proceeding with training."
+              fi
+          volumeMounts:
+            - name: storage
+              mountPath: /mnt/storage
       containers:
         - name: student-trainer
           image: pytorch/pytorch:1.9.0-cuda11.1-cudnn8-runtime
@@ -73,23 +132,58 @@ spec:
                 echo "torch>=1.9.0" >> requirements.txt
                 echo "tqdm>=4.62.0" >> requirements.txt
                 echo "scikit-learn>=1.0.0" >> requirements.txt
+                echo "pyyaml>=6.0.0" >> requirements.txt  # Added for config loading
               fi
               
               pip install --no-cache-dir -r requirements.txt || { echo "WARNING: Some requirements may have failed"; }
               pip install --no-cache-dir matplotlib tqdm pyyaml librosa scikit-learn || { echo "ERROR: Failed to install additional Python packages"; exit 1; }
               
-              # Verify that spectrograms and labels exist in the extracted location
+              # Verify the data paths from the config
+              echo "Checking data paths from config..."
+              grep -A 10 "paths:" ./config/student_config.yaml
+              
+              # Double check that the symlinks are still valid
+              if [ ! -L "./data/synth/spectrograms" ]; then
+                echo "Recreating symlink for spectrograms"
+                mkdir -p ./data/synth
+                ln -sf "/mnt/storage/data/synth/spectrograms" "./data/synth/spectrograms"
+              fi
+              
+              if [ ! -L "./data/synth/labels" ]; then
+                echo "Recreating symlink for labels"
+                mkdir -p ./data/synth
+                ln -sf "/mnt/storage/data/synth/labels" "./data/synth/labels"
+              fi
+              
+              # Verify that spectrograms and labels exist in the expected location
               SPEC_COUNT=$(find ./data/synth/spectrograms -type f -name "*.npy" | wc -l)
               LABEL_COUNT=$(find ./data/synth/labels -type f -name "*.lab" | wc -l)
               echo "Found $SPEC_COUNT spectrogram files and $LABEL_COUNT label files"
+              
+              # Before starting training, verify data exists
               if [ "$SPEC_COUNT" -eq 0 ] || [ "$LABEL_COUNT" -eq 0 ]; then
-                echo "ERROR: Missing spectrograms or labels for training"
-                exit 1
+                echo "WARNING: No data found in the expected paths"
+                echo "Looking for data in alternate locations..."
+                
+                ALT_SPEC_COUNT=$(find /mnt/storage -type f -name "*.npy" | wc -l)
+                ALT_LABEL_COUNT=$(find /mnt/storage -type f -name "*.lab" | wc -l)
+                echo "Found $ALT_SPEC_COUNT .npy files and $ALT_LABEL_COUNT .lab files in alternate locations"
+                
+                # Show where the files were found
+                if [ "$ALT_SPEC_COUNT" -gt 0 ]; then
+                  echo "Sample spectrogram locations:"
+                  find /mnt/storage -type f -name "*.npy" | head -5
+                fi
+                
+                if [ "$ALT_LABEL_COUNT" -gt 0 ]; then
+                  echo "Sample label locations:"
+                  find /mnt/storage -type f -name "*.lab" | head -5
+                fi
               fi
               
-              # Run the student training script with the provided student config.
-              echo "Starting student training..."
-              PYTHONPATH=/mnt/storage/ChordMini python train_student.py --config ./config/student_config.yaml --save_dir ./checkpoints/student
+              # Run the student training script
+              echo "Starting student training with updated script..."
+              python train_student.py --config ./config/student_config.yaml --save_dir ./checkpoints/student
               
               echo "=== Student model training complete ==="
           resources:

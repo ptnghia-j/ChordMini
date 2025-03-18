@@ -154,6 +154,10 @@ def main():
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
     
+    # Get project root directory (important for path resolution)
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    logger.info(f"Project root: {project_root}")
+    
     # Set paths: if config.paths[...] are absolute, use them directly
     spec_dir_config = config.paths['spec_dir']
     if os.path.isabs(spec_dir_config):
@@ -167,21 +171,74 @@ def main():
     else:
         synth_label_dir = os.path.join(project_root, label_dir_config)
 
+    # Create directories if they don't exist
+    os.makedirs(synth_spec_dir, exist_ok=True)
+    os.makedirs(synth_label_dir, exist_ok=True)
+    
+    # Check if directories exist and contain files
+    spec_count = len([f for f in os.listdir(synth_spec_dir) if os.path.isfile(os.path.join(synth_spec_dir, f))])
+    label_count = len([f for f in os.listdir(synth_label_dir) if os.path.isfile(os.path.join(synth_label_dir, f))])
+    
     logger.info(f"Loading data from:")
-    logger.info(f"  Spectrograms: {synth_spec_dir}")
-    logger.info(f"  Labels: {synth_label_dir}")
+    logger.info(f"  Spectrograms: {synth_spec_dir} ({spec_count} files)")
+    logger.info(f"  Labels: {synth_label_dir} ({label_count} files)")
+    
+    # Fail early if no data is found
+    if spec_count == 0 or label_count == 0:
+        raise RuntimeError(f"ERROR: Missing spectrogram or label files. Found {spec_count} spectrogram files and {label_count} label files.")
+    
+    # Check in subdirectories if no files are found at the top level
+    if spec_count == 0:
+        subdirs = [d for d in os.listdir(synth_spec_dir) if os.path.isdir(os.path.join(synth_spec_dir, d))]
+        if subdirs:
+            logger.info(f"No spectrogram files found at top level. Found subdirectories: {subdirs}")
+            for subdir in subdirs:
+                subdir_path = os.path.join(synth_spec_dir, subdir)
+                subdir_files = len([f for f in os.listdir(subdir_path) if os.path.isfile(os.path.join(subdir_path, f))])
+                logger.info(f"  Subdir {subdir}: {subdir_files} files")
+    
+    if label_count == 0:
+        subdirs = [d for d in os.listdir(synth_label_dir) if os.path.isdir(os.path.join(synth_label_dir, d))]
+        if subdirs:
+            logger.info(f"No label files found at top level. Found subdirectories: {subdirs}")
+            for subdir in subdirs:
+                subdir_path = os.path.join(synth_label_dir, subdir)
+                subdir_files = len([f for f in os.listdir(subdir_path) if os.path.isfile(os.path.join(subdir_path, f))])
+                logger.info(f"  Subdir {subdir}: {subdir_files} files")
     
     # Build a chord mapping from the synthesized data
-    temp_dataset = SynthDataset(synth_spec_dir, synth_label_dir, chord_mapping=None, seq_len=1, stride=1)
-    unique_chords = set(sample['chord_label'] for sample in temp_dataset.samples)
-    chord_mapping = {chord: idx for idx, chord in enumerate(sorted(unique_chords))}
-    
-    # Make sure 'N' is included for no-chord label
-    if "N" not in chord_mapping:
-        chord_mapping["N"] = len(chord_mapping)
+    try:
+        temp_dataset = SynthDataset(synth_spec_dir, synth_label_dir, chord_mapping=None, seq_len=1, stride=1)
+        if not temp_dataset.samples:
+            raise RuntimeError("No valid samples were loaded from the dataset directories")
         
-    logger.info(f"Generated chord mapping (total labels): {len(chord_mapping)}")
-    logger.info(f"Sample chord mapping: {dict(list(chord_mapping.items())[:5])}")
+        unique_chords = set(sample['chord_label'] for sample in temp_dataset.samples)
+        chord_mapping = {chord: idx for idx, chord in enumerate(sorted(unique_chords))}
+        
+        # Make sure 'N' is included for no-chord label
+        if "N" not in chord_mapping:
+            chord_mapping["N"] = len(chord_mapping)
+            
+        logger.info(f"Generated chord mapping (total labels): {len(chord_mapping)}")
+        logger.info(f"Sample chord mapping: {dict(list(chord_mapping.items())[:5])}")
+    except Exception as e:
+        logger.error(f"Error loading dataset: {e}")
+        logger.error("Check that the data directories contain valid spectrogram and label files.")
+        # Show directory contents to help with debugging
+        logger.info("\nDirectory contents:")
+        logger.info(f"Spectrogram directory ({synth_spec_dir}):")
+        try:
+            logger.info(f"  Files: {os.listdir(synth_spec_dir)[:10]}")
+        except Exception:
+            logger.info("  Could not list directory contents")
+        
+        logger.info(f"Label directory ({synth_label_dir}):")
+        try:
+            logger.info(f"  Files: {os.listdir(synth_label_dir)[:10]}")
+        except Exception:
+            logger.info("  Could not list directory contents")
+        
+        raise
     
     # Load synthesized dataset with the chord mapping
     synth_dataset = SynthDataset(
@@ -200,24 +257,30 @@ def main():
     
     # Debug samples - add more detailed shape information
     logger.info("=== Debug: Training set sample ===")
-    train_batch = next(iter(train_loader))
-    logger.info(f"Training spectrogram tensor shape: {train_batch['spectro'].shape}")
-    
-    # Determine if we're using CQT or STFT based on frequency dimension
-    actual_freq_dim = train_batch['spectro'].shape[-1]
-    logger.info(f"Detected frequency dimension in data: {actual_freq_dim}")
-    
-    # For CQT, frequency dimension is typically around 144
-    # For STFT, it's typically much higher (e.g., 1024 or 2048)
-    is_cqt = actual_freq_dim <= 256
-    
-    if is_cqt:
-        logger.info(f"Detected Constant-Q Transform (CQT) input with {actual_freq_dim} frequency bins")
-    else:
-        logger.info(f"Detected STFT input with {actual_freq_dim} frequency bins")
+    try:
+        train_batch = next(iter(train_loader))
+        logger.info(f"Training spectrogram tensor shape: {train_batch['spectro'].shape}")
         
-    # Set the frequency dimension to match the actual data
-    n_freq = actual_freq_dim
+        # Determine if we're using CQT or STFT based on frequency dimension
+        actual_freq_dim = train_batch['spectro'].shape[-1]
+        logger.info(f"Detected frequency dimension in data: {actual_freq_dim}")
+        
+        # For CQT, frequency dimension is typically around 144
+        # For STFT, it's typically much higher (e.g., 1024 or 2048)
+        is_cqt = actual_freq_dim <= 256
+        
+        if is_cqt:
+            logger.info(f"Detected Constant-Q Transform (CQT) input with {actual_freq_dim} frequency bins")
+        else:
+            logger.info(f"Detected STFT input with {actual_freq_dim} frequency bins")
+            
+        # Set the frequency dimension to match the actual data
+        n_freq = actual_freq_dim
+    except Exception as e:
+        logger.error(f"Error processing training batch: {e}")
+        logger.error("This may indicate problems with the data format. Attempting to continue...")
+        n_freq = config.model.get('n_freq', 144)
+        logger.info(f"Using default frequency dimension: {n_freq}")
     
     # Default n_classes from config or 122
     n_classes = config.model.get('n_classes', 122)
@@ -329,6 +392,7 @@ def main():
     
     # Create our StudentTrainer (with class weights padding)
     checkpoints_dir = os.path.join(project_root, config.paths['checkpoints_dir'])
+    os.makedirs(checkpoints_dir, exist_ok=True)
     trainer = StudentTrainer(
         model, 
         optimizer,
