@@ -75,7 +75,7 @@ class EncoderF(nn.Module):
       def layer_fn(x, residual):
         out, _ = attn(x, x, x, need_weights=False)
         return ff(out + residual)
-      x = checkpoint.checkpoint(layer_fn, x, residual, use_reentrant=False)  # fixed: added use_reentrant parameter
+      x = checkpoint.checkpoint(layer_fn, x, residual)  # Removed 'use_reentrant=False' parameter
     
     y = x.reshape(B, T, self.n_freq)
     y = self.dropout(y)

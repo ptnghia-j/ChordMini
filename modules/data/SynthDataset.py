@@ -6,6 +6,7 @@ from collections import Counter
 import glob
 from pathlib import Path
 import matplotlib.pyplot as plt
+import time  # Added for progress tracking
 
 class SynthDataset(Dataset):
     """
@@ -49,170 +50,95 @@ class SynthDataset(Dataset):
         
     def _load_data(self):
         """Load all spectrogram and label files, handling nested directory structure"""
+        start_time = time.time()
+        
         # Check if directories exist
         if not self.spec_dir.exists():
             print(f"WARNING: Spectrogram directory does not exist: {self.spec_dir}")
         if not self.label_dir.exists():
             print(f"WARNING: Label directory does not exist: {self.label_dir}")
+
+        # First, find all valid spectrogram files using a fast glob pattern
+        print("Scanning for spectrogram files (this may take a moment)...")
+        spec_files = list(self.spec_dir.glob("**/*.npy"))
         
-        # Find all subdirectories (like '000', '001', etc.)
-        subdirs = []
-        spec_files_total = 0
-        label_files_total = 0
-        
-        # Check if we have a nested directory structure or flat structure
-        try:
-            if self.spec_dir.exists():
-                subdirs = [d for d in self.spec_dir.iterdir() if d.is_dir()]
-                print(f"Found {len(subdirs)} subdirectories in spectrogram directory")
-                
-                # If very few subdirs, check if they match the expected pattern (numeric folders)
-                if 1 <= len(subdirs) <= 5:
-                    subdir_names = [d.name for d in subdirs]
-                    print(f"Subdirectory names: {subdir_names}")
-        except Exception as e:
-            print(f"Error checking subdirectories: {e}")
-            subdirs = []
-        
-        if not subdirs:
-            # No subdirectories - try flat structure first
-            print("No subdirectories found. Searching for files directly...")
-            spec_files = list(self.spec_dir.glob("*.npy")) if self.spec_dir.exists() else []
-            print(f"Found {len(spec_files)} .npy files directly in spectrogram directory")
+        # Early exit if no files found
+        if not spec_files:
+            print("No spectrogram files found. Check your data paths.")
+            return
             
-            if spec_files:
-                # We found files directly in the directory
-                for spec_file in spec_files:
-                    base_name = spec_file.stem
-                    if base_name.endswith("_spec"):
-                        base_name = base_name.replace("_spec", "")
-                        
-                    # Try several label file naming patterns
-                    potential_label_files = [
-                        self.label_dir / f"{base_name}.lab",
-                        self.label_dir / f"{base_name}_lab.lab"
-                    ]
-                    
-                    for label_file in potential_label_files:
-                        if label_file.exists():
-                            self._process_file_pair(spec_file, label_file)
-                            break
-            else:
-                # Try searching recursively with glob pattern for nested files
-                print("Searching recursively for .npy files...")
-                try:
-                    spec_files = list(self.spec_dir.glob("**/*.npy")) if self.spec_dir.exists() else []
-                    print(f"Found {len(spec_files)} .npy files in recursive search")
-                    
-                    # Process found files
-                    for spec_file in spec_files:
-                        # Extract the relative path components
-                        rel_path = spec_file.relative_to(self.spec_dir)
-                        base_name = rel_path.stem
-                        if base_name.endswith("_spec"):
-                            base_name = base_name.replace("_spec", "")
-                        
-                        # Check if spectrogram is in a subdirectory
-                        if len(rel_path.parts) > 1:
-                            # File is in a subdirectory
-                            subdir_name = rel_path.parts[0]
-                            # Look for label in the same subdirectory structure
-                            potential_label_files = [
-                                self.label_dir / subdir_name / f"{base_name}.lab",
-                                self.label_dir / subdir_name / f"{base_name}_lab.lab"
-                            ]
-                        else:
-                            # File is directly in the directory
-                            potential_label_files = [
-                                self.label_dir / f"{base_name}.lab",
-                                self.label_dir / f"{base_name}_lab.lab"
-                            ]
-                        
-                        # Try to find matching label file
-                        label_found = False
-                        for label_file in potential_label_files:
-                            if label_file.exists():
-                                self._process_file_pair(spec_file, label_file)
-                                label_found = True
-                                break
-                        
-                        if not label_found:
-                            # Try searching for the label file anywhere in label_dir
-                            label_search = list(self.label_dir.glob(f"**/{base_name}.lab")) + \
-                                         list(self.label_dir.glob(f"**/{base_name}_lab.lab"))
-                            if label_search:
-                                self._process_file_pair(spec_file, label_search[0])
-                            else:
-                                print(f"WARNING: No matching label file found for {spec_file}")
-                except Exception as e:
-                    print(f"Error during recursive search: {e}")
-        else:
-            # We have a nested directory structure - process each subdirectory
-            for subdir in subdirs:
-                print(f"Processing subdirectory: {subdir.name}")
-                spec_subdir = self.spec_dir / subdir.name
-                label_subdir = self.label_dir / subdir.name
-                
-                if not spec_subdir.exists():
-                    print(f"WARNING: Spectrogram subdirectory does not exist: {spec_subdir}")
-                    continue
-                
-                # Check if corresponding label subdirectory exists
-                if not label_subdir.exists():
-                    print(f"WARNING: Label subdirectory does not exist: {label_subdir}")
-                
-                # Find all spectrogram files in this subdirectory
-                spec_files = list(spec_subdir.glob("*.npy"))
-                print(f"  Found {len(spec_files)} spectrogram files in {subdir.name}")
-                spec_files_total += len(spec_files)
-                
-                # Get corresponding label files count
-                if label_subdir.exists():
-                    label_files = list(label_subdir.glob("*.lab"))
-                    label_files_total += len(label_files)
-                    print(f"  Found {len(label_files)} label files in {subdir.name}")
-                
-                for spec_file in spec_files:
-                    # Try multiple patterns for base name extraction
-                    base_name = spec_file.stem
-                    if base_name.endswith("_spec"):
-                        base_name = base_name.replace("_spec", "")
-                    
-                    # Try different label file naming patterns
-                    potential_label_files = []
-                    
-                    # First, try the label in the same subdirectory
-                    if label_subdir.exists():
-                        potential_label_files.extend([
-                            label_subdir / f"{base_name}.lab",
-                            label_subdir / f"{base_name}_lab.lab",
-                        ])
-                    
-                    # Then try looking for the label file directly in the main label directory
-                    potential_label_files.extend([
-                        self.label_dir / f"{base_name}.lab",
-                        self.label_dir / f"{base_name}_lab.lab",
-                    ])
-                    
-                    # Try searching for the label file in any other subdirectory
-                    for other_subdir in self.label_dir.glob("*"):
-                        if other_subdir.is_dir() and other_subdir.name != subdir.name:
-                            potential_label_files.extend([
-                                other_subdir / f"{base_name}.lab",
-                                other_subdir / f"{base_name}_lab.lab",
-                            ])
-                    
-                    # Try to find a matching label file from the potential candidates
-                    label_found = False
-                    for label_file in potential_label_files:
-                        if label_file.exists():
-                            self._process_file_pair(spec_file, label_file)
-                            label_found = True
-                            break
-                    
-                    if not label_found:
-                        print(f"WARNING: No matching label file found for {spec_file}")
+        print(f"Found {len(spec_files)} spectrogram files")
         
+        # Create a set of non-empty directory names for faster filtering
+        spec_dirs = set()
+        for f in spec_files:
+            if len(f.parts) > len(self.spec_dir.parts):
+                spec_dirs.add(f.parts[len(self.spec_dir.parts)])
+        
+        print(f"Found {len(spec_dirs)} non-empty subdirectories")
+        
+        # Process only non-empty directories
+        processed = 0
+        total_files = len(spec_files)
+        
+        # Process files in batches to show progress
+        batch_size = max(1, total_files // 10)  # Show progress roughly every 10%
+        
+        # Create lookup dictionary for label files to avoid repeated directory scanning
+        label_lookup = {}
+        for label_file in self.label_dir.glob("**/*.lab"):
+            key = label_file.stem
+            if key.endswith("_lab"):
+                key = key[:-4]  # Remove '_lab' suffix
+            label_lookup[key] = label_file
+        
+        print(f"Found {len(label_lookup)} label files")
+        
+        # Process all files efficiently
+        for i, spec_file in enumerate(spec_files):
+            # Show progress periodically
+            if i % batch_size == 0 or i == total_files - 1:
+                percent = (i / total_files) * 100
+                elapsed = time.time() - start_time
+                print(f"Processing: {percent:.1f}% ({i}/{total_files}) - Elapsed: {elapsed:.2f}s")
+            
+            # Extract file name for matching
+            base_name = spec_file.stem
+            if base_name.endswith("_spec"):
+                base_name = base_name[:-5]  # Remove '_spec' suffix
+                
+            # Find matching label file directly from lookup dictionary
+            label_file = label_lookup.get(base_name)
+            
+            if label_file and label_file.exists():
+                self._process_file_pair(spec_file, label_file)
+                processed += 1
+            else:
+                # Try alternative naming patterns only if not found in the lookup
+                found = False
+                for suffix in ["", "_lab"]:
+                    # Try with different subdirectories
+                    if spec_file.parent.name in spec_dirs:
+                        label_path = self.label_dir / spec_file.parent.name / f"{base_name}{suffix}.lab"
+                        if label_path.exists():
+                            self._process_file_pair(spec_file, label_path)
+                            processed += 1
+                            found = True
+                            break
+                if not found:
+                    # Try with base directory if not found in matching subdirectory
+                    for suffix in ["", "_lab"]:
+                        label_path = self.label_dir / f"{base_name}{suffix}.lab"
+                        if label_path.exists():
+                            self._process_file_pair(spec_file, label_path)
+                            processed += 1
+                            break
+                    
+        # Report final statistics
+        end_time = time.time()
+        duration = end_time - start_time
+        print(f"Processed {processed}/{total_files} files in {duration:.2f} seconds")
+            
         # Report on spectrogram dimensions to help identify CQT vs STFT
         if self.samples:
             # Analyze the first sample to get frequency dimension
@@ -220,7 +146,6 @@ class SynthDataset(Dataset):
             freq_dim = first_spec.shape[-1] if len(first_spec.shape) > 0 else 0
             spec_type = "CQT (Constant-Q Transform)" if freq_dim <= 256 else "STFT"
             print(f"Loaded {len(self.samples)} valid samples")
-            print(f"Total found: {spec_files_total} spectrogram files, {label_files_total} label files")
             print(f"Spectrogram frequency dimension: {freq_dim} (likely {spec_type})")
             
             # Report on class distribution
