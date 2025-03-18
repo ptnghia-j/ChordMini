@@ -70,16 +70,21 @@ class EncoderF(nn.Module):
     pe = positional_encoding(batch_size=x.shape[0], n_time=x.shape[1], n_feature=x.shape[2]).to(get_device())
     x = x + pe * self.pr  # use out-of-place addition instead of x += pe * self.pr
 
-    # Ensure x is set to require gradients so that checkpointing works properly
+    # Make sure x requires gradients
     if not x.requires_grad:
         x.requires_grad_()
 
     for attn, ff in zip(self.attn_layer, self.ff_layer):
       residual = x
+      
+      # IMPORTANT: Also ensure residual has requires_grad=True since it's passed to checkpoint
+      if not residual.requires_grad:
+          residual.requires_grad_()
+          
       def layer_fn(x, residual):
         out, _ = attn(x, x, x, need_weights=False)
         return ff(out + residual)
-      x = checkpoint.checkpoint(layer_fn, x, residual)  # Removed 'use_reentrant=False' parameter
+      x = checkpoint.checkpoint(layer_fn, x, residual)  # Both inputs now have requires_grad=True
     
     y = x.reshape(B, T, self.n_freq)
     y = self.dropout(y)
