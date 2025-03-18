@@ -1,15 +1,16 @@
 import yaml
 
 
-# TODO: add function should be changed
 class HParams(object):
     # Hyperparameter class using yaml
     def __init__(self, **kwargs):
         self.__dict__ = kwargs
 
     def add(self, **kwargs):
-        # change is needed - if key is existed, do not update.
-        self.__dict__.update(kwargs)
+        # If key already exists, do not update
+        for key, value in kwargs.items():
+            if key not in self.__dict__:
+                self.__dict__[key] = value
 
     def update(self, **kwargs):
         self.__dict__.update(kwargs)
