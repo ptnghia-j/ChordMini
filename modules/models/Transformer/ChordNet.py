@@ -85,8 +85,7 @@ class ChordNet(nn.Module):
     def predict(self, x, weight=None):
         logits, _ = self.forward(x, weight)
         if logits.ndim == 3:
-            logits = logits.mean(dim=1)
-
+            logits = logits.mean(dim=1)  # Averages over the 108-frame sequence
         return torch.argmax(logits, dim=-1)
 
 
