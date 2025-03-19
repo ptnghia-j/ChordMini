@@ -1,76 +1,58 @@
 import logging
-import os
 import sys
 import time
 
+# Create logger
+logger = logging.getLogger('ChordMini')
+logger.setLevel(logging.INFO)
 
-project_name = os.getcwd().split('/')[-1]
-_logger = logging.getLogger(project_name)
-_logger.addHandler(logging.StreamHandler())
+# Prevent propagation to root logger to avoid duplicate messages
+logger.propagate = False
 
-def _log_prefix():
+# Define custom formatter
+class CustomFormatter(logging.Formatter):
+    def format(self, record):
+        timestamp = time.strftime('%m-%d %H:%M:%S.%3d', 
+                                  time.localtime(record.created)) 
+        level = record.levelname[0]  # Only first letter of level
+        filename = record.filename
+        lineno = record.lineno
+        message = super().format(record)
+        return f'I ChordMini {timestamp} {filename}:{lineno}] {message}'
 
-    # Returns (filename, line number) for the stack frame.
-    def _get_file_line():
+# Create console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
 
-        # pylint: disable=protected-access
-        # noinspection PyProtectedMember
-        f = sys._getframe()
-        # pylint: enable=protected-access
-        our_file = f.f_code.co_filename
-        f = f.f_back
-        while f:
-            code = f.f_code
-            if code.co_filename != our_file:
-                return code.co_filename, f.f_lineno
-            f = f.f_back
-        return '<unknown>', 0
+# Add formatter to console handler
+formatter = CustomFormatter()
+console_handler.setFormatter(formatter)
 
-    # current time
-    now = time.time()
-    now_tuple = time.localtime(now)
-    now_millisecond = int(1e3 * (now % 1.0))
+# Add console handler to logger
+logger.addHandler(console_handler)
 
-    # current filename and line
-    filename, line = _get_file_line()
-    basename = os.path.basename(filename)
+# For compatibility with code using print-style logging
+def info(message):
+    """Log an info message"""
+    logger.info(message)
 
-    s = '%02d-%02d %02d:%02d:%02d.%03d %s:%d] ' % (
-        now_tuple[1],  # month
-        now_tuple[2],  # day
-        now_tuple[3],  # hour
-        now_tuple[4],  # min
-        now_tuple[5],  # sec
-        now_millisecond,
-        basename,
-        line)
+def warning(message):
+    """Log a warning message"""
+    logger.warning(message)
 
-    return s
+def error(message):
+    """Log an error message"""
+    logger.error(message)
 
+def debug(message):
+    """Log a debug message"""
+    logger.debug(message)
 
-def logging_verbosity(verbosity=0):
-    _logger.setLevel(verbosity)
-
-
-def debug(msg, *args, **kwargs):
-    _logger.debug('D ' + project_name + ' ' + _log_prefix() + msg, *args, **kwargs)
-
-
-def info(msg, *args, **kwargs):
-    _logger.info('I ' + project_name + ' ' + _log_prefix() + msg, *args, **kwargs)
-
-
-def warn(msg, *args, **kwargs):
-    _logger.warning('W ' + project_name + ' ' + _log_prefix() + msg, *args, **kwargs)
-
-
-def warning(msg, *args, **kwargs):
-    warn(msg, *args, **kwargs)
-
-
-def error(msg, *args, **kwargs):
-    _logger.error('E ' + project_name + ' ' + _log_prefix() + msg, *args, **kwargs)
-
-
-def fatal(msg, *args, **kwargs):
-    _logger.fatal('F ' + project_name + ' ' + _log_prefix() + msg, *args, **kwargs)
+def logging_verbosity(verbose_level):
+    """Set logging verbosity"""
+    if verbose_level == 0:
+        logger.setLevel(logging.WARNING)
+    elif verbose_level == 1:
+        logger.setLevel(logging.INFO)
+    elif verbose_level >= 2:
+        logger.setLevel(logging.DEBUG)
