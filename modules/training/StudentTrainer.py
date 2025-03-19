@@ -260,7 +260,6 @@ class StudentTrainer(BaseTrainer):
         return False
     
     def validate_with_metrics(self, val_loader):
-        """Run validation and return both loss and accuracy."""
         self.model.eval()
         val_loss = 0.0
         val_correct = 0
@@ -269,197 +268,90 @@ class StudentTrainer(BaseTrainer):
         with torch.no_grad():
             for batch in val_loader:
                 inputs, targets = self._process_batch(batch)
-                
-                # Apply normalization if specified
                 if self.normalization:
                     inputs = (inputs - self.normalization['mean']) / self.normalization['std']
-                
-                # Forward pass
                 outputs = self.model(inputs)
-                
-                # Handle temporal data - reshape if needed
                 if isinstance(outputs, tuple):
                     logits = outputs[0]
                 else:
                     logits = outputs
-                
-                # Check for shape mismatch and adjust accordingly
-                if logits.dim() > targets.dim():
-                    # If logits have more dimensions than targets
-                    if logits.dim() == 3:  # [batch, time, classes]
-                        # Average over time dimension if targets don't have time dimension
-                        if targets.dim() == 1:
-                            logits = logits.mean(dim=1)  # [batch, classes]
-                        elif targets.dim() == 2 and targets.shape[1] == 1:
-                            # If targets are [batch, 1], we squeeze
-                            targets = targets.squeeze(1)
-                            logits = logits.mean(dim=1)
-                        elif targets.dim() == 2 and targets.shape[1] > 1:
-                            # Need more sophisticated handling for multi-frame targets
-                            # For now, take majority vote across time
-                            if targets.shape[1] == logits.shape[1]:
-                                # Keep both dimensions but reshape for loss
-                                batch_size, seq_len = targets.shape
-                                # No need to flatten - compute metrics per frame
-                                targets_flat = targets.view(-1)
-                                logits_flat = logits.view(-1, logits.size(-1))
-                                # Compute loss on flattened data
-                                loss = self.loss_fn(logits_flat, targets_flat)
-                                # Get predictions
-                                preds = logits_flat.argmax(dim=1)
-                                # Track metrics
-                                val_correct += (preds == targets_flat).sum().item()
-                                val_total += targets_flat.size(0)
-                                val_loss += loss.item()
-                                continue  # Skip the rest of the loop for this special case
-                            else:
-                                # If time dimensions don't match, take majority vote
-                                targets = torch.mode(targets, dim=1)[0]
-                                logits = logits.mean(dim=1)
-                
-                # Calculate loss
+
+                # If logits are per-frame, flatten them together with targets
+                if logits.ndim == 3 and targets.ndim == 2:
+                    batch_size, time_steps, _ = logits.shape
+                    logits_flat = logits.reshape(-1, logits.size(-1))
+                    targets_flat = targets.reshape(-1)
+                    loss = self.loss_fn(logits_flat, targets_flat)
+                    preds_flat = torch.argmax(logits_flat, dim=1)
+                    val_correct += (preds_flat == targets_flat).sum().item()
+                    val_total += targets_flat.size(0)
+                    val_loss += loss.item()
+                    continue
+
                 loss = self.loss_fn(logits, targets)
                 val_loss += loss.item()
-                
-                # Get predictions
                 preds = logits.argmax(dim=1)
-                
-                # Track metrics
                 val_correct += (preds == targets).sum().item()
                 val_total += targets.size(0)
         
-        # Calculate average metrics
         avg_loss = val_loss / len(val_loader)
         val_acc = val_correct / val_total if val_total > 0 else 0
-        
-        self._log(f"Validation Loss: {avg_loss:.4f}, Accuracy: {val_acc:.4f}")
-        
+        self._log(f"Epoch Validation Loss: {avg_loss:.4f}, Accuracy: {val_acc:.4f}")
         self.model.train()
         return avg_loss, val_acc
-    
+
     def train(self, train_loader, val_loader=None):
-        """Enhanced training loop with early stopping and LR adjustment."""
         self.model.train()
-        
         for epoch in range(1, self.num_epochs + 1):
             self.timer.reset(); self.timer.start()
             epoch_loss = 0.0
             train_correct = 0
             train_total = 0
-            
-            # Training phase
             for batch_idx, batch in enumerate(train_loader):
                 inputs, targets = self._process_batch(batch)
-                
-                # Apply normalization if specified
                 if self.normalization:
                     inputs = (inputs - self.normalization['mean']) / self.normalization['std']
-                
-                # Forward and backward pass
                 self.optimizer.zero_grad(set_to_none=True)
-                
                 outputs = self.model(inputs)
-                
-                # Handle temporal data - reshape if needed
                 if isinstance(outputs, tuple):
                     logits = outputs[0]
                 else:
                     logits = outputs
-                
-                # Check for shape mismatch and adjust accordingly
-                if logits.dim() > targets.dim():
-                    # If logits have more dimensions than targets
-                    if logits.dim() == 3:  # [batch, time, classes]
-                        # Average over time dimension if targets don't have time dimension
-                        if targets.dim() == 1:
-                            logits = logits.mean(dim=1)  # [batch, classes]
-                        elif targets.dim() == 2 and targets.shape[1] == 1:
-                            # If targets are [batch, 1], we squeeze
-                            targets = targets.squeeze(1)
-                            logits = logits.mean(dim=1)
-                        elif targets.dim() == 2 and targets.shape[1] > 1:
-                            # Need more sophisticated handling for multi-frame targets
-                            # For now, take majority vote across time
-                            if targets.shape[1] == logits.shape[1]:
-                                # Keep both dimensions but reshape for loss
-                                batch_size, seq_len = targets.shape
-                                # Flatten for loss calculation
-                                targets_flat = targets.reshape(-1)
-                                logits_flat = logits.reshape(-1, logits.size(-1))
-                                # Compute loss on flattened data
-                                loss = self.loss_fn(logits_flat, targets_flat)
-                                # For metrics, get predictions on flattened data
-                                preds = logits_flat.argmax(dim=1)
-                                train_correct += (preds == targets_flat).sum().item()
-                                train_total += targets_flat.size(0)
-                                epoch_loss += loss.item()
-                                # Backward pass
-                                loss.backward()
-                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                                self.optimizer.step()
-                                
-                                # Log progress
-                                if batch_idx % 20 == 0:
-                                    self._log(f"Epoch {epoch}/{self.num_epochs} | Batch {batch_idx}/{len(train_loader)} | "
-                                            f"Loss: {loss.item():.4f}")
-                                
-                                # Skip the rest of the loop for this special case
-                                continue
-                            else:
-                                # If time dimensions don't match, take majority vote
-                                targets = torch.mode(targets, dim=1)[0]
-                                logits = logits.mean(dim=1)
-                
-                # Only use the logits for loss calculation - now properly shaped
+
+                # For per-frame supervision, flatten logits and targets when needed
+                if logits.ndim == 3 and targets.ndim == 2:
+                    logits = logits.reshape(-1, logits.size(-1))
+                    targets = targets.reshape(-1)
+
                 loss = self.loss_fn(logits, targets)
-                
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
-                
-                # Track metrics
                 preds = logits.argmax(dim=1)
                 train_correct += (preds == targets).sum().item()
                 train_total += targets.size(0)
                 epoch_loss += loss.item()
-                
-                # Log progress
                 if batch_idx % 20 == 0:
-                    self._log(f"Epoch {epoch}/{self.num_epochs} | Batch {batch_idx}/{len(train_loader)} | "
-                            f"Loss: {loss.item():.4f}")
+                    self._log(f"Epoch {epoch}/{self.num_epochs} | Batch {batch_idx}/{len(train_loader)} | Loss: {loss.item():.4f}")
             
-            # Calculate average training metrics
             avg_train_loss = epoch_loss / len(train_loader)
             train_acc = train_correct / train_total if train_total > 0 else 0
-            
             self.timer.stop()
-            self._log(f"Epoch {epoch}/{self.num_epochs} | Train Loss: {avg_train_loss:.4f} | "
-                    f"Train Accuracy: {train_acc:.4f} | Time: {self.timer.elapsed_time():.2f} sec")
-            
-            # Store training loss
+            self._log(f"Epoch {epoch}/{self.num_epochs} | Train Loss: {avg_train_loss:.4f} | Train Accuracy: {train_acc:.4f} | Time: {self.timer.elapsed_time():.2f} sec")
             self.train_losses.append(avg_train_loss)
             if self.animator:
                 self.animator.add(epoch, avg_train_loss)
             
-            # Validation phase
             if val_loader is not None:
                 val_loss, val_acc = self.validate_with_metrics(val_loader)
                 self.val_losses.append(val_loss)
-                
-                # Adjust learning rate based on validation accuracy
                 self._adjust_learning_rate(val_acc)
-                
-                # Save best model
                 self._save_best_model(val_acc, val_loss, epoch)
-                
-                # Check for early stopping
                 if self._check_early_stopping():
                     break
             
-            # Save periodic checkpoint
             if epoch % 5 == 0 or epoch == self.num_epochs:
                 checkpoint_path = os.path.join(self.checkpoint_dir, f"student_model_epoch_{epoch}.pth")
-                
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': self.model.state_dict(),
@@ -471,10 +363,8 @@ class StudentTrainer(BaseTrainer):
                     'mean': self.normalization['mean'] if self.normalization else None,
                     'std': self.normalization['std'] if self.normalization else None
                 }, checkpoint_path)
-                
                 self._log(f"Saved checkpoint at epoch {epoch}")
-        
-        # After training finishes
+
         self._print_loss_history()
         self._plot_loss_history()
 

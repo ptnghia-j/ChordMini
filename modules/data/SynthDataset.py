@@ -156,7 +156,11 @@ class SynthDataset(Dataset):
         
     def _process_file_pair(self, spec_file, label_file):
         """Process a pair of spectrogram and label files"""
-        # Load spectrogram
+        # Extract song_id from filename to track song boundaries
+        song_id = spec_file.stem
+        if song_id.endswith("_spec"):
+            song_id = song_id[:-5]
+            
         try:
             spec = np.load(spec_file)
             
@@ -192,7 +196,8 @@ class SynthDataset(Dataset):
                     
                 self.samples.append({
                     'spectro': spec,
-                    'chord_label': chord_label
+                    'chord_label': chord_label,
+                    'song_id': song_id  # Add song_id to track song boundaries
                 })
             else:
                 # Handle multi-frame spectrograms
@@ -211,7 +216,8 @@ class SynthDataset(Dataset):
                         
                     self.samples.append({
                         'spectro': spec[t],
-                        'chord_label': chord_label
+                        'chord_label': chord_label,
+                        'song_id': song_id  # Add song_id to track song boundaries
                     })
                 
             # Log the first file's dimensions in detail
@@ -258,32 +264,58 @@ class SynthDataset(Dataset):
         return "N"  # No chord found
     
     def _generate_segments(self):
-        """Generate sequence segments from the loaded samples"""
+        """Generate sequence segments from loaded samples, respecting song boundaries"""
         if not self.samples:
             print("WARNING: No samples to generate segments from")
             return
-            
-        if len(self.samples) <= self.seq_len:
-            print(f"WARNING: Not enough samples ({len(self.samples)}) to create segments of length {self.seq_len}")
-            # Create at least one segment using the available samples
-            self.segment_indices.append((0, len(self.samples)))
-            return
-            
-        # Generate segments with stride
-        num_samples = len(self.samples)
-        segment_start = 0
         
-        while segment_start + self.seq_len <= num_samples:
-            segment_end = segment_start + self.seq_len
-            self.segment_indices.append((segment_start, segment_end))
-            segment_start += self.stride
-            
-        print(f"Generated {len(self.segment_indices)} segments")
+        # Group samples by song_id
+        song_samples = {}
+        for i, sample in enumerate(self.samples):
+            song_id = sample['song_id']
+            if song_id not in song_samples:
+                song_samples[song_id] = []
+            song_samples[song_id].append(i)
+        
+        print(f"Found {len(song_samples)} unique songs")
+        
+        # Generate segments for each song separately
+        total_segments = 0
+        for song_id, indices in song_samples.items():
+            if len(indices) < self.seq_len:
+                # For very short songs, create a single segment with padding
+                if len(indices) > 0:
+                    self.segment_indices.append((indices[0], indices[0] + self.seq_len))
+                    total_segments += 1
+                continue
+                
+            # Create segments with stride, staying within this song's samples
+            segment_start_idx = 0
+            while segment_start_idx + self.seq_len <= len(indices):
+                segment_start = indices[segment_start_idx]
+                segment_end = segment_start + self.seq_len
+                
+                # Check if segment would cross song boundary
+                if segment_start_idx + self.seq_len <= len(indices):
+                    # Safe to create a full segment
+                    self.segment_indices.append((segment_start, segment_end))
+                    total_segments += 1
+                else:
+                    # Need to create a padded segment at song boundary
+                    self.segment_indices.append((segment_start, segment_start + self.seq_len))
+                    total_segments += 1
+                    
+                segment_start_idx += self.stride
+                if segment_start_idx >= len(indices):
+                    break
+        
+        print(f"Generated {total_segments} segments across {len(song_samples)} songs")
     
     def __len__(self):
         return len(self.segment_indices)
     
     def __getitem__(self, idx):
+        """Get a segment by index, with proper padding for song boundaries"""
         if not self.segment_indices:
             raise IndexError("Dataset is empty - no segments available")
             
@@ -291,29 +323,65 @@ class SynthDataset(Dataset):
         sequence = []
         label_seq = []
         
-        # Get the shape of a sample spectrogram to use for padding
+        # Get sample shape for padding
         first_spec = self.samples[0]['spectro']
+        
+        # Get song_id of the starting sample to check for song boundary
+        start_song_id = self.samples[seg_start]['song_id']
         
         for i in range(seg_start, seg_end):
             if i < len(self.samples):
                 sample_i = self.samples[i]
+                
+                # Check if we've crossed a song boundary
+                if sample_i['song_id'] != start_song_id:
+                    # We've crossed a song boundary, pad the rest of the sequence
+                    padding_needed = seg_end - i
+                    
+                    # Use last valid sample shape for padding
+                    if sequence:
+                        padding_shape = sequence[-1].shape
+                    else:
+                        padding_shape = first_spec.shape
+                        
+                    # Add padding
+                    for _ in range(padding_needed):
+                        sequence.append(torch.zeros(padding_shape, dtype=torch.float))
+                        label_seq.append(self.chord_to_idx.get("N", 0))
+                        
+                    break
+                    
+                # Regular case: add the sample to the sequence
                 spec_vec = torch.tensor(sample_i['spectro'], dtype=torch.float)
                 chord_label = sample_i['chord_label']
-                
-                # Handle case where chord_label might not be in mapping
                 chord_idx = self.chord_to_idx.get(chord_label, self.chord_to_idx.get("N", 0))
-                label_seq.append(chord_idx)
+                
                 sequence.append(spec_vec)
+                label_seq.append(chord_idx)
             else:
-                # Pad with zeros and a default label (here, using 0)
-                if not sequence:
-                    padding_shape = first_spec.shape
-                else:
+                # We've reached the end of the dataset, pad with zeros
+                if sequence:
                     padding_shape = sequence[-1].shape
+                else:
+                    padding_shape = first_spec.shape
+                    
                 sequence.append(torch.zeros(padding_shape, dtype=torch.float))
                 label_seq.append(self.chord_to_idx.get("N", 0))
         
-        # Return full frame-level label sequence instead of majority vote
+        # Ensure we have exactly seq_len frames
+        if len(sequence) < self.seq_len:
+            padding_needed = self.seq_len - len(sequence)
+            
+            if sequence:
+                padding_shape = sequence[-1].shape
+            else:
+                padding_shape = first_spec.shape
+                
+            for _ in range(padding_needed):
+                sequence.append(torch.zeros(padding_shape, dtype=torch.float))
+                label_seq.append(self.chord_to_idx.get("N", 0))
+        
+        # Return full frame-level label sequence
         sample_out = {
             'spectro': torch.stack(sequence, dim=0),       # [seq_len, feature_dim]
             'chord_idx': torch.tensor(label_seq, dtype=torch.long)  # [seq_len]
