@@ -213,283 +213,541 @@ def lab_file_error_modify(ref_labels):
     return ref_labels
 
 def root_majmin_score_calculation(valid_dataset, config, mean, std, device, model, model_type, verbose=False):
+    """
+    Calculate root and majmin scores for chord recognition using mir_eval framework.
+    Optimized for ChordNet model with frame-level predictions.
+    
+    Parameters:
+    -----------
+    valid_dataset: Dataset
+        Dataset with validation samples
+    config: HParams
+        Configuration parameters
+    mean, std: float
+        Normalization parameters
+    device: torch.device
+        Device for computation
+    model: nn.Module
+        ChordNet model
+    model_type: str
+        Model type identifier (should be 'ChordNet' in most cases)
+    verbose: bool
+        Whether to print detailed per-song scores
+        
+    Returns:
+    --------
+    score_list_dict: dict
+        Dictionary of score lists for metrics
+    song_length_list: list
+        List of song lengths
+    average_score_dict: dict
+        Dictionary of average scores for metrics
+    """
     valid_song_names = valid_dataset.song_names
     paths = valid_dataset.preprocessor.get_all_files()
 
     metrics_ = metrics()
     song_length_list = list()
+    
     for path in paths:
         song_name, lab_file_path, mp3_file_path, _ = path
         if not song_name in valid_song_names:
             continue
         try:
+            # Extract features from audio file
             n_timestep = config.model['timestep']
             feature, feature_per_second, song_length_second = audio_file_to_features(mp3_file_path, config)
             feature = feature.T
             feature = (feature - mean) / std
             time_unit = feature_per_second
 
+            # Pad features to match the timestep size
             num_pad = n_timestep - (feature.shape[0] % n_timestep)
             feature = np.pad(feature, ((0, num_pad), (0, 0)), mode="constant", constant_values=0)
             num_instance = feature.shape[0] // n_timestep
 
             start_time = 0.0
             lines = []
+            
+            # Generate chord predictions
             with torch.no_grad():
                 model.eval()
                 feature = torch.tensor(feature, dtype=torch.float32).unsqueeze(0).to(device)
+                
+                # Process each segment
                 for t in range(num_instance):
-                    if model_type == 'btc':
-                        encoder_output, _ = model.self_attn_layers(feature[:, n_timestep * t:n_timestep * (t + 1), :])
-                        prediction, _ = model.output_layer(encoder_output)
-                        prediction = prediction.squeeze()
-                    elif model_type == 'cnn' or model_type =='crnn':
-                        prediction, _, _, _ = model(feature[:, n_timestep * t:n_timestep * (t + 1), :], torch.randint(config.model['num_chords'], (n_timestep,)).to(device))
-                    for i in range(n_timestep):
+                    # Extract frame-level predictions for this segment
+                    prediction = model.predict(
+                        feature[:, n_timestep * t:n_timestep * (t + 1), :], 
+                        per_frame=True
+                    ).squeeze()
+                    
+                    # Ensure prediction is a 1D tensor
+                    if prediction.dim() == 0:
+                        prediction = prediction.unsqueeze(0)
+                        
+                    # Process each frame in the segment
+                    for i in range(prediction.size(0)):
+                        # Skip first frame of first segment
                         if t == 0 and i == 0:
                             prev_chord = prediction[i].item()
                             continue
+                            
+                        # Only record chord change points
                         if prediction[i].item() != prev_chord:
                             lines.append(
                                 '%.6f %.6f %s\n' % (
-                                    start_time, time_unit * (n_timestep * t + i), idx2voca_chord().get(prev_chord, "Unknown")))
+                                    start_time, 
+                                    time_unit * (n_timestep * t + i), 
+                                    idx2voca_chord().get(prev_chord, "Unknown")
+                                )
+                            )
                             start_time = time_unit * (n_timestep * t + i)
                             prev_chord = prediction[i].item()
+                            
+                        # Handle the final segment's final frame
                         if t == num_instance - 1 and i + num_pad == n_timestep:
                             if start_time != time_unit * (n_timestep * t + i):
                                 lines.append(
                                     '%.6f %.6f %s\n' % (
-                                        start_time, time_unit * (n_timestep * t + i), idx2voca_chord().get(prev_chord, "Unknown")))
+                                        start_time, 
+                                        time_unit * (n_timestep * t + i), 
+                                        idx2voca_chord().get(prev_chord, "Unknown")
+                                    )
+                                )
                             break
+            
+            # Write predictions to a temporary file
             pid = os.getpid()
-            tmp_path = 'tmp_' + str(pid) + '.lab'
+            tmp_path = f'tmp_{pid}.lab'
             with open(tmp_path, 'w') as f:
                 for line in lines:
                     f.write(line)
 
+            # Calculate scores for root and majmin metrics
             root_majmin = ['root', 'majmin']
             for m in root_majmin:
-                metrics_.score_list_dict[m].append(metrics_.score(metric=m, gt_path=lab_file_path, est_path=tmp_path))
+                metrics_.score_list_dict[m].append(
+                    metrics_.score(metric=m, gt_path=lab_file_path, est_path=tmp_path)
+                )
+                
             song_length_list.append(song_length_second)
+            
             if verbose:
                 for m in root_majmin:
-                    print('song name %s, %s score : %.4f' % (song_name, m, metrics_.score_list_dict[m][-1]))
-        except:
-            print('song name %s\' lab file error' % song_name)
+                    print('song name %s, %s score : %.4f' % (
+                        song_name, m, metrics_.score_list_dict[m][-1])
+                    )
+                    
+        except Exception as e:
+            print(f'song name {song_name} lab file error: {str(e)}')
 
-    tmp = song_length_list / np.sum(song_length_list)
+    # Calculate weighted average scores based on song length
+    tmp = np.array(song_length_list) / np.sum(song_length_list)
     for m in root_majmin:
         metrics_.average_score[m] = np.sum(np.multiply(metrics_.score_list_dict[m], tmp))
 
     return metrics_.score_list_dict, song_length_list, metrics_.average_score
 
 def root_majmin_score_calculation_crf(valid_dataset, config, mean, std, device, pre_model, model, model_type, verbose=False):
+    """
+    Calculate root and majmin scores for chord recognition using a CRF post-processing model.
+    Updated to work with ChordNet architecture with frame-level predictions.
+    
+    Parameters:
+    -----------
+    valid_dataset: Dataset
+        Dataset with validation samples
+    config: HParams
+        Configuration parameters
+    mean, std: float
+        Normalization parameters
+    device: torch.device
+        Device for computation
+    pre_model: nn.Module
+        Feature extraction model (ChordNet)
+    model: nn.Module
+        CRF model for sequence modeling
+    model_type: str
+        Model type identifier (should be 'ChordNet' in most cases)
+    verbose: bool
+        Whether to print detailed per-song scores
+        
+    Returns:
+    --------
+    score_list_dict, song_length_list, average_score_dict: as described in root_majmin_score_calculation
+    """
     valid_song_names = valid_dataset.song_names
     paths = valid_dataset.preprocessor.get_all_files()
 
     metrics_ = metrics()
     song_length_list = list()
+    
     for path in paths:
         song_name, lab_file_path, mp3_file_path, _ = path
         if not song_name in valid_song_names:
             continue
         try:
+            # Extract features from audio file
             n_timestep = config.model['timestep']
             feature, feature_per_second, song_length_second = audio_file_to_features(mp3_file_path, config)
             feature = feature.T
             feature = (feature - mean) / std
             time_unit = feature_per_second
 
+            # Pad features to match the timestep size
             num_pad = n_timestep - (feature.shape[0] % n_timestep)
             feature = np.pad(feature, ((0, num_pad), (0, 0)), mode="constant", constant_values=0)
             num_instance = feature.shape[0] // n_timestep
 
             start_time = 0.0
             lines = []
+            
+            # Generate chord predictions
             with torch.no_grad():
                 model.eval()
+                pre_model.eval()
                 feature = torch.tensor(feature, dtype=torch.float32).unsqueeze(0).to(device)
+                
+                # Process each segment
                 for t in range(num_instance):
-                    if (model_type == 'cnn') or (model_type == 'crnn') or (model_type == 'btc'):
-                        logits = pre_model(feature[:, n_timestep * t:n_timestep * (t + 1), :], torch.randint(config.model['num_chords'], (n_timestep,)).to(device))
-                        prediction, _ = model(logits, torch.randint(config.model['num_chords'], (n_timestep,)).to(device))
-                    else:
-                        raise NotImplementedError
+                    # First pass through ChordNet to get logits
+                    logits, _ = pre_model(feature[:, n_timestep * t:n_timestep * (t + 1), :])
+                    
+                    # Then apply CRF model for sequence modeling
+                    # Use random chord targets for CRF as placeholder (as per original code)
+                    rand_targets = torch.randint(config.model.get('num_chords', logits.size(-1)), 
+                                                (logits.size(1),)).to(device)
+                    prediction, _ = model(logits, rand_targets)
+                    
+                    # Process each frame in the segment
                     for i in range(n_timestep):
+                        # Skip first frame of first segment
                         if t == 0 and i == 0:
                             prev_chord = prediction[i].item()
                             continue
+                            
+                        # Only record chord change points
                         if prediction[i].item() != prev_chord:
                             lines.append(
                                 '%.6f %.6f %s\n' % (
-                                    start_time, time_unit * (n_timestep * t + i), idx2voca_chord().get(prev_chord, "Unknown")))
+                                    start_time, 
+                                    time_unit * (n_timestep * t + i), 
+                                    idx2voca_chord().get(prev_chord, "Unknown")
+                                )
+                            )
                             start_time = time_unit * (n_timestep * t + i)
                             prev_chord = prediction[i].item()
+                            
+                        # Handle the final segment's final frame
                         if t == num_instance - 1 and i + num_pad == n_timestep:
                             if start_time != time_unit * (n_timestep * t + i):
                                 lines.append(
                                     '%.6f %.6f %s\n' % (
-                                        start_time, time_unit * (n_timestep * t + i), idx2voca_chord().get(prev_chord, "Unknown")))
+                                        start_time, 
+                                        time_unit * (n_timestep * t + i), 
+                                        idx2voca_chord().get(prev_chord, "Unknown")
+                                    )
+                                )
                             break
+            
+            # Write predictions to a temporary file
             pid = os.getpid()
-            tmp_path = 'tmp_' + str(pid) + '.lab'
+            tmp_path = f'tmp_{pid}.lab'
             with open(tmp_path, 'w') as f:
                 for line in lines:
                     f.write(line)
 
+            # Calculate scores for root and majmin metrics
             root_majmin = ['root', 'majmin']
             for m in root_majmin:
-                metrics_.score_list_dict[m].append(metrics_.score(metric=m, gt_path=lab_file_path, est_path=tmp_path))
+                metrics_.score_list_dict[m].append(
+                    metrics_.score(metric=m, gt_path=lab_file_path, est_path=tmp_path)
+                )
+                
             song_length_list.append(song_length_second)
+            
             if verbose:
                 for m in root_majmin:
-                    print('song name %s, %s score : %.4f' % (song_name, m, metrics_.score_list_dict[m][-1]))
-        except:
-            print('song name %s\' lab file error' % song_name)
+                    print('song name %s, %s score : %.4f' % (
+                        song_name, m, metrics_.score_list_dict[m][-1])
+                    )
+                    
+        except Exception as e:
+            print(f'song name {song_name} lab file error: {str(e)}')
 
-    tmp = song_length_list / np.sum(song_length_list)
+    # Calculate weighted average scores based on song length
+    tmp = np.array(song_length_list) / np.sum(song_length_list)
     for m in root_majmin:
         metrics_.average_score[m] = np.sum(np.multiply(metrics_.score_list_dict[m], tmp))
 
     return metrics_.score_list_dict, song_length_list, metrics_.average_score
 
-
 def large_voca_score_calculation(valid_dataset, config, mean, std, device, model, model_type, verbose=False):
+    """
+    Calculate chord recognition scores using mir_eval framework.
+    Specifically optimized for ChordNet model with frame-level predictions.
+    
+    Parameters:
+    -----------
+    valid_dataset: Dataset
+        Dataset with validation samples
+    config: HParams
+        Configuration parameters
+    mean, std: float
+        Normalization parameters
+    device: torch.device
+        Device for computation
+    model: nn.Module
+        ChordNet model
+    model_type: str
+        Model type identifier (should be 'ChordNet' in most cases)
+    verbose: bool
+        Whether to print detailed per-song scores
+        
+    Returns:
+    --------
+    score_list_dict: dict
+        Dictionary of score lists for each metric
+    song_length_list: list
+        List of song lengths
+    average_score_dict: dict
+        Dictionary of average scores for each metric
+    """
     master_mapping = idx2voca_chord()
     valid_song_names = valid_dataset.song_names
     paths = valid_dataset.preprocessor.get_all_files()
 
     metrics_ = metrics()
     song_length_list = list()
+    
     for path in paths:
         song_name, lab_file_path, mp3_file_path, _ = path
         if not song_name in valid_song_names:
             continue
         try:
+            # Extract features from audio file
             n_timestep = config.model['timestep']
             feature, feature_per_second, song_length_second = audio_file_to_features(mp3_file_path, config)
             feature = feature.T
             feature = (feature - mean) / std
             time_unit = feature_per_second
 
+            # Pad features to match the timestep size
             num_pad = n_timestep - (feature.shape[0] % n_timestep)
             feature = np.pad(feature, ((0, num_pad), (0, 0)), mode="constant", constant_values=0)
             num_instance = feature.shape[0] // n_timestep
 
             start_time = 0.0
             lines = []
+            
+            # Generate chord predictions
             with torch.no_grad():
                 model.eval()
                 feature = torch.tensor(feature, dtype=torch.float32).unsqueeze(0).to(device)
+                
+                # Process each segment
                 for t in range(num_instance):
-                    if model_type == 'btc':
-                        encoder_output, _ = model.self_attn_layers(feature[:, n_timestep * t:n_timestep * (t + 1), :])
-                        prediction, _ = model.output_layer(encoder_output)
-                        prediction = prediction.squeeze()
-                    elif model_type == 'cnn' or model_type =='crnn':
-                        prediction, _, _, _ = model(feature[:, n_timestep * t:n_timestep * (t + 1), :], torch.randint(config.model['num_chords'], (n_timestep,)).to(device))
-                    for i in range(n_timestep):
+                    # Extract frame-level predictions for this segment
+                    prediction = model.predict(
+                        feature[:, n_timestep * t:n_timestep * (t + 1), :], 
+                        per_frame=True
+                    ).squeeze()
+                    
+                    # Ensure prediction is a 1D tensor
+                    if prediction.dim() == 0:
+                        prediction = prediction.unsqueeze(0)
+                    
+                    # Process each frame in the segment    
+                    for i in range(prediction.size(0)):
+                        # Skip first frame of first segment
                         if t == 0 and i == 0:
                             prev_chord = prediction[i].item()
                             continue
+                            
+                        # Only record chord change points
                         if prediction[i].item() != prev_chord:
                             lines.append(
                                 '%.6f %.6f %s\n' % (
-                                    start_time, time_unit * (n_timestep * t + i), master_mapping.get(prev_chord, "Unknown")))
+                                    start_time, 
+                                    time_unit * (n_timestep * t + i), 
+                                    master_mapping.get(prev_chord, "Unknown")
+                                )
+                            )
                             start_time = time_unit * (n_timestep * t + i)
                             prev_chord = prediction[i].item()
+                            
+                        # Handle the final segment's final frame
                         if t == num_instance - 1 and i + num_pad == n_timestep:
                             if start_time != time_unit * (n_timestep * t + i):
                                 lines.append(
                                     '%.6f %.6f %s\n' % (
-                                        start_time, time_unit * (n_timestep * t + i), master_mapping.get(prev_chord, "Unknown")))
+                                        start_time, 
+                                        time_unit * (n_timestep * t + i), 
+                                        master_mapping.get(prev_chord, "Unknown")
+                                    )
+                                )
                             break
+                            
+            # Write predictions to a temporary file
             pid = os.getpid()
-            tmp_path = 'tmp_' + str(pid) + '.lab'
+            tmp_path = f'tmp_{pid}.lab'
             with open(tmp_path, 'w') as f:
                 for line in lines:
                     f.write(line)
 
+            # Calculate scores for all metrics
             for m in metrics_.score_metrics:
-                metrics_.score_list_dict[m].append(metrics_.score(metric=m, gt_path=lab_file_path, est_path=tmp_path))
+                metrics_.score_list_dict[m].append(
+                    metrics_.score(metric=m, gt_path=lab_file_path, est_path=tmp_path)
+                )
+                
             song_length_list.append(song_length_second)
+            
             if verbose:
                 for m in metrics_.score_metrics:
-                    print('song name %s, %s score : %.4f' % (song_name, m, metrics_.score_list_dict[m][-1]))
-        except:
-            print('song name %s\' lab file error' % song_name)
+                    print('song name %s, %s score : %.4f' % (
+                        song_name, m, metrics_.score_list_dict[m][-1])
+                    )
+        except Exception as e:
+            print(f'song name {song_name} lab file error: {str(e)}')
 
-    tmp = song_length_list / np.sum(song_length_list)
+    # Calculate weighted average scores based on song length
+    tmp = np.array(song_length_list) / np.sum(song_length_list)
     for m in metrics_.score_metrics:
         metrics_.average_score[m] = np.sum(np.multiply(metrics_.score_list_dict[m], tmp))
 
     return metrics_.score_list_dict, song_length_list, metrics_.average_score
 
 def large_voca_score_calculation_crf(valid_dataset, config, mean, std, device, pre_model, model, model_type, verbose=False):
+    """
+    Calculate large vocabulary chord recognition scores using a CRF post-processing model.
+    Updated to work with ChordNet architecture with frame-level predictions.
+    
+    Parameters:
+    -----------
+    valid_dataset: Dataset
+        Dataset with validation samples
+    config: HParams
+        Configuration parameters
+    mean, std: float
+        Normalization parameters
+    device: torch.device
+        Device for computation
+    pre_model: nn.Module
+        Feature extraction model (ChordNet)
+    model: nn.Module
+        CRF model for sequence modeling
+    model_type: str
+        Model type identifier (should be 'ChordNet' in most cases)
+    verbose: bool
+        Whether to print detailed per-song scores
+        
+    Returns:
+    --------
+    score_list_dict, song_length_list, average_score_dict: as described in large_voca_score_calculation
+    """
     master_mapping = idx2voca_chord()
     valid_song_names = valid_dataset.song_names
     paths = valid_dataset.preprocessor.get_all_files()
 
     metrics_ = metrics()
     song_length_list = list()
+    
     for path in paths:
         song_name, lab_file_path, mp3_file_path, _ = path
         if not song_name in valid_song_names:
             continue
         try:
+            # Extract features from audio file
             n_timestep = config.model['timestep']
             feature, feature_per_second, song_length_second = audio_file_to_features(mp3_file_path, config)
             feature = feature.T
             feature = (feature - mean) / std
             time_unit = feature_per_second
 
+            # Pad features to match the timestep size
             num_pad = n_timestep - (feature.shape[0] % n_timestep)
             feature = np.pad(feature, ((0, num_pad), (0, 0)), mode="constant", constant_values=0)
             num_instance = feature.shape[0] // n_timestep
 
             start_time = 0.0
             lines = []
+            
+            # Generate chord predictions
             with torch.no_grad():
                 model.eval()
+                pre_model.eval()
                 feature = torch.tensor(feature, dtype=torch.float32).unsqueeze(0).to(device)
+                
+                # Process each segment
                 for t in range(num_instance):
-                    if (model_type == 'cnn') or (model_type == 'crnn') or (model_type == 'btc'):
-                        logits = pre_model(feature[:, n_timestep * t:n_timestep * (t + 1), :], torch.randint(config.model['num_chords'], (n_timestep,)).to(device))
-                        prediction, _ = model(logits, torch.randint(config.model['num_chords'], (n_timestep,)).to(device))
-                    else:
-                        raise NotImplementedError
+                    # First pass through ChordNet to get logits
+                    logits, _ = pre_model(feature[:, n_timestep * t:n_timestep * (t + 1), :])
+                    
+                    # Then apply CRF model for sequence modeling
+                    # Use random chord targets for CRF as placeholder (as per original code)
+                    rand_targets = torch.randint(config.model.get('num_chords', logits.size(-1)), 
+                                                (logits.size(1),)).to(device)
+                    prediction, _ = model(logits, rand_targets)
+                    
+                    # Process each frame in the segment
                     for i in range(n_timestep):
+                        # Skip first frame of first segment
                         if t == 0 and i == 0:
                             prev_chord = prediction[i].item()
                             continue
+                            
+                        # Only record chord change points
                         if prediction[i].item() != prev_chord:
                             lines.append(
                                 '%.6f %.6f %s\n' % (
-                                    start_time, time_unit * (n_timestep * t + i), master_mapping.get(prev_chord, "Unknown")))
+                                    start_time, 
+                                    time_unit * (n_timestep * t + i), 
+                                    master_mapping.get(prev_chord, "Unknown")
+                                )
+                            )
                             start_time = time_unit * (n_timestep * t + i)
                             prev_chord = prediction[i].item()
+                            
+                        # Handle the final segment's final frame
                         if t == num_instance - 1 and i + num_pad == n_timestep:
                             if start_time != time_unit * (n_timestep * t + i):
                                 lines.append(
                                     '%.6f %.6f %s\n' % (
-                                        start_time, time_unit * (n_timestep * t + i), master_mapping.get(prev_chord, "Unknown")))
+                                        start_time, 
+                                        time_unit * (n_timestep * t + i), 
+                                        master_mapping.get(prev_chord, "Unknown")
+                                    )
+                                )
                             break
+            
+            # Write predictions to a temporary file
             pid = os.getpid()
-            tmp_path = 'tmp_' + str(pid) + '.lab'
+            tmp_path = f'tmp_{pid}.lab'
             with open(tmp_path, 'w') as f:
                 for line in lines:
                     f.write(line)
 
+            # Calculate scores for all metrics
             for m in metrics_.score_metrics:
-                metrics_.score_list_dict[m].append(metrics_.score(metric=m, gt_path=lab_file_path, est_path=tmp_path))
+                metrics_.score_list_dict[m].append(
+                    metrics_.score(metric=m, gt_path=lab_file_path, est_path=tmp_path)
+                )
+                
             song_length_list.append(song_length_second)
+            
             if verbose:
                 for m in metrics_.score_metrics:
-                    print('song name %s, %s score : %.4f' % (song_name, m, metrics_.score_list_dict[m][-1]))
-        except:
-            print('song name %s\' lab file error' % song_name)
+                    print('song name %s, %s score : %.4f' % (
+                        song_name, m, metrics_.score_list_dict[m][-1])
+                    )
+                    
+        except Exception as e:
+            print(f'song name {song_name} lab file error: {str(e)}')
 
-    tmp = song_length_list / np.sum(song_length_list)
+    # Calculate weighted average scores based on song length
+    tmp = np.array(song_length_list) / np.sum(song_length_list)
     for m in metrics_.score_metrics:
         metrics_.average_score[m] = np.sum(np.multiply(metrics_.score_list_dict[m], tmp))
 
