@@ -60,26 +60,28 @@ class Tester:
                     logger.info(f"DEBUG: Logits mean: {logits.mean().item()}, std: {logits.std().item()}")
                     logger.info(f"DEBUG: First batch sample logits (max 5 values): {logits[0, :5]}")
                 
-                # Get predictions
-                preds = self.model.predict(inputs)
+                # Use per-frame predictions if targets have a time dimension
+                use_per_frame = targets.dim() > 1 and targets.shape[1] > 1
+                preds = self.model.predict(inputs, per_frame=use_per_frame)
                 
-                # IMPORTANT FIX: Handle sequence vs frame-level mismatch
-                # If targets are [batch_size, seq_len] and preds are [batch_size],
-                # we need to process them differently
-                if targets.dim() > 1 and preds.dim() == 1:
-                    # Model is making one prediction per sequence
-                    # For evaluation, we'll use the most common target in each sequence
-                    # as the ground truth label for that sequence
-                    seq_targets = []
-                    for i in range(targets.shape[0]):
-                        # Get the most common label in this sequence
-                        labels, counts = torch.unique(targets[i], return_counts=True)
-                        most_common_idx = torch.argmax(counts)
-                        seq_targets.append(labels[most_common_idx].item())
-                    targets_np = np.array(seq_targets)
-                    preds_np = preds.cpu().numpy()
+                # Process predictions based on their dimensions
+                if targets.dim() > 1:
+                    if preds.dim() > 1:
+                        # Both are frame-level: flatten both
+                        preds_np = preds.cpu().numpy().flatten()
+                        targets_np = targets.cpu().numpy().flatten()
+                    else:
+                        # Targets are frame-level but preds are segment-level
+                        # Use most common target for each sequence
+                        seq_targets = []
+                        for i in range(targets.shape[0]):
+                            labels, counts = torch.unique(targets[i], return_counts=True)
+                            most_common_idx = torch.argmax(counts)
+                            seq_targets.append(labels[most_common_idx].item())
+                        targets_np = np.array(seq_targets)
+                        preds_np = preds.cpu().numpy()
                 else:
-                    # Standard case - both are the same shape
+                    # Standard case - both are segment-level
                     preds_np = preds.cpu().numpy().flatten()
                     targets_np = targets.cpu().numpy().flatten()
                 
@@ -354,6 +356,14 @@ def main():
     # Invert: keys = chord names, values = unique indices.
     chord_mapping = {chord: idx for idx, chord in master_mapping.items()}
     
+    # Verify mapping of special chords - this ensures "N" is properly mapped
+    logger.info(f"Mapping of special chords:")
+    for special_chord in ["N", "X"]:
+        if special_chord in chord_mapping:
+            logger.info(f"  '{special_chord}' mapped to index {chord_mapping[special_chord]}")
+        else:
+            logger.warning(f"  '{special_chord}' not found in mapping!")
+    
     # Log mapping info
     logger.info(f"\nUsing chord mapping from chords.py with {len(chord_mapping)} unique chords")
     logger.info(f"Sample chord mapping: {dict(list(chord_mapping.items())[:5])}")
@@ -366,6 +376,12 @@ def main():
         seq_len=config.training['seq_len'], 
         stride=config.training['seq_stride']
     )
+    
+    # After loading dataset, verify chord distribution matches expected mapping
+    chord_counter = Counter([sample['chord_label'] for sample in synth_dataset.samples])
+    logger.info("\nChord distribution in loaded dataset:")
+    n_chord_count = chord_counter.get("N", 0)
+    logger.info(f"'N' chord count: {n_chord_count} ({n_chord_count/len(synth_dataset.samples)*100:.2f}% of total)")
     
     logger.info(f"Total synthesized samples: {len(synth_dataset)}")
     
@@ -403,10 +419,10 @@ def main():
     
     # Get the number of unique chords in our dataset for the output layer
     num_unique_chords = len(chord_mapping)
-    if num_unique_chords > n_classes:
-        logger.warning(f"WARNING: Dataset has {num_unique_chords} unique chords, but model is configured for {n_classes} classes!")
-        logger.warning(f"Increasing n_classes to match dataset: {num_unique_chords}")
-        n_classes = num_unique_chords
+    
+    # Initialize n_classes with the number of unique chords
+    n_classes = num_unique_chords
+    
     logger.info(f"Output classes: {n_classes}")
     
     # Determine n_group based on frequency dimension for CQT vs STFT

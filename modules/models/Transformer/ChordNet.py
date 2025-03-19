@@ -83,11 +83,30 @@ class ChordNet(nn.Module):
 
         return logits, o if loss is None else (logits, loss)
 
-    def predict(self, x, weight=None):
+    def predict(self, x, weight=None, per_frame=False):
+        """
+        Make chord predictions from input spectrograms.
+        
+        Args:
+            x: Input tensor
+            weight: Optional weight parameter
+            per_frame: If True, return predictions per frame (time step)
+                      If False (default), average over time dimension
+        
+        Returns:
+            Tensor of predictions with shape [batch] or [batch, time] depending on per_frame
+        """
         logits, _ = self.forward(x, weight)
+        
+        # Return per-frame predictions if requested
+        if per_frame and logits.ndim == 3:
+            return torch.argmax(logits, dim=2)  # [batch, time]
+        
+        # Otherwise use the standard approach with averaging
         if logits.ndim == 3:
-            logits = logits.mean(dim=1)  # Averages over the 108-frame sequence
-        return torch.argmax(logits, dim=-1)
+            logits = logits.mean(dim=1)  # Average over time dimension
+        
+        return torch.argmax(logits, dim=-1)  # [batch]
 
 
 if __name__ == '__main__':
