@@ -9,27 +9,7 @@ import torch
 import os
 import audioread
 
-idx2chord = ['C', 'C:min', 'C#', 'C#:min', 'D', 'D:min', 'D#', 'D#:min', 'E', 'E:min', 'F', 'F:min', 'F#',
-             'F#:min', 'G', 'G:min', 'G#', 'G#:min', 'A', 'A:min', 'A#', 'A#:min', 'B', 'B:min', 'N']
-
-root_list = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-quality_list = ['min', 'maj', 'dim', 'aug', 'min6', 'maj6', 'min7', 'minmaj7', 'maj7', '7', 'dim7', 'hdim7', 'sus2', 'sus4']
-
-def idx2voca_chord():
-    idx2voca_chord = {}
-    idx2voca_chord[169] = 'N'
-    idx2voca_chord[168] = 'X'
-    for i in range(168):
-        root = i // 14
-        root = root_list[root]
-        quality = i % 14
-        quality = quality_list[quality]
-        if i % 14 != 1:
-            chord = root + ':' + quality
-        else:
-            chord = root
-        idx2voca_chord[i] = chord
-    return idx2voca_chord
+from modules.utils.chords import idx2voca_chord
 
 def audio_file_to_features(audio_file, config):
     import os
@@ -272,14 +252,14 @@ def root_majmin_score_calculation(valid_dataset, config, mean, std, device, mode
                         if prediction[i].item() != prev_chord:
                             lines.append(
                                 '%.6f %.6f %s\n' % (
-                                    start_time, time_unit * (n_timestep * t + i), idx2chord[prev_chord]))
+                                    start_time, time_unit * (n_timestep * t + i), idx2voca_chord().get(prev_chord, "Unknown")))
                             start_time = time_unit * (n_timestep * t + i)
                             prev_chord = prediction[i].item()
                         if t == num_instance - 1 and i + num_pad == n_timestep:
                             if start_time != time_unit * (n_timestep * t + i):
                                 lines.append(
                                     '%.6f %.6f %s\n' % (
-                                        start_time, time_unit * (n_timestep * t + i), idx2chord[prev_chord]))
+                                        start_time, time_unit * (n_timestep * t + i), idx2voca_chord().get(prev_chord, "Unknown")))
                             break
             pid = os.getpid()
             tmp_path = 'tmp_' + str(pid) + '.lab'
@@ -342,14 +322,14 @@ def root_majmin_score_calculation_crf(valid_dataset, config, mean, std, device, 
                         if prediction[i].item() != prev_chord:
                             lines.append(
                                 '%.6f %.6f %s\n' % (
-                                    start_time, time_unit * (n_timestep * t + i), idx2chord[prev_chord]))
+                                    start_time, time_unit * (n_timestep * t + i), idx2voca_chord().get(prev_chord, "Unknown")))
                             start_time = time_unit * (n_timestep * t + i)
                             prev_chord = prediction[i].item()
                         if t == num_instance - 1 and i + num_pad == n_timestep:
                             if start_time != time_unit * (n_timestep * t + i):
                                 lines.append(
                                     '%.6f %.6f %s\n' % (
-                                        start_time, time_unit * (n_timestep * t + i), idx2chord[prev_chord]))
+                                        start_time, time_unit * (n_timestep * t + i), idx2voca_chord().get(prev_chord, "Unknown")))
                             break
             pid = os.getpid()
             tmp_path = 'tmp_' + str(pid) + '.lab'
@@ -375,7 +355,7 @@ def root_majmin_score_calculation_crf(valid_dataset, config, mean, std, device, 
 
 
 def large_voca_score_calculation(valid_dataset, config, mean, std, device, model, model_type, verbose=False):
-    idx2voca = idx2voca_chord()
+    master_mapping = idx2voca_chord()
     valid_song_names = valid_dataset.song_names
     paths = valid_dataset.preprocessor.get_all_files()
 
@@ -415,14 +395,14 @@ def large_voca_score_calculation(valid_dataset, config, mean, std, device, model
                         if prediction[i].item() != prev_chord:
                             lines.append(
                                 '%.6f %.6f %s\n' % (
-                                    start_time, time_unit * (n_timestep * t + i), idx2voca[prev_chord]))
+                                    start_time, time_unit * (n_timestep * t + i), master_mapping.get(prev_chord, "Unknown")))
                             start_time = time_unit * (n_timestep * t + i)
                             prev_chord = prediction[i].item()
                         if t == num_instance - 1 and i + num_pad == n_timestep:
                             if start_time != time_unit * (n_timestep * t + i):
                                 lines.append(
                                     '%.6f %.6f %s\n' % (
-                                        start_time, time_unit * (n_timestep * t + i), idx2voca[prev_chord]))
+                                        start_time, time_unit * (n_timestep * t + i), master_mapping.get(prev_chord, "Unknown")))
                             break
             pid = os.getpid()
             tmp_path = 'tmp_' + str(pid) + '.lab'
@@ -446,7 +426,7 @@ def large_voca_score_calculation(valid_dataset, config, mean, std, device, model
     return metrics_.score_list_dict, song_length_list, metrics_.average_score
 
 def large_voca_score_calculation_crf(valid_dataset, config, mean, std, device, pre_model, model, model_type, verbose=False):
-    idx2voca = idx2voca_chord()
+    master_mapping = idx2voca_chord()
     valid_song_names = valid_dataset.song_names
     paths = valid_dataset.preprocessor.get_all_files()
 
@@ -485,14 +465,14 @@ def large_voca_score_calculation_crf(valid_dataset, config, mean, std, device, p
                         if prediction[i].item() != prev_chord:
                             lines.append(
                                 '%.6f %.6f %s\n' % (
-                                    start_time, time_unit * (n_timestep * t + i), idx2voca[prev_chord]))
+                                    start_time, time_unit * (n_timestep * t + i), master_mapping.get(prev_chord, "Unknown")))
                             start_time = time_unit * (n_timestep * t + i)
                             prev_chord = prediction[i].item()
                         if t == num_instance - 1 and i + num_pad == n_timestep:
                             if start_time != time_unit * (n_timestep * t + i):
                                 lines.append(
                                     '%.6f %.6f %s\n' % (
-                                        start_time, time_unit * (n_timestep * t + i), idx2voca[prev_chord]))
+                                        start_time, time_unit * (n_timestep * t + i), master_mapping.get(prev_chord, "Unknown")))
                             break
             pid = os.getpid()
             tmp_path = 'tmp_' + str(pid) + '.lab'

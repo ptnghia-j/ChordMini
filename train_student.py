@@ -15,6 +15,7 @@ from modules.utils.hparams import HParams
 import argparse
 import glob
 from pathlib import Path
+from modules.utils.chords import idx2voca_chord  # NEW import
 
 class ListSampler(Sampler):
     def __init__(self, indices):
@@ -62,11 +63,27 @@ class Tester:
                 # Get predictions
                 preds = self.model.predict(inputs)
                 
-                # Convert and store (flatten to ensure hashable types)
-                preds_np = preds.cpu().numpy().flatten()
-                targets_np = targets.cpu().numpy().flatten()
+                # IMPORTANT FIX: Handle sequence vs frame-level mismatch
+                # If targets are [batch_size, seq_len] and preds are [batch_size],
+                # we need to process them differently
+                if targets.dim() > 1 and preds.dim() == 1:
+                    # Model is making one prediction per sequence
+                    # For evaluation, we'll use the most common target in each sequence
+                    # as the ground truth label for that sequence
+                    seq_targets = []
+                    for i in range(targets.shape[0]):
+                        # Get the most common label in this sequence
+                        labels, counts = torch.unique(targets[i], return_counts=True)
+                        most_common_idx = torch.argmax(counts)
+                        seq_targets.append(labels[most_common_idx].item())
+                    targets_np = np.array(seq_targets)
+                    preds_np = preds.cpu().numpy()
+                else:
+                    # Standard case - both are the same shape
+                    preds_np = preds.cpu().numpy().flatten()
+                    targets_np = targets.cpu().numpy().flatten()
                 
-                # Count distribution using flat lists
+                # Count distribution using the adjusted arrays
                 pred_counter.update(preds_np.tolist())
                 target_counter.update(targets_np.tolist())
                 
@@ -332,58 +349,16 @@ def main():
     if spec_count == 0 or label_count == 0:
         raise RuntimeError(f"ERROR: Missing spectrogram or label files. Found {spec_count} spectrogram files and {label_count} label files.")
     
-    # Build a chord mapping from the synthesized data
-    try:
-        temp_dataset = SynthDataset(synth_spec_dir, synth_label_dir, chord_mapping=None, seq_len=1, stride=1)
-        if not temp_dataset.samples:
-            raise RuntimeError("No valid samples were loaded from the dataset directories")
-        
-        unique_chords = set(sample['chord_label'] for sample in temp_dataset.samples)
-        chord_mapping = {chord: idx for idx, chord in enumerate(sorted(unique_chords))}
-        
-        # Make sure 'N' is included for no-chord label
-        if "N" not in chord_mapping:
-            chord_mapping["N"] = len(chord_mapping)
-            
-        logger.info(f"Generated chord mapping (total labels): {len(chord_mapping)}")
-        logger.info(f"Sample chord mapping: {dict(list(chord_mapping.items())[:5])}")
-    except Exception as e:
-        logger.error(f"Error loading dataset: {e}")
-        logger.error("Check that the data directories contain valid spectrogram and label files.")
-        logger.info("\nDirectory contents:")
-        logger.info(f"Spectrogram directory ({synth_spec_dir}):")
-        try:
-            # Try to find subdirectories
-            subdirs = [d for d in os.listdir(synth_spec_dir) if os.path.isdir(os.path.join(synth_spec_dir, d))]
-            logger.info(f"  Subdirectories: {subdirs[:10]}")
-            
-            # Check for files in first few subdirectories
-            for subdir in subdirs[:3]:
-                subdir_path = os.path.join(synth_spec_dir, subdir)
-                files = os.listdir(subdir_path)[:10]
-                logger.info(f"  Files in {subdir}: {files}")
-        except Exception as e:
-            logger.info(f"  Could not list directory contents: {e}")
-        
-        logger.info(f"Label directory ({synth_label_dir}):")
-        try:
-            # Try to find subdirectories
-            subdirs = [d for d in os.listdir(synth_label_dir) if os.path.isdir(os.path.join(synth_label_dir, d))]
-            logger.info(f"  Subdirectories: {subdirs[:10]}")
-            
-            # Check for files in first few subdirectories
-            for subdir in subdirs[:3]:
-                subdir_path = os.path.join(synth_label_dir, subdir)
-                files = os.listdir(subdir_path)[:10]
-                logger.info(f"  Files in {subdir}: {files}")
-        except Exception as e:
-            logger.info(f"  Could not list directory contents: {e}")
+    # Use the mapping defined in chords.py and invert it so that it is chord->index.
+    master_mapping = idx2voca_chord()
+    # Invert: keys = chord names, values = unique indices.
+    chord_mapping = {chord: idx for idx, chord in master_mapping.items()}
     
-    # Set n_classes based directly on the chord mapping so they always match
-    n_classes = len(chord_mapping)
-    logger.info(f"n_classes: {n_classes} based on dataset.")
+    # Log mapping info
+    logger.info(f"\nUsing chord mapping from chords.py with {len(chord_mapping)} unique chords")
+    logger.info(f"Sample chord mapping: {dict(list(chord_mapping.items())[:5])}")
     
-    # Load synthesized dataset with the chord mapping
+    # Load synthesized dataset with this chord mapping
     synth_dataset = SynthDataset(
         synth_spec_dir,
         synth_label_dir, 

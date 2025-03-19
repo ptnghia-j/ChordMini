@@ -467,7 +467,7 @@ class Chords:
 
     def convert_to_id_voca(self, root, quality):
         if root == -1:
-            return 169
+            return 169  # "N" (no chord) is mapped to 169
         else:
             if quality == 'min':
                 return root * 14
@@ -498,7 +498,7 @@ class Chords:
             elif quality == 'sus4':
                 return root * 14 + 13
             else:
-                return 168
+                return 168  # Unknown chord mapped to 168
 
     def get_converted_chord_voca(self, filename):
         loaded_chord = self.load_chords(filename)
@@ -539,3 +539,23 @@ class Chords:
                 if ref_labels[i].find('min') != -1:
                     ref_labels[i] = ref_labels[i][:ref_labels[i].find('min')] + ':' + ref_labels[i][ref_labels[i].find('min'):]
         return ref_labels
+
+def idx2voca_chord():
+    """
+    Create a mapping from chord index to chord label.
+    Adjust the mapping as needed to match your evaluation conventions.
+    """
+    # For example, assuming indices 0..167 map to chords via convert_to_id_voca,
+    # and 168, 169 map to unknown and no-chord respectively.
+    mapping = {}
+    for i in range(168):
+        # This assumes a predefined order; customize as needed.
+        root = i // 14
+        quality_idx = i % 14
+        quality_list = ['min', 'maj', 'dim', 'aug', 'min6', 'maj6', 'min7', 'minmaj7', 'maj7', '7', 'dim7', 'hdim7', 'sus2', 'sus4']
+        # Use chords from PITCH_CLASS defined in this module.
+        label = PITCH_CLASS[root] + (":" + quality_list[quality_idx] if quality_idx != 1 else "")
+        mapping[i] = label
+    mapping[168] = "X"
+    mapping[169] = "N"
+    return mapping
