@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: student-training-job
+  name: chord-mini
   namespace: csuf-titans
   labels:
     app: chord-student-training

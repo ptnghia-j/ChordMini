@@ -511,10 +511,12 @@ def main():
             ratio = dist_counter.get(ch, 0) / total_samples * 100
             logger.info(f"Chord: {ch}, Count: {dist_counter.get(ch, 0)}, Percentage: {ratio:.4f}%")
         
-        # Compute class weights - inversely proportional to frequency
-        class_weights = np.array([0.0 if ch not in dist_counter else total_samples / max(dist_counter.get(ch, 1), 1)
-                                for ch in sorted_chords], dtype=np.float32)
-        logger.info(f"Generated class weights for {len(class_weights)} classes")
+        # Compute class weights using log(inverse frequency)
+        class_weights = np.array([
+            0.0 if ch not in dist_counter else np.log(total_samples / max(dist_counter.get(ch, 1)) + 1)
+            for ch in sorted_chords
+        ], dtype=np.float32)
+        logger.info(f"Generated class weights for {len(class_weights)} classes using log(inverse frequency)")
     else:
         logger.info("Using focal loss instead of class weights for handling imbalance")
 
