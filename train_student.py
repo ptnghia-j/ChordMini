@@ -224,6 +224,16 @@ def main():
                         help='Model type for evaluation') 
     parser.add_argument('--storage_root', type=str, default=None, 
                         help='Root directory for data storage (overrides config value)')
+    parser.add_argument('--use_warmup', action='store_true',
+                       help='Use warm-up learning rate scheduling')
+    parser.add_argument('--warmup_epochs', type=int, default=5,
+                       help='Number of warm-up epochs')
+    parser.add_argument('--warmup_start_lr', type=float, default=None,
+                       help='Initial learning rate for warm-up (default: 1/10 of base LR)')
+    # Add new arguments for smooth LR scheduling
+    parser.add_argument('--lr_schedule', type=str, choices=['cosine', 'linear_decay', 'one_cycle', 'cosine_warm_restarts'], default=None,
+                       help='Learning rate schedule type (default: validation-based)')
+    
     args = parser.parse_args()
 
     # Load configuration from YAML
@@ -369,13 +379,18 @@ def main():
     logger.info(f"\nUsing chord mapping from chords.py with {len(chord_mapping)} unique chords")
     logger.info(f"Sample chord mapping: {dict(list(chord_mapping.items())[:5])}")
 
-    # Load synthesized dataset with this chord mapping
+    # Compute frame_duration from configuration if available,
+    # otherwise default to 0.1 s
+    frame_duration = config.feature.get('hop_duration', 0.1)
+    
+    # Load synthesized dataset with the provided chord mapping and frame_duration
     synth_dataset = SynthDataset(
         synth_spec_dir,
         synth_label_dir, 
         chord_mapping=chord_mapping, 
         seq_len=config.training['seq_len'], 
-        stride=config.training['seq_stride']
+        stride=config.training['seq_stride'],
+        frame_duration=frame_duration           # New parameter passed here
     )
 
     # After loading dataset, verify chord distribution matches expected mapping
@@ -523,7 +538,7 @@ def main():
     
     logger.info(f"Checkpoints will be saved to: {checkpoints_dir}")
 
-    # Create our StudentTrainer (with class weights padding)
+    # Create our StudentTrainer with new smooth scheduler parameter
     trainer = StudentTrainer(
         model, 
         optimizer,
@@ -536,7 +551,12 @@ def main():
         lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
         min_lr=config.training.get('min_lr', 5e-6),
         checkpoint_dir=checkpoints_dir,
-        logger=logger
+        logger=logger,
+        use_warmup=args.use_warmup,
+        warmup_epochs=args.warmup_epochs,
+        warmup_start_lr=args.warmup_start_lr,
+        warmup_end_lr=config.training['learning_rate'],  # Use config LR as warmup end point
+        lr_schedule_type=args.lr_schedule  # Pass the scheduler type
     )
 
     # Set chord mapping for saving with the checkpoint

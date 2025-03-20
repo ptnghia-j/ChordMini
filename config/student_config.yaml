@@ -9,13 +9,20 @@ training:
   epsilon: 1.0e-9
   early_stopping_patience: 9
   seq_len: 108
-  seq_stride: 54
+  seq_stride: 36
   save_checkpoint_interval: 10
   min_lr: 5.0e-6
   lr_decay_factor: 0.95
+  # Warm-up parameters
+  use_warmup: false
+  warmup_epochs: 5
+  warmup_start_lr: 1.0e-5  # 1/10 of learning_rate by default
+  # New LR schedule parameter (optional)
+  lr_schedule: null  # Can be 'cosine', 'linear_decay', 'one_cycle', or 'cosine_warm_restarts'
+
 # Model hyperparameters
 model:
-  n_group: 4          # GroupNorm groups - adjusted to work with n_freq=144
+  n_group: 4          # Adjust based on frequency dimension (see below)
   f_layer: 3          # Frequency attention layers - increased to better match BTC
   f_head: 6           # Frequency attention heads - increased for more capacity
   t_layer: 3          # Temporal attention layers - increased to better match BTC
@@ -24,6 +31,19 @@ model:
   d_head: 6           # Decoder heads - increased for more capacity
   dropout: 0.3        # Dropout rate - kept the same
   use_chord_aware_loss: false
+
+mp3:
+  song_hz: 22050
+  inst_len: 10.0      # Updated to match teacher
+  skip_interval: 5.0  # Added from teacher
+
+feature:
+  n_bins: 144         # Updated to match teacher
+  bins_per_octave: 24 # Updated to match teacher
+  hop_length: 2048    # Updated to match teacher
+  hop_duration: 0.0928  # Computed as 2048 / 22050 ≈ 0.0928 seconds per frame
+  large_voca: false   # Matches teacher
+
 # Data paths
 paths:
   # Storage root path - can be changed to point to different data storage locations

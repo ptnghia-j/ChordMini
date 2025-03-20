@@ -20,13 +20,15 @@ class SynthDataset(Dataset):
         chord_mapping: Dictionary mapping chord names to indices
         seq_len: Length of each sequence in frames
         stride: Step between consecutive sequences (if None, use seq_len for non-overlapping)
+        frame_duration: Duration of each frame in seconds
     """
-    def __init__(self, spec_dir, label_dir, chord_mapping=None, seq_len=10, stride=None):
+    def __init__(self, spec_dir, label_dir, chord_mapping=None, seq_len=10, stride=None, frame_duration=0.1):
         self.spec_dir = Path(spec_dir)
         self.label_dir = Path(label_dir)
         self.chord_mapping = chord_mapping
         self.seq_len = seq_len
         self.stride = stride if stride is not None else seq_len
+        self.frame_duration = frame_duration   # New parameter for frame-level duration
         self.samples = []
         self.segment_indices = []
         
@@ -202,8 +204,8 @@ class SynthDataset(Dataset):
             else:
                 # Handle multi-frame spectrograms
                 for t in range(time_frames):
-                    # Find the chord label for this time frame
-                    frame_time = t * 0.1  # Assuming 0.1s per frame
+                    # Use the supplied frame_duration rather than a fixed 0.1 s
+                    frame_time = t * self.frame_duration   # Modified line
                     chord_label = self._find_chord_at_time(chord_labels, frame_time)
                     
                     # Make sure the chord label exists in the mapping
