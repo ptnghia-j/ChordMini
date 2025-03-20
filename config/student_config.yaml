@@ -1,8 +1,8 @@
 # Student model configuration
 # Training hyperparameters
 training:
-  batch_size: 64
-  max_epochs: 50
+  batch_size: 128
+  max_epochs: 100
   learning_rate: 1.0e-4
   weight_decay: 1.0e-5
   betas: [0.9, 0.98]
@@ -15,7 +15,7 @@ training:
   lr_decay_factor: 0.95
   # Warm-up parameters
   use_warmup: false
-  warmup_epochs: 5
+  warmup_epochs: 10
   warmup_start_lr: 1.0e-5  # 1/10 of learning_rate by default
   # New LR schedule parameter (optional)
   lr_schedule: null  # Can be 'cosine', 'linear_decay', 'one_cycle', or 'cosine_warm_restarts'
