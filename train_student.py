@@ -234,6 +234,14 @@ def main():
     parser.add_argument('--lr_schedule', type=str, choices=['cosine', 'linear_decay', 'one_cycle', 'cosine_warm_restarts'], default=None,
                        help='Learning rate schedule type (default: validation-based)')
     
+    # Add focal loss arguments
+    parser.add_argument('--use_focal_loss', action='store_true',
+                       help='Use focal loss to handle class imbalance')
+    parser.add_argument('--focal_gamma', type=float, default=2.0,
+                       help='Gamma parameter for focal loss (default: 2.0)')
+    parser.add_argument('--focal_alpha', type=float, default=None,
+                       help='Alpha parameter for focal loss (default: None)')
+    
     args = parser.parse_args()
 
     # Load configuration from YAML
@@ -491,21 +499,24 @@ def main():
                                eps=config.training['epsilon'])
 
     # Calculate class weights to handle imbalanced data
-    dist_counter = Counter([sample['chord_label'] for sample in synth_dataset.samples])
-    sorted_chords = sorted(chord_mapping.keys())
-    total_samples = sum(dist_counter.values())
-    
-    logger.info(f"Total chord instances: {total_samples}")
-    for ch in sorted_chords[:10]:
-        ratio = dist_counter.get(ch, 0) / total_samples * 100
-        logger.info(f"Chord: {ch}, Count: {dist_counter.get(ch, 0)}, Percentage: {ratio:.4f}%")
-    
-    # Compute class weights - inversely proportional to frequency
-    class_weights = np.array([0.0 if ch not in dist_counter else total_samples / max(dist_counter.get(ch, 1), 1)
-                             for ch in sorted_chords], dtype=np.float32)
-
-    # Log class weight information
-    logger.info(f"Generated class weights for {len(class_weights)} classes, but model expects {n_classes}")
+    # Only calculate if not using focal loss
+    class_weights = None
+    if not args.use_focal_loss and not config.training.get('use_focal_loss', False):
+        dist_counter = Counter([sample['chord_label'] for sample in synth_dataset.samples])
+        sorted_chords = sorted(chord_mapping.keys())
+        total_samples = sum(dist_counter.values())
+        
+        logger.info(f"Total chord instances: {total_samples}")
+        for ch in sorted_chords[:10]:
+            ratio = dist_counter.get(ch, 0) / total_samples * 100
+            logger.info(f"Chord: {ch}, Count: {dist_counter.get(ch, 0)}, Percentage: {ratio:.4f}%")
+        
+        # Compute class weights - inversely proportional to frequency
+        class_weights = np.array([0.0 if ch not in dist_counter else total_samples / max(dist_counter.get(ch, 1), 1)
+                                for ch in sorted_chords], dtype=np.float32)
+        logger.info(f"Generated class weights for {len(class_weights)} classes")
+    else:
+        logger.info("Using focal loss instead of class weights for handling imbalance")
 
     # Create idx_to_chord mapping for the loss function
     idx_to_chord = {v: k for k, v in chord_mapping.items()}
@@ -544,7 +555,7 @@ def main():
         optimizer,
         device=device, 
         num_epochs=config.training['max_epochs'],
-        class_weights=class_weights,  # Will be padded within StudentTrainer
+        class_weights=class_weights,  # Will be None if using focal loss
         idx_to_chord=idx_to_chord,
         normalization={'mean': mean, 'std': std},
         early_stopping_patience=config.training.get('early_stopping_patience', 5),
@@ -556,7 +567,10 @@ def main():
         warmup_epochs=args.warmup_epochs,
         warmup_start_lr=args.warmup_start_lr,
         warmup_end_lr=config.training['learning_rate'],  # Use config LR as warmup end point
-        lr_schedule_type=args.lr_schedule  # Pass the scheduler type
+        lr_schedule_type=args.lr_schedule,  # Pass the scheduler type
+        use_focal_loss=args.use_focal_loss or config.training.get('use_focal_loss', False),
+        focal_gamma=args.focal_gamma or config.training.get('focal_gamma', 2.0),
+        focal_alpha=args.focal_alpha or config.training.get('focal_alpha', None)
     )
 
     # Set chord mapping for saving with the checkpoint

@@ -120,6 +120,10 @@ spec:
               value: "true"   # Set to "true" to enable warmup (if not using LR_SCHEDULE)
             - name: WARMUP_EPOCHS
               value: "5"       # Number of warmup epochs
+            - name: USE_FOCAL_LOSS
+              value: "true"    # Set to "true" to enable focal loss
+            - name: FOCAL_GAMMA
+              value: "2.0"     # Gamma parameter for focal loss
           command:
             - sh
             - -c
@@ -199,9 +203,20 @@ spec:
                 echo "Using default validation-based learning rate adjustment"
               fi
               
-              # Run the student training script with LR scheduling options
+              # Get focal loss arguments
+              FOCAL_LOSS_ARG=""
+              if [ "${USE_FOCAL_LOSS}" == "true" ]; then
+                echo "Using focal loss with gamma=${FOCAL_GAMMA}"
+                FOCAL_LOSS_ARG="--use_focal_loss --focal_gamma ${FOCAL_GAMMA}"
+                # Add focal_alpha if specified
+                if [ "${FOCAL_ALPHA}" != "" ]; then
+                  FOCAL_LOSS_ARG="${FOCAL_LOSS_ARG} --focal_alpha ${FOCAL_ALPHA}"
+                fi
+              fi
+              
+              # Run the student training script with all options
               echo "Starting student training with updated script and learning rate scheduling..."
-              python train_student.py --config ./config/student_config.yaml --save_dir ./checkpoints/student ${LR_SCHEDULE_ARG}
+              python train_student.py --config ./config/student_config.yaml --save_dir ./checkpoints/student ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG}
               
               echo "=== Student model training complete ==="
           resources:
