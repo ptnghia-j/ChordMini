@@ -15,17 +15,33 @@ class StudentTrainer(BaseTrainer):
                  normalization=None, early_stopping_patience=5,
                  lr_decay_factor=0.95, min_lr=5e-6, 
                  use_warmup=False, warmup_epochs=5, warmup_start_lr=None, warmup_end_lr=None,
-                 lr_schedule_type=None):
+                 lr_schedule_type=None, use_focal_loss=False, focal_gamma=2.0, focal_alpha=None):
         
         # First call the parent's __init__ to set up the logger and other attributes
         super().__init__(model, optimizer, scheduler, device, num_epochs,
                          logger, use_animator, checkpoint_dir, max_grad_norm,
                          None, idx_to_chord, normalization)  # Pass None for class_weights initially
         
+        # Focal loss parameters - set these first as they affect class weight handling
+        self.use_focal_loss = use_focal_loss
+        self.focal_gamma = focal_gamma
+        self.focal_alpha = focal_alpha
+        
+        if self.use_focal_loss:
+            self._log(f"Using Focal Loss (gamma={focal_gamma}) to handle class imbalance")
+            if self.focal_alpha is not None:
+                self._log(f"Using alpha={focal_alpha} for additional class weighting")
+            # When using focal loss, don't use standard class weights
+            class_weights = None
+            self._log("Class weights disabled as focal loss is being used")
+        
         # Now that logger is initialized, we can pad class weights
+        self.weight_tensor = None
+        self.class_weights = None
+        
         if class_weights is not None and hasattr(model, 'fc') and hasattr(model.fc, 'out_features'):
             # Handle class imbalance - modify weights before padding
-            if idx_to_chord is not None:
+            if idx_to_chord is not None and not self.use_focal_loss:
                 class_weights = self._adjust_weights_for_no_chord(class_weights, idx_to_chord)
             
             expected_classes = model.fc.out_features
@@ -33,9 +49,15 @@ class StudentTrainer(BaseTrainer):
             padded_weights = self._pad_class_weights(class_weights, expected_classes)
             
             # Now set the loss function with padded weights
-            weight_tensor = torch.tensor(padded_weights, device=self.device)
-            self.loss_fn = torch.nn.CrossEntropyLoss(weight=weight_tensor)
+            self.weight_tensor = torch.tensor(padded_weights, device=self.device)
             self.class_weights = padded_weights
+        
+        # Set up standard loss function - use weight tensor only if not using focal loss
+        if not self.use_focal_loss:
+            self.loss_fn = torch.nn.CrossEntropyLoss(weight=self.weight_tensor)
+        else:
+            # For focal loss, we'll use unweighted cross entropy as base
+            self.loss_fn = torch.nn.CrossEntropyLoss(weight=None)
         
         # Early stopping parameters
         self.early_stopping_patience = early_stopping_patience
@@ -76,11 +98,6 @@ class StudentTrainer(BaseTrainer):
         # Best model tracking
         self.best_model_path = os.path.join(self.checkpoint_dir, "student_model_best.pth")
         self.chord_mapping = None
-        
-        # Enable focal loss (optional)
-        self.use_focal_loss = False
-        if self.use_focal_loss:
-            self._log("Using Focal Loss to handle class imbalance")
     
     def _create_smooth_scheduler(self):
         """Create a smooth learning rate scheduler."""
@@ -389,14 +406,18 @@ class StudentTrainer(BaseTrainer):
                     batch_size, time_steps, _ = logits.shape
                     logits_flat = logits.reshape(-1, logits.size(-1))
                     targets_flat = targets.reshape(-1)
-                    loss = self.loss_fn(logits_flat, targets_flat)
+                    
+                    # Use our compute_loss for focal loss support
+                    loss = self.compute_loss(logits_flat, targets_flat)
+                    
                     preds_flat = torch.argmax(logits_flat, dim=1)
                     val_correct += (preds_flat == targets_flat).sum().item()
                     val_total += targets_flat.size(0)
                     val_loss += loss.item()
                     continue
 
-                loss = self.loss_fn(logits, targets)
+                # Standard case
+                loss = self.compute_loss(logits, targets)
                 val_loss += loss.item()
                 preds = logits.argmax(dim=1)
                 val_correct += (preds == targets).sum().item()
@@ -407,6 +428,37 @@ class StudentTrainer(BaseTrainer):
         self._log(f"Epoch Validation Loss: {avg_loss:.4f}, Accuracy: {val_acc:.4f}")
         self.model.train()
         return avg_loss, val_acc
+
+    def compute_loss(self, logits, targets):
+        """
+        Compute the appropriate loss based on configuration.
+        Uses focal loss if enabled, otherwise standard cross entropy loss.
+        """
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        if logits.ndim == 3:
+            logits = logits.reshape(-1, logits.size(-1))
+            if targets.ndim == 2:
+                targets = targets.reshape(-1)
+        
+        # Use focal loss if enabled
+        if self.use_focal_loss:
+            # Note: focal_loss implementation uses weight=None directly
+            # as the weight parameter is controlled by focal_alpha
+            loss = self.focal_loss(logits, targets, 
+                                  gamma=self.focal_gamma, 
+                                  alpha=self.focal_alpha)
+        else:
+            # Use the standard loss function with class weights
+            loss = self.loss_fn(logits, targets)
+        
+        # Ensure loss is non-negative (critical fix)
+        loss = torch.clamp(loss, min=0.0)
+        
+        if torch.isnan(loss):
+            self._log(f"NaN loss computed. Outputs: {logits[:5, :5]} | Targets: {targets[:5]}")
+        
+        return loss
 
     def train(self, train_loader, val_loader=None):
         self.model.train()
@@ -461,7 +513,8 @@ class StudentTrainer(BaseTrainer):
                     logits = logits.reshape(-1, logits.size(-1))
                     targets = targets.reshape(-1)
 
-                loss = self.loss_fn(logits, targets)
+                # Use our custom compute_loss method which handles focal loss
+                loss = self.compute_loss(logits, targets)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
