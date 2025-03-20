@@ -114,6 +114,12 @@ spec:
           env:
             - name: PYTHONPATH
               value: /mnt/storage/ChordMini
+            - name: LR_SCHEDULE
+              value: "cosine"  # Options: cosine, linear_decay, one_cycle, cosine_warm_restarts
+            - name: USE_WARMUP
+              value: "true"   # Set to "true" to enable warmup (if not using LR_SCHEDULE)
+            - name: WARMUP_EPOCHS
+              value: "5"       # Number of warmup epochs
           command:
             - sh
             - -c
@@ -181,9 +187,21 @@ spec:
                 fi
               fi
               
-              # Run the student training script
-              echo "Starting student training with updated script..."
-              python train_student.py --config ./config/student_config.yaml --save_dir ./checkpoints/student
+              # Get LR schedule option from environment
+              LR_SCHEDULE_ARG=""
+              if [ "${LR_SCHEDULE}" != "" ] && [ "${LR_SCHEDULE}" != "null" ]; then
+                echo "Using ${LR_SCHEDULE} learning rate schedule"
+                LR_SCHEDULE_ARG="--lr_schedule ${LR_SCHEDULE}"
+              elif [ "${USE_WARMUP}" == "true" ]; then
+                echo "Using warm-up learning rate schedule for ${WARMUP_EPOCHS} epochs"
+                LR_SCHEDULE_ARG="--use_warmup --warmup_epochs ${WARMUP_EPOCHS}"
+              else
+                echo "Using default validation-based learning rate adjustment"
+              fi
+              
+              # Run the student training script with LR scheduling options
+              echo "Starting student training with updated script and learning rate scheduling..."
+              python train_student.py --config ./config/student_config.yaml --save_dir ./checkpoints/student ${LR_SCHEDULE_ARG}
               
               echo "=== Student model training complete ==="
           resources:
