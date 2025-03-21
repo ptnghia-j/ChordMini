@@ -448,11 +448,11 @@ def main():
         seq_len=config.training['seq_len'], 
         stride=config.training['seq_stride'],
         frame_duration=frame_duration,
-        num_workers=os.cpu_count(),  # Use all available CPU cores for dataset loading
-        cache_file=cache_file,  # Will be None if caching is disabled
+        num_workers=min(8, os.cpu_count() or 1),  # Limit to 8 workers maximum
+        cache_file=cache_file,
         use_cache=not args.disable_cache,
         metadata_only=use_metadata_only,
-        cache_fraction=args.cache_fraction  # Only cache a fraction of the dataset
+        cache_fraction=args.cache_fraction
     )
 
     # After loading dataset, verify chord distribution matches expected mapping
@@ -688,9 +688,55 @@ def main():
     # Set chord mapping for saving with the checkpoint
     trainer.set_chord_mapping(chord_mapping)
 
-    # Train the model using our trainer
-    logger.info("Starting training...")
-    trainer.train(train_loader, val_loader)
+    # Check for existing checkpoints to resume training
+    start_epoch = 1
+    if os.path.exists(checkpoints_dir):
+        checkpoint_files = glob.glob(os.path.join(checkpoints_dir, "student_model_epoch_*.pth"))
+        if checkpoint_files:
+            # Extract epoch numbers and find the highest one
+            epoch_numbers = []
+            for f in checkpoint_files:
+                try:
+                    epoch_num = int(os.path.basename(f).replace("student_model_epoch_", "").replace(".pth", ""))
+                    epoch_numbers.append((epoch_num, f))
+                except ValueError:
+                    continue
+            
+            if epoch_numbers:
+                # Find the most recent checkpoint
+                latest_epoch, latest_checkpoint = max(epoch_numbers, key=lambda x: x[0])
+                logger.info(f"Found checkpoint from epoch {latest_epoch}. Attempting to resume training...")
+                
+                try:
+                    # Load checkpoint
+                    checkpoint = torch.load(latest_checkpoint, map_location=device)
+                    
+                    # Restore model state
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    
+                    # Restore optimizer state
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    
+                    # Restore scheduler if it exists in the checkpoint
+                    if 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None and hasattr(trainer, 'smooth_scheduler'):
+                        trainer.smooth_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    
+                    # Set starting epoch to the next one
+                    start_epoch = latest_epoch + 1
+                    logger.info(f"Successfully loaded checkpoint. Training will resume from epoch {start_epoch}.")
+                    
+                    # If we have validation stats, restore those too
+                    if 'accuracy' in checkpoint:
+                        trainer.best_val_acc = checkpoint.get('accuracy', 0)
+                        logger.info(f"Restored best validation accuracy: {trainer.best_val_acc:.4f}")
+                    
+                except Exception as e:
+                    logger.error(f"Error loading checkpoint: {e}")
+                    logger.info("Training will start from scratch.")
+                    start_epoch = 1
+    
+    # Modify train method call to include starting epoch
+    trainer.train(train_loader, val_loader, start_epoch=start_epoch)
 
     # Test the model
     logger.info("Starting testing phase...")

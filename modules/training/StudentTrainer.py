@@ -484,17 +484,20 @@ class StudentTrainer(BaseTrainer):
         
         return loss
 
-    def train(self, train_loader, val_loader=None):
+    def train(self, train_loader, val_loader=None, start_epoch=1):
+        """Train the model with support for resuming from checkpoints."""
         self.model.train()
         
         # Get actual steps per epoch for scheduler
         num_batches = len(train_loader)
         
         # Update OneCycleLR with actual steps if needed
-        if isinstance(self.smooth_scheduler, OneCycleLR):
-            total_steps = num_batches * self.num_epochs
+        if isinstance(self.smooth_scheduler, OneCycleLR) and start_epoch > 1:
+            # For resuming training, we need to adjust the total_steps based on starting epoch
+            remaining_epochs = self.num_epochs - (start_epoch - 1)
+            total_steps = num_batches * remaining_epochs
             # Recreate scheduler with correct total_steps
-            self._log(f"Initializing OneCycleLR with {total_steps} total steps")
+            self._log(f"Initializing OneCycleLR with {total_steps} total steps (resuming from epoch {start_epoch})")
             self.smooth_scheduler = OneCycleLR(
                 self.optimizer,
                 max_lr=self.initial_lr * 10,
@@ -504,11 +507,11 @@ class StudentTrainer(BaseTrainer):
                 final_div_factor=10000,
                 anneal_strategy='cos'
             )
-            
-        # Reset KD warning flag for each epoch
+        
+        # Reset KD warning flag
         self._kd_warning_logged = False
             
-        for epoch in range(1, self.num_epochs + 1):
+        for epoch in range(start_epoch, self.num_epochs + 1):
             # Keep track of current LR source for logging
             if self.lr_schedule_type:
                 lr_source = f"'{self.lr_schedule_type}' scheduler"
