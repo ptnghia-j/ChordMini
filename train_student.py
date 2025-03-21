@@ -411,6 +411,13 @@ def main():
     # otherwise default to 0.1 s
     frame_duration = config.feature.get('hop_duration', 0.1)
     
+    # Resolve checkpoints directory path BEFORE dataset initialization
+    checkpoints_dir_config = config.paths.get('checkpoints_dir', 'checkpoints')
+    checkpoints_dir = resolve_path(checkpoints_dir_config, storage_root, project_root)
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    logger.info(f"Checkpoints will be saved to: {checkpoints_dir}")
+    
+    # Now we can safely use checkpoints_dir in the dataset initialization
     # Load synthesized dataset with optimized parameters
     synth_dataset = SynthDataset(
         synth_spec_dir,
@@ -625,13 +632,6 @@ def main():
         mean = 0.0
         std = 1.0
         logger.warning("Could not calculate mean and std, using defaults")
-
-    # Resolve checkpoints directory path
-    checkpoints_dir_config = config.paths.get('checkpoints_dir', 'checkpoints')
-    checkpoints_dir = resolve_path(checkpoints_dir_config, storage_root, project_root)
-    os.makedirs(checkpoints_dir, exist_ok=True)
-    
-    logger.info(f"Checkpoints will be saved to: {checkpoints_dir}")
 
     # Create our StudentTrainer with all parameters (remove teacher_model parameter)
     trainer = StudentTrainer(
