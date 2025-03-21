@@ -1,3 +1,12 @@
+"""
+This utility computes the model parameter footprint.
+Note that the total parameter count includes extra components such as:
+• Feed-forward (MLP) layers inside each attention block,
+• Learned positional encodings,
+• Layer normalization layers and associated bias terms.
+Our ChordNet model (via BaseTransformer) incorporates all these parts,
+so the footprint computed by summing model.parameters() already accounts for them.
+"""
 import torch
 import sys
 import os
@@ -161,6 +170,11 @@ def compare_scaled_models(model_results):
         for row in rows:
             print("\t".join(str(cell) for cell in row))
 
+def compute_model_footprint(model):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total_params, trainable_params
+
 def main():
     parser = argparse.ArgumentParser(description='Calculate model footprint for different scaling factors')
     parser.add_argument('--n_freq', type=int, help='Number of frequency bins', default=144)
@@ -241,3 +255,11 @@ if __name__ == "__main__":
         print(f"Error: {e}")
         import traceback
         traceback.print_exc()
+
+    # Instantiate our model (default configuration)
+    model = ChordNet()
+    total, trainable = compute_model_footprint(model)
+    print(f"Total parameters: {total}")
+    print(f"Trainable parameters: {trainable}")
+    # The printed footprint includes parameters from all components:
+    # feed-forward layers, positional encodings, layer normalization, and biases.

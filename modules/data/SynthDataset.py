@@ -1,6 +1,6 @@
 import os
 import torch
-import numpy as np  # <-- FIXED: proper numpy import np
+import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from collections import Counter
 import glob
@@ -355,6 +355,8 @@ class SynthDataset(Dataset):
                     # Load minimal information needed for song identification and structure
                     spec_info = np.load(spec_file, mmap_mode='r')
                     spec_shape = spec_info.shape
+                    # NEW: Parse the label file to obtain chord_labels
+                    chord_labels = self._parse_label_file(label_file)
                     # Create sample with metadata only
                     for t in range(spec_shape[0] if len(spec_shape) > 1 else 1):
                         frame_time = t * self.frame_duration
