@@ -6,31 +6,64 @@ from collections import Counter
 import glob
 from pathlib import Path
 import matplotlib.pyplot as plt
-import time  # Added for progress tracking
+import time
+import multiprocessing
+from functools import partial
+import pickle
+import warnings
+from tqdm import tqdm
+import hashlib
 
 class SynthDataset(Dataset):
     """
     Dataset for loading preprocessed spectrograms and chord labels.
-    This dataset is designed to work with pre-generated data from a teacher model,
-    with support for nested directory structures.
-    
-    Args:
-        spec_dir: Directory containing spectrogram files (.npy files)
-        label_dir: Directory containing label files (.lab files)
-        chord_mapping: Dictionary mapping chord names to indices
-        seq_len: Length of each sequence in frames
-        stride: Step between consecutive sequences (if None, use seq_len for non-overlapping)
-        frame_duration: Duration of each frame in seconds
+    Optimized implementation with multiprocessing and caching.
     """
-    def __init__(self, spec_dir, label_dir, chord_mapping=None, seq_len=10, stride=None, frame_duration=0.1):
+    def __init__(self, spec_dir, label_dir, chord_mapping=None, seq_len=10, stride=None, 
+                 frame_duration=0.1, num_workers=None, cache_file=None, verbose=True):
         self.spec_dir = Path(spec_dir)
         self.label_dir = Path(label_dir)
         self.chord_mapping = chord_mapping
         self.seq_len = seq_len
         self.stride = stride if stride is not None else seq_len
-        self.frame_duration = frame_duration   # New parameter for frame-level duration
+        self.frame_duration = frame_duration
         self.samples = []
         self.segment_indices = []
+        self.verbose = verbose
+        
+        # Safely determine number of workers based on environment
+        if num_workers is None:
+            try:
+                # Start with CPU count but cap at reasonable values
+                self.num_workers = min(4, os.cpu_count() or 1)
+                
+                # Check if we're running in a container with limited resources
+                if os.path.exists('/sys/fs/cgroup/memory/memory.limit_in_bytes'):
+                    with open('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'r') as f:
+                        mem_limit = int(f.read().strip()) / (1024 * 1024 * 1024)  # Convert to GB
+                        # If less than 4GB memory, reduce workers to avoid OOM
+                        if mem_limit < 4:
+                            self.num_workers = 1
+                            if verbose:
+                                print(f"Limited memory detected ({mem_limit:.1f}GB), using single worker")
+            except Exception as e:
+                # Fallback to safe default
+                self.num_workers = 1
+                if verbose:
+                    print(f"Error determining CPU count: {e}, using single worker")
+        else:
+            self.num_workers = num_workers
+        
+        # Generate a safer cache file name using hashing if none provided
+        if cache_file is None:
+            # Create a stable cache file name from paths using hashing
+            cache_key = f"{spec_dir}_{label_dir}_{seq_len}_{stride}_{frame_duration}"
+            cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
+            self.cache_file = f"dataset_cache_{cache_hash}.pkl"
+            if verbose:
+                print(f"Using cache file: {self.cache_file}")
+        else:
+            self.cache_file = cache_file
         
         # Map from chord name to index
         if self.chord_mapping is not None:
@@ -41,7 +74,7 @@ class SynthDataset(Dataset):
         # Load all data
         self._load_data()
         
-        # Generate sequence segments
+        # Generate sequence segments 
         self._generate_segments()
         
         # Split data for train/eval/test
@@ -51,140 +84,192 @@ class SynthDataset(Dataset):
         self.test_indices = list(range(int(total_segs * 0.9), total_segs))
         
     def _load_data(self):
-        """Load all spectrogram and label files, handling nested directory structure"""
+        """Optimized data loading with caching and multiprocessing"""
         start_time = time.time()
+        
+        # Try to load from cache first
+        if os.path.exists(self.cache_file):
+            if self.verbose:
+                print(f"Loading dataset from cache: {self.cache_file}")
+            try:
+                with open(self.cache_file, 'rb') as f:
+                    cache_data = pickle.load(f)
+                    # Validate cache data has expected format
+                    if ('samples' in cache_data and 'chord_to_idx' in cache_data and 
+                        isinstance(cache_data['samples'], list) and 
+                        isinstance(cache_data['chord_to_idx'], dict)):
+                        self.samples = cache_data['samples']
+                        self.chord_to_idx = cache_data['chord_to_idx']
+                        
+                        if self.verbose:
+                            print(f"Loaded {len(self.samples)} samples from cache in {time.time() - start_time:.2f}s")
+                        return
+                    else:
+                        print("Cache format invalid, rebuilding dataset")
+            except Exception as e:
+                if self.verbose:
+                    print(f"Error loading cache, rebuilding dataset: {e}")
         
         # Check if directories exist
         if not self.spec_dir.exists():
-            print(f"WARNING: Spectrogram directory does not exist: {self.spec_dir}")
+            warnings.warn(f"Spectrogram directory does not exist: {self.spec_dir}")
         if not self.label_dir.exists():
-            print(f"WARNING: Label directory does not exist: {self.label_dir}")
+            warnings.warn(f"Label directory does not exist: {self.label_dir}")
 
-        # First, find all valid spectrogram files using a fast glob pattern
-        print("Scanning for spectrogram files (this may take a moment)...")
-        spec_files = list(self.spec_dir.glob("**/*.npy"))
-        
-        # Early exit if no files found
-        if not spec_files:
-            print("No spectrogram files found. Check your data paths.")
-            return
+        # Find spectrogram files faster with specific pattern
+        if self.verbose:
+            print("Finding spectrogram files (this may take a moment)...")
             
-        print(f"Found {len(spec_files)} spectrogram files")
-        
-        # Create a set of non-empty directory names for faster filtering
-        spec_dirs = set()
-        for f in spec_files:
-            if len(f.parts) > len(self.spec_dir.parts):
-                spec_dirs.add(f.parts[len(self.spec_dir.parts)])
-        
-        print(f"Found {len(spec_dirs)} non-empty subdirectories")
-        
-        # Process only non-empty directories
-        processed = 0
-        total_files = len(spec_files)
-        
-        # Process files in batches to show progress
-        batch_size = max(1, total_files // 10)  # Show progress roughly every 10%
-        
-        # Create lookup dictionary for label files to avoid repeated directory scanning
-        label_lookup = {}
-        for label_file in self.label_dir.glob("**/*.lab"):
-            key = label_file.stem
+        # Create a fast mapping of label files for lookup
+        label_files = {}
+        for label_path in self.label_dir.glob("**/*.lab"):
+            key = label_path.stem
             if key.endswith("_lab"):
                 key = key[:-4]  # Remove '_lab' suffix
-            label_lookup[key] = label_file
+            label_files[key] = label_path
         
-        print(f"Found {len(label_lookup)} label files")
-        
-        # Process all files efficiently
-        for i, spec_file in enumerate(spec_files):
-            # Show progress periodically
-            if i % batch_size == 0 or i == total_files - 1:
-                percent = (i / total_files) * 100
-                elapsed = time.time() - start_time
-                print(f"Processing: {percent:.1f}% ({i}/{total_files}) - Elapsed: {elapsed:.2f}s")
+        if self.verbose:
+            print(f"Found {len(label_files)} label files")
             
+        # Find all spectrogram files once
+        spec_files = list(self.spec_dir.glob("**/*.npy"))
+        
+        if not spec_files:
+            warnings.warn("No spectrogram files found. Check your data paths.")
+            return
+            
+        if self.verbose:
+            print(f"Found {len(spec_files)} spectrogram files")
+            
+        # Process files in parallel if appropriate
+        try:
+            if self.num_workers > 1 and len(spec_files) > 10:
+                # Split files into chunks for parallel processing
+                chunk_size = max(1, len(spec_files) // self.num_workers)
+                chunks = [spec_files[i:i + chunk_size] for i in range(0, len(spec_files), chunk_size)]
+                
+                if self.verbose:
+                    print(f"Processing files with {self.num_workers} workers ({len(chunks)} chunks)")
+                
+                # Use context manager to ensure pool is properly closed
+                with multiprocessing.Pool(processes=self.num_workers) as pool:
+                    worker_func = partial(self._process_file_chunk, label_files=label_files)
+                    
+                    # Process chunks and collect results with a timeout to prevent hangs
+                    all_samples = []
+                    for chunk_samples in tqdm(pool.imap(worker_func, chunks), 
+                                            total=len(chunks), 
+                                            desc="Loading data",
+                                            disable=not self.verbose):
+                        all_samples.extend(chunk_samples)
+                        
+                self.samples = all_samples
+            else:
+                # Fall back to sequential processing if needed
+                self.samples = []
+                for spec_file in tqdm(spec_files, desc="Loading data", disable=not self.verbose):
+                    processed = self._process_file(spec_file, label_files)
+                    if processed:
+                        self.samples.extend(processed)
+        except Exception as e:
+            # If parallel processing fails, fall back to sequential
+            self.samples = []
+            if self.verbose:
+                print(f"Parallel processing failed: {e}")
+                print("Falling back to sequential processing...")
+            for spec_file in tqdm(spec_files, desc="Loading data", disable=not self.verbose):
+                processed = self._process_file(spec_file, label_files)
+                if processed:
+                    self.samples.extend(processed)
+        
+        # Cache the dataset for future use with proper error handling
+        if self.samples:
+            try:
+                cache_dir = os.path.dirname(self.cache_file)
+                if cache_dir and not os.path.exists(cache_dir):
+                    os.makedirs(cache_dir, exist_ok=True)
+                    
+                with open(self.cache_file, 'wb') as f:
+                    pickle.dump({
+                        'samples': self.samples,
+                        'chord_to_idx': self.chord_to_idx
+                    }, f)
+                if self.verbose:
+                    print(f"Saved dataset cache to {self.cache_file}")
+            except Exception as e:
+                if self.verbose:
+                    print(f"Error saving cache (will continue without caching): {e}")
+                
+        # Report on spectrogram dimensions
+        if self.samples:
+            # Analyze the first sample
+            first_spec = self.samples[0]['spectro']
+            freq_dim = first_spec.shape[-1] if len(first_spec.shape) > 0 else 0
+            spec_type = "CQT (Constant-Q Transform)" if freq_dim <= 256 else "STFT"
+            if self.verbose:
+                print(f"Loaded {len(self.samples)} valid samples")
+                print(f"Spectrogram frequency dimension: {freq_dim} (likely {spec_type})")
+                
+                # Report on class distribution
+                chord_counter = Counter(sample['chord_label'] for sample in self.samples)
+                print(f"Found {len(chord_counter)} unique chord classes")
+                
+                end_time = time.time()
+                print(f"Dataset loading completed in {end_time - start_time:.2f} seconds")
+        else:
+            warnings.warn("No samples loaded. Check your data paths and structure.")
+    
+    def _process_file_chunk(self, spec_files, label_files):
+        """Process a chunk of files for parallel processing"""
+        chunk_samples = []
+        for spec_file in spec_files:
+            processed = self._process_file(spec_file, label_files)
+            if processed:
+                chunk_samples.extend(processed)
+        return chunk_samples
+        
+    def _process_file(self, spec_file, label_files):
+        """Process a single spectrogram file and its matching label file"""
+        samples = []
+        try:
             # Extract file name for matching
             base_name = spec_file.stem
             if base_name.endswith("_spec"):
                 base_name = base_name[:-5]  # Remove '_spec' suffix
                 
-            # Find matching label file directly from lookup dictionary
-            label_file = label_lookup.get(base_name)
+            # Find matching label file directly from dictionary
+            label_file = label_files.get(base_name)
             
-            if label_file and label_file.exists():
-                self._process_file_pair(spec_file, label_file)
-                processed += 1
-            else:
-                # Try alternative naming patterns only if not found in the lookup
+            if not label_file or not label_file.exists():
+                # Try some alternative naming patterns
                 found = False
                 for suffix in ["", "_lab"]:
-                    # Try with different subdirectories
-                    if spec_file.parent.name in spec_dirs:
-                        label_path = self.label_dir / spec_file.parent.name / f"{base_name}{suffix}.lab"
-                        if label_path.exists():
-                            self._process_file_pair(spec_file, label_path)
-                            processed += 1
-                            found = True
-                            break
+                    alt_name = f"{base_name}{suffix}"
+                    if alt_name in label_files:
+                        label_file = label_files[alt_name]
+                        found = True
+                        break
+                        
                 if not found:
-                    # Try with base directory if not found in matching subdirectory
-                    for suffix in ["", "_lab"]:
-                        label_path = self.label_dir / f"{base_name}{suffix}.lab"
-                        if label_path.exists():
-                            self._process_file_pair(spec_file, label_path)
-                            processed += 1
-                            break
-                    
-        # Report final statistics
-        end_time = time.time()
-        duration = end_time - start_time
-        print(f"Processed {processed}/{total_files} files in {duration:.2f} seconds")
+                    return samples  # Skip this file if no label found
             
-        # Report on spectrogram dimensions to help identify CQT vs STFT
-        if self.samples:
-            # Analyze the first sample to get frequency dimension
-            first_spec = self.samples[0]['spectro']
-            freq_dim = first_spec.shape[-1] if len(first_spec.shape) > 0 else 0
-            spec_type = "CQT (Constant-Q Transform)" if freq_dim <= 256 else "STFT"
-            print(f"Loaded {len(self.samples)} valid samples")
-            print(f"Spectrogram frequency dimension: {freq_dim} (likely {spec_type})")
-            
-            # Report on class distribution
-            chord_counter = Counter(sample['chord_label'] for sample in self.samples)
-            print(f"Found {len(chord_counter)} unique chord classes")
-        else:
-            print("No samples loaded. Check your data paths and structure.")
-        
-    def _process_file_pair(self, spec_file, label_file):
-        """Process a pair of spectrogram and label files"""
-        # Extract song_id from filename to track song boundaries
-        song_id = spec_file.stem
-        if song_id.endswith("_spec"):
-            song_id = song_id[:-5]
-            
-        try:
+            # Load spectrogram data
             spec = np.load(spec_file)
             
-            # Check for NaN values and log warning if found
+            # Check for NaN values
             if np.isnan(spec).any():
-                print(f"Warning: NaN values found in {spec_file}")
-                # Replace NaNs with zeros for stability
+                warnings.warn(f"NaN values found in {spec_file}, replacing with zeros")
                 spec = np.nan_to_num(spec, nan=0.0)
             
             # Check for extreme values
             if np.abs(spec).max() > 1000:
-                print(f"Warning: Extreme values found in {spec_file}. Max abs value: {np.abs(spec).max()}")
+                warnings.warn(f"Extreme values found in {spec_file}, max: {np.abs(spec).max()}")
             
             # Load label file
             chord_labels = self._parse_label_file(label_file)
             
-            # Ensure the spectrogram and labels have matching length
-            time_frames = spec.shape[0] if len(spec.shape) > 1 else 1  # Assuming shape is (time, features)
-            
-            # Add to samples
-            if len(spec.shape) <= 1:
-                # Handle single frame spectrograms
+            # Create a sample for each frame
+            if len(spec.shape) <= 1:  # Single frame
                 chord_label = self._find_chord_at_time(chord_labels, 0.0)
                 
                 # Make sure the chord label exists in the mapping
@@ -192,20 +277,17 @@ class SynthDataset(Dataset):
                     if chord_label not in self.chord_to_idx:
                         self.chord_to_idx[chord_label] = len(self.chord_to_idx)
                 elif chord_label not in self.chord_mapping:
-                    print(f"Warning: Unknown chord label {chord_label} found in {label_file}")
-                    # Skip this sample if we can't map it
-                    return
+                    warnings.warn(f"Unknown chord label {chord_label} found in {label_file}")
+                    return samples
                     
-                self.samples.append({
+                samples.append({
                     'spectro': spec,
                     'chord_label': chord_label,
-                    'song_id': song_id  # Add song_id to track song boundaries
+                    'song_id': base_name
                 })
-            else:
-                # Handle multi-frame spectrograms
-                for t in range(time_frames):
-                    # Use the supplied frame_duration rather than a fixed 0.1 s
-                    frame_time = t * self.frame_duration   # Modified line
+            else:  # Multiple frames
+                for t in range(spec.shape[0]):
+                    frame_time = t * self.frame_duration
                     chord_label = self._find_chord_at_time(chord_labels, frame_time)
                     
                     # Make sure the chord label exists in the mapping
@@ -213,23 +295,19 @@ class SynthDataset(Dataset):
                         if chord_label not in self.chord_to_idx:
                             self.chord_to_idx[chord_label] = len(self.chord_to_idx)
                     elif chord_label not in self.chord_mapping:
-                        print(f"Warning: Unknown chord label {chord_label} found in {label_file}")
-                        chord_label = "N"  # Default to no-chord
+                        warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
+                        chord_label = "N"
                         
-                    self.samples.append({
+                    samples.append({
                         'spectro': spec[t],
                         'chord_label': chord_label,
-                        'song_id': song_id  # Add song_id to track song boundaries
+                        'song_id': base_name
                     })
-                
-            # Log the first file's dimensions in detail
-            if len(self.samples) <= time_frames:  # This must be the first file processed
-                print(f"First spectrogram shape: {spec.shape}")
-                print(f"Example frame dimensions: {self.samples[0]['spectro'].shape if len(spec.shape) > 1 else spec.shape}")
-                print(f"First sample chord: {self.samples[0]['chord_label']}")
-                
+                    
         except Exception as e:
-            print(f"Error processing {spec_file} and {label_file}: {e}")
+            warnings.warn(f"Error processing file {spec_file}: {e}")
+            
+        return samples
     
     def _parse_label_file(self, label_file):
         """Parse a label file into a list of (start_time, end_time, chord) tuples"""
@@ -266,9 +344,9 @@ class SynthDataset(Dataset):
         return "N"  # No chord found
     
     def _generate_segments(self):
-        """Generate sequence segments from loaded samples, respecting song boundaries"""
+        """Generate segments more efficiently using song boundaries"""
         if not self.samples:
-            print("WARNING: No samples to generate segments from")
+            warnings.warn("No samples to generate segments from")
             return
         
         # Group samples by song_id
@@ -279,10 +357,13 @@ class SynthDataset(Dataset):
                 song_samples[song_id] = []
             song_samples[song_id].append(i)
         
-        print(f"Found {len(song_samples)} unique songs")
+        if self.verbose:
+            print(f"Found {len(song_samples)} unique songs")
         
-        # Generate segments for each song separately
+        # Generate segments for each song
+        start_time = time.time()
         total_segments = 0
+        
         for song_id, indices in song_samples.items():
             if len(indices) < self.seq_len:
                 # For very short songs, create a single segment with padding
@@ -291,27 +372,16 @@ class SynthDataset(Dataset):
                     total_segments += 1
                 continue
                 
-            # Create segments with stride, staying within this song's samples
-            segment_start_idx = 0
-            while segment_start_idx + self.seq_len <= len(indices):
-                segment_start = indices[segment_start_idx]
-                segment_end = segment_start + self.seq_len
-                
-                # Check if segment would cross song boundary
-                if segment_start_idx + self.seq_len <= len(indices):
-                    # Safe to create a full segment
-                    self.segment_indices.append((segment_start, segment_end))
-                    total_segments += 1
-                else:
-                    # Need to create a padded segment at song boundary
-                    self.segment_indices.append((segment_start, segment_start + self.seq_len))
-                    total_segments += 1
-                    
-                segment_start_idx += self.stride
-                if segment_start_idx >= len(indices):
-                    break
+            # Create segments with stride, respecting song boundaries
+            for start_idx in range(0, len(indices) - self.seq_len + 1, self.stride):
+                segment_start = indices[start_idx]
+                segment_end = indices[start_idx + self.seq_len - 1] + 1
+                self.segment_indices.append((segment_start, segment_end))
+                total_segments += 1
         
-        print(f"Generated {total_segments} segments across {len(song_samples)} songs")
+        if self.verbose:
+            end_time = time.time()
+            print(f"Generated {total_segments} segments in {end_time - start_time:.2f} seconds")
     
     def __len__(self):
         return len(self.segment_indices)
@@ -391,61 +461,64 @@ class SynthDataset(Dataset):
         
         return sample_out
     
-    def get_train_iterator(self, batch_size=128, shuffle=True):
-        """Get a DataLoader for the training set"""
+    def get_train_iterator(self, batch_size=128, shuffle=True, num_workers=4, pin_memory=True):
+        """Get an optimized DataLoader for the training set"""
         if not self.train_indices:
-            print("WARNING: No training segments available")
-            # Return an empty dataset
+            warnings.warn("No training segments available")
             return DataLoader(
                 SynthSegmentSubset(self, []),
                 batch_size=batch_size,
                 shuffle=shuffle,
-                pin_memory=True
+                pin_memory=pin_memory
             )
             
         return DataLoader(
             SynthSegmentSubset(self, self.train_indices),
             batch_size=batch_size,
             shuffle=shuffle,
-            pin_memory=True
+            num_workers=num_workers,  # Use multiple workers for data loading
+            pin_memory=pin_memory,   # Pin memory for faster GPU transfer
+            persistent_workers=True if num_workers > 0 else False  # Keep workers alive between epochs
         )
     
-    def get_eval_iterator(self, batch_size=128, shuffle=False):
-        """Get a DataLoader for the evaluation set"""
+    def get_eval_iterator(self, batch_size=128, shuffle=False, num_workers=4, pin_memory=True):
+        """Get an optimized DataLoader for the evaluation set"""
         if not self.eval_indices:
-            print("WARNING: No evaluation segments available")
-            # Return an empty dataset
+            warnings.warn("No evaluation segments available")
             return DataLoader(
                 SynthSegmentSubset(self, []),
                 batch_size=batch_size,
                 shuffle=shuffle,
-                pin_memory=True
+                pin_memory=pin_memory
             )
             
         return DataLoader(
             SynthSegmentSubset(self, self.eval_indices),
             batch_size=batch_size,
             shuffle=shuffle,
-            pin_memory=True
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=True if num_workers > 0 else False
         )
     
-    def get_test_iterator(self, batch_size=128, shuffle=False):
-        """Get a DataLoader for the test set"""
+    def get_test_iterator(self, batch_size=128, shuffle=False, num_workers=4, pin_memory=True):
+        """Get an optimized DataLoader for the test set"""
         if not self.test_indices:
-            print("WARNING: No test segments available")
-            # Return an empty dataset
+            warnings.warn("No test segments available")
             return DataLoader(
                 SynthSegmentSubset(self, []),
                 batch_size=batch_size,
                 shuffle=shuffle,
-                pin_memory=True
+                pin_memory=pin_memory
             )
             
         return DataLoader(
             SynthSegmentSubset(self, self.test_indices),
             batch_size=batch_size,
             shuffle=shuffle,
-            pin_memory=True
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=True if num_workers > 0 else False
         )
 
 

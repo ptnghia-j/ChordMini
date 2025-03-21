@@ -15,7 +15,8 @@ class StudentTrainer(BaseTrainer):
                  normalization=None, early_stopping_patience=5,
                  lr_decay_factor=0.95, min_lr=5e-6, 
                  use_warmup=False, warmup_epochs=5, warmup_start_lr=None, warmup_end_lr=None,
-                 lr_schedule_type=None, use_focal_loss=False, focal_gamma=2.0, focal_alpha=None):
+                 lr_schedule_type=None, use_focal_loss=False, focal_gamma=2.0, focal_alpha=None,
+                 use_kd_loss=False, kd_alpha=0.5, temperature=1.0):
         
         # First call the parent's __init__ to set up the logger and other attributes
         super().__init__(model, optimizer, scheduler, device, num_epochs,
@@ -26,6 +27,14 @@ class StudentTrainer(BaseTrainer):
         self.use_focal_loss = use_focal_loss
         self.focal_gamma = focal_gamma
         self.focal_alpha = focal_alpha
+        
+        # New KD parameters:
+        self.use_kd_loss = use_kd_loss
+        self.kd_alpha = kd_alpha
+        self.temperature = temperature
+        if self.use_kd_loss:
+            self._log(f"Using KD loss with α={kd_alpha} and temperature={temperature}")
+            self._log("Teacher logits expected to be provided in each batch")
         
         if self.use_focal_loss:
             self._log(f"Using Focal Loss (gamma={focal_gamma}) to handle class imbalance")
@@ -429,10 +438,10 @@ class StudentTrainer(BaseTrainer):
         self.model.train()
         return avg_loss, val_acc
 
-    def compute_loss(self, logits, targets):
+    def compute_loss(self, logits, targets, teacher_logits=None):
         """
-        Compute the appropriate loss based on configuration.
-        Uses focal loss if enabled, otherwise standard cross entropy loss.
+        Compute the loss.
+        If KD loss is enabled and teacher_logits are provided, combine standard loss and KD loss.
         """
         if isinstance(logits, tuple):
             logits = logits[0]
@@ -452,6 +461,21 @@ class StudentTrainer(BaseTrainer):
             # Use the standard loss function with class weights
             loss = self.loss_fn(logits, targets)
         
+        # If KD loss is enabled and teacher_logits are given, compute KD loss and combine.
+        if self.use_kd_loss:
+            if teacher_logits is not None:
+                temperature = self.temperature
+                # Compute softened predictions for student and teacher
+                student_log_probs = torch.nn.functional.log_softmax(logits / temperature, dim=1)
+                teacher_probs = torch.nn.functional.softmax(teacher_logits / temperature, dim=1)
+                kd_loss = torch.nn.functional.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (temperature ** 2)
+                loss = (1 - self.kd_alpha) * loss + self.kd_alpha * kd_loss
+            else:
+                # Log warning only once per epoch to avoid spam
+                if not hasattr(self, '_kd_warning_logged'):
+                    self._log("WARNING: KD loss enabled but teacher logits not provided in batch")
+                    self._kd_warning_logged = True
+        
         # Ensure loss is non-negative (critical fix)
         loss = torch.clamp(loss, min=0.0)
         
@@ -463,10 +487,14 @@ class StudentTrainer(BaseTrainer):
     def train(self, train_loader, val_loader=None):
         self.model.train()
         
+        # Get actual steps per epoch for scheduler
+        num_batches = len(train_loader)
+        
         # Update OneCycleLR with actual steps if needed
         if isinstance(self.smooth_scheduler, OneCycleLR):
-            total_steps = len(train_loader) * self.num_epochs
+            total_steps = num_batches * self.num_epochs
             # Recreate scheduler with correct total_steps
+            self._log(f"Initializing OneCycleLR with {total_steps} total steps")
             self.smooth_scheduler = OneCycleLR(
                 self.optimizer,
                 max_lr=self.initial_lr * 10,
@@ -476,13 +504,24 @@ class StudentTrainer(BaseTrainer):
                 final_div_factor=10000,
                 anneal_strategy='cos'
             )
-            self._log(f"Updated OneCycleLR with {total_steps} total steps")
+            
+        # Reset KD warning flag for each epoch
+        self._kd_warning_logged = False
             
         for epoch in range(1, self.num_epochs + 1):
+            # Keep track of current LR source for logging
+            if self.lr_schedule_type:
+                lr_source = f"'{self.lr_schedule_type}' scheduler"
+            elif self.use_warmup and epoch <= self.warmup_epochs:
+                lr_source = "warm-up schedule"
+            else:
+                lr_source = "validation-based adjustment"
+            
             # Apply warm-up LR schedule if enabled and in warm-up phase
             # (only if we're not using a smooth scheduler)
             if self.use_warmup and self.lr_schedule_type is None and epoch <= self.warmup_epochs:
                 self._warmup_learning_rate(epoch)
+                self._log(f"Epoch {epoch}: LR = {self.optimizer.param_groups[0]['lr']:.6f} (from {lr_source})")
             
             self.timer.reset(); self.timer.start()
             epoch_loss = 0.0
@@ -499,6 +538,11 @@ class StudentTrainer(BaseTrainer):
                 
                 # Regular training step
                 inputs, targets = self._process_batch(batch)
+                # Extract teacher logits from batch if provided
+                teacher_logits = None
+                if self.use_kd_loss and 'teacher_logits' in batch:
+                    teacher_logits = batch['teacher_logits'].to(self.device)
+                
                 if self.normalization:
                     inputs = (inputs - self.normalization['mean']) / self.normalization['std']
                 self.optimizer.zero_grad(set_to_none=True)
@@ -512,9 +556,12 @@ class StudentTrainer(BaseTrainer):
                 if logits.ndim == 3 and targets.ndim == 2:
                     logits = logits.reshape(-1, logits.size(-1))
                     targets = targets.reshape(-1)
+                    # If we have teacher logits, reshape them too
+                    if teacher_logits is not None and teacher_logits.ndim == 3:
+                        teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
 
-                # Use our custom compute_loss method which handles focal loss
-                loss = self.compute_loss(logits, targets)
+                # Use our custom compute_loss method with teacher_logits if available
+                loss = self.compute_loss(logits, targets, teacher_logits)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
@@ -552,6 +599,7 @@ class StudentTrainer(BaseTrainer):
                 # 2. We're not in the warm-up phase
                 if not self.lr_schedule_type and not (self.use_warmup and epoch <= self.warmup_epochs):
                     self._adjust_learning_rate(val_acc)
+                    self._log(f"Epoch {epoch}: LR = {self.optimizer.param_groups[0]['lr']:.6f} (from {lr_source})")
                 
                 # Always track the best model and check for early stopping
                 self._save_best_model(val_acc, val_loss, epoch)

@@ -242,6 +242,18 @@ def main():
     parser.add_argument('--focal_alpha', type=float, default=None,
                        help='Alpha parameter for focal loss (default: None)')
     
+    # Add knowledge distillation arguments (remove teacher_model_path)
+    parser.add_argument('--use_kd_loss', action='store_true',
+                       help='Use knowledge distillation loss (teacher logits must be in batch data)')
+    parser.add_argument('--kd_alpha', type=float, default=0.5,
+                       help='Weight for knowledge distillation loss (default: 0.5)')
+    parser.add_argument('--temperature', type=float, default=1.0,
+                       help='Temperature for softening distributions (default: 1.0)')
+    
+    # Add model scale argument
+    parser.add_argument('--model_scale', type=float, default=None,
+                       help='Scaling factor for model capacity (0.5=half, 1.0=base, 2.0=double)')
+    
     args = parser.parse_args()
 
     # Load configuration from YAML
@@ -256,6 +268,14 @@ def main():
 
     if args.storage_root is not None:
         config.paths['storage_root'] = args.storage_root
+
+    # Override model scale from command line if provided
+    if args.model_scale is not None:
+        if not hasattr(config.model, 'scale'):
+            config.model['scale'] = args.model_scale
+        else:
+            config.model.scale = args.model_scale
+        logger.info(f"Overriding model scale from command line: {args.model_scale}")
 
     # Set random seed for reproducibility
     if hasattr(config.misc, 'seed'):
@@ -391,14 +411,16 @@ def main():
     # otherwise default to 0.1 s
     frame_duration = config.feature.get('hop_duration', 0.1)
     
-    # Load synthesized dataset with the provided chord mapping and frame_duration
+    # Load synthesized dataset with optimized parameters
     synth_dataset = SynthDataset(
         synth_spec_dir,
         synth_label_dir, 
         chord_mapping=chord_mapping, 
         seq_len=config.training['seq_len'], 
         stride=config.training['seq_stride'],
-        frame_duration=frame_duration           # New parameter passed here
+        frame_duration=frame_duration,
+        num_workers=os.cpu_count(),  # Use all available CPU cores for dataset loading
+        cache_file=os.path.join(checkpoints_dir, "dataset_cache.pkl")  # Cache dataset for future runs
     )
 
     # After loading dataset, verify chord distribution matches expected mapping
@@ -408,9 +430,23 @@ def main():
     logger.info(f"'N' chord count: {n_chord_count} ({n_chord_count/len(synth_dataset.samples)*100:.2f}% of total)")
     logger.info(f"Total synthesized samples: {len(synth_dataset)}")
 
-    # Create data loaders
-    train_loader = synth_dataset.get_train_iterator(batch_size=config.training['batch_size'], shuffle=True)
-    val_loader = synth_dataset.get_eval_iterator(batch_size=config.training['batch_size'], shuffle=False)
+    # Create data loaders with optimized settings
+    # Determine optimal num_workers
+    num_workers = min(4, os.cpu_count()) if torch.cuda.is_available() else 0
+    
+    train_loader = synth_dataset.get_train_iterator(
+        batch_size=config.training['batch_size'], 
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available()
+    )
+    
+    val_loader = synth_dataset.get_eval_iterator(
+        batch_size=config.training['batch_size'], 
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available()
+    )
 
     # Debug samples - add more detailed shape information
     logger.info("=== Debug: Training set sample ===")
@@ -460,16 +496,62 @@ def main():
     actual_feature_dim = n_freq // n_group
     logger.info(f"Using n_group={n_group}, resulting in actual feature dimension: {actual_feature_dim}")
 
+    # Get model scale factor and compute scaled parameters
+    model_scale = config.model.get('scale', 1.0)
+    
+    # Get base configuration for the model
+    base_config = config.model.get('base_config', {})
+    
+    # If base_config is not specified, fall back to direct model parameters
+    if not base_config:
+        base_config = {
+            'f_layer': config.model.get('f_layer', 3),
+            'f_head': config.model.get('f_head', 6),
+            't_layer': config.model.get('t_layer', 3),
+            't_head': config.model.get('t_head', 6),
+            'd_layer': config.model.get('d_layer', 3),
+            'd_head': config.model.get('d_head', 6)
+        }
+    
+    # Apply scale to model parameters
+    f_layer = max(1, int(round(base_config['f_layer'] * model_scale)))
+    f_head = max(1, int(round(base_config['f_head'] * model_scale)))
+    t_layer = max(1, int(round(base_config['t_layer'] * model_scale)))
+    t_head = max(1, int(round(base_config['t_head'] * model_scale)))
+    d_layer = max(1, int(round(base_config['d_layer'] * model_scale)))
+    d_head = max(1, int(round(base_config['d_head'] * model_scale)))
+    
+    # Log model scaling information
+    logger.info(f"Using model scale: {model_scale}")
+    if model_scale != 1.0:
+        logger.info("Scaled model configuration:")
+        logger.info(f"  f_layer: {base_config['f_layer']} -> {f_layer}")
+        logger.info(f"  f_head: {base_config['f_head']} -> {f_head}")
+        logger.info(f"  t_layer: {base_config['t_layer']} -> {t_layer}")
+        logger.info(f"  t_head: {base_config['t_head']} -> {t_head}")
+        logger.info(f"  d_layer: {base_config['d_layer']} -> {d_layer}")
+        logger.info(f"  d_head: {base_config['d_head']} -> {d_head}")
+    
+    # Verify that the scaled parameters maintain dimensional compatibility
+    if actual_feature_dim % f_head != 0:
+        logger.warning(f"Feature dimension {actual_feature_dim} not divisible by scaled f_head={f_head}")
+        # Find compatible f_head value
+        for head_count in range(f_head, 0, -1):
+            if actual_feature_dim % head_count == 0:
+                logger.warning(f"Adjusting f_head from {f_head} to {head_count} for compatibility")
+                f_head = head_count
+                break
+            
     model = ChordNet(
         n_freq=n_freq, 
         n_classes=n_classes, 
         n_group=n_group,
-        f_layer=config.model['f_layer'], 
-        f_head=config.model['f_head'], 
-        t_layer=config.model['t_layer'], 
-        t_head=config.model['t_head'], 
-        d_layer=config.model['d_layer'], 
-        d_head=config.model['d_head'], 
+        f_layer=f_layer, 
+        f_head=f_head, 
+        t_layer=t_layer, 
+        t_head=t_head, 
+        d_layer=d_layer, 
+        d_head=d_head, 
         dropout=config.model['dropout'],
         #ignore_index=chord_mapping.get("N")
     ).to(device)
@@ -479,12 +561,12 @@ def main():
     logger.info(f"  n_freq: {n_freq}")
     logger.info(f"  n_classes: {n_classes}")
     logger.info(f"  n_group: {n_group}")
-    logger.info(f"  f_layer: {config.model['f_layer']}")
-    logger.info(f"  f_head: {config.model['f_head']}")
-    logger.info(f"  t_layer: {config.model['t_layer']}")
-    logger.info(f"  t_head: {config.model['t_head']}")
-    logger.info(f"  d_layer: {config.model['d_layer']}")
-    logger.info(f"  d_head: {config.model['d_head']}")
+    logger.info(f"  f_layer: {f_layer}")
+    logger.info(f"  f_head: {f_head}")
+    logger.info(f"  t_layer: {t_layer}")
+    logger.info(f"  t_head: {t_head}")
+    logger.info(f"  d_layer: {d_layer}")
+    logger.info(f"  d_head: {d_head}")
     logger.info(f"  dropout: {config.model['dropout']}")
 
     if torch.cuda.device_count() > 1 and config.misc['use_cuda']:
@@ -493,7 +575,7 @@ def main():
 
     # Create optimizer - match teacher settings
     optimizer = torch.optim.Adam(model.parameters(), 
-                               lr=config.training['learning_rate'],
+                               lr=config.training['learning_rate'],    
                                weight_decay=config.training['weight_decay'], 
                                betas=tuple(config.training['betas']), 
                                eps=config.training['epsilon'])
@@ -505,7 +587,7 @@ def main():
         dist_counter = Counter([sample['chord_label'] for sample in synth_dataset.samples])
         sorted_chords = sorted(chord_mapping.keys())
         total_samples = sum(dist_counter.values())
-        
+        ignore_index=chord_mapping.get("N")
         logger.info(f"Total chord instances: {total_samples}")
         for ch in sorted_chords[:10]:
             ratio = dist_counter.get(ch, 0) / total_samples * 100
@@ -522,7 +604,7 @@ def main():
 
     # Create idx_to_chord mapping for the loss function
     idx_to_chord = {v: k for k, v in chord_mapping.items()}
-
+    
     # Calculate global mean and std for normalization (as done in teacher model)
     mean = 0
     square_mean = 0
@@ -551,10 +633,10 @@ def main():
     
     logger.info(f"Checkpoints will be saved to: {checkpoints_dir}")
 
-    # Create our StudentTrainer with new smooth scheduler parameter
+    # Create our StudentTrainer with all parameters (remove teacher_model parameter)
     trainer = StudentTrainer(
         model, 
-        optimizer,
+        optimizer, 
         device=device, 
         num_epochs=config.training['max_epochs'],
         class_weights=class_weights,  # Will be None if using focal loss
@@ -572,7 +654,10 @@ def main():
         lr_schedule_type=args.lr_schedule,  # Pass the scheduler type
         use_focal_loss=args.use_focal_loss or config.training.get('use_focal_loss', False),
         focal_gamma=args.focal_gamma or config.training.get('focal_gamma', 2.0),
-        focal_alpha=args.focal_alpha or config.training.get('focal_alpha', None)
+        focal_alpha=args.focal_alpha or config.training.get('focal_alpha', None),
+        use_kd_loss=args.use_kd_loss,
+        kd_alpha=args.kd_alpha,
+        temperature=args.temperature
     )
 
     # Set chord mapping for saving with the checkpoint
@@ -592,7 +677,7 @@ def main():
     test_batch = next(iter(test_loader))
     logger.info(f"Test spectrogram tensor shape: {test_batch['spectro'].shape}")
     logger.info(f"Test labels: {test_batch['chord_idx'][:10]}")
-    
+
     # Evaluate on test set using the Tester class
     tester = Tester(model, test_loader, device, idx_to_chord=idx_to_chord)
     tester.evaluate()

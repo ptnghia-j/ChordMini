@@ -15,7 +15,7 @@ training:
   lr_decay_factor: 0.95
   # Warm-up parameters
   use_warmup: false
-  warmup_epochs: 10
+  warmup_epochs: 20
   warmup_start_lr: 1.0e-5  # 1/10 of learning_rate by default
   # New LR schedule parameter (optional)
   lr_schedule: null  # Can be 'cosine', 'linear_decay', 'one_cycle', or 'cosine_warm_restarts'
@@ -23,17 +23,23 @@ training:
   use_focal_loss: false     # Set to true to enable focal loss
   focal_gamma: 2.0          # Controls the down-weighting of well-classified examples
   focal_alpha: null         # Optional class weighting factor (null to use class_weights)
+  # Knowledge distillation parameters
+  use_kd_loss: false          # Whether to use knowledge distillation
+  kd_alpha: 0.5               # Weight for KD loss (0-1)
+  temperature: 1.0            # Temperature for softening distributions
 
 # Model hyperparameters
 model:
-  n_group: 4          # Adjust based on frequency dimension (see below)
-  f_layer: 3          # Frequency attention layers - increased to better match BTC
-  f_head: 6           # Frequency attention heads - increased for more capacity
-  t_layer: 3          # Temporal attention layers - increased to better match BTC
-  t_head: 6           # Temporal attention heads - increased for more capacity
-  d_layer: 3          # Decoder layers - increased to better match BTC bidirectional capability
-  d_head: 6           # Decoder heads - increased for more capacity
-  dropout: 0.3        # Dropout rate - kept the same
+  scale: 1.0          # Scaling factor: 0.5 = half size, 1.0 = base size, 2.0 = double size
+  base_config:        # Base configuration for scale=1.0
+    f_layer: 3        # Base frequency attention layers 
+    f_head: 6         # Base frequency attention heads
+    t_layer: 3        # Base temporal attention layers
+    t_head: 6         # Base temporal attention heads
+    d_layer: 3        # Base decoder layers
+    d_head: 6         # Base decoder heads
+  n_group: 4          # Keep this the same to maintain frequency dimension compatibility
+  dropout: 0.3        # Keep dropout the same
   use_chord_aware_loss: false
 
 mp3:
