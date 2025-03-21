@@ -116,7 +116,7 @@ spec:
               value: /mnt/storage/ChordMini
             # Add model scale option
             - name: MODEL_SCALE
-              value: "0.5"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
+              value: "1.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
             # Learning rate scheduling options
             - name: LR_SCHEDULE
               value: "cosine"  # Options: cosine, linear_decay, one_cycle, cosine_warm_restarts
@@ -136,15 +136,12 @@ spec:
               value: "0.5"    # Weight for KD loss (between 0 and 1)
             - name: TEMPERATURE
               value: "1.0"    # Temperature for softening distributions
-            # Option to disable dataset caching to reduce memory usage  
-            - name: DISABLE_CACHE
-              value: "true"  # Set to "true" to disable full dataset caching
-            # Option to use metadata-only caching
+            # Option to control dataset caching behavior  
             - name: METADATA_CACHE
-              value: "true"  # Set to "true" to enable metadata-only caching
+              value: "true"  # Set to "true" to enable metadata-only caching, "false" to disable all caching
             # Option to control cache fraction
             - name: CACHE_FRACTION
-              value: "0.05"   # Cache only 10% of samples
+              value: "0.1"   # Cache only 10% of samples
           command:
             - sh
             - -c
@@ -254,12 +251,12 @@ spec:
               
               # Handle caching options for memory optimization
               CACHE_ARGS=""
-              if [ "${DISABLE_CACHE}" == "true" ]; then
-                echo "Disabling dataset caching to reduce memory usage"
-                CACHE_ARGS="--disable_cache"
-              elif [ "${METADATA_CACHE}" == "true" ]; then
+              if [ "${METADATA_CACHE}" == "true" ]; then
                 echo "Using metadata-only caching to reduce memory usage"
                 CACHE_ARGS="--metadata_cache"
+              else
+                echo "Dataset caching disabled to reduce memory usage"
+                CACHE_ARGS="--disable_cache"
               fi
               
               # Add cache fraction argument
@@ -276,12 +273,12 @@ spec:
               echo "=== Student model training complete ==="
           resources:
             requests:
-              cpu: "4"             
-              memory: "16Gi"    
+              cpu: "3"             
+              memory: "12Gi"    
               nvidia.com/gpu: "1"
             limits:
-              cpu: "6"             
-              memory: "24Gi" 
+              cpu: "5"             
+              memory: "16Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage
