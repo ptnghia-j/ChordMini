@@ -2,34 +2,104 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from modules.models.Transformer.BaseTransformer import BaseTransformer
-
+import warnings
 
 class ChordNet(nn.Module):
     def __init__(self, n_freq=2048, n_classes=122, n_group=32,
                  f_layer=5, f_head=8,
                  t_layer=5, t_head=8,
                  d_layer=5, d_head=8,
-                 dropout=0.2, ignore_index=None, *args, **kwargs):
+                 dropout=0.2, ignore_index=None, cqt_threshold=256, *args, **kwargs):
         super().__init__()
         
-        # CQT vs STFT handling
-        # For CQT input (typically n_freq=144), we want n_group=12 to get actual_feature_dim=12
-        # For STFT input (typically n_freq=2048), the provided n_group would be used
-        is_cqt = n_freq <= 256  # Simple heuristic to detect CQT input
+        # Make CQT threshold configurable but use default if not specified
+        self.cqt_threshold = cqt_threshold
+        
+        # CQT vs STFT handling with more robust detection
+        is_cqt = n_freq <= self.cqt_threshold
+        original_n_group = n_group
+        
         if is_cqt:
-            # Note: forcing n_group=12 when using CQT leads to an actual feature dimension of 144/12 = 12.
-            # For better performance you might reconsider this setting.
-            n_group = 12
+            # Note: We prefer n_group=12 for CQT (144 bins) for better feature representation
+            # But we'll make sure it divides n_freq evenly
+            candidates = [12, 16, 24, 48, 72, 144]
+            for cand in candidates:
+                if n_freq % cand == 0 and (n_freq // cand) % f_head == 0:  # Ensure divisible by head count
+                    n_group = cand
+                    break
+            
+            # If no suitable n_group found, adjust to ensure compatibility with increased head count
+            if (n_freq // n_group) % f_head != 0:
+                for divisor in [8, 12, 16, 24, 32, 48, 64]:
+                    if n_freq % divisor == 0 and (n_freq // divisor) % f_head == 0:
+                        warnings.warn(f"Adjusted n_group from {n_group} to {divisor} for compatibility with larger head count")
+                        n_group = divisor
+                        break
+            
             print(f"Detected CQT input (n_freq={n_freq}), setting n_group={n_group}")
         else:
             print(f"Using standard STFT configuration with n_freq={n_freq}, n_group={n_group}")
+            
+            # For STFT, also ensure compatibility with increased head count
+            if (n_freq // n_group) % f_head != 0:
+                for divisor in [8, 12, 16, 24, 32, 48, 64]:
+                    if n_freq % divisor == 0 and (n_freq // divisor) % f_head == 0:
+                        warnings.warn(f"Adjusted n_group from {n_group} to {divisor} for compatibility with larger head count")
+                        n_group = divisor
+                        break
+
+        # Check if n_freq is divisible by n_group and adjust if needed
+        if n_freq % n_group != 0:
+            # Find closest divisor that's also compatible with head count
+            for divisor in [8, 12, 16, 24, 32, 48, 64]:
+                if n_freq % divisor == 0 and (n_freq // divisor) % f_head == 0:
+                    warnings.warn(f"n_freq ({n_freq}) not divisible by n_group ({n_group}). "
+                                 f"Adjusted n_group to {divisor}.")
+                    n_group = divisor
+                    break
+            else:
+                # If no exact divisor found, find best approximation
+                best_remainder = n_freq
+                best_divisor = n_group
+                
+                for div in range(1, 65):  # Try reasonable divisors
+                    remainder = n_freq % div
+                    # Must be compatible with head count
+                    if remainder < best_remainder and (n_freq // div) % f_head == 0:
+                        best_remainder = remainder
+                        best_divisor = div
+                
+                # Trim input if reasonable, otherwise pad
+                if best_remainder < n_freq * 0.1:  # Less than 10% wastage
+                    new_n_freq = n_freq - best_remainder
+                    warnings.warn(f"n_freq ({n_freq}) not divisible by any suitable value. "
+                                f"Trimming to {new_n_freq} to be divisible by {best_divisor}.")
+                    n_freq = new_n_freq
+                    n_group = best_divisor
+                else:
+                    # If n_group is still not compatible, adjust f_head instead
+                    warnings.warn(f"Could not find good divisor for n_freq={n_freq}. "
+                                f"Adjusting attention heads for compatibility.")
+                    feature_dim = n_freq // n_group
+                    # Find largest compatible head count
+                    for h in range(f_head, 0, -1):
+                        if feature_dim % h == 0:
+                            warnings.warn(f"Adjusted f_head from {f_head} to {h} for dimensional compatibility")
+                            f_head = h
+                            break
 
         # Calculate the actual feature dimension that will come out of the transformer
         actual_feature_dim = n_freq // n_group
-        print(f"Actual feature dimension: {actual_feature_dim}")
+        print(f"Using feature dimensions: n_freq={n_freq}, n_group={n_group}, feature_dim={actual_feature_dim}, heads={f_head}")
         
-        # Ensure n_freq is divisible by n_group
-        assert n_freq % n_group == 0, f"n_freq ({n_freq}) must be divisible by n_group ({n_group})"
+        # Final compatibility check
+        if actual_feature_dim % f_head != 0:
+            warnings.warn(f"Feature dimension {actual_feature_dim} not divisible by head count {f_head}. "
+                         f"This will cause errors. Please adjust parameters.")
+        
+        # Check if n_group was changed from what the user specified
+        if n_group != original_n_group:
+            warnings.warn(f"Modified n_group from {original_n_group} to {n_group} for compatibility")
 
         self.transformer = BaseTransformer(
             n_channel=1,  # Explicitly specify we only need 1 channel for ChordNet

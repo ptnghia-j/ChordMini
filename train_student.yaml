@@ -114,16 +114,28 @@ spec:
           env:
             - name: PYTHONPATH
               value: /mnt/storage/ChordMini
+            # Add model scale option
+            - name: MODEL_SCALE
+              value: "0.5"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
+            # Learning rate scheduling options
             - name: LR_SCHEDULE
               value: "cosine"  # Options: cosine, linear_decay, one_cycle, cosine_warm_restarts
             - name: USE_WARMUP
               value: "true"   # Set to "true" to enable warmup (if not using LR_SCHEDULE)
             - name: WARMUP_EPOCHS
-              value: "5"       # Number of warmup epochs
+              value: "5"      # Number of warmup epochs
+            # Focal loss options
             - name: USE_FOCAL_LOSS
-              value: "true"    # Set to "true" to enable focal loss
+              value: "true"   # Set to "true" to enable focal loss
             - name: FOCAL_GAMMA
-              value: "2.0"     # Gamma parameter for focal loss
+              value: "2.0"    # Gamma parameter for focal loss
+            # Knowledge distillation options
+            - name: USE_KD_LOSS
+              value: "false"  # Set to "true" to enable knowledge distillation
+            - name: KD_ALPHA
+              value: "0.5"    # Weight for KD loss (between 0 and 1)
+            - name: TEMPERATURE
+              value: "1.0"    # Temperature for softening distributions
           command:
             - sh
             - -c
@@ -214,19 +226,37 @@ spec:
                 fi
               fi
               
+              # Get knowledge distillation arguments
+              KD_LOSS_ARG=""
+              if [ "${USE_KD_LOSS}" == "true" ]; then
+                echo "Using knowledge distillation with alpha=${KD_ALPHA} and temperature=${TEMPERATURE}"
+                KD_LOSS_ARG="--use_kd_loss --kd_alpha ${KD_ALPHA} --temperature ${TEMPERATURE}"
+                echo "Note: Teacher logits must be included in the batch data"
+              fi
+              
+              # Get model scale from environment
+              MODEL_SCALE_ARG=""
+              if [ "${MODEL_SCALE}" != "" ] && [ "${MODEL_SCALE}" != "1.0" ]; then
+                echo "Using model scale factor: ${MODEL_SCALE}"
+                MODEL_SCALE_ARG="--model_scale ${MODEL_SCALE}"
+              else
+                echo "Using default model scale (1.0)"
+              fi
+              
               # Run the student training script with all options
-              echo "Starting student training with updated script and learning rate scheduling..."
-              python train_student.py --config ./config/student_config.yaml --save_dir ./checkpoints/student ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG}
+              echo "Starting student training with updated script and all options..."
+              python train_student.py --config ./config/student_config.yaml --save_dir ./checkpoints/student \
+                ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG}
               
               echo "=== Student model training complete ==="
           resources:
             requests:
-              cpu: "2"
-              memory: "8Gi"
+              cpu: "4"             
+              memory: "16Gi"    
               nvidia.com/gpu: "1"
             limits:
-              cpu: "3"
-              memory: "12Gi"
+              cpu: "6"             
+              memory: "24Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage
