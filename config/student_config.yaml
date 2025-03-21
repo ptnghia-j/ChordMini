@@ -39,7 +39,7 @@ model:
     d_layer: 3        # Base decoder layers
     d_head: 6         # Base decoder heads
   n_group: 4          # Keep this the same to maintain frequency dimension compatibility
-  dropout: 0.3        # Keep dropout the same
+  dropout: 0.5       # increase drop rate
   use_chord_aware_loss: false
 
 mp3:
