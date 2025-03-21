@@ -270,7 +270,7 @@ spec:
               
               # Run the student training script with all options
               echo "Starting student training with updated script and all options..."
-              python train_student.py --config ./config/student_config.yaml --save_dir ./checkpoints/student \
+              python train_student.py --config ./config/student_config.yaml --save_dir checkpoints/student \
                 ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS}
               
               echo "=== Student model training complete ==="
