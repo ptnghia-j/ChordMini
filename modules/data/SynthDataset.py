@@ -21,9 +21,10 @@ class SynthDataset(Dataset):
     """
     def __init__(self, spec_dir, label_dir, chord_mapping=None, seq_len=10, stride=None, 
                  frame_duration=0.1, num_workers=None, cache_file=None, verbose=True,
-                 use_cache=True, metadata_only=True, cache_fraction=0.1):
+                 use_cache=True, metadata_only=True, cache_fraction=0.1, logits_dir=None):
         self.spec_dir = Path(spec_dir)
         self.label_dir = Path(label_dir)
+        self.logits_dir = Path(logits_dir) if logits_dir is not None else None
         self.chord_mapping = chord_mapping
         self.seq_len = seq_len
         self.stride = stride if stride is not None else seq_len
@@ -331,7 +332,39 @@ class SynthDataset(Dataset):
             base_name = spec_file.stem
             if base_name.endswith("_spec"):
                 base_name = base_name[:-5]  # Remove '_spec' suffix
+            
+            # Find matching logit file if logits_dir is provided - prioritize .npy and .npz formats
+            logit_file = None
+            if self.logits_dir is not None:
+                # Focus only on the two required formats with common naming patterns
+                possible_patterns = [
+                    f"{base_name}.npy",         # Simple base name
+                    f"{base_name}_logits.npy",  # With _logits suffix
+                    f"{base_name}.npz",         # NPZ format with simple base name
+                    f"{base_name}_logits.npz"   # NPZ format with _logits suffix
+                ]
                 
+                # Check subdirectories if needed (up to 1 level)
+                search_dirs = [self.logits_dir]
+                for subdir in self.logits_dir.glob("*/"):
+                    if subdir.is_dir():
+                        search_dirs.append(subdir)
+                
+                # Try all combinations of directories and patterns
+                for directory in search_dirs:
+                    for pattern in possible_patterns:
+                        candidate = directory / pattern
+                        if candidate.exists():
+                            logit_file = candidate
+                            if self.verbose:
+                                print(f"Found logits file: {logit_file} (format: {candidate.suffix})")
+                            break
+                    if logit_file:
+                        break
+                        
+                if logit_file is None and self.verbose:
+                    print(f"Could not find matching .npy or .npz logits file for {base_name} in {self.logits_dir}")
+            
             # Find matching label file directly from dictionary
             label_file = label_files.get(base_name)
             
@@ -376,6 +409,10 @@ class SynthDataset(Dataset):
                             'song_id': base_name,
                             'frame_idx': t
                         })
+                        
+                        # Record logit path if available
+                        if logit_file:
+                            samples[-1]['logit_path'] = str(logit_file)
             else:
                 # Original behavior - load full spectrogram
                 spec = np.load(spec_file)
@@ -427,7 +464,47 @@ class SynthDataset(Dataset):
                             'chord_label': chord_label,
                             'song_id': base_name
                         })
+                        
+                        # Load logits if available
+                        if logit_file:
+                            try:
+                                logits = np.load(logit_file)
+                                # Add logits to the sample
+                                samples[-1]['teacher_logits'] = logits
+                            except Exception as e:
+                                warnings.warn(f"Error loading logits file {logit_file}: {e}")
+            
+            # Load logits with handling for .npy and .npz formats
+            if logit_file:
+                try:
+                    # Check file extension to handle different formats
+                    if str(logit_file).endswith('.npz'):
+                        # For npz files, try standard array names
+                        npz_data = np.load(logit_file)
+                        if 'logits' in npz_data:
+                            teacher_logits = npz_data['logits']
+                        elif 'teacher_logits' in npz_data:
+                            teacher_logits = npz_data['teacher_logits']
+                        elif len(npz_data.files) > 0:
+                            # Just use the first array in the file
+                            teacher_logits = npz_data[npz_data.files[0]]
+                            if self.verbose:
+                                print(f"Using first array '{npz_data.files[0]}' from NPZ file")
+                        else:
+                            raise ValueError(f"No arrays found in {logit_file}")
+                    else:
+                        # For npy files, load directly
+                        teacher_logits = np.load(logit_file)
                     
+                    # Add the logits to the sample
+                    samples[-1]['teacher_logits'] = teacher_logits
+                    
+                    if self.verbose and samples[-1]['teacher_logits'].shape:
+                        print(f"Loaded teacher logits with shape {samples[-1]['teacher_logits'].shape}")
+                        
+                except Exception as e:
+                    warnings.warn(f"Error loading logits file {logit_file}: {e}")
+            
         except Exception as e:
             warnings.warn(f"Error processing file {spec_file}: {e}")
             
@@ -590,6 +667,26 @@ class SynthDataset(Dataset):
                 
                 sequence.append(spec_vec)
                 label_seq.append(chord_idx)
+                
+                # If we have logit paths, load them
+                if 'logit_path' in sample_i:
+                    try:
+                        logit_path = sample_i['logit_path']
+                        teacher_logits = np.load(logit_path)
+                        
+                        # Process logits according to batch structure
+                        if sequence and len(sequence) > 0:
+                            if len(teacher_logits.shape) > 1:
+                                # If multi-dimensional, get specific frame's logits
+                                if 'frame_idx' in sample_i:
+                                    teacher_logits = teacher_logits[sample_i['frame_idx']]
+                            
+                            # Convert to tensor
+                            logits_tensor = torch.tensor(teacher_logits, dtype=torch.float)
+                            sample_out['teacher_logits'] = logits_tensor
+                    except Exception as e:
+                        # If logits fail to load, don't include them
+                        warnings.warn(f"Could not load teacher logits from {logit_path}: {e}")
             else:
                 # We've reached the end of the dataset, pad with zeros
                 if sequence:

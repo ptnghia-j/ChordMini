@@ -249,6 +249,8 @@ def main():
                        help='Weight for knowledge distillation loss (default: 0.5)')
     parser.add_argument('--temperature', type=float, default=1.0,
                        help='Temperature for softening distributions (default: 1.0)')
+    parser.add_argument('--logits_dir', type=str, default=None, 
+                       help='Directory containing teacher logits (required for KD)')
     
     # Add model scale argument
     parser.add_argument('--model_scale', type=float, default=None,
@@ -440,6 +442,25 @@ def main():
     
     logger.info(f"Using partial dataset caching: {args.cache_fraction*100:.1f}% of samples")
     
+    # Initialize SynthDataset with logits path if KD is enabled
+    logits_dir = None
+    if args.use_kd_loss and args.logits_dir:
+        logits_dir = resolve_path(args.logits_dir, storage_root, project_root)
+        logger.info(f"Knowledge distillation enabled - using teacher logits from: {logits_dir}")
+        
+        # Verify logits directory exists and contains files
+        if not os.path.exists(logits_dir):
+            logger.warning(f"Logits directory does not exist: {logits_dir}")
+            if args.use_kd_loss:
+                logger.error("Knowledge distillation requires valid logits directory")
+                raise RuntimeError(f"Logits directory not found: {logits_dir}")
+        else:
+            logits_count = count_files_in_subdirectories(logits_dir, "*.npy")
+            logger.info(f"Found {logits_count} teacher logit files in {logits_dir}")
+            if logits_count == 0 and args.use_kd_loss:
+                logger.error("No teacher logit files found but knowledge distillation is enabled")
+                raise RuntimeError(f"No teacher logit files found in: {logits_dir}")
+    
     # Initialize dataset with memory optimization options
     synth_dataset = SynthDataset(
         synth_spec_dir,
@@ -452,7 +473,8 @@ def main():
         cache_file=cache_file,
         use_cache=not args.disable_cache,
         metadata_only=use_metadata_only,
-        cache_fraction=args.cache_fraction
+        cache_fraction=args.cache_fraction,
+        logits_dir=logits_dir  # Pass logits_dir to the dataset
     )
 
     # After loading dataset, verify chord distribution matches expected mapping

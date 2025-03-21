@@ -1,4 +1,7 @@
 # Student model configuration
+# These are default values that can be overridden with --arg values or 
+# environment variables (USE_FOCAL_LOSS, etc.) in the Kubernetes job spec.
+
 # Training hyperparameters
 training:
   batch_size: 128
@@ -13,20 +16,20 @@ training:
   save_checkpoint_interval: 10
   min_lr: 5.0e-6
   lr_decay_factor: 0.95
-  # Warm-up parameters
+  # Warm-up parameters (can be overridden by USE_WARMUP env var)
   use_warmup: false
   warmup_epochs: 20
-  warmup_start_lr: 1.0e-5  # 1/10 of learning_rate by default
-  # New LR schedule parameter (optional)
+  warmup_start_lr: 1.0e-5
+  # LR schedule parameter (can be overridden by LR_SCHEDULE env var)
   lr_schedule: null  # Can be 'cosine', 'linear_decay', 'one_cycle', or 'cosine_warm_restarts'
-  # Focal loss parameters
-  use_focal_loss: false     # Set to true to enable focal loss
-  focal_gamma: 2.0          # Controls the down-weighting of well-classified examples
-  focal_alpha: null         # Optional class weighting factor (null to use class_weights)
-  # Knowledge distillation parameters
-  use_kd_loss: false          # Whether to use knowledge distillation
-  kd_alpha: 0.5               # Weight for KD loss (0-1)
-  temperature: 1.0            # Temperature for softening distributions
+  # Focal loss parameters (can be overridden by USE_FOCAL_LOSS env var)
+  use_focal_loss: false
+  focal_gamma: 2.0
+  focal_alpha: null
+  # Knowledge distillation parameters (can be overridden by USE_KD_LOSS env var)
+  use_kd_loss: false
+  kd_alpha: 0.5
+  temperature: 1.0
 
 # Model hyperparameters
 model:

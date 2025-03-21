@@ -112,36 +112,38 @@ spec:
           workingDir: /mnt/storage/ChordMini
           imagePullPolicy: IfNotPresent
           env:
+            # These environment variables override defaults in student_config.yaml
             - name: PYTHONPATH
               value: /mnt/storage/ChordMini
-            # Add model scale option
+            # Model scale - overrides student_config.yaml
             - name: MODEL_SCALE
               value: "1.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
-            # Learning rate scheduling options
+            # Learning rate scheduling options - overrides student_config.yaml settings
             - name: LR_SCHEDULE
               value: "cosine"  # Options: cosine, linear_decay, one_cycle, cosine_warm_restarts
             - name: USE_WARMUP
-              value: "true"   # Set to "true" to enable warmup (if not using LR_SCHEDULE)
+              value: "true"    # Overrides use_warmup in student_config.yaml
             - name: WARMUP_EPOCHS
-              value: "5"      # Number of warmup epochs
-            # Focal loss options
+              value: "5"       # Overrides warmup_epochs in student_config.yaml
+            # Focal loss options - overrides student_config.yaml settings
             - name: USE_FOCAL_LOSS
-              value: "true"   # Set to "true" to enable focal loss
+              value: "true"    # Overrides use_focal_loss in student_config.yaml
             - name: FOCAL_GAMMA
-              value: "2.0"    # Gamma parameter for focal loss
-            # Knowledge distillation options
+              value: "2.0"     # Overrides focal_gamma in student_config.yaml
+            # Knowledge distillation options - overrides student_config.yaml settings
             - name: USE_KD_LOSS
-              value: "false"  # Set to "true" to enable knowledge distillation
+              value: "false"   # Overrides use_kd_loss in student_config.yaml
             - name: KD_ALPHA
-              value: "0.5"    # Weight for KD loss (between 0 and 1)
+              value: "0.5"     # Overrides kd_alpha in student_config.yaml
             - name: TEMPERATURE
-              value: "1.0"    # Temperature for softening distributions
-            # Option to control dataset caching behavior  
+              value: "1.0"     # Overrides temperature in student_config.yaml
+            - name: KD_DATA_ROOT
+              value: "/mnt/storage/data/logits/synth"  # Base dir for KD data
+            # Caching options
             - name: METADATA_CACHE
-              value: "true"  # Set to "true" to enable metadata-only caching, "false" to disable all caching
-            # Option to control cache fraction
+              value: "true"    # Set to "true" to enable metadata-only caching, "false" to disable all caching
             - name: CACHE_FRACTION
-              value: "0.1"   # Cache only 10% of samples
+              value: "0.1"     # Cache only 10% of samples
           command:
             - sh
             - -c
@@ -265,10 +267,43 @@ spec:
                 CACHE_ARGS="${CACHE_ARGS} --cache_fraction ${CACHE_FRACTION}"
               fi
               
+              # Handle KD paths when KD is enabled with more flexible configuration
+              if [ "${USE_KD_LOSS}" == "true" ]; then
+                echo "Knowledge distillation enabled - using teacher logits"
+                
+                # Check if KD_DATA_ROOT exists
+                if [ -d "${KD_DATA_ROOT}" ]; then
+                  echo "Using KD data from: ${KD_DATA_ROOT}"
+                  
+                  # Define paths based on directory structure
+                  if [ -d "${KD_DATA_ROOT}/spectrograms" ] && [ -d "${KD_DATA_ROOT}/labels" ] && [ -d "${KD_DATA_ROOT}/logits" ]; then
+                    # Standard structure with separate directories
+                    KD_ARGS="--spec_dir ${KD_DATA_ROOT}/spectrograms --label_dir ${KD_DATA_ROOT}/labels --logits_dir ${KD_DATA_ROOT}/logits"
+                    echo "Using standard KD directory structure"
+                  elif [ -d "${KD_DATA_ROOT}" ]; then
+                    # All files might be in the root directory
+                    KD_ARGS="--spec_dir ${KD_DATA_ROOT} --label_dir ${KD_DATA_ROOT} --logits_dir ${KD_DATA_ROOT}"
+                    echo "Using flat KD directory structure"
+                  else
+                    echo "WARNING: Could not determine KD directory structure, using defaults"
+                    KD_ARGS="--logits_dir ${KD_DATA_ROOT}"
+                  fi
+                else
+                  echo "WARNING: KD_DATA_ROOT does not exist: ${KD_DATA_ROOT}"
+                  echo "Attempting to use default paths"
+                  KD_ARGS="--logits_dir /mnt/storage/data/logits/synth/logits"
+                fi
+                
+                # Log the actual paths being used
+                echo "KD arguments: ${KD_ARGS}"
+              else
+                KD_ARGS=""
+              fi
+              
               # Run the student training script with all options
               echo "Starting student training with updated script and all options..."
               python train_student.py --config ./config/student_config.yaml --save_dir checkpoints/student \
-                ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS}
+                ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS}
               
               echo "=== Student model training complete ==="
           resources:
