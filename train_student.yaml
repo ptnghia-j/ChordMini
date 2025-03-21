@@ -136,6 +136,15 @@ spec:
               value: "0.5"    # Weight for KD loss (between 0 and 1)
             - name: TEMPERATURE
               value: "1.0"    # Temperature for softening distributions
+            # Option to disable dataset caching to reduce memory usage  
+            - name: DISABLE_CACHE
+              value: "true"  # Set to "true" to disable full dataset caching
+            # Option to use metadata-only caching
+            - name: METADATA_CACHE
+              value: "true"  # Set to "true" to enable metadata-only caching
+            # Option to control cache fraction
+            - name: CACHE_FRACTION
+              value: "0.05"   # Cache only 10% of samples
           command:
             - sh
             - -c
@@ -243,10 +252,26 @@ spec:
                 echo "Using default model scale (1.0)"
               fi
               
+              # Handle caching options for memory optimization
+              CACHE_ARGS=""
+              if [ "${DISABLE_CACHE}" == "true" ]; then
+                echo "Disabling dataset caching to reduce memory usage"
+                CACHE_ARGS="--disable_cache"
+              elif [ "${METADATA_CACHE}" == "true" ]; then
+                echo "Using metadata-only caching to reduce memory usage"
+                CACHE_ARGS="--metadata_cache"
+              fi
+              
+              # Add cache fraction argument
+              if [ "${CACHE_FRACTION}" != "" ] && [ "${CACHE_FRACTION}" != "1.0" ]; then
+                echo "Using partial dataset caching: ${CACHE_FRACTION} of samples"
+                CACHE_ARGS="${CACHE_ARGS} --cache_fraction ${CACHE_FRACTION}"
+              fi
+              
               # Run the student training script with all options
               echo "Starting student training with updated script and all options..."
               python train_student.py --config ./config/student_config.yaml --save_dir ./checkpoints/student \
-                ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG}
+                ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS}
               
               echo "=== Student model training complete ==="
           resources:

@@ -3,6 +3,8 @@ import sys
 import os
 import yaml
 import argparse
+import copy
+from tabulate import tabulate
 
 # Add project root to path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
@@ -53,102 +55,189 @@ def get_valid_n_freq(n_group, suggested_n_freq=None):
         else:
             return ((144 + n_group // 2) // n_group) * n_group
 
-def compare_models(student_model, teacher_params):
-    """Compare student model parameters with teacher model parameters"""
-    print("\nModel Comparison - Student vs Teacher:")
-    print("-" * 80)
-    print(f"{'Parameter':<30} {'Student':<20} {'Teacher':<20}")
-    print("-" * 80)
+def scale_config(config, scale_factor):
+    """Scale model configuration by a given factor."""
+    scaled_config = copy.deepcopy(config)
     
-    # Get properties directly from the student model
-    student_params = {
-        'n_freq': student_model.transformer.encoder_f[0].n_freq if hasattr(student_model, 'transformer') else 'N/A',
-        'n_group': student_model.transformer.encoder_f[0].n_group if hasattr(student_model, 'transformer') else 'N/A',
-        'f_layer': len(student_model.transformer.encoder_f[0].attn_layer) if hasattr(student_model, 'transformer') else 'N/A',
-        'f_head': student_model.transformer.encoder_f[0].attn_layer[0].num_heads if hasattr(student_model, 'transformer') else 'N/A',
-        't_layer': len(student_model.transformer.encoder_t[0].attn_layer) if hasattr(student_model, 'transformer') else 'N/A', 
-        't_head': student_model.transformer.encoder_t[0].attn_layer[0].num_heads if hasattr(student_model, 'transformer') else 'N/A',
-        'd_layer': len(student_model.transformer.decoder.attn_layer1) if hasattr(student_model, 'transformer') else 'N/A',
-        'd_head': student_model.transformer.decoder.attn_layer1[0].num_heads if hasattr(student_model, 'transformer') else 'N/A',
-        'n_classes': student_model.fc.out_features if hasattr(student_model, 'fc') else 'N/A',
-        'Total Params': f"{count_parameters(student_model):,}"
-    }
+    # Get base configuration for the model
+    base_config = config.model.get('base_config', {})
     
-    # Print comparison
-    for param in student_params:
-        print(f"{param:<30} {str(student_params[param]):<20} {str(teacher_params.get(param, 'N/A')):<20}")
-    print("-" * 80)
+    # If base_config is not specified, fall back to direct model parameters
+    if not base_config:
+        base_config = {
+            'f_layer': config.model.get('f_layer', 3),
+            'f_head': config.model.get('f_head', 6),
+            't_layer': config.model.get('t_layer', 3),
+            't_head': config.model.get('t_head', 6),
+            'd_layer': config.model.get('d_layer', 3),
+            'd_head': config.model.get('d_head', 6)
+        }
+    
+    # Apply scale to model parameters
+    scaled_config.model['f_layer'] = max(1, int(round(base_config['f_layer'] * scale_factor)))
+    scaled_config.model['f_head'] = max(1, int(round(base_config['f_head'] * scale_factor)))
+    scaled_config.model['t_layer'] = max(1, int(round(base_config['t_layer'] * scale_factor)))
+    scaled_config.model['t_head'] = max(1, int(round(base_config['t_head'] * scale_factor)))
+    scaled_config.model['d_layer'] = max(1, int(round(base_config['d_layer'] * scale_factor)))
+    scaled_config.model['d_head'] = max(1, int(round(base_config['d_head'] * scale_factor)))
+    
+    return scaled_config
 
-def main():
-    parser = argparse.ArgumentParser(description='Calculate model footprint')
-    parser.add_argument('--n_freq', type=int, help='Number of frequency bins', default=144)
-    parser.add_argument('--n_classes', type=int, help='Number of chord classes', default=170)
-    args = parser.parse_args()
+def create_model_with_scale(config, scale_factor, n_freq, n_classes, verbose=False):
+    """Create a model with the given scale factor and return its details."""
+    scaled_config = scale_config(config, scale_factor)
     
-    # Load student config
-    config_path = os.path.join(project_root, 'config', 'student_config.yaml')
-    config = HParams.load(config_path)
-    
-    print(f"Loaded student configuration from: {config_path}")
-    
-    # Instantiate student model with parameters from config
-    print("Creating student model with configuration:")
-    print(f"  n_group: {config.model['n_group']}")
-    print(f"  f_layer: {config.model['f_layer']}")
-    print(f"  f_head: {config.model['f_head']}")
-    print(f"  t_layer: {config.model['t_layer']}")
-    print(f"  t_head: {config.model['t_head']}")
-    print(f"  d_layer: {config.model['d_layer']}")
-    print(f"  d_head: {config.model['d_head']}")
-    print(f"  dropout: {config.model['dropout']}")
-
-    # Get a valid n_freq value based on n_group
-    n_freq = get_valid_n_freq(config.model['n_group'], args.n_freq)
-    n_classes = args.n_classes
-    
-    print(f"  n_freq: {n_freq} (must be divisible by n_group)")
-    print(f"  n_classes: {n_classes}")
+    if verbose:
+        print(f"\nCreating model with scale factor: {scale_factor}x")
+        print(f"  f_layer: {scaled_config.model['f_layer']}")
+        print(f"  f_head: {scaled_config.model['f_head']}")
+        print(f"  t_layer: {scaled_config.model['t_layer']}")
+        print(f"  t_head: {scaled_config.model['t_head']}")
+        print(f"  d_layer: {scaled_config.model['d_layer']}")
+        print(f"  d_head: {scaled_config.model['d_head']}")
     
     # Create the model
-    model = ChordNet(n_freq=n_freq, 
-                     n_classes=n_classes, 
-                     n_group=config.model['n_group'],
-                     f_layer=config.model['f_layer'], 
-                     f_head=config.model['f_head'], 
-                     t_layer=config.model['t_layer'], 
-                     t_head=config.model['t_head'], 
-                     d_layer=config.model['d_layer'], 
-                     d_head=config.model['d_head'], 
-                     dropout=config.model['dropout'])
+    model = ChordNet(
+        n_freq=n_freq, 
+        n_classes=n_classes, 
+        n_group=scaled_config.model['n_group'],
+        f_layer=scaled_config.model['f_layer'], 
+        f_head=scaled_config.model['f_head'], 
+        t_layer=scaled_config.model['t_layer'], 
+        t_head=scaled_config.model['t_head'], 
+        d_layer=scaled_config.model['d_layer'], 
+        d_head=scaled_config.model['d_head'], 
+        dropout=scaled_config.model['dropout']
+    )
     
     total_params = count_parameters(model)
     size_bytes = model_size_in_bytes(model)
     size_mb = size_bytes / (1024 ** 2)
     
-    print(f"\nStudent Model Summary")
-    print(f"===================")
-    print(f"Total trainable parameters: {total_params:,}")
-    print(f"Model size: {size_mb:.2f} MB")
-    
-    # Print detailed parameter breakdown
-    print_model_parameters(model)
-    
-    # Define teacher model parameters for comparison
-    teacher_params = {
-        'n_freq': 144,
-        'n_group': 'N/A',  # Teacher doesn't use groups as described
-        'f_layer': 'N/A',  # Teacher uses bidirectional attention
-        'f_head': 'N/A',   # Different architecture
-        't_layer': 'N/A',  # Different architecture 
-        't_head': 'N/A',   # Different architecture
-        'd_layer': 'N/A',  # Different architecture
-        'd_head': 'N/A',   # Different architecture
-        'n_classes': 170,
-        'Total Params': 'N/A'  # We don't have exact count
+    return {
+        'scale': scale_factor,
+        'f_layer': scaled_config.model['f_layer'],
+        'f_head': scaled_config.model['f_head'],
+        't_layer': scaled_config.model['t_layer'],
+        't_head': scaled_config.model['t_head'],
+        'd_layer': scaled_config.model['d_layer'],
+        'd_head': scaled_config.model['d_head'],
+        'params': total_params,
+        'size_mb': size_mb,
+        'model': model
     }
+
+def compare_scaled_models(model_results):
+    """Print a comparison table of models with different scaling factors."""
+    print("\nModel Scaling Comparison:")
+    print("=" * 80)
     
-    # Compare student model with teacher model
-    compare_models(model, teacher_params)
+    # Prepare table rows
+    headers = ["Scale", "F-Layers", "F-Heads", "T-Layers", "T-Heads", "D-Layers", "D-Heads", "Parameters", "Size (MB)"]
+    rows = []
+    
+    for result in model_results:
+        # Format parameter count with commas
+        params_formatted = f"{result['params']:,}"
+        rows.append([
+            f"{result['scale']}x",
+            result['f_layer'],
+            result['f_head'],
+            result['t_layer'],
+            result['t_head'],
+            result['d_layer'],
+            result['d_head'],
+            params_formatted,
+            f"{result['size_mb']:.2f}"
+        ])
+    
+    # Print the table with tabulate
+    try:
+        print(tabulate(rows, headers=headers, tablefmt="grid"))
+    except ImportError:
+        # If tabulate is not available, fall back to simple formatting
+        print("\t".join(headers))
+        print("-" * 80)
+        for row in rows:
+            print("\t".join(str(cell) for cell in row))
+
+def main():
+    parser = argparse.ArgumentParser(description='Calculate model footprint for different scaling factors')
+    parser.add_argument('--n_freq', type=int, help='Number of frequency bins', default=144)
+    parser.add_argument('--n_classes', type=int, help='Number of chord classes', default=170)
+    parser.add_argument('--scales', type=float, nargs='+', default=[0.5, 1.0, 2.0], 
+                       help='Scaling factors for model capacity (default: 0.5, 1.0, 2.0)')
+    parser.add_argument('--detail', type=float, default=None,
+                       help='Show detailed parameters for a specific scale (e.g., 1.0)')
+    args = parser.parse_args()
+    
+    # Load student config
+    config_path = os.path.join(project_root, 'config', 'student_config.yaml')
+    try:
+        config = HParams.load(config_path)
+        print(f"Loaded student configuration from: {config_path}")
+    except Exception as e:
+        print(f"Error loading config from {config_path}: {e}")
+        config = HParams({
+            'model': {
+                'n_group': 4,
+                'f_layer': 3,
+                'f_head': 6,
+                't_layer': 3,
+                't_head': 6,
+                'd_layer': 3,
+                'd_head': 6,
+                'dropout': 0.3
+            }
+        })
+        print("Using default configuration")
+    
+    # Get a valid n_freq value based on n_group
+    n_freq = get_valid_n_freq(config.model['n_group'], args.n_freq)
+    n_classes = args.n_classes
+    
+    print(f"Using parameters:")
+    print(f"  n_freq: {n_freq} (must be divisible by n_group)")
+    print(f"  n_classes: {n_classes}")
+    print(f"  n_group: {config.model['n_group']}")
+    
+    # Create models for each scaling factor
+    model_results = []
+    for scale in args.scales:
+        result = create_model_with_scale(config, scale, n_freq, n_classes, verbose=(scale == args.detail))
+        model_results.append(result)
+        
+        # If this is the detail scale, print detailed parameters
+        if args.detail is not None and scale == args.detail:
+            print(f"\nDetailed analysis for {scale}x scale model:")
+            print(f"Total trainable parameters: {result['params']:,}")
+            print(f"Model size: {result['size_mb']:.2f} MB")
+            print_model_parameters(result['model'])
+    
+    # Compare all scaled models
+    compare_scaled_models(model_results)
+    
+    # Print recommendations based on available parameters
+    baseline_params = next((r['params'] for r in model_results if r['scale'] == 1.0), None)
+    if baseline_params:
+        print("\nDeployment Recommendations:")
+        print("=" * 80)
+        print(f"- Baseline model (1.0x): {baseline_params:,} parameters, suitable for standard deployment")
+        
+        half_params = next((r['params'] for r in model_results if r['scale'] == 0.5), None)
+        if half_params:
+            print(f"- Half-scale model (0.5x): {half_params:,} parameters ({half_params/baseline_params:.1%} of baseline)")
+            print("  Recommended for memory-constrained environments")
+        
+        double_params = next((r['params'] for r in model_results if r['scale'] == 2.0), None)
+        if double_params:
+            print(f"- Double-scale model (2.0x): {double_params:,} parameters ({double_params/baseline_params:.1%} of baseline)")
+            print("  Recommended for high-performance environments with sufficient resources")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()

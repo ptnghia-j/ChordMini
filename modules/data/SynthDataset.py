@@ -1,6 +1,6 @@
 import os
 import torch
-import numpy as np
+import numpy as np  # <-- FIXED: proper numpy import np
 from torch.utils.data import Dataset, DataLoader
 from collections import Counter
 import glob
@@ -20,7 +20,8 @@ class SynthDataset(Dataset):
     Optimized implementation with multiprocessing and caching.
     """
     def __init__(self, spec_dir, label_dir, chord_mapping=None, seq_len=10, stride=None, 
-                 frame_duration=0.1, num_workers=None, cache_file=None, verbose=True):
+                 frame_duration=0.1, num_workers=None, cache_file=None, verbose=True,
+                 use_cache=True, metadata_only=True, cache_fraction=0.1):
         self.spec_dir = Path(spec_dir)
         self.label_dir = Path(label_dir)
         self.chord_mapping = chord_mapping
@@ -30,6 +31,9 @@ class SynthDataset(Dataset):
         self.samples = []
         self.segment_indices = []
         self.verbose = verbose
+        self.use_cache = use_cache and cache_file is not None
+        self.metadata_only = metadata_only  # Only cache metadata, not full spectrograms
+        self.cache_fraction = cache_fraction  # Fraction of samples to cache (default: 10%)
         
         # Safely determine number of workers based on environment
         if num_workers is None:
@@ -88,7 +92,7 @@ class SynthDataset(Dataset):
         start_time = time.time()
         
         # Try to load from cache first
-        if os.path.exists(self.cache_file):
+        if self.use_cache and os.path.exists(self.cache_file):
             if self.verbose:
                 print(f"Loading dataset from cache: {self.cache_file}")
             try:
@@ -98,12 +102,44 @@ class SynthDataset(Dataset):
                     if ('samples' in cache_data and 'chord_to_idx' in cache_data and 
                         isinstance(cache_data['samples'], list) and 
                         isinstance(cache_data['chord_to_idx'], dict)):
-                        self.samples = cache_data['samples']
+                        
+                        # Check if this is a partial cache
+                        is_partial_cache = cache_data.get('is_partial_cache', False)
+                        
+                        # Handle metadata-only cache (no spectrograms stored)
+                        if self.metadata_only and 'metadata_only' in cache_data and cache_data['metadata_only']:
+                            # Load actual spectrogram files as needed
+                            self.samples = []
+                            for sample_meta in cache_data['samples']:
+                                # Load spectrogram on-demand
+                                spec_path = sample_meta.get('spec_path')
+                                if spec_path and os.path.exists(spec_path):
+                                    try:
+                                        spec = np.load(spec_path)
+                                        # Create complete sample
+                                        sample = sample_meta.copy()
+                                        sample['spectro'] = spec
+                                        self.samples.append(sample)
+                                    except Exception as e:
+                                        if self.verbose:
+                                            print(f"Error loading {spec_path}: {e}")
+                                            
+                        else:
+                            # Full cache including spectrograms
+                            self.samples = cache_data['samples']
+                            
                         self.chord_to_idx = cache_data['chord_to_idx']
                         
                         if self.verbose:
                             print(f"Loaded {len(self.samples)} samples from cache in {time.time() - start_time:.2f}s")
-                        return
+                            if is_partial_cache:
+                                print(f"Note: This is a partial cache ({self.cache_fraction*100:.1f}% of full dataset)")
+                        
+                        # If this is a partial cache and cache_fraction is 1.0, we need to load the rest
+                        if is_partial_cache and self.cache_fraction == 1.0:
+                            print("Partial cache detected but full dataset requested. Continuing to load remaining files...")
+                        else:
+                            return
                     else:
                         print("Cache format invalid, rebuilding dataset")
             except Exception as e:
@@ -141,7 +177,7 @@ class SynthDataset(Dataset):
         if self.verbose:
             print(f"Found {len(spec_files)} spectrogram files")
             
-        # Process files in parallel if appropriate
+        # Process files in parallel with memory-optimized handling
         try:
             if self.num_workers > 1 and len(spec_files) > 10:
                 # Split files into chunks for parallel processing
@@ -183,17 +219,76 @@ class SynthDataset(Dataset):
                     self.samples.extend(processed)
         
         # Cache the dataset for future use with proper error handling
-        if self.samples:
+        if self.samples and self.use_cache:
             try:
                 cache_dir = os.path.dirname(self.cache_file)
                 if cache_dir and not os.path.exists(cache_dir):
                     os.makedirs(cache_dir, exist_ok=True)
+                
+                # If using partial caching, select a contiguous portion instead of random songs
+                if self.cache_fraction < 1.0:
+                    # Group samples by song_id
+                    song_groups = {}
+                    for sample in self.samples:
+                        song_id = sample['song_id']
+                        if song_id not in song_groups:
+                            song_groups[song_id] = []
+                        song_groups[song_id].append(sample)
                     
-                with open(self.cache_file, 'wb') as f:
-                    pickle.dump({
-                        'samples': self.samples,
-                        'chord_to_idx': self.chord_to_idx
-                    }, f)
+                    # Get a sorted list of song IDs for deterministic results
+                    song_ids = sorted(song_groups.keys())
+                    
+                    # Select a contiguous portion of songs up to the target fraction
+                    total_samples = len(self.samples)
+                    target_samples = max(1, int(total_samples * self.cache_fraction))
+                    
+                    samples_to_cache = []
+                    samples_selected = 0
+                    
+                    # Take the first n songs that fit within our target sample count
+                    for song_id in song_ids:
+                        if samples_selected >= target_samples:
+                            break
+                        
+                        song_samples = song_groups[song_id]
+                        samples_to_cache.extend(song_samples)
+                        samples_selected += len(song_samples)
+                    
+                    if self.verbose:
+                        song_count = len(samples_to_cache) // 100  # Approximate song count for display
+                        print(f"Caching first {len(samples_to_cache)} samples from {song_count} songs "
+                              f"({len(samples_to_cache)/total_samples*100:.1f}% of total)")
+                else:
+                    samples_to_cache = self.samples
+                
+                # If metadata-only, create and store metadata
+                if self.metadata_only:
+                    samples_meta = []
+                    for sample in samples_to_cache:
+                        # Store metadata and file path instead of actual array
+                        meta = {k: sample[k] for k in sample if k != 'spectro'}
+                        spec_path = os.path.join(self.spec_dir, f"{sample['song_id']}.npy")
+                        if os.path.exists(spec_path):
+                            meta['spec_path'] = spec_path
+                        samples_meta.append(meta)
+                    
+                    with open(self.cache_file, 'wb') as f:
+                        pickle.dump({
+                            'samples': samples_meta,
+                            'chord_to_idx': self.chord_to_idx,
+                            'metadata_only': True,
+                            'is_partial_cache': self.cache_fraction < 1.0
+                        }, f)
+                else:
+                    # Full cache including spectrograms (original approach)
+                    with open(self.cache_file, 'wb') as f:
+                        pickle.dump({
+                            'samples': samples_to_cache,
+                            'chord_to_idx': self.chord_to_idx,
+                            'metadata_only': False,
+                            'is_partial_cache': self.cache_fraction < 1.0
+                        }, f)
+                        
                 if self.verbose:
                     print(f"Saved dataset cache to {self.cache_file}")
             except Exception as e:
@@ -229,7 +324,7 @@ class SynthDataset(Dataset):
         return chunk_samples
         
     def _process_file(self, spec_file, label_files):
-        """Process a single spectrogram file and its matching label file"""
+        """Process a single spectrogram file and its matching label file with memory optimization"""
         samples = []
         try:
             # Extract file name for matching
@@ -253,56 +348,83 @@ class SynthDataset(Dataset):
                 if not found:
                     return samples  # Skip this file if no label found
             
-            # Load spectrogram data
-            spec = np.load(spec_file)
-            
-            # Check for NaN values
-            if np.isnan(spec).any():
-                warnings.warn(f"NaN values found in {spec_file}, replacing with zeros")
-                spec = np.nan_to_num(spec, nan=0.0)
-            
-            # Check for extreme values
-            if np.abs(spec).max() > 1000:
-                warnings.warn(f"Extreme values found in {spec_file}, max: {np.abs(spec).max()}")
-            
-            # Load label file
-            chord_labels = self._parse_label_file(label_file)
-            
-            # Create a sample for each frame
-            if len(spec.shape) <= 1:  # Single frame
-                chord_label = self._find_chord_at_time(chord_labels, 0.0)
+            # Load spectrogram data - if metadata_only, we'll store the path instead
+            if self.metadata_only:
+                # Just check if file exists and record metadata
+                if os.path.exists(spec_file):
+                    # Load minimal information needed for song identification and structure
+                    spec_info = np.load(spec_file, mmap_mode='r')
+                    spec_shape = spec_info.shape
+                    # Create sample with metadata only
+                    for t in range(spec_shape[0] if len(spec_shape) > 1 else 1):
+                        frame_time = t * self.frame_duration
+                        chord_label = self._find_chord_at_time(chord_labels, frame_time)
+                        
+                        # Make sure the chord label exists in the mapping
+                        if self.chord_mapping is None:
+                            if chord_label not in self.chord_to_idx:
+                                self.chord_to_idx[chord_label] = len(self.chord_to_idx)
+                        elif chord_label not in self.chord_mapping:
+                            warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
+                            chord_label = "N"
+                            
+                        samples.append({
+                            'spec_path': str(spec_file),
+                            'chord_label': chord_label,
+                            'song_id': base_name,
+                            'frame_idx': t
+                        })
+            else:
+                # Original behavior - load full spectrogram
+                spec = np.load(spec_file)
                 
-                # Make sure the chord label exists in the mapping
-                if self.chord_mapping is None:
-                    if chord_label not in self.chord_to_idx:
-                        self.chord_to_idx[chord_label] = len(self.chord_to_idx)
-                elif chord_label not in self.chord_mapping:
-                    warnings.warn(f"Unknown chord label {chord_label} found in {label_file}")
-                    return samples
-                    
-                samples.append({
-                    'spectro': spec,
-                    'chord_label': chord_label,
-                    'song_id': base_name
-                })
-            else:  # Multiple frames
-                for t in range(spec.shape[0]):
-                    frame_time = t * self.frame_duration
-                    chord_label = self._find_chord_at_time(chord_labels, frame_time)
+                # Check for NaN values
+                if np.isnan(spec).any():
+                    warnings.warn(f"NaN values found in {spec_file}, replacing with zeros")
+                    spec = np.nan_to_num(spec, nan=0.0)
+                
+                # Check for extreme values
+                if np.abs(spec).max() > 1000:
+                    warnings.warn(f"Extreme values found in {spec_file}, max: {np.abs(spec).max()}")
+                
+                # Load label file
+                chord_labels = self._parse_label_file(label_file)
+                
+                # Create a sample for each frame
+                if len(spec.shape) <= 1:  # Single frame
+                    chord_label = self._find_chord_at_time(chord_labels, 0.0)
                     
                     # Make sure the chord label exists in the mapping
                     if self.chord_mapping is None:
                         if chord_label not in self.chord_to_idx:
                             self.chord_to_idx[chord_label] = len(self.chord_to_idx)
                     elif chord_label not in self.chord_mapping:
-                        warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
-                        chord_label = "N"
+                        warnings.warn(f"Unknown chord label {chord_label} found in {label_file}")
+                        return samples
                         
                     samples.append({
-                        'spectro': spec[t],
+                        'spectro': spec,
                         'chord_label': chord_label,
                         'song_id': base_name
                     })
+                else:  # Multiple frames
+                    for t in range(spec.shape[0]):
+                        frame_time = t * self.frame_duration
+                        chord_label = self._find_chord_at_time(chord_labels, frame_time)
+                        
+                        # Make sure the chord label exists in the mapping
+                        if self.chord_mapping is None:
+                            if chord_label not in self.chord_to_idx:
+                                self.chord_to_idx[chord_label] = len(self.chord_to_idx)
+                        elif chord_label not in self.chord_mapping:
+                            warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
+                            chord_label = "N"
+                            
+                        samples.append({
+                            'spectro': spec[t],
+                            'chord_label': chord_label,
+                            'song_id': base_name
+                        })
                     
         except Exception as e:
             warnings.warn(f"Error processing file {spec_file}: {e}")
@@ -387,7 +509,7 @@ class SynthDataset(Dataset):
         return len(self.segment_indices)
     
     def __getitem__(self, idx):
-        """Get a segment by index, with proper padding for song boundaries"""
+        """Get a segment by index, with proper padding for song boundaries and lazy loading"""
         if not self.segment_indices:
             raise IndexError("Dataset is empty - no segments available")
             
@@ -396,7 +518,24 @@ class SynthDataset(Dataset):
         label_seq = []
         
         # Get sample shape for padding
-        first_spec = self.samples[0]['spectro']
+        first_sample = self.samples[0]
+        first_spec = None
+        
+        # Lazy loading for first sample if needed
+        if self.metadata_only and 'spectro' not in first_sample and 'spec_path' in first_sample:
+            # Load from file
+            try:
+                spec_path = first_sample['spec_path']
+                first_spec = np.load(spec_path)
+                # For single frames, get specific frame
+                if first_sample.get('frame_idx') is not None and len(first_spec.shape) > 1:
+                    first_spec = first_spec[first_sample['frame_idx']]
+            except Exception:
+                # Fallback to zeros with a reasonable shape
+                first_spec = np.zeros((144, ))
+        else:
+            # Get from sample
+            first_spec = first_sample.get('spectro', np.zeros((144, )))
         
         # Get song_id of the starting sample to check for song boundary
         start_song_id = self.samples[seg_start]['song_id']
@@ -424,7 +563,26 @@ class SynthDataset(Dataset):
                     break
                     
                 # Regular case: add the sample to the sequence
-                spec_vec = torch.tensor(sample_i['spectro'], dtype=torch.float)
+                # Lazy load spectrogram if needed
+                if self.metadata_only and 'spectro' not in sample_i and 'spec_path' in sample_i:
+                    try:
+                        spec_path = sample_i['spec_path']
+                        spec = np.load(spec_path)
+                        # For single frames, get specific frame
+                        if sample_i.get('frame_idx') is not None and len(spec.shape) > 1:
+                            spec = spec[sample_i['frame_idx']]
+                        spec_vec = torch.tensor(spec, dtype=torch.float)
+                    except Exception as e:
+                        # Use zeros on error
+                        if sequence:
+                            padding_shape = sequence[-1].shape
+                        else:
+                            padding_shape = first_spec.shape
+                        spec_vec = torch.zeros(padding_shape, dtype=torch.float)
+                else:
+                    # Use stored spectrogram
+                    spec_vec = torch.tensor(sample_i['spectro'], dtype=torch.float)
+                
                 chord_label = sample_i['chord_label']
                 chord_idx = self.chord_to_idx.get(chord_label, self.chord_to_idx.get("N", 0))
                 

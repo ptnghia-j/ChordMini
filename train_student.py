@@ -254,6 +254,14 @@ def main():
     parser.add_argument('--model_scale', type=float, default=None,
                        help='Scaling factor for model capacity (0.5=half, 1.0=base, 2.0=double)')
     
+    # Add parameter to control dataset caching behavior
+    parser.add_argument('--disable_cache', action='store_true',
+                      help='Disable dataset caching to reduce memory usage')
+    parser.add_argument('--metadata_cache', action='store_true',
+                      help='Only cache metadata (not spectrograms) to reduce memory usage')
+    parser.add_argument('--cache_fraction', type=float, default=0.1,
+                      help='Fraction of dataset to cache (default: 0.1 = 10%%)')
+    
     args = parser.parse_args()
 
     # Load configuration from YAML
@@ -419,6 +427,20 @@ def main():
     
     # Now we can safely use checkpoints_dir in the dataset initialization
     # Load synthesized dataset with optimized parameters
+    cache_file = os.path.join(checkpoints_dir, "dataset_cache.pkl") if not args.disable_cache else None
+    
+    # Memory optimization: if we have an OOM issue, prioritize metadata-only caching
+    use_metadata_only = True  # Default to metadata-only to avoid OOM
+    if args.metadata_cache:
+        use_metadata_only = True
+        logger.info("Using metadata-only caching to reduce memory usage")
+    elif args.disable_cache:
+        use_metadata_only = False  # Doesn't matter if cache is disabled
+        logger.info("Dataset caching disabled to reduce memory usage")
+    
+    logger.info(f"Using partial dataset caching: {args.cache_fraction*100:.1f}% of samples")
+    
+    # Initialize dataset with memory optimization options
     synth_dataset = SynthDataset(
         synth_spec_dir,
         synth_label_dir, 
@@ -427,7 +449,10 @@ def main():
         stride=config.training['seq_stride'],
         frame_duration=frame_duration,
         num_workers=os.cpu_count(),  # Use all available CPU cores for dataset loading
-        cache_file=os.path.join(checkpoints_dir, "dataset_cache.pkl")  # Cache dataset for future runs
+        cache_file=cache_file,  # Will be None if caching is disabled
+        use_cache=not args.disable_cache,
+        metadata_only=use_metadata_only,
+        cache_fraction=args.cache_fraction  # Only cache a fraction of the dataset
     )
 
     # After loading dataset, verify chord distribution matches expected mapping
