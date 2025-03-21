@@ -440,7 +440,7 @@ class StudentTrainer(BaseTrainer):
 
     def compute_loss(self, logits, targets, teacher_logits=None):
         """
-        Compute the loss.
+        Compute the loss with enhanced dimension handling and error reporting.
         If KD loss is enabled and teacher_logits are provided, combine standard loss and KD loss.
         """
         if isinstance(logits, tuple):
@@ -464,12 +464,98 @@ class StudentTrainer(BaseTrainer):
         # If KD loss is enabled and teacher_logits are given, compute KD loss and combine.
         if self.use_kd_loss:
             if teacher_logits is not None:
-                temperature = self.temperature
-                # Compute softened predictions for student and teacher
-                student_log_probs = torch.nn.functional.log_softmax(logits / temperature, dim=1)
-                teacher_probs = torch.nn.functional.softmax(teacher_logits / temperature, dim=1)
-                kd_loss = torch.nn.functional.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (temperature ** 2)
-                loss = (1 - self.kd_alpha) * loss + self.kd_alpha * kd_loss
+                # Add debug information at first use about raw logits
+                if not hasattr(self, '_kd_debug_logged'):
+                    self._log(f"KD Loss active: alpha={self.kd_alpha}, temp={self.temperature}")
+                    self._log(f"Student logits shape: {logits.shape}")
+                    self._log(f"Teacher logits shape: {teacher_logits.shape}")
+                    
+                    # Check if logits appear to be raw (not already normalized)
+                    try:
+                        max_abs_value = torch.abs(teacher_logits).max().item()
+                        self._log(f"Teacher logits max absolute value: {max_abs_value:.4f}")
+                        if max_abs_value > 10:
+                            self._log("Teacher logits appear to be raw (unnormalized) as expected")
+                        else:
+                            self._log("WARNING: Teacher logits might already be normalized or have low magnitude")
+                    except Exception as e:
+                        self._log(f"Error analyzing teacher logits: {e}")
+                    
+                    self._kd_debug_logged = True
+                    
+                # Enhanced dimension matching with better error reporting
+                try:
+                    # Ensure dimensions match between student and teacher logits
+                    if teacher_logits.shape != logits.shape:
+                        self._log(f"Shape mismatch: teacher_logits {teacher_logits.shape}, student logits {logits.shape}")
+                        
+                        # If teacher has more dimensions than student, reduce
+                        if teacher_logits.dim() > logits.dim():
+                            if teacher_logits.dim() == 3 and logits.dim() == 2:
+                                # Average over time dimension (dim=1)
+                                orig_shape = teacher_logits.shape
+                                teacher_logits = teacher_logits.mean(dim=1)
+                                self._log(f"Reduced teacher logits from {orig_shape} to {teacher_logits.shape}")
+                            else:
+                                raise ValueError(f"Cannot automatically adjust teacher logits with {teacher_logits.dim()} dims to match student logits with {logits.dim()} dims")
+                        
+                        # If student has more dimensions, adapt teacher
+                        elif logits.dim() > teacher_logits.dim():
+                            if logits.dim() == 3 and teacher_logits.dim() == 2:
+                                # Expand teacher to match time dimension
+                                orig_shape = teacher_logits.shape
+                                teacher_logits = teacher_logits.unsqueeze(1).expand(-1, logits.size(1), -1)
+                                teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
+                                self._log(f"Expanded teacher logits from {orig_shape} to {teacher_logits.shape}")
+                            else:
+                                raise ValueError(f"Cannot automatically adjust teacher logits with {teacher_logits.dim()} dims to match student logits with {logits.dim()} dims")
+                        
+                        # If dimensions are the same but shapes differ
+                        elif teacher_logits.shape != logits.shape:
+                            if teacher_logits.size(-1) != logits.size(-1):
+                                raise ValueError(f"Teacher and student have different output dimensions: {teacher_logits.size(-1)} vs {logits.size(-1)}")
+                            else:
+                                # Try batch size adaptation if possible
+                                if teacher_logits.size(0) > logits.size(0) and teacher_logits.size(0) % logits.size(0) == 0:
+                                    # Take subset of teacher's batch
+                                    teacher_logits = teacher_logits[:logits.size(0)]
+                                    self._log(f"Using subset of teacher batch to match student batch size: {teacher_logits.shape}")
+                                elif logits.size(0) > teacher_logits.size(0) and logits.size(0) % teacher_logits.size(0) == 0:
+                                    # Repeat teacher's batch
+                                    repeat_factor = logits.size(0) // teacher_logits.size(0)
+                                    teacher_logits = teacher_logits.repeat(repeat_factor, 1)
+                                    self._log(f"Repeated teacher batch {repeat_factor} times to match student batch size: {teacher_logits.shape}")
+                                else:
+                                    raise ValueError(f"Cannot adjust teacher batch size {teacher_logits.size(0)} to match student batch size {logits.size(0)}")
+                    
+                    # Check once more that dimensions match
+                    if teacher_logits.shape != logits.shape:
+                        raise ValueError(f"Failed to match dimensions: teacher_logits {teacher_logits.shape}, student logits {logits.shape}")
+                    
+                    # Proceed with KD loss calculation
+                    temperature = self.temperature
+                    student_log_probs = torch.nn.functional.log_softmax(logits / temperature, dim=1)
+                    teacher_probs = torch.nn.functional.softmax(teacher_logits / temperature, dim=1)
+                    
+                    # Additional safeguard against NaN values
+                    if torch.isnan(student_log_probs).any() or torch.isnan(teacher_probs).any():
+                        self._log("WARNING: NaN values detected in softmax outputs, using clipping")
+                        teacher_logits = torch.clamp(teacher_logits, -100, 100)
+                        logits = torch.clamp(logits, -100, 100)
+                        student_log_probs = torch.nn.functional.log_softmax(logits / temperature, dim=1)
+                        teacher_probs = torch.nn.functional.softmax(teacher_logits / temperature, dim=1)
+                    
+                    kd_loss = torch.nn.functional.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (temperature ** 2)
+                    loss = (1 - self.kd_alpha) * loss + self.kd_alpha * kd_loss
+                    
+                except Exception as e:
+                    self._log(f"ERROR in KD loss computation: {e}")
+                    self._log("Continuing with standard loss only")
+                    # Don't modify the original loss
+                    if not hasattr(self, '_kd_error_logged'):
+                        self._log("Further KD errors will be suppressed. Check your logits files and dimensions.")
+                        self._kd_error_logged = True
+                
             else:
                 # Log warning only once per epoch to avoid spam
                 if not hasattr(self, '_kd_warning_logged'):
