@@ -193,3 +193,6 @@ $RECYCLE.BIN/
 /data/
 
 .qodo
+
+#ignore checkpoints folder
+checkpoints/
