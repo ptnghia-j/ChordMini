@@ -17,19 +17,19 @@ training:
   min_lr: 5.0e-6
   lr_decay_factor: 0.95
   # Warm-up parameters (can be overridden by USE_WARMUP env var)
-  use_warmup: false
-  warmup_epochs: 20
+  use_warmup: true
+  warmup_epochs: 10
   warmup_start_lr: 1.0e-5
   # LR schedule parameter (can be overridden by LR_SCHEDULE env var)
-  lr_schedule: null  # Can be 'cosine', 'linear_decay', 'one_cycle', or 'cosine_warm_restarts'
+  lr_schedule: 'cosine'  # Can be 'cosine', 'linear_decay', 'one_cycle', or 'cosine_warm_restarts'
   # Focal loss parameters (can be overridden by USE_FOCAL_LOSS env var)
-  use_focal_loss: false
+  use_focal_loss: true
   focal_gamma: 2.0
-  focal_alpha: null
+  focal_alpha: 0.25
   # Knowledge distillation parameters (can be overridden by USE_KD_LOSS env var)
-  use_kd_loss: false
-  kd_alpha: 0.5
-  temperature: 1.0
+  use_kd_loss: true
+  kd_alpha: 0.9
+  temperature: 20.0
 
 # Model hyperparameters
 model:
@@ -77,7 +77,7 @@ paths:
 
 # Data parameters
 data:
-  lazy_init: false           # Controls dataset lazy initialization
+  lazy_init: true           # Controls dataset lazy initialization
   cache_fraction: 0.1        # Fraction of dataset to cache (default: 0.1 = 10%)
   metadata_only: true        # Only cache metadata, not full spectrograms
   disable_cache: false       # Set to true to disable dataset caching

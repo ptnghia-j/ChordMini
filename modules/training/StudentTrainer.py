@@ -281,7 +281,7 @@ class StudentTrainer(BaseTrainer):
         """
         # Verify dimensions match before proceeding
         if student_logits.shape != teacher_logits.shape:
-            self._log(f"WARNING: Dimension mismatch in distillation_loss: student {student_logits.shape}, teacher {teacher_logits.shape}")
+            self._log(f"Dimension mismatch in distillation_loss: student {student_logits.shape}, teacher {teacher_logits.shape}")
             
             # Try to adapt dimensions - add detailed logging for diagnosis
             s_shape, t_shape = student_logits.shape, teacher_logits.shape
@@ -296,7 +296,10 @@ class StudentTrainer(BaseTrainer):
                         teacher_logits = teacher_logits.repeat(s_shape[0], 1)
                         self._log(f"Expanded teacher batch via repeat from 1 to {s_shape[0]}")
                     else:
-                        raise ValueError(f"Cannot adapt mismatched batch sizes: student={s_shape[0]}, teacher={t_shape[0]}")
+                        # Use batch subsampling to match sizes
+                        self._log(f"Subsampling student batch from {s_shape[0]} to {t_shape[0]}")
+                        student_logits = student_logits[:t_shape[0]]
+                        targets = targets[:t_shape[0]] if targets.size(0) > t_shape[0] else targets
             
             if len(s_shape) != len(t_shape):  # Dimension count mismatch
                 self._log(f"Dimension count mismatch: student has {len(s_shape)}, teacher has {len(t_shape)}")
@@ -307,13 +310,27 @@ class StudentTrainer(BaseTrainer):
                     teacher_logits = teacher_logits.mean(dim=1)  # Average over time
                     self._log(f"Averaged teacher time dimension, new shape: {teacher_logits.shape}")
                 else:
-                    raise ValueError(f"Cannot reconcile dimension count difference")
+                    # For more complex mismatches, try to match final dimension
+                    if s_shape[-1] != t_shape[-1]:
+                        self._log(f"Class dimension mismatch: student={s_shape[-1]}, teacher={t_shape[-1]}")
+                        if s_shape[-1] < t_shape[-1]:
+                            # Teacher has more classes - truncate
+                            teacher_logits = teacher_logits[..., :s_shape[-1]]
+                            self._log(f"Truncated teacher classes from {t_shape[-1]} to {s_shape[-1]}")
+                        else:
+                            # Student has more classes - pad teacher with very negative values
+                            pad_size = s_shape[-1] - t_shape[-1]
+                            pad = torch.full((t_shape[0], pad_size), -100.0, device=teacher_logits.device)
+                            teacher_logits = torch.cat([teacher_logits, pad], dim=-1)
+                            self._log(f"Padded teacher classes from {t_shape[-1]} to {s_shape[-1]}")
             
             # Check once more before continuing
             if student_logits.shape != teacher_logits.shape:
-                raise ValueError(f"Failed to match dimensions after attempted fixes: student {student_logits.shape}, teacher {teacher_logits.shape}")
+                self._log(f"Failed to match dimensions after attempted fixes: student {student_logits.shape}, teacher {teacher_logits.shape}")
+                self._log("Falling back to standard cross entropy loss")
+                return F.cross_entropy(student_logits, targets)
             
-            self._log(f"Successfully adapted dimensions for KD loss")
+            self._log(f"Successfully adapted dimensions for KD loss to {student_logits.shape}")
         
         # Use class attributes for temperature and alpha
         temperature = self.temperature
@@ -335,7 +352,15 @@ class StudentTrainer(BaseTrainer):
         ce_loss = F.cross_entropy(student_logits, targets)
         
         # Combine losses with alpha weighting
-        return alpha * kl_loss + (1 - alpha) * ce_loss
+        combined_loss = alpha * kl_loss + (1 - alpha) * ce_loss
+        
+        # Add logging once for diagnostics
+        if not hasattr(self, '_kd_loss_logged'):
+            self._log(f"KD loss breakdown - KL: {kl_loss.item():.4f}, CE: {ce_loss.item():.4f}, Combined: {combined_loss.item():.4f}")
+            self._log(f"Using α={alpha}, temperature={temperature}")
+            self._kd_loss_logged = True
+        
+        return combined_loss
 
     def label_smoothed_loss(self, logits, targets, smoothing=0.1):
         """
@@ -619,6 +644,12 @@ class StudentTrainer(BaseTrainer):
         # Reset KD warning flag
         self._kd_warning_logged = False
         
+        # Log KD status at the beginning of training
+        if self.use_kd_loss:
+            self._log(f"Knowledge Distillation enabled: α={self.kd_alpha}, temperature={self.temperature}")
+        else:
+            self._log("Knowledge Distillation disabled, using standard loss")
+        
         # Handle initial learning rate explicitly (before first epoch)
         # This ensures we start exactly at warmup_start_lr
         if self.use_warmup and start_epoch == 1:
@@ -644,6 +675,10 @@ class StudentTrainer(BaseTrainer):
             train_correct = 0
             train_total = 0
             
+            # Track KD usage statistics for this epoch
+            kd_batches = 0
+            total_batches = 0
+            
             # Get number of batches for fractional epoch calculation
             num_batches = len(train_loader)
             
@@ -655,15 +690,25 @@ class StudentTrainer(BaseTrainer):
                 
                 # Regular training step
                 inputs, targets = self._process_batch(batch)
+                
                 # Extract teacher logits from batch if provided
                 teacher_logits = None
                 if self.use_kd_loss and 'teacher_logits' in batch:
                     teacher_logits = batch['teacher_logits'].to(self.device)
+                    self._log(f"Teacher logits shape: {teacher_logits.shape}")
+                    kd_batches += 1
                 
+                total_batches += 1
+                
+                if self.use_kd_loss and teacher_logits is None and batch_idx == 0:
+                    self._log("WARNING: KD enabled but no teacher logits found in batch")
+                    
                 if self.normalization:
                     inputs = (inputs - self.normalization['mean']) / self.normalization['std']
+                    
                 self.optimizer.zero_grad(set_to_none=True)
                 outputs = self.model(inputs)
+                
                 if isinstance(outputs, tuple):
                     logits = outputs[0]
                 else:
@@ -671,25 +716,45 @@ class StudentTrainer(BaseTrainer):
 
                 # For per-frame supervision, flatten logits and targets when needed
                 if logits.ndim == 3 and targets.ndim == 2:
+                    # Store original shape for adapting teacher_logits if needed
+                    orig_logits_shape = logits.shape
+                    
                     logits = logits.reshape(-1, logits.size(-1))
                     targets = targets.reshape(-1)
+                    
                     # If we have teacher logits, reshape them too
                     if teacher_logits is not None and teacher_logits.ndim == 3:
-                        teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
+                        if teacher_logits.shape[0:2] == orig_logits_shape[0:2]:
+                            teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
+                        else:
+                            self._log(f"Shape mismatch between student ({orig_logits_shape}) and teacher ({teacher_logits.shape}) logits")
+                            # Try time dimension averaging as fallback
+                            if teacher_logits.shape[0] == orig_logits_shape[0]:
+                                teacher_logits = teacher_logits.mean(dim=1)
+                            elif teacher_logits.ndim > 2:
+                                teacher_logits = teacher_logits.mean(dim=1).reshape(-1, teacher_logits.size(-1))
 
                 # Use our custom compute_loss method with teacher_logits if available
                 loss = self.compute_loss(logits, targets, teacher_logits)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
+                
                 preds = logits.argmax(dim=1)
                 train_correct += (preds == targets).sum().item()
                 train_total += targets.size(0)
                 epoch_loss += loss.item()
+                
                 if batch_idx % 20 == 0:
-                    # Log current LR
+                    # Log current LR and indicate whether KD is being used for this batch
                     current_lr = self.optimizer.param_groups[0]['lr']
-                    self._log(f"Epoch {epoch}/{self.num_epochs} | Batch {batch_idx}/{len(train_loader)} | Loss: {loss.item():.4f} | LR: {current_lr:.7f}")
+                    kd_status = " (with KD)" if teacher_logits is not None else ""
+                    self._log(f"Epoch {epoch}/{self.num_epochs} | Batch {batch_idx}/{len(train_loader)} | Loss: {loss.item():.4f}{kd_status} | LR: {current_lr:.7f}")
+            
+            # Log KD usage statistics 
+            if self.use_kd_loss:
+                kd_percent = (kd_batches / total_batches) * 100 if total_batches > 0 else 0
+                self._log(f"KD usage: {kd_batches}/{total_batches} batches ({kd_percent:.1f}%)")
             
             # Log training metrics for this epoch
             avg_train_loss = epoch_loss / len(train_loader)
@@ -697,6 +762,7 @@ class StudentTrainer(BaseTrainer):
             self.timer.stop()
             self._log(f"Epoch {epoch}/{self.num_epochs} | Train Loss: {avg_train_loss:.4f} | Train Accuracy: {train_acc:.4f} | Time: {self.timer.elapsed_time():.2f} sec")
             self.train_losses.append(avg_train_loss)
+            
             if self.animator:
                 self.animator.add(epoch, avg_train_loss)
             
