@@ -120,30 +120,17 @@ spec:
               value: "1.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
             # Learning rate scheduling options - overrides student_config.yaml settings
             - name: LR_SCHEDULE
-              value: "cosine"  # Options: cosine, linear_decay, one_cycle, cosine_warm_restarts
-            - name: USE_WARMUP
-              value: "true"    # Overrides use_warmup in student_config.yaml
-            - name: WARMUP_EPOCHS
-              value: "10"       # Overrides warmup_epochs in student_config.yaml
-            # Focal loss options - overrides student_config.yaml settings
-            - name: USE_FOCAL_LOSS
-              value: "true"    # Overrides use_focal_loss in student_config.yaml
-            - name: FOCAL_GAMMA
-              value: "1.5"     # Overrides focal_gamma in student_config.yaml
-            # Knowledge distillation options - overrides student_config.yaml settings
+              value: "cosine"
+            # Knowledge distillation settings
             - name: USE_KD_LOSS
-              value: "true"   # Overrides use_kd_loss in student_config.yaml
+              value: "false"  # Set to "true" to enable KD loss
             - name: KD_ALPHA
-              value: "0.9"     # Overrides kd_alpha in student_config.yaml
+              value: "0.5"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
-              value: "20.0"     # Overrides temperature in student_config.yaml
-            - name: KD_DATA_ROOT
-              value: "/mnt/storage/data/logits/synth"  # Base dir for KD data
-            # Caching options
-            - name: METADATA_CACHE
-              value: "true"    # Set to "true" to enable metadata-only caching, "false" to disable all caching
-            - name: CACHE_FRACTION
-              value: "0.01"     # Cache only 1% of samples
+              value: "2.0"  # Temperature for softening distributions
+            # Single data root for all data types
+            - name: DATA_ROOT
+              value: "/mnt/storage/data"
           command:
             - sh
             - -c
@@ -309,11 +296,11 @@ spec:
           resources:
             requests:
               cpu: "4"             
-              memory: "12Gi"    
+              memory: "16Gi"    
               nvidia.com/gpu: "1"
             limits:
-              cpu: "6"             
-              memory: "16Gi" 
+              cpu: "8"             
+              memory: "32Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage
