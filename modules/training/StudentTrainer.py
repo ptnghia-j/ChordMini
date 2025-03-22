@@ -3,6 +3,7 @@ import torch
 import numpy as np
 from modules.training.Trainer import BaseTrainer
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, OneCycleLR, CosineAnnealingWarmRestarts
+import torch.nn.functional as F
 
 class StudentTrainer(BaseTrainer):
     """
@@ -92,18 +93,25 @@ class StudentTrainer(BaseTrainer):
         self.lr_schedule_type = lr_schedule_type
         self.smooth_scheduler = None
         
-        # Create smooth scheduler if requested
+        # Modified to allow both warmup and scheduler to coexist
+        # Set up smooth scheduler if requested
         if self.lr_schedule_type:
             self._create_smooth_scheduler()
             self._log(f"Using smooth '{self.lr_schedule_type}' learning rate schedule")
-        elif self.use_warmup:
+        else:
+            self._log("Using validation-based learning rate adjustment")
+        
+        # Set up warmup independent of scheduler choice
+        if self.use_warmup:
             self._log(f"Using warm-up LR schedule for first {self.warmup_epochs} epochs")
             self._log(f"Warm-up LR: {self.warmup_start_lr:.6f} → {self.warmup_end_lr:.6f}")
             # Set initial learning rate to warm-up start LR
             self._set_lr(self.warmup_start_lr)
-        else:
-            self._log("Using validation-based learning rate adjustment")
             
+            # If using both warmup and a scheduler, log this combined approach
+            if self.lr_schedule_type:
+                self._log(f"Will apply {self.lr_schedule_type} scheduler after warmup completes")
+        
         # Best model tracking
         self.best_model_path = os.path.join(self.checkpoint_dir, "student_model_best.pth")
         self.chord_mapping = None
@@ -169,40 +177,59 @@ class StudentTrainer(BaseTrainer):
             if batch_idx > 0 and batch_idx % max(1, num_batches // 10) == 0:
                 self.smooth_scheduler.step(epoch - 1 + batch_idx / num_batches)
     
+    def _update_learning_rate(self, epoch, batch_idx=None, num_batches=None):
+        """
+        Update learning rate based on warmup and scheduler status.
+        This new method allows combining warmup with other schedulers.
+        
+        Args:
+            epoch: Current training epoch
+            batch_idx: Current batch index within epoch (for fractional updates)
+            num_batches: Total number of batches per epoch (for fractional updates)
+        
+        Returns:
+            Current learning rate after update
+        """
+        # Check if we're in warmup phase
+        in_warmup = self.use_warmup and epoch <= self.warmup_epochs
+        
+        if in_warmup:
+            # In warmup phase, override other schedulers
+            return self._warmup_learning_rate(epoch)
+        elif self.lr_schedule_type and batch_idx is not None and num_batches is not None:
+            # After warmup, use the selected scheduler with an adjusted epoch
+            # (subtract warmup epochs to make scheduler start from 0)
+            if self.use_warmup:
+                # If using both, we pretend the scheduler started after warmup
+                effective_epoch = epoch - self.warmup_epochs
+                self._update_smooth_scheduler(effective_epoch, batch_idx, num_batches)
+            else:
+                # Standard scheduling without warmup adjustment
+                self._update_smooth_scheduler(epoch, batch_idx, num_batches)
+            return self.optimizer.param_groups[0]['lr'] 
+        else:
+            # No scheduler or no batch info provided
+            return self.optimizer.param_groups[0]['lr']
+    
     def _adjust_weights_for_no_chord(self, weights, idx_to_chord):
-        """Adjust weights to handle 'N' (no chord) class imbalance"""
+        """
+        Previously adjusted weights for 'N' chord class. Now simply logs chord information
+        without modifying weights to ensure balanced training.
+        """
         n_chord_idx = None
         
-        # Find the index that corresponds to "N" chord
+        # Find the index that corresponds to "N" chord (for logging only)
         for idx, chord in idx_to_chord.items():
             if chord == "N":
                 n_chord_idx = idx
                 break
         
         if n_chord_idx is not None and n_chord_idx < len(weights):
-            self._log(f"Adjusting weights for 'N' (no chord) at index {n_chord_idx}")
-            
-            # Reduce weight for "N" class to prevent model collapse to majority class
-            weights = np.array(weights, dtype=np.float32)
-            
-            # Option 1: Reduce "N" class weight by a factor (e.g., 0.5)
-            n_weight_factor = 0.5
-            weights[n_chord_idx] *= n_weight_factor
-            
-            # Option 2: Boost all other classes to compensate for "N" dominance
-            boost_factor = 1.5
-            non_n_mask = np.ones_like(weights, dtype=bool)
-            non_n_mask[n_chord_idx] = False
-            weights[non_n_mask] *= boost_factor
-            
-            self._log(f"Modified 'N' class weight: {weights[n_chord_idx]:.4f} (reduced by factor {n_weight_factor})")
-            self._log(f"Boosted other classes by factor {boost_factor}")
-            
-            # Normalize weights to maintain overall scale
-            if weights.sum() > 0:
-                orig_sum = len(weights)  # Original sum (equal weights would be 1.0 each)
-                weights = weights * (orig_sum / weights.sum())
-                
+            self._log(f"Found 'N' (no chord) at index {n_chord_idx}")
+            self._log(f"Weight for 'N' class: {weights[n_chord_idx]:.4f}")
+            self._log("No weight adjustment applied - using original class weights")
+        
+        # Return weights unmodified
         return weights
     
     def focal_loss(self, logits, targets, gamma=2.0, alpha=None):
@@ -240,35 +267,31 @@ class StudentTrainer(BaseTrainer):
         
         return focal_loss.mean()
 
-    def distillation_loss(self, student_logits, teacher_logits, targets, temperature=2.0, alpha=0.7):
+    def distillation_loss(self, student_logits, teacher_logits, targets):
         """
         Combine a KL divergence loss between softened teacher and student predictions with
-        a label-smoothed cross entropy loss on the pseudo-labels.
+        standard cross entropy loss on the targets.
         
         Args:
             student_logits (Tensor): Student raw outputs.
             teacher_logits (Tensor): Teacher soft targets.
-            targets (Tensor): Pseudo-labels.
-            temperature (float): Temperature for softening.
-            alpha (float): Weighting factor between distillation and cross entropy.
+            targets (Tensor): Target labels.
         Returns:
             Combined loss.
         """
-        import torch.nn.functional as F
+        # Use class attributes for temperature and alpha
+        temperature = self.temperature
+        alpha = self.kd_alpha
         
-        # Soft targets: apply temperature scaling
+        # KL divergence loss with temperature scaling for soft targets
         student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
         teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
         kl_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (temperature ** 2)
         
-        # Label-smoothed cross entropy
-        smoothing = 0.1
-        confidence = 1.0 - smoothing
-        log_probs = F.log_softmax(student_logits, dim=1)
-        nll_loss = -log_probs.gather(dim=1, index=targets.unsqueeze(1)).squeeze(1)
-        smooth_loss = -log_probs.mean(dim=1)
-        ce_loss = confidence * nll_loss + smoothing * smooth_loss
+        # Standard cross entropy loss for hard targets
+        ce_loss = F.cross_entropy(student_logits, targets)
         
+        # Combine losses with alpha weighting
         return alpha * kl_loss + (1 - alpha) * ce_loss
 
     def label_smoothed_loss(self, logits, targets, smoothing=0.1):
@@ -283,7 +306,6 @@ class StudentTrainer(BaseTrainer):
         Returns:
             Scalar loss.
         """
-        import torch.nn.functional as F
         n_classes = logits.size(-1)
         log_probs = F.log_softmax(logits, dim=-1)
         with torch.no_grad():
@@ -598,19 +620,18 @@ class StudentTrainer(BaseTrainer):
         self._kd_warning_logged = False
             
         for epoch in range(start_epoch, self.num_epochs + 1):
+            # Modified to use the new combined warmup+scheduler method
             # Keep track of current LR source for logging
-            if self.lr_schedule_type:
-                lr_source = f"'{self.lr_schedule_type}' scheduler"
-            elif self.use_warmup and epoch <= self.warmup_epochs:
+            if self.use_warmup and epoch <= self.warmup_epochs:
                 lr_source = "warm-up schedule"
+            elif self.lr_schedule_type:
+                lr_source = f"'{self.lr_schedule_type}' scheduler"
             else:
                 lr_source = "validation-based adjustment"
             
-            # Apply warm-up LR schedule if enabled and in warm-up phase
-            # (only if we're not using a smooth scheduler)
-            if self.use_warmup and self.lr_schedule_type is None and epoch <= self.warmup_epochs:
-                self._warmup_learning_rate(epoch)
-                self._log(f"Epoch {epoch}: LR = {self.optimizer.param_groups[0]['lr']:.6f} (from {lr_source})")
+            # Apply learning rate update (warmup takes precedence if in warmup phase)
+            current_lr = self._update_learning_rate(epoch)
+            self._log(f"Epoch {epoch}: LR = {current_lr:.6f} (from {lr_source})")
             
             self.timer.reset(); self.timer.start()
             epoch_loss = 0.0
@@ -621,9 +642,10 @@ class StudentTrainer(BaseTrainer):
             num_batches = len(train_loader)
             
             for batch_idx, batch in enumerate(train_loader):
-                # Update smooth scheduler if applicable
-                if self.lr_schedule_type:
-                    self._update_smooth_scheduler(epoch, batch_idx, num_batches)
+                # Update learning rate with batch info for smooth updates
+                if self.lr_schedule_type or self.use_warmup:
+                    # Allow fractional epoch updates after warmup phase
+                    self._update_learning_rate(epoch, batch_idx, num_batches)
                 
                 # Regular training step
                 inputs, targets = self._process_batch(batch)
@@ -674,9 +696,10 @@ class StudentTrainer(BaseTrainer):
             
             # Step epoch-based schedulers
             if self.lr_schedule_type and isinstance(self.smooth_scheduler, (CosineAnnealingLR, LambdaLR)):
-                self.smooth_scheduler.step()
-                current_lr = self.optimizer.param_groups[0]['lr']
-                self._log(f"Scheduler stepped to LR: {current_lr:.7f}")
+                if not (self.use_warmup and epoch <= self.warmup_epochs):
+                    self.smooth_scheduler.step()
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    self._log(f"Scheduler stepped to LR: {current_lr:.7f}")
             
             # Run validation
             if val_loader is not None:
