@@ -264,6 +264,10 @@ def main():
     parser.add_argument('--cache_fraction', type=float, default=0.1,
                       help='Fraction of dataset to cache (default: 0.1 = 10%%)')
     
+    # Add lazy_init argument
+    parser.add_argument('--lazy_init', action='store_true',
+                      help='Use lazy initialization for dataset to reduce memory usage')
+    
     args = parser.parse_args()
 
     # Load configuration from YAML
@@ -440,6 +444,14 @@ def main():
         use_metadata_only = False  # Doesn't matter if cache is disabled
         logger.info("Dataset caching disabled to reduce memory usage")
     
+    # Get lazy_init from config or command line
+    lazy_init = config.data.get('lazy_init', False) if hasattr(config, 'data') else False
+    if args.lazy_init:
+        lazy_init = True
+    
+    if lazy_init:
+        logger.info("Using lazy initialization to reduce memory usage at startup")
+    
     logger.info(f"Using partial dataset caching: {args.cache_fraction*100:.1f}% of samples")
     
     # Initialize SynthDataset with logits path if KD is enabled
@@ -461,7 +473,7 @@ def main():
                 logger.error("No teacher logit files found but knowledge distillation is enabled")
                 raise RuntimeError(f"No teacher logit files found in: {logits_dir}")
     
-    # Initialize dataset with memory optimization options
+    # Initialize dataset with memory optimization options including lazy_init
     synth_dataset = SynthDataset(
         synth_spec_dir,
         synth_label_dir, 
@@ -474,9 +486,10 @@ def main():
         use_cache=not args.disable_cache,
         metadata_only=use_metadata_only,
         cache_fraction=args.cache_fraction,
-        logits_dir=logits_dir  # Pass logits_dir to the dataset
+        logits_dir=logits_dir,  # Pass logits_dir to the dataset
+        lazy_init=lazy_init     # Add lazy initialization parameter
     )
-
+    
     # After loading dataset, verify chord distribution matches expected mapping
     chord_counter = Counter([sample['chord_label'] for sample in synth_dataset.samples])
     logger.info("\nChord distribution in loaded dataset:")

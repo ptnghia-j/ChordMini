@@ -21,7 +21,8 @@ class SynthDataset(Dataset):
     """
     def __init__(self, spec_dir, label_dir, chord_mapping=None, seq_len=10, stride=None, 
                  frame_duration=0.1, num_workers=None, cache_file=None, verbose=True,
-                 use_cache=True, metadata_only=True, cache_fraction=0.1, logits_dir=None):
+                 use_cache=True, metadata_only=True, cache_fraction=0.1, logits_dir=None,
+                 lazy_init=False):  # Removed shard_idx and total_shards parameters
         self.spec_dir = Path(spec_dir)
         self.label_dir = Path(label_dir)
         self.logits_dir = Path(logits_dir) if logits_dir is not None else None
@@ -35,6 +36,7 @@ class SynthDataset(Dataset):
         self.use_cache = use_cache and cache_file is not None
         self.metadata_only = metadata_only  # Only cache metadata, not full spectrograms
         self.cache_fraction = cache_fraction  # Fraction of samples to cache (default: 10%)
+        self.lazy_init = lazy_init
         
         # Safely determine number of workers based on environment
         if num_workers is None:
@@ -61,7 +63,7 @@ class SynthDataset(Dataset):
         
         # Generate a safer cache file name using hashing if none provided
         if cache_file is None:
-            # Create a stable cache file name from paths using hashing
+            # Removed shard suffix
             cache_key = f"{spec_dir}_{label_dir}_{seq_len}_{stride}_{frame_duration}"
             cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
             self.cache_file = f"dataset_cache_{cache_hash}.pkl"
@@ -76,11 +78,18 @@ class SynthDataset(Dataset):
         else:
             self.chord_to_idx = {}
             
-        # Load all data
-        self._load_data()
-        
-        # Generate sequence segments 
-        self._generate_segments()
+        # Only load data if not using lazy initialization
+        if not self.lazy_init:
+            self._load_data()
+            self._generate_segments()
+        else:
+            # Just initialize empty containers when lazy
+            self.samples = []
+            self.segment_indices = []
+            # Store file paths for lazy loading
+            self.spec_files = list(Path(spec_dir).glob("**/*.npy"))
+            if verbose:
+                print(f"Found {len(self.spec_files)} spectrogram files (lazy mode)")
         
         # Split data for train/eval/test
         total_segs = len(self.segment_indices)
@@ -89,10 +98,10 @@ class SynthDataset(Dataset):
         self.test_indices = list(range(int(total_segs * 0.9), total_segs))
         
     def _load_data(self):
-        """Optimized data loading with caching and multiprocessing"""
+        """Optimized data loading with caching, multiprocessing"""
         start_time = time.time()
         
-        # Try to load from cache first
+        # Try to load from cache first, with shard-specific naming if applicable
         if self.use_cache and os.path.exists(self.cache_file):
             if self.verbose:
                 print(f"Loading dataset from cache: {self.cache_file}")
