@@ -117,15 +117,27 @@ class StudentTrainer(BaseTrainer):
         self.chord_mapping = None
     
     def _create_smooth_scheduler(self):
-        """Create a smooth learning rate scheduler."""
+        """Create a smooth learning rate scheduler that works with warmup."""
+        # Store total training epochs for scheduler calculations
+        self.total_training_epochs = self.num_epochs
+        
+        # If warmup is enabled, we'll create a special combined scheduler
+        if self.use_warmup and self.warmup_epochs > 0:
+            # For warmup + scheduler combo, we create scheduler for post-warmup epochs only
+            self.post_warmup_epochs = max(1, self.num_epochs - self.warmup_epochs)
+            self._log(f"Creating scheduler for {self.post_warmup_epochs} post-warmup epochs")
+        else:
+            # No warmup, scheduler will be used for all epochs
+            self.post_warmup_epochs = self.num_epochs
+            
         if self.lr_schedule_type == 'cosine':
-            # Cosine annealing from initial LR to min_lr over num_epochs
+            # Cosine annealing from initial LR to min_lr over post-warmup epochs
             self.smooth_scheduler = CosineAnnealingLR(
                 self.optimizer, 
-                T_max=self.num_epochs,
+                T_max=self.post_warmup_epochs,
                 eta_min=self.min_lr
             )
-            self._log(f"Cosine annealing from {self.initial_lr:.6f} to {self.min_lr:.6f}")
+            self._log(f"Cosine annealing from {self.initial_lr:.6f} to {self.min_lr:.6f} after warmup")
             
         elif self.lr_schedule_type == 'cosine_warm_restarts':
             # Cosine annealing with warm restarts
@@ -136,7 +148,7 @@ class StudentTrainer(BaseTrainer):
                 T_mult=2,  # Double the period after each restart
                 eta_min=self.min_lr
             )
-            self._log(f"Cosine annealing with warm restarts: min_lr={self.min_lr:.6f}")
+            self._log(f"Cosine annealing with warm restarts: min_lr={self.min_lr:.6f} after warmup")
             
         elif self.lr_schedule_type == 'one_cycle':
             # One-cycle learning rate schedule
@@ -144,22 +156,22 @@ class StudentTrainer(BaseTrainer):
             self.smooth_scheduler = OneCycleLR(
                 self.optimizer,
                 max_lr=self.initial_lr * 10,  # Peak LR
-                total_steps=steps_per_epoch * self.num_epochs,
+                total_steps=steps_per_epoch * self.post_warmup_epochs,
                 pct_start=0.3,  # Spend 30% ramping up, 70% ramping down
                 div_factor=25,  # Initial LR = max_lr/25
                 final_div_factor=10000,  # Final LR = max_lr/10000
                 anneal_strategy='cos'
             )
-            self._log(f"One-cycle LR: {self.initial_lr:.6f} → {self.initial_lr*10:.6f} → {self.initial_lr*10/10000:.8f}")
+            self._log(f"One-cycle LR: {self.initial_lr:.6f} → {self.initial_lr*10:.6f} → {self.initial_lr*10/10000:.8f} after warmup")
             
         elif self.lr_schedule_type == 'linear_decay':
             # Linear decay from initial LR to min_lr
-            lambda_fn = lambda epoch: 1 - (1 - self.min_lr / self.initial_lr) * (epoch / self.num_epochs)
+            lambda_fn = lambda epoch: 1 - (1 - self.min_lr / self.initial_lr) * (epoch / self.post_warmup_epochs)
             self.smooth_scheduler = LambdaLR(self.optimizer, lr_lambda=lambda_fn)
-            self._log(f"Linear decay from {self.initial_lr:.6f} to {self.min_lr:.6f}")
+            self._log(f"Linear decay from {self.initial_lr:.6f} to {self.min_lr:.6f} after warmup")
             
         else:
-            self._log(f"Unknown scheduler type: {self.lr_schedule_type}. Using validation-based adjustment")
+            self._log(f"Unknown scheduler type: {self.lr_schedule_type}. Using warmup-only with validation-based adjustment")
             self.lr_schedule_type = None
     
     def _update_smooth_scheduler(self, epoch, batch_idx, num_batches):
@@ -179,36 +191,52 @@ class StudentTrainer(BaseTrainer):
     
     def _update_learning_rate(self, epoch, batch_idx=None, num_batches=None):
         """
-        Update learning rate based on warmup and scheduler status.
-        This new method allows combining warmup with other schedulers.
+        Update learning rate combining warmup and scheduler logic.
         
         Args:
-            epoch: Current training epoch
+            epoch: Current training epoch (1-indexed)
             batch_idx: Current batch index within epoch (for fractional updates)
             num_batches: Total number of batches per epoch (for fractional updates)
         
         Returns:
             Current learning rate after update
         """
-        # Check if we're in warmup phase
+        # Determine if we're in warmup phase (epoch is 1-indexed)
         in_warmup = self.use_warmup and epoch <= self.warmup_epochs
         
         if in_warmup:
-            # In warmup phase, override other schedulers
+            # In warmup phase, use warmup-specific LR calculation
             return self._warmup_learning_rate(epoch)
-        elif self.lr_schedule_type and batch_idx is not None and num_batches is not None:
-            # After warmup, use the selected scheduler with an adjusted epoch
-            # (subtract warmup epochs to make scheduler start from 0)
+        elif self.lr_schedule_type:
+            # After warmup, use the selected scheduler with adjusted epoch numbering
             if self.use_warmup:
-                # If using both, we pretend the scheduler started after warmup
-                effective_epoch = epoch - self.warmup_epochs
-                self._update_smooth_scheduler(effective_epoch, batch_idx, num_batches)
+                # Calculate effective epoch for scheduler - adjust to 0-indexed relative to warmup end
+                effective_epoch = epoch - self.warmup_epochs - 1
+                
+                # For fractional updates within an epoch (some schedulers support this)
+                if batch_idx is not None and num_batches is not None and isinstance(self.smooth_scheduler, (OneCycleLR, CosineAnnealingWarmRestarts)):
+                    fractional_epoch = effective_epoch + (batch_idx / num_batches)
+                    self.smooth_scheduler.step(fractional_epoch)
+                else:
+                    # Just use regular epoch-based steps (CosineAnnealingLR, LambdaLR)
+                    # Only step if we haven't already stepped for this epoch
+                    if not hasattr(self, '_last_stepped_epoch') or self._last_stepped_epoch != effective_epoch:
+                        self.smooth_scheduler.step(effective_epoch)
+                        self._last_stepped_epoch = effective_epoch
             else:
-                # Standard scheduling without warmup adjustment
-                self._update_smooth_scheduler(epoch, batch_idx, num_batches)
-            return self.optimizer.param_groups[0]['lr'] 
+                # No warmup - use standard scheduler stepping
+                if batch_idx is not None and num_batches is not None and isinstance(self.smooth_scheduler, (OneCycleLR, CosineAnnealingWarmRestarts)):
+                    fractional_epoch = (epoch - 1) + (batch_idx / num_batches)
+                    self.smooth_scheduler.step(fractional_epoch)
+                else:
+                    # Just use regular epoch-based steps 
+                    if not hasattr(self, '_last_stepped_epoch') or self._last_stepped_epoch != (epoch - 1):
+                        self.smooth_scheduler.step()
+                        self._last_stepped_epoch = epoch - 1
+                        
+            return self.optimizer.param_groups[0]['lr']
         else:
-            # No scheduler or no batch info provided
+            # No scheduler - just return current LR (will be handled by validation-based adjustment)
             return self.optimizer.param_groups[0]['lr']
     
     def _adjust_weights_for_no_chord(self, weights, idx_to_chord):
@@ -425,7 +453,7 @@ class StudentTrainer(BaseTrainer):
     
     def _warmup_learning_rate(self, epoch):
         """Calculate and set learning rate during warm-up period"""
-        if epoch >= self.warmup_epochs:
+        if epoch > self.warmup_epochs:
             # Warm-up complete, set to end LR
             return self._set_lr(self.warmup_end_lr)
         
@@ -630,12 +658,25 @@ class StudentTrainer(BaseTrainer):
         num_batches = len(train_loader)
         
         # Update OneCycleLR with actual steps if needed
-        if isinstance(self.smooth_scheduler, OneCycleLR) and start_epoch > 1:
-            # For resuming training, we need to adjust the total_steps based on starting epoch
-            remaining_epochs = self.num_epochs - (start_epoch - 1)
-            total_steps = num_batches * remaining_epochs
+        if isinstance(self.smooth_scheduler, OneCycleLR):
+            # Calculate total steps adjusting for warmup if needed
+            if self.use_warmup and start_epoch <= self.warmup_epochs:
+                # If we're still in warmup, scheduler only needs post-warmup steps
+                remaining_epochs = self.num_epochs - self.warmup_epochs
+                total_steps = num_batches * remaining_epochs
+                self._log(f"OneCycleLR configured for {total_steps} steps after {self.warmup_epochs} warmup epochs")
+            elif self.use_warmup and start_epoch > self.warmup_epochs:
+                # Already past warmup, calculate remaining post-warmup epochs
+                remaining_epochs = self.num_epochs - (start_epoch - 1)
+                total_steps = num_batches * remaining_epochs
+                self._log(f"Resuming OneCycleLR for {total_steps} steps (past warmup)")
+            else:
+                # No warmup, scheduler handles all epochs
+                remaining_epochs = self.num_epochs - (start_epoch - 1)
+                total_steps = num_batches * remaining_epochs
+                self._log(f"OneCycleLR configured for {total_steps} steps")
+                
             # Recreate scheduler with correct total_steps
-            self._log(f"Initializing OneCycleLR with {total_steps} total steps (resuming from epoch {start_epoch})")
             self.smooth_scheduler = OneCycleLR(
                 self.optimizer,
                 max_lr=self.initial_lr * 10,
@@ -656,14 +697,21 @@ class StudentTrainer(BaseTrainer):
             self._log("Knowledge Distillation disabled, using standard loss")
         
         # Handle initial learning rate explicitly (before first epoch)
-        # This ensures we start exactly at warmup_start_lr
         if self.use_warmup and start_epoch == 1:
             self._log(f"Setting initial learning rate to warm-up start value: {self.warmup_start_lr:.6f}")
             self._set_lr(self.warmup_start_lr)
+        elif self.use_warmup and start_epoch > 1 and start_epoch <= self.warmup_epochs:
+            # Resuming in the middle of warmup - calculate appropriate warmup LR
+            self._warmup_learning_rate(start_epoch)
+            self._log(f"Resuming in warmup phase at epoch {start_epoch} with LR: {self.optimizer.param_groups[0]['lr']:.6f}")
+        elif self.use_warmup and start_epoch > self.warmup_epochs and self.lr_schedule_type:
+            # Resuming after warmup, need to advance scheduler to the right point
+            effective_epoch = start_epoch - self.warmup_epochs - 1
+            self.smooth_scheduler.step(effective_epoch)
+            self._log(f"Resuming after warmup at epoch {start_epoch} (scheduler epoch {effective_epoch}) with LR: {self.optimizer.param_groups[0]['lr']:.6f}")
             
         for epoch in range(start_epoch, self.num_epochs + 1):
-            # Modified to use the new combined warmup+scheduler method
-            # Keep track of current LR source for logging
+            # Determine LR source for this epoch
             if self.use_warmup and epoch <= self.warmup_epochs:
                 lr_source = "warm-up schedule"
             elif self.lr_schedule_type:
