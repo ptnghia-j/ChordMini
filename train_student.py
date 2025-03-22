@@ -491,11 +491,14 @@ def main():
     )
     
     # After loading dataset, verify chord distribution matches expected mapping
-    chord_counter = Counter([sample['chord_label'] for sample in synth_dataset.samples])
-    logger.info("\nChord distribution in loaded dataset:")
-    n_chord_count = chord_counter.get("N", 0)
-    logger.info(f"'N' chord count: {n_chord_count} ({n_chord_count/len(synth_dataset.samples)*100:.2f}% of total)")
-    logger.info(f"Total synthesized samples: {len(synth_dataset)}")
+    if len(synth_dataset.samples) == 0:
+        logger.warning("No samples loaded from SynthDataset (lazy mode). Skipping chord distribution calculation.")
+    else:
+        chord_counter = Counter([sample['chord_label'] for sample in synth_dataset.samples])
+        logger.info("\nChord distribution in loaded dataset:")
+        n_chord_count = chord_counter.get("N", 0)
+        logger.info(f"'N' chord count: {n_chord_count} ({n_chord_count/len(synth_dataset.samples)*100:.2f}% of total)")
+        logger.info(f"Total synthesized samples: {len(synth_dataset.samples)}")
 
     # Create data loaders with optimized settings
     # Determine optimal num_workers

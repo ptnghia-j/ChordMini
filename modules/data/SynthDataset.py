@@ -83,13 +83,109 @@ class SynthDataset(Dataset):
             self._load_data()
             self._generate_segments()
         else:
-            # Just initialize empty containers when lazy
+            # In lazy mode, scan paths and build lightweight metadata, but don't load files
             self.samples = []
             self.segment_indices = []
+            
             # Store file paths for lazy loading
             self.spec_files = list(Path(spec_dir).glob("**/*.npy"))
             if verbose:
                 print(f"Found {len(self.spec_files)} spectrogram files (lazy mode)")
+            
+            # Create a fast mapping of label files for lookup (same as in _load_data)
+            label_files = {}
+            for label_path in Path(label_dir).glob("**/*.lab"):
+                key = label_path.stem
+                if key.endswith("_lab"):
+                    key = key[:-4]  # Remove '_lab' suffix
+                label_files[key] = label_path
+            
+            # Build minimal metadata for each file without loading content
+            song_samples = {}  # Group indices by song_id
+            
+            for spec_file in self.spec_files:
+                # Extract file name for matching
+                base_name = spec_file.stem
+                if base_name.endswith("_spec"):
+                    base_name = base_name[:-5]  # Remove '_spec' suffix
+                
+                # Find matching label file
+                label_file = label_files.get(base_name)
+                if not label_file or not label_file.exists():
+                    # Try alternative names
+                    found = False
+                    for suffix in ["", "_lab"]:
+                        alt_name = f"{base_name}{suffix}"
+                        if alt_name in label_files:
+                            label_file = label_files[alt_name]
+                            found = True
+                            break
+                    
+                    if not found:
+                        continue  # Skip if no label found
+                
+                # Parse the label file
+                chord_labels = self._parse_label_file(label_file)
+                
+                # Get shape info without loading the full data
+                try:
+                    # Use memory-mapped mode to get shape without loading
+                    spec_info = np.load(spec_file, mmap_mode='r')
+                    spec_shape = spec_info.shape
+                    
+                    # Create metadata for each frame (like in _process_file but without loading content)
+                    sample_indices = []
+                    for t in range(spec_shape[0] if len(spec_shape) > 1 else 1):
+                        frame_time = t * self.frame_duration
+                        chord_label = self._find_chord_at_time(chord_labels, frame_time)
+                        
+                        # Make sure the chord label exists in the mapping
+                        if self.chord_mapping is None:
+                            if chord_label not in self.chord_to_idx:
+                                self.chord_to_idx[chord_label] = len(self.chord_to_idx)
+                        elif chord_label not in self.chord_mapping:
+                            chord_label = "N"  # Use no-chord for unknown chords
+                        
+                        # Store metadata (not the actual spectrogram)
+                        sample_idx = len(self.samples)
+                        self.samples.append({
+                            'spec_path': str(spec_file),
+                            'chord_label': chord_label,
+                            'song_id': base_name,
+                            'frame_idx': t
+                        })
+                        
+                        # Track this sample in the song group for segmenting
+                        if base_name not in song_samples:
+                            song_samples[base_name] = []
+                        song_samples[base_name].append(sample_idx)
+                        
+                except Exception as e:
+                    if verbose:
+                        print(f"Error scanning file {spec_file}: {e}")
+            
+            # Now generate segments from the metadata (similar to _generate_segments)
+            if song_samples:
+                if verbose:
+                    print(f"Found {len(song_samples)} unique songs with metadata")
+                
+                for song_id, indices in song_samples.items():
+                    if len(indices) < self.seq_len:
+                        # For very short songs, create a single segment with padding
+                        if len(indices) > 0:
+                            self.segment_indices.append((indices[0], indices[0] + self.seq_len))
+                        continue
+                    
+                    # Create segments with stride, respecting song boundaries
+                    for start_idx in range(0, len(indices) - self.seq_len + 1, self.stride):
+                        segment_start = indices[start_idx]
+                        segment_end = indices[start_idx + self.seq_len - 1] + 1
+                        self.segment_indices.append((segment_start, segment_end))
+                
+                if verbose:
+                    print(f"Generated {len(self.segment_indices)} segments in lazy mode")
+            else:
+                warnings.warn("No valid samples found in lazy mode initialization")
         
         # Split data for train/eval/test
         total_segs = len(self.segment_indices)
@@ -605,27 +701,36 @@ class SynthDataset(Dataset):
         sequence = []
         label_seq = []
         
-        # Get sample shape for padding
-        first_sample = self.samples[0]
+        # Get first sample to determine shape for padding
+        first_sample = self.samples[seg_start]
         first_spec = None
         
-        # Lazy loading for first sample if needed
-        if self.metadata_only and 'spectro' not in first_sample and 'spec_path' in first_sample:
-            # Load from file
+        # Lazy loading for first sample to determine shape
+        if 'spectro' not in first_sample and 'spec_path' in first_sample:
             try:
                 spec_path = first_sample['spec_path']
-                first_spec = np.load(spec_path)
-                # For single frames, get specific frame
-                if first_sample.get('frame_idx') is not None and len(first_spec.shape) > 1:
-                    first_spec = first_spec[first_sample['frame_idx']]
-            except Exception:
-                # Fallback to zeros with a reasonable shape
-                first_spec = np.zeros((144, ))
+                # Use memory-mapped mode first to get the shape without loading full data
+                with np.load(spec_path, mmap_mode='r') as mmap_spec:
+                    if first_sample.get('frame_idx') is not None and len(mmap_spec.shape) > 1:
+                        frame_idx = first_sample['frame_idx']
+                        # Now load just the frame we need - more efficient than loading entire file
+                        full_spec = np.load(spec_path)
+                        first_spec = full_spec[frame_idx] if frame_idx < full_spec.shape[0] else np.zeros((144,))
+                    else:
+                        # Single-frame spectrogram
+                        first_spec = np.array(mmap_spec)
+            except Exception as e:
+                # Fallback to zeros with a reasonable shape on error
+                warnings.warn(f"Error loading first sample: {e}, using zero padding")
+                first_spec = np.zeros((144,))
+        elif 'spectro' in first_sample:
+            # Use stored spectrogram if available
+            first_spec = first_sample.get('spectro', np.zeros((144,)))
         else:
-            # Get from sample
-            first_spec = first_sample.get('spectro', np.zeros((144, )))
+            # Default fallback
+            first_spec = np.zeros((144,))
         
-        # Get song_id of the starting sample to check for song boundary
+        # Process remaining samples in the segment
         start_song_id = self.samples[seg_start]['song_id']
         
         for i in range(seg_start, seg_end):
@@ -636,94 +741,102 @@ class SynthDataset(Dataset):
                 if sample_i['song_id'] != start_song_id:
                     # We've crossed a song boundary, pad the rest of the sequence
                     padding_needed = seg_end - i
-                    
-                    # Use last valid sample shape for padding
-                    if sequence:
-                        padding_shape = sequence[-1].shape
-                    else:
-                        padding_shape = first_spec.shape
-                        
-                    # Add padding
+                    padding_shape = sequence[-1].shape if sequence else first_spec.shape
                     for _ in range(padding_needed):
                         sequence.append(torch.zeros(padding_shape, dtype=torch.float))
                         label_seq.append(self.chord_to_idx.get("N", 0))
-                        
                     break
                     
-                # Regular case: add the sample to the sequence
-                # Lazy load spectrogram if needed
-                if self.metadata_only and 'spectro' not in sample_i and 'spec_path' in sample_i:
+                # Lazy load spectrogram if needed - most important part for memory efficiency
+                if 'spectro' not in sample_i and 'spec_path' in sample_i:
                     try:
                         spec_path = sample_i['spec_path']
                         spec = np.load(spec_path)
-                        # For single frames, get specific frame
+                        # For multi-frame spectrograms, extract the specific frame
                         if sample_i.get('frame_idx') is not None and len(spec.shape) > 1:
-                            spec = spec[sample_i['frame_idx']]
-                        spec_vec = torch.tensor(spec, dtype=torch.float)
+                            frame_idx = sample_i['frame_idx']
+                            if frame_idx < spec.shape[0]:
+                                spec_vec = torch.tensor(spec[frame_idx], dtype=torch.float)
+                            else:
+                                # Handle out of range index
+                                warnings.warn(f"Frame index {frame_idx} out of range for {spec_path} with shape {spec.shape}")
+                                spec_vec = torch.zeros(first_spec.shape, dtype=torch.float)
+                        else:
+                            spec_vec = torch.tensor(spec, dtype=torch.float)
                     except Exception as e:
                         # Use zeros on error
-                        if sequence:
-                            padding_shape = sequence[-1].shape
-                        else:
-                            padding_shape = first_spec.shape
+                        warnings.warn(f"Error loading {sample_i['spec_path']}: {e}")
+                        padding_shape = sequence[-1].shape if sequence else first_spec.shape
                         spec_vec = torch.zeros(padding_shape, dtype=torch.float)
                 else:
-                    # Use stored spectrogram
-                    spec_vec = torch.tensor(sample_i['spectro'], dtype=torch.float)
+                    # Use stored spectrogram if available
+                    spec_vec = torch.tensor(sample_i.get('spectro', np.zeros_like(first_spec)), dtype=torch.float)
                 
+                # Get chord label and convert to index
                 chord_label = sample_i['chord_label']
                 chord_idx = self.chord_to_idx.get(chord_label, self.chord_to_idx.get("N", 0))
                 
                 sequence.append(spec_vec)
                 label_seq.append(chord_idx)
                 
-                # If we have logit paths, load them
-                if 'logit_path' in sample_i:
+                # Also handle lazy loading for teacher logits
+                if 'logit_path' in sample_i and 'teacher_logits' not in sample_i:
                     try:
                         logit_path = sample_i['logit_path']
-                        teacher_logits = np.load(logit_path)
+                        # Check file extension to handle different formats
+                        if str(logit_path).endswith('.npz'):
+                            # For npz files, try standard array names
+                            with np.load(logit_path) as npz_data:
+                                if 'logits' in npz_data:
+                                    teacher_logits = npz_data['logits']
+                                elif 'teacher_logits' in npz_data:
+                                    teacher_logits = npz_data['teacher_logits']
+                                elif len(npz_data.files) > 0:
+                                    # Just use the first array in the file
+                                    teacher_logits = npz_data[npz_data.files[0]]
+                                else:
+                                    raise ValueError(f"No arrays found in {logit_path}")
+                        else:
+                            # For npy files, load directly
+                            teacher_logits = np.load(logit_path)
                         
-                        # Process logits according to batch structure
-                        if sequence and len(sequence) > 0:
-                            if len(teacher_logits.shape) > 1:
-                                # If multi-dimensional, get specific frame's logits
-                                if 'frame_idx' in sample_i:
-                                    teacher_logits = teacher_logits[sample_i['frame_idx']]
-                            
-                            # Convert to tensor
-                            logits_tensor = torch.tensor(teacher_logits, dtype=torch.float)
+                        # Process multi-frame logits
+                        if len(teacher_logits.shape) > 1 and 'frame_idx' in sample_i:
+                            frame_idx = sample_i['frame_idx']
+                            if frame_idx < teacher_logits.shape[0]:
+                                teacher_logits = teacher_logits[frame_idx]
+                        
+                        # Convert to tensor
+                        logits_tensor = torch.tensor(teacher_logits, dtype=torch.float)
+                        
+                        # Add to sample output if we created it already
+                        if 'sample_out' in locals():
                             sample_out['teacher_logits'] = logits_tensor
                     except Exception as e:
-                        # If logits fail to load, don't include them
-                        warnings.warn(f"Could not load teacher logits from {logit_path}: {e}")
+                        warnings.warn(f"Error loading teacher logits from {logit_path}: {e}")
             else:
                 # We've reached the end of the dataset, pad with zeros
-                if sequence:
-                    padding_shape = sequence[-1].shape
-                else:
-                    padding_shape = first_spec.shape
-                    
+                padding_shape = sequence[-1].shape if sequence else first_spec.shape
                 sequence.append(torch.zeros(padding_shape, dtype=torch.float))
                 label_seq.append(self.chord_to_idx.get("N", 0))
         
         # Ensure we have exactly seq_len frames
         if len(sequence) < self.seq_len:
             padding_needed = self.seq_len - len(sequence)
-            
-            if sequence:
-                padding_shape = sequence[-1].shape
-            else:
-                padding_shape = first_spec.shape
-                
+            padding_shape = sequence[-1].shape if sequence else first_spec.shape
             for _ in range(padding_needed):
                 sequence.append(torch.zeros(padding_shape, dtype=torch.float))
                 label_seq.append(self.chord_to_idx.get("N", 0))
         
-        # Return full frame-level label sequence
+        # Create sample output with the collected data
         sample_out = {
             'spectro': torch.stack(sequence, dim=0),       # [seq_len, feature_dim]
             'chord_idx': torch.tensor(label_seq, dtype=torch.long)  # [seq_len]
         }
+        
+        # If we parsed teacher logits (when defined above), add them to the output
+        if 'logits_tensor' in locals():
+            sample_out['teacher_logits'] = logits_tensor
         
         return sample_out
     
