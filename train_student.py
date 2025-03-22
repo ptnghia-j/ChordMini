@@ -282,15 +282,46 @@ def main():
 
     if args.storage_root is not None:
         config.paths['storage_root'] = args.storage_root
-
-    # Override model scale from command line if provided
-    if args.model_scale is not None:
-        if not hasattr(config.model, 'scale'):
-            config.model['scale'] = args.model_scale
+    
+    # Log training configuration
+    logger.info("\n=== Training Configuration ===")
+    logger.info(f"Model type: {args.model}")
+    logger.info(f"Model scale: {args.model_scale or config.model.get('scale', 1.0)}")
+    
+    # Log knowledge distillation settings
+    use_kd = args.use_kd_loss or config.training.get('use_kd_loss', False)
+    kd_alpha = args.kd_alpha or config.training.get('kd_alpha', 0.5)
+    temperature = args.temperature or config.training.get('temperature', 1.0)
+    
+    if use_kd:
+        logger.info("\n=== Knowledge Distillation Enabled ===")
+        logger.info(f"KD alpha: {kd_alpha} (weighting between KD and CE loss)")
+        logger.info(f"Temperature: {temperature} (for softening distributions)")
+        if args.logits_dir:
+            logger.info(f"Teacher logits directory: {args.logits_dir}")
         else:
-            config.model.scale = args.model_scale
-        logger.info(f"Overriding model scale from command line: {args.model_scale}")
-
+            logger.warning("No teacher logits directory specified! KD may not work correctly.")
+    else:
+        logger.info("Knowledge distillation is disabled, using standard loss")
+    
+    # Log focal loss settings
+    if args.use_focal_loss or config.training.get('use_focal_loss', False):
+        logger.info("\n=== Focal Loss Enabled ===")
+        logger.info(f"Gamma: {args.focal_gamma or config.training.get('focal_gamma', 2.0)}")
+        if args.focal_alpha or config.training.get('focal_alpha'):
+            logger.info(f"Alpha: {args.focal_alpha or config.training.get('focal_alpha')}")
+    else:
+        logger.info("Using standard cross-entropy loss")
+    
+    # Log learning rate settings
+    logger.info("\n=== Learning Rate Configuration ===")
+    logger.info(f"Initial LR: {config.training['learning_rate']}")
+    if args.lr_schedule or config.training.get('lr_schedule'):
+        logger.info(f"LR schedule: {args.lr_schedule or config.training.get('lr_schedule')}")
+    if args.use_warmup or config.training.get('use_warmup', False):
+        logger.info(f"Using LR warm-up for {args.warmup_epochs or config.training.get('warmup_epochs', 5)} epochs")
+        logger.info(f"Warm-up start LR: {args.warmup_start_lr or config.training.get('warmup_start_lr', config.training['learning_rate']/10)}")
+    
     # Set random seed for reproducibility
     if hasattr(config.misc, 'seed'):
         seed = config.misc['seed']

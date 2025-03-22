@@ -123,11 +123,16 @@ spec:
               value: "cosine"
             # Knowledge distillation settings
             - name: USE_KD_LOSS
-              value: "false"  # Set to "true" to enable KD loss
+              value: "true"  # Set to "true" to enable KD loss
             - name: KD_ALPHA
-              value: "0.5"  # Weight for KD loss (0-1)
+              value: "0.9"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
-              value: "2.0"  # Temperature for softening distributions
+              value: "20.0"  # Temperature for softening distributions
+            # Warmup settings
+            - name: USE_WARMUP
+              value: "true"  # Set to "true" to enable learning rate warm-up
+            - name: WARMUP_EPOCHS
+              value: "10"  # Number of epochs for warm-up
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
@@ -225,7 +230,7 @@ spec:
               KD_LOSS_ARG=""
               if [ "${USE_KD_LOSS}" == "true" ]; then
                 echo "Using knowledge distillation with alpha=${KD_ALPHA} and temperature=${TEMPERATURE}"
-                KD_LOSS_ARG="--use_kd_loss --kd_alpha ${KD_ALPHA} --temperature ${TEMPERATURE}"
+                KD_LOSS_ARG="--use_kd_loss --kd_alpha ${KD_ALPHA} --temperature ${TEMPERATURE} --logits_dir ${DATA_ROOT}/logits/synth"
                 echo "Note: Teacher logits must be included in the batch data"
               fi
               
@@ -259,24 +264,24 @@ spec:
                 echo "Knowledge distillation enabled - using teacher logits"
                 
                 # Check if KD_DATA_ROOT exists
-                if [ -d "${KD_DATA_ROOT}" ]; then
-                  echo "Using KD data from: ${KD_DATA_ROOT}"
+                if [ -d "${DATA_ROOT}/logits/synth" ]; then
+                  echo "Using KD data from: ${DATA_ROOT}/logits/synth"
                   
                   # Define paths based on directory structure
-                  if [ -d "${KD_DATA_ROOT}/spectrograms" ] && [ -d "${KD_DATA_ROOT}/labels" ] && [ -d "${KD_DATA_ROOT}/logits" ]; then
+                  if [ -d "${DATA_ROOT}/logits/synth/spectrograms" ] && [ -d "${DATA_ROOT}/logits/synth/labels" ] && [ -d "${DATA_ROOT}/logits/synth/logits" ]; then
                     # Standard structure with separate directories
-                    KD_ARGS="--spec_dir ${KD_DATA_ROOT}/spectrograms --label_dir ${KD_DATA_ROOT}/labels --logits_dir ${KD_DATA_ROOT}/logits"
+                    KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms --label_dir ${DATA_ROOT}/logits/synth/labels --logits_dir ${DATA_ROOT}/logits/synth/logits"
                     echo "Using standard KD directory structure"
-                  elif [ -d "${KD_DATA_ROOT}" ]; then
+                  elif [ -d "${DATA_ROOT}/logits/synth" ]; then
                     # All files might be in the root directory
-                    KD_ARGS="--spec_dir ${KD_DATA_ROOT} --label_dir ${KD_DATA_ROOT} --logits_dir ${KD_DATA_ROOT}"
+                    KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth --label_dir ${DATA_ROOT}/logits/synth --logits_dir ${DATA_ROOT}/logits/synth"
                     echo "Using flat KD directory structure"
                   else
                     echo "WARNING: Could not determine KD directory structure, using defaults"
-                    KD_ARGS="--logits_dir ${KD_DATA_ROOT}"
+                    KD_ARGS="--logits_dir ${DATA_ROOT}/logits/synth"
                   fi
                 else
-                  echo "WARNING: KD_DATA_ROOT does not exist: ${KD_DATA_ROOT}"
+                  echo "WARNING: KD_DATA_ROOT does not exist: ${DATA_ROOT}/logits/synth"
                   echo "Attempting to use default paths"
                   KD_ARGS="--logits_dir /mnt/storage/data/logits/synth/logits"
                 fi
@@ -299,8 +304,8 @@ spec:
               memory: "16Gi"    
               nvidia.com/gpu: "1"
             limits:
-              cpu: "8"             
-              memory: "32Gi" 
+              cpu: "6"             
+              memory: "24Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage

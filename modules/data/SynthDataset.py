@@ -446,7 +446,9 @@ class SynthDataset(Dataset):
                     f"{base_name}.npy",         # Simple base name
                     f"{base_name}_logits.npy",  # With _logits suffix
                     f"{base_name}.npz",         # NPZ format with simple base name
-                    f"{base_name}_logits.npz"   # NPZ format with _logits suffix
+                    f"{base_name}_logits.npz",  # NPZ format with _logits suffix
+                    f"{base_name}_teacher.npy", # With _teacher suffix (common convention)
+                    f"{base_name}_soft.npy",    # With _soft suffix (another convention)
                 ]
                 
                 # Check subdirectories if needed (up to 1 level)
@@ -461,15 +463,29 @@ class SynthDataset(Dataset):
                         candidate = directory / pattern
                         if candidate.exists():
                             logit_file = candidate
-                            if self.verbose:
-                                print(f"Found logits file: {logit_file} (format: {candidate.suffix})")
+                            if self.verbose and not hasattr(self, '_logit_file_found'):
+                                print(f"Found teacher logits file: {logit_file} (format: {candidate.suffix})")
+                                self._logit_file_found = True
                             break
                     if logit_file:
                         break
                         
-                if logit_file is None and self.verbose:
-                    print(f"Could not find matching .npy or .npz logits file for {base_name} in {self.logits_dir}")
-            
+                if logit_file is None and self.verbose and not hasattr(self, '_logit_warning_shown'):
+                    print(f"WARNING: Could not find matching teacher logits file for {base_name} in {self.logits_dir}")
+                    print(f"Searched patterns: {possible_patterns}")
+                    print(f"This will disable knowledge distillation for this sample")
+                    self._logit_warning_shown = True
+                    
+                    # List a few files in the logits directory to help diagnose the issue
+                    try:
+                        some_files = list(self.logits_dir.glob("*.npy"))[:5] + list(self.logits_dir.glob("*.npz"))[:5]
+                        if some_files:
+                            print(f"Some files found in logits directory: {[f.name for f in some_files]}")
+                        else:
+                            print(f"No .npy or .npz files found in {self.logits_dir}")
+                    except Exception as e:
+                        print(f"Error examining logits directory: {e}")
+
             # Find matching label file directly from dictionary
             label_file = label_files.get(base_name)
             
@@ -593,19 +609,39 @@ class SynthDataset(Dataset):
                         elif len(npz_data.files) > 0:
                             # Just use the first array in the file
                             teacher_logits = npz_data[npz_data.files[0]]
-                            if self.verbose:
+                            if self.verbose and not hasattr(self, '_npz_array_reported'):
                                 print(f"Using first array '{npz_data.files[0]}' from NPZ file")
+                                self._npz_array_reported = True
                         else:
                             raise ValueError(f"No arrays found in {logit_file}")
                     else:
                         # For npy files, load directly
                         teacher_logits = np.load(logit_file)
                     
-                    # Add the logits to the sample
-                    samples[-1]['teacher_logits'] = teacher_logits
-                    
-                    if self.verbose and samples[-1]['teacher_logits'].shape:
-                        print(f"Loaded teacher logits with shape {samples[-1]['teacher_logits'].shape}")
+                    # Sanity check shape and values
+                    if isinstance(teacher_logits, np.ndarray):
+                        if self.verbose and not hasattr(self, '_logit_shape_reported'):
+                            print(f"Teacher logits shape: {teacher_logits.shape}, min: {teacher_logits.min()}, max: {teacher_logits.max()}")
+                            self._logit_shape_reported = True
+                        
+                        # Handle NaN or inf values
+                        if np.isnan(teacher_logits).any() or np.isinf(teacher_logits).any():
+                            teacher_logits = np.nan_to_num(teacher_logits, nan=0.0, posinf=100.0, neginf=-100.0)
+                            if self.verbose and not hasattr(self, '_logit_nan_reported'):
+                                print(f"WARNING: NaN or inf values found in teacher logits and replaced")
+                                self._logit_nan_reported = True
+                        
+                        # Add the logits to all samples from this file
+                        for sample in samples:
+                            sample['teacher_logits'] = teacher_logits
+                        
+                        if self.verbose and not hasattr(self, '_logit_success_reported'):
+                            print(f"Successfully loaded teacher logits with shape {teacher_logits.shape}")
+                            self._logit_success_reported = True
+                    else:
+                        if self.verbose and not hasattr(self, '_logit_type_warning'):
+                            print(f"WARNING: Loaded teacher logits has unexpected type: {type(teacher_logits)}")
+                            self._logit_type_warning = True
                         
                 except Exception as e:
                     warnings.warn(f"Error loading logits file {logit_file}: {e}")
