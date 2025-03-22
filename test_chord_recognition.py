@@ -12,6 +12,10 @@ from modules.utils.mir_eval_modules import audio_file_to_features, idx2voca_chor
 from modules.utils.hparams import HParams
 from modules.models.Transformer.ChordNet import ChordNet
 
+# Explicitly disable MPS globally at the beginning
+if hasattr(torch, 'backends') and hasattr(torch.backends, 'mps'):
+    torch.backends.mps.enabled = False
+
 def get_audio_paths(audio_dir):
     """Get paths to all audio files in directory and subdirectories."""
     audio_paths = []
@@ -22,8 +26,6 @@ def get_audio_paths(audio_dir):
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Run chord recognition on audio files")
-    parser.add_argument('--voca', default=True, type=lambda x: (str(x).lower() == 'true'),
-                       help='Use large vocabulary chord set (True) or just major/minor (False)')
     parser.add_argument('--audio_dir', type=str, default='./test',
                        help='Directory containing audio files')
     parser.add_argument('--save_dir', type=str, default='./test/output',
@@ -36,58 +38,98 @@ def main():
                        help='Apply smoothing to predictions to reduce noise')
     parser.add_argument('--min_segment_duration', type=float, default=0.0,
                        help='Minimum duration in seconds for a chord segment (to reduce fragmentation)')
+    # Add model scale parameter
+    parser.add_argument('--model_scale', type=float, default=1.0,
+                       help='Scaling factor for model capacity (0.5=half, 1.0=base, 2.0=double)')
     args = parser.parse_args()
 
     # Set up logging
     logger.logging_verbosity(1)
     warnings.filterwarnings('ignore')
 
-    # Determine device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Force CPU usage regardless of what's available
+    device = torch.device("cpu")
+    logger.info(f"Forcing CPU usage for consistent device handling")
+    
+    # Explicitly disable MPS again to be safe
+    if hasattr(torch, 'backends') and hasattr(torch.backends, 'mps'):
+        torch.backends.mps.enabled = False
+    
     logger.info(f"Using device: {device}")
 
     # Load configuration
     config = HParams.load(args.config)
     logger.info(f"Loaded configuration from {args.config}")
 
-    # Configure model based on vocabulary size
-    if args.voca:
-        config.feature['large_voca'] = True
-        n_classes = 170  # Large vocabulary
-        model_file = args.model_file or './checkpoints/student_model_best_large_voca.pth'
-        idx_to_chord = idx2voca_chord()
-        logger.info("Using large vocabulary chord set")
-    else:
-        config.feature['large_voca'] = False
-        n_classes = 25  # Major and minor chords only (12 roots * 2 + no-chord)
-        model_file = args.model_file or './checkpoints/student_model_best.pth'
-        # Simplified mapping for major/minor only
-        idx_to_chord = {i: f"{['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'][i//2]}{'m' if i%2 else ''}" 
-                       for i in range(24)}
-        idx_to_chord[24] = "N"  # No chord
-        logger.info("Using major/minor chord set")
+    # Always use large vocabulary
+    config.feature['large_voca'] = True  # Set to True always
+    n_classes = 170  # Large vocabulary size
+    model_file = args.model_file or './checkpoints/student_model_best.pth'
+    idx_to_chord = idx2voca_chord()
+    logger.info("Using large vocabulary chord set (170 chords)")
 
-    # Initialize model - we need to detect the right input dimension from config
+    # Initialize model with proper scaling
     n_freq = config.feature.get('n_bins', 144)
     logger.info(f"Using n_freq={n_freq} for model input")
+    
+    # Get base configuration for the model
+    base_config = config.model.get('base_config', {})
+    
+    # If base_config is not specified, fall back to direct model parameters
+    if not base_config:
+        base_config = {
+            'f_layer': config.model.get('f_layer', 3),
+            'f_head': config.model.get('f_head', 6),
+            't_layer': config.model.get('t_layer', 3),
+            't_head': config.model.get('t_head', 6),
+            'd_layer': config.model.get('d_layer', 3),
+            'd_head': config.model.get('d_head', 6)
+        }
+    
+    # Apply scale to model parameters
+    model_scale = args.model_scale
+    logger.info(f"Using model scale: {model_scale}")
+    
+    f_layer = max(1, int(round(base_config.get('f_layer', 3) * model_scale)))
+    f_head = max(1, int(round(base_config.get('f_head', 6) * model_scale)))
+    t_layer = max(1, int(round(base_config.get('t_layer', 3) * model_scale)))
+    t_head = max(1, int(round(base_config.get('t_head', 6) * model_scale)))
+    d_layer = max(1, int(round(base_config.get('d_layer', 3) * model_scale)))
+    d_head = max(1, int(round(base_config.get('d_head', 6) * model_scale)))
+    
+    # Log scaled parameters
+    logger.info(f"Scaled model parameters: f_layer={f_layer}, f_head={f_head}, t_layer={t_layer}, t_head={t_head}, d_layer={d_layer}, d_head={d_head}")
     
     model = ChordNet(
         n_freq=n_freq,
         n_classes=n_classes,
         n_group=config.model.get('n_group', 4),
-        f_layer=config.model.get('f_layer', 3),
-        f_head=config.model.get('f_head', 6),
-        t_layer=config.model.get('t_layer', 3),
-        t_head=config.model.get('t_head', 6),
-        d_layer=config.model.get('d_layer', 3),
-        d_head=config.model.get('d_head', 6),
+        f_layer=f_layer,
+        f_head=f_head,
+        t_layer=t_layer,
+        t_head=t_head,
+        d_layer=d_layer,
+        d_head=d_head,
         dropout=config.model.get('dropout', 0.3)
     ).to(device)
 
-    # Load model weights
+    # Load model weights with explicit device mapping
     if os.path.isfile(model_file):
         logger.info(f"Loading model from {model_file}")
-        checkpoint = torch.load(model_file, map_location=device)
+        try:
+            # First try loading with weights_only=False (for PyTorch 2.6+ compatibility)
+            checkpoint = torch.load(model_file, map_location=device, weights_only=False)
+            logger.info("Model loaded successfully with weights_only=False")
+        except TypeError:
+            # Fall back to older PyTorch versions that don't have weights_only parameter
+            logger.info("Falling back to legacy loading method (for older PyTorch versions)")
+            checkpoint = torch.load(model_file, map_location=device)
+        
+        # Try to extract model scale from checkpoint if available
+        if 'model_scale' in checkpoint:
+            loaded_scale = checkpoint['model_scale']
+            if loaded_scale != model_scale:
+                logger.warning(f"Model was trained with scale {loaded_scale} but using scale {model_scale} for inference")
         
         # Check if model state dict is directly available or nested
         if 'model_state_dict' in checkpoint:
@@ -114,7 +156,7 @@ def main():
     audio_paths = get_audio_paths(args.audio_dir)
     logger.info(f"Found {len(audio_paths)} audio files to process")
     
-    # Process each audio file
+    # Process each audio file - ensure consistent device usage
     for i, audio_path in enumerate(audio_paths):
         logger.info(f"Processing file {i+1} of {len(audio_paths)}: {os.path.basename(audio_path)}")
         
@@ -146,22 +188,52 @@ def main():
             # Process features and generate predictions
             with torch.no_grad():
                 model.eval()
-                feature_tensor = torch.tensor(feature, dtype=torch.float32).unsqueeze(0).to(device)
+                # Move model to CPU explicitly
+                model = model.cpu()
                 
-                # Get frame-level predictions
-                for t in range(num_instance):
-                    # Extract current segment
-                    segment = feature_tensor[:, n_timestep * t:n_timestep * (t + 1), :]
+                # Ensure feature tensor is on CPU
+                feature_tensor = torch.tensor(feature, dtype=torch.float32)
+                
+                # Get frame-level predictions in batches to avoid OOM errors
+                all_predictions = []
+                batch_size = 32  # Process in smaller batches
+                
+                for t in range(0, num_instance, batch_size):
+                    end_idx = min(t + batch_size, num_instance)
+                    batch_count = end_idx - t
                     
-                    # Get frame-level predictions
-                    prediction = model.predict(segment, per_frame=True).squeeze()
+                    # Create a batch of the appropriate size
+                    if batch_count == 1:
+                        # Handle single segment case
+                        segment = feature_tensor[n_timestep * t:n_timestep * (t + 1), :].unsqueeze(0)
+                    else:
+                        # Collect multiple segments
+                        segments = []
+                        for b in range(batch_count):
+                            if t + b < num_instance:
+                                seg = feature_tensor[n_timestep * (t+b):n_timestep * (t+b+1), :]
+                                segments.append(seg)
+                        
+                        if segments:
+                            segment = torch.stack(segments, dim=0)
+                        else:
+                            continue
                     
-                    # Ensure prediction is a 1D tensor
-                    if prediction.dim() == 0:
-                        prediction = prediction.unsqueeze(0)
+                    # Get frame-level predictions - ensure everything stays on CPU
+                    with torch.no_grad():
+                        # Explicitly move segment to CPU to match model device
+                        segment = segment.cpu()
+                        prediction = model.predict(segment, per_frame=True)
+                        # Explicitly move prediction to CPU if it's not already
+                        if prediction.device.type != 'cpu':
+                            prediction = prediction.cpu()
                     
-                    # Store predictions
-                    all_predictions.append(prediction.cpu().numpy())
+                    # Flatten and collect predictions
+                    if prediction.dim() > 1:
+                        for p in prediction:
+                            all_predictions.append(p.cpu().numpy())
+                    else:
+                        all_predictions.append(prediction.cpu().numpy())
             
             # Concatenate all predictions
             all_predictions = np.concatenate(all_predictions)
@@ -210,6 +282,8 @@ def main():
             
         except Exception as e:
             logger.error(f"Error processing {audio_path}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())  # Add detailed error trace
             continue
     
     logger.info("Chord recognition complete")

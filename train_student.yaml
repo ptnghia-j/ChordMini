@@ -124,26 +124,26 @@ spec:
             - name: USE_WARMUP
               value: "true"    # Overrides use_warmup in student_config.yaml
             - name: WARMUP_EPOCHS
-              value: "5"       # Overrides warmup_epochs in student_config.yaml
+              value: "20"       # Overrides warmup_epochs in student_config.yaml
             # Focal loss options - overrides student_config.yaml settings
             - name: USE_FOCAL_LOSS
-              value: "true"    # Overrides use_focal_loss in student_config.yaml
+              value: "false"    # Overrides use_focal_loss in student_config.yaml
             - name: FOCAL_GAMMA
-              value: "2.0"     # Overrides focal_gamma in student_config.yaml
+              value: "1.5"     # Overrides focal_gamma in student_config.yaml
             # Knowledge distillation options - overrides student_config.yaml settings
             - name: USE_KD_LOSS
-              value: "false"   # Overrides use_kd_loss in student_config.yaml
+              value: "true"   # Overrides use_kd_loss in student_config.yaml
             - name: KD_ALPHA
-              value: "0.5"     # Overrides kd_alpha in student_config.yaml
+              value: "0.9"     # Overrides kd_alpha in student_config.yaml
             - name: TEMPERATURE
-              value: "1.0"     # Overrides temperature in student_config.yaml
+              value: "20.0"     # Overrides temperature in student_config.yaml
             - name: KD_DATA_ROOT
               value: "/mnt/storage/data/logits/synth"  # Base dir for KD data
             # Caching options
             - name: METADATA_CACHE
               value: "true"    # Set to "true" to enable metadata-only caching, "false" to disable all caching
             - name: CACHE_FRACTION
-              value: "0.1"     # Cache only 10% of samples
+              value: "0.01"     # Cache only 1% of samples
           command:
             - sh
             - -c
@@ -308,12 +308,12 @@ spec:
               echo "=== Student model training complete ==="
           resources:
             requests:
-              cpu: "3"             
-              memory: "12Gi"    
+              cpu: "4"             
+              memory: "16Gi"    
               nvidia.com/gpu: "1"
             limits:
-              cpu: "5"             
-              memory: "16Gi" 
+              cpu: "6"             
+              memory: "24Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage

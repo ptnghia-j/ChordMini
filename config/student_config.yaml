@@ -10,7 +10,7 @@ training:
   weight_decay: 1.0e-5
   betas: [0.9, 0.98]
   epsilon: 1.0e-9
-  early_stopping_patience: 9
+  early_stopping_patience: 20
   seq_len: 108
   seq_stride: 36
   save_checkpoint_interval: 10
@@ -55,7 +55,7 @@ feature:
   bins_per_octave: 24 # Updated to match teacher
   hop_length: 2048    # Updated to match teacher
   hop_duration: 0.0928  # Computed as 2048 / 22050 ≈ 0.0928 seconds per frame
-  large_voca: false   # Matches teacher
+  large_voca: true    # Changed to true to use large vocabulary by default
 
 # Data paths
 paths:
