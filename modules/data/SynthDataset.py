@@ -285,6 +285,16 @@ class SynthDataset(Dataset):
             
         # Process files in parallel with memory-optimized handling
         try:
+            # Add counters for tracking skipped files
+            self.total_processed = 0
+            self.total_skipped = 0
+            self.skipped_reasons = {
+                'missing_label': 0,
+                'missing_logits': 0,
+                'load_error': 0,
+                'format_error': 0
+            }
+            
             if self.num_workers > 1 and len(spec_files) > 10:
                 # Split files into chunks for parallel processing
                 chunk_size = max(1, len(spec_files) // self.num_workers)
@@ -299,30 +309,68 @@ class SynthDataset(Dataset):
                     
                     # Process chunks and collect results with a timeout to prevent hangs
                     all_samples = []
-                    for chunk_samples in tqdm(pool.imap(worker_func, chunks), 
+                    for chunk_result in tqdm(pool.imap(worker_func, chunks), 
                                             total=len(chunks), 
                                             desc="Loading data",
                                             disable=not self.verbose):
-                        all_samples.extend(chunk_samples)
+                        all_samples.extend(chunk_result['samples'])
+                        self.total_processed += chunk_result['processed']
+                        self.total_skipped += chunk_result['skipped']
+                        for reason, count in chunk_result['skipped_reasons'].items():
+                            self.skipped_reasons[reason] += count
                         
                 self.samples = all_samples
             else:
                 # Fall back to sequential processing if needed
                 self.samples = []
                 for spec_file in tqdm(spec_files, desc="Loading data", disable=not self.verbose):
+                    self.total_processed += 1
                     processed = self._process_file(spec_file, label_files)
                     if processed:
                         self.samples.extend(processed)
+                    else:
+                        self.total_skipped += 1
         except Exception as e:
             # If parallel processing fails, fall back to sequential
             self.samples = []
+            self.total_processed = 0
+            self.total_skipped = 0
             if self.verbose:
                 print(f"Parallel processing failed: {e}")
                 print("Falling back to sequential processing...")
             for spec_file in tqdm(spec_files, desc="Loading data", disable=not self.verbose):
+                self.total_processed += 1
                 processed = self._process_file(spec_file, label_files)
                 if processed:
                     self.samples.extend(processed)
+                else:
+                    self.total_skipped += 1
+        
+        # Log statistics about skipped files
+        if hasattr(self, 'total_processed') and self.total_processed > 0:
+            skip_percentage = (self.total_skipped / self.total_processed) * 100
+            if self.verbose:
+                print(f"\nFile processing statistics:")
+                print(f"  Total processed: {self.total_processed}")
+                print(f"  Skipped: {self.total_skipped} ({skip_percentage:.1f}%)")
+                if hasattr(self, 'skipped_reasons'):
+                    for reason, count in self.skipped_reasons.items():
+                        if count > 0:
+                            reason_pct = (count / self.total_skipped) * 100 if self.total_skipped > 0 else 0
+                            print(f"    - {reason}: {count} ({reason_pct:.1f}%)")
+                
+                # Warning if too many files are skipped
+                if skip_percentage > 50:
+                    print("\nWARNING: More than 50% of files were skipped!")
+                    print("This may indicate a mismatch between your spectrogram, label, and logits naming conventions.")
+                    print("Please check that your file naming patterns match your actual data.")
+                    
+                    # Show example of expected patterns
+                    print("\nExpected matching patterns:")
+                    print("  Spectrogram: [base_name]_spec.npy or [base_name].npy")
+                    print("  Label:       [base_name].lab or [base_name]_lab.lab")
+                    if self.logits_dir is not None:
+                        print("  Logits:      [base_name].npy, [base_name]_logits.npy, [base_name]_teacher.npy, etc.")
         
         # Cache the dataset for future use with proper error handling
         if self.samples and self.use_cache:
@@ -423,84 +471,159 @@ class SynthDataset(Dataset):
     def _process_file_chunk(self, spec_files, label_files):
         """Process a chunk of files for parallel processing"""
         chunk_samples = []
+        chunk_processed = 0
+        chunk_skipped = 0
+        skipped_reasons = {
+            'missing_label': 0,
+            'missing_logits': 0,
+            'load_error': 0,
+            'format_error': 0
+        }
+        
         for spec_file in spec_files:
-            processed = self._process_file(spec_file, label_files)
+            chunk_processed += 1
+            processed, skip_reason = self._process_file(spec_file, label_files, return_skip_reason=True)
             if processed:
                 chunk_samples.extend(processed)
-        return chunk_samples
+            else:
+                chunk_skipped += 1
+                if skip_reason in skipped_reasons:
+                    skipped_reasons[skip_reason] += 1
+                
+        # Return both samples and statistics
+        return {
+            'samples': chunk_samples,
+            'processed': chunk_processed,
+            'skipped': chunk_skipped,
+            'skipped_reasons': skipped_reasons
+        }
         
-    def _process_file(self, spec_file, label_files):
+    def _process_file(self, spec_file, label_files, return_skip_reason=False):
         """Process a single spectrogram file and its matching label file with memory optimization"""
         samples = []
+        skip_reason = None
+        
         try:
             # Extract file name for matching
             base_name = spec_file.stem
             if base_name.endswith("_spec"):
                 base_name = base_name[:-5]  # Remove '_spec' suffix
             
-            # Find matching logit file if logits_dir is provided - prioritize .npy and .npz formats
+            # IMPORTANT: First check if we have all three required components before processing:
+            # 1. Spectrogram (we already have this since spec_file is passed in)
+            # 2. Label file
+            # 3. Logits file (if KD is enabled)
+            
+            # Check for matching label file with expanded patterns
+            label_file = None
+            label_patterns = [
+                f"{base_name}",       # Base name
+                f"{base_name}_lab",   # With _lab suffix 
+                f"{base_name}",       # Try without suffix
+                # Additional patterns specific to your data format
+                f"{base_name.replace('_spec', '')}", # In case base_name still has _spec
+                f"{base_name.split('_')[0]}"  # Try just the first part before any underscore
+            ]
+            
+            for pattern in label_patterns:
+                if pattern in label_files:
+                    label_file = label_files[pattern]
+                    if label_file.exists():
+                        break
+            
+            if not label_file or not os.path.exists(str(label_file)):
+                # No matching label file - skip this entire file
+                if self.verbose and not hasattr(self, '_missing_label_pattern_warning'):
+                    print(f"\nWARNING: No matching label file found for base name: {base_name}")
+                    print(f"Tried patterns: {label_patterns}")
+                    print(f"Label file mapping contains {len(label_files)} entries with keys like: {list(label_files.keys())[:5]}")
+                    self._missing_label_pattern_warning = True
+                
+                if hasattr(self, 'skipped_reasons'):
+                    self.skipped_reasons['missing_label'] += 1
+                skip_reason = 'missing_label'
+                if return_skip_reason:
+                    return [], skip_reason
+                return []  # Return empty list to skip this file
+            
+            # Find matching logit file if logits_dir is provided
             logit_file = None
             if self.logits_dir is not None:
-                # Focus only on the two required formats with common naming patterns
+                # Expanded patterns to match more file naming conventions
                 possible_patterns = [
                     f"{base_name}.npy",         # Simple base name
                     f"{base_name}_logits.npy",  # With _logits suffix
+                    f"{base_name}_teacher.npy", # With _teacher suffix
+                    f"{base_name}_soft.npy",    # With _soft suffix
                     f"{base_name}.npz",         # NPZ format with simple base name
                     f"{base_name}_logits.npz",  # NPZ format with _logits suffix
-                    f"{base_name}_teacher.npy", # With _teacher suffix (common convention)
-                    f"{base_name}_soft.npy",    # With _soft suffix (another convention)
+                    # Additional patterns specific to your data format
+                    f"{base_name.replace('_spec', '')}.npy",  # Remove _spec if present
+                    f"{base_name.replace('_spec', '')}_logits.npy",
+                    f"{base_name.split('_')[0]}.npy",  # Try just first part before underscore
+                    f"{base_name.split('_')[0]}_logits.npy"
                 ]
                 
-                # Check subdirectories if needed (up to 1 level)
-                search_dirs = [self.logits_dir]
-                for subdir in self.logits_dir.glob("*/"):
-                    if subdir.is_dir():
-                        search_dirs.append(subdir)
-                
-                # Try all combinations of directories and patterns
-                for directory in search_dirs:
+                # First check logits subdirectory if it exists
+                logits_subdir = self.logits_dir / "logits"
+                if logits_subdir.exists() and logits_subdir.is_dir():
                     for pattern in possible_patterns:
-                        candidate = directory / pattern
-                        if candidate.exists():
+                        candidate = logits_subdir / pattern
+                        if os.path.exists(str(candidate)):
                             logit_file = candidate
                             if self.verbose and not hasattr(self, '_logit_file_found'):
-                                print(f"Found teacher logits file: {logit_file} (format: {candidate.suffix})")
+                                print(f"Found teacher logits file in logits subfolder: {logit_file}")
                                 self._logit_file_found = True
                             break
-                    if logit_file:
-                        break
-                        
-                if logit_file is None and self.verbose and not hasattr(self, '_logit_warning_shown'):
-                    print(f"WARNING: Could not find matching teacher logits file for {base_name} in {self.logits_dir}")
-                    print(f"Searched patterns: {possible_patterns}")
-                    print(f"This will disable knowledge distillation for this sample")
-                    self._logit_warning_shown = True
+                
+                # If not found in logits subfolder, check main directory and other subfolders
+                if logit_file is None:
+                    # Check subdirectories if needed (up to 1 level)
+                    search_dirs = [self.logits_dir]
+                    for subdir in self.logits_dir.glob("*/"):
+                        if subdir.is_dir() and subdir != logits_subdir:
+                            search_dirs.append(subdir)
                     
-                    # List a few files in the logits directory to help diagnose the issue
-                    try:
-                        some_files = list(self.logits_dir.glob("*.npy"))[:5] + list(self.logits_dir.glob("*.npz"))[:5]
-                        if some_files:
-                            print(f"Some files found in logits directory: {[f.name for f in some_files]}")
-                        else:
-                            print(f"No .npy or .npz files found in {self.logits_dir}")
-                    except Exception as e:
-                        print(f"Error examining logits directory: {e}")
-
-            # Find matching label file directly from dictionary
-            label_file = label_files.get(base_name)
+                    # Try all combinations of directories and patterns
+                    for directory in search_dirs:
+                        for pattern in possible_patterns:
+                            candidate = directory / pattern
+                            if os.path.exists(str(candidate)):
+                                logit_file = candidate
+                                if self.verbose and not hasattr(self, '_logit_file_found'):
+                                    print(f"Found teacher logits file: {logit_file} (format: {candidate.suffix})")
+                                    self._logit_file_found = True
+                                break
+                        if logit_file:
+                            break
+                
+                # If we couldn't find a matching logits file, skip this file entirely
+                if logit_file is None:
+                    if self.verbose and not hasattr(self, '_missing_logits_pattern_warning'):
+                        print(f"\nWARNING: No matching teacher logits file found for base name: {base_name}")
+                        print(f"Tried patterns: {possible_patterns}")
+                        print(f"Searched directories: {[str(d) for d in search_dirs]}")
+                        # If this happens often, show the first few files in the logits directory
+                        sample_files = []
+                        try:
+                            for d in search_dirs:
+                                if os.path.exists(str(d)):
+                                    sample_files.extend([os.path.basename(str(f)) for f in list(d.glob("*.npy"))[:5]])
+                            if sample_files:
+                                print(f"Sample files in logits directory: {sample_files}")
+                        except Exception as e:
+                            print(f"Error listing logits directory: {e}")
+                        self._missing_logits_pattern_warning = True
+                    
+                    if hasattr(self, 'skipped_reasons'):
+                        self.skipped_reasons['missing_logits'] += 1
+                    skip_reason = 'missing_logits'
+                    if return_skip_reason:
+                        return [], skip_reason
+                    return []  # Return empty list to skip this file
             
-            if not label_file or not label_file.exists():
-                # Try some alternative naming patterns
-                found = False
-                for suffix in ["", "_lab"]:
-                    alt_name = f"{base_name}{suffix}"
-                    if alt_name in label_files:
-                        label_file = label_files[alt_name]
-                        found = True
-                        break
-                        
-                if not found:
-                    return samples  # Skip this file if no label found
+            # At this point, we have all required components (spec, label, and logits if enabled)
+            # Now proceed with processing as before
             
             # Load spectrogram data - if metadata_only, we'll store the path instead
             if self.metadata_only:
@@ -509,7 +632,7 @@ class SynthDataset(Dataset):
                     # Load minimal information needed for song identification and structure
                     spec_info = np.load(spec_file, mmap_mode='r')
                     spec_shape = spec_info.shape
-                    # NEW: Parse the label file to obtain chord_labels
+                    # Parse the label file to obtain chord_labels
                     chord_labels = self._parse_label_file(label_file)
                     # Create sample with metadata only
                     for t in range(spec_shape[0] if len(spec_shape) > 1 else 1):
@@ -531,7 +654,7 @@ class SynthDataset(Dataset):
                             'frame_idx': t
                         })
                         
-                        # Record logit path if available
+                        # Record logit path if available (it should always be available here)
                         if logit_file:
                             samples[-1]['logit_path'] = str(logit_file)
             else:
@@ -560,14 +683,35 @@ class SynthDataset(Dataset):
                             self.chord_to_idx[chord_label] = len(self.chord_to_idx)
                     elif chord_label not in self.chord_mapping:
                         warnings.warn(f"Unknown chord label {chord_label} found in {label_file}")
-                        return samples
+                        return []  # Skip this file if label not in mapping
                         
-                    samples.append({
+                    sample_dict = {
                         'spectro': spec,
                         'chord_label': chord_label,
                         'song_id': base_name
-                    })
+                    }
+                    
+                    # Add logits if available (should always be available here)
+                    if logit_file:
+                        try:
+                            teacher_logits = self._load_logits_file(logit_file)
+                            if teacher_logits is not None:
+                                sample_dict['teacher_logits'] = teacher_logits
+                        except Exception as e:
+                            warnings.warn(f"Error loading logits file {logit_file}: {e}")
+                            return []  # Skip this file if logits can't be loaded
+                    
+                    samples.append(sample_dict)
                 else:  # Multiple frames
+                    # Pre-load logits for frame-wise access
+                    teacher_logits = None
+                    if logit_file:
+                        try:
+                            teacher_logits = self._load_logits_file(logit_file)
+                        except Exception as e:
+                            warnings.warn(f"Error loading logits file {logit_file}: {e}")
+                            return []  # Skip this file if logits can't be loaded
+                    
                     for t in range(spec.shape[0]):
                         frame_time = t * self.frame_duration
                         chord_label = self._find_chord_at_time(chord_labels, frame_time)
@@ -580,76 +724,124 @@ class SynthDataset(Dataset):
                             warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
                             chord_label = "N"
                             
-                        samples.append({
+                        sample_dict = {
                             'spectro': spec[t],
                             'chord_label': chord_label,
                             'song_id': base_name
-                        })
+                        }
                         
-                        # Load logits if available
-                        if logit_file:
-                            try:
-                                logits = np.load(logit_file)
-                                # Add logits to the sample
-                                samples[-1]['teacher_logits'] = logits
-                            except Exception as e:
-                                warnings.warn(f"Error loading logits file {logit_file}: {e}")
-            
-            # Load logits with handling for .npy and .npz formats
-            if logit_file:
-                try:
-                    # Check file extension to handle different formats
-                    if str(logit_file).endswith('.npz'):
-                        # For npz files, try standard array names
-                        npz_data = np.load(logit_file)
-                        if 'logits' in npz_data:
-                            teacher_logits = npz_data['logits']
-                        elif 'teacher_logits' in npz_data:
-                            teacher_logits = npz_data['teacher_logits']
-                        elif len(npz_data.files) > 0:
-                            # Just use the first array in the file
-                            teacher_logits = npz_data[npz_data.files[0]]
-                            if self.verbose and not hasattr(self, '_npz_array_reported'):
-                                print(f"Using first array '{npz_data.files[0]}' from NPZ file")
-                                self._npz_array_reported = True
-                        else:
-                            raise ValueError(f"No arrays found in {logit_file}")
-                    else:
-                        # For npy files, load directly
-                        teacher_logits = np.load(logit_file)
-                    
-                    # Sanity check shape and values
-                    if isinstance(teacher_logits, np.ndarray):
-                        if self.verbose and not hasattr(self, '_logit_shape_reported'):
-                            print(f"Teacher logits shape: {teacher_logits.shape}, min: {teacher_logits.min()}, max: {teacher_logits.max()}")
-                            self._logit_shape_reported = True
-                        
-                        # Handle NaN or inf values
-                        if np.isnan(teacher_logits).any() or np.isinf(teacher_logits).any():
-                            teacher_logits = np.nan_to_num(teacher_logits, nan=0.0, posinf=100.0, neginf=-100.0)
-                            if self.verbose and not hasattr(self, '_logit_nan_reported'):
-                                print(f"WARNING: NaN or inf values found in teacher logits and replaced")
-                                self._logit_nan_reported = True
-                        
-                        # Add the logits to all samples from this file
-                        for sample in samples:
-                            sample['teacher_logits'] = teacher_logits
-                        
-                        if self.verbose and not hasattr(self, '_logit_success_reported'):
-                            print(f"Successfully loaded teacher logits with shape {teacher_logits.shape}")
-                            self._logit_success_reported = True
-                    else:
-                        if self.verbose and not hasattr(self, '_logit_type_warning'):
-                            print(f"WARNING: Loaded teacher logits has unexpected type: {type(teacher_logits)}")
-                            self._logit_type_warning = True
-                        
-                except Exception as e:
-                    warnings.warn(f"Error loading logits file {logit_file}: {e}")
+                        # Add frame-specific logits if available
+                        if teacher_logits is not None:
+                            if isinstance(teacher_logits, np.ndarray):
+                                if len(teacher_logits.shape) > 1 and t < teacher_logits.shape[0]:
+                                    # Multi-frame logits - extract the specific frame
+                                    sample_dict['teacher_logits'] = teacher_logits[t]
+                                else:
+                                    # Single-frame logits - use as is
+                                    sample_dict['teacher_logits'] = teacher_logits
+                            
+                        samples.append(sample_dict)
             
         except Exception as e:
-            warnings.warn(f"Error processing file {spec_file}: {e}")
+            if hasattr(self, 'skipped_reasons'):
+                if "format" in str(e).lower() or "corrupt" in str(e).lower():
+                    self.skipped_reasons['format_error'] += 1
+                    skip_reason = 'format_error'
+                else:
+                    self.skipped_reasons['load_error'] += 1
+                    skip_reason = 'load_error'
             
+            warnings.warn(f"Error processing file {spec_file}: {str(e)}")
+            
+            # Log the first few errors in detail to help debugging
+            if not hasattr(self, '_error_count'):
+                self._error_count = 0
+            
+            if self._error_count < 5 and self.verbose:
+                import traceback
+                print(f"\nDetailed error processing {spec_file}:")
+                print(traceback.format_exc())
+                self._error_count += 1
+            
+            if return_skip_reason:
+                return [], skip_reason
+            return []
+            
+        # Return processed samples (or empty list if we skipped this file)
+        if return_skip_reason:
+            return samples, skip_reason
         return samples
+    
+    def _load_logits_file(self, logit_file):
+        """Load logits from file with format detection and error handling"""
+        try:
+            # Check file extension to handle different formats
+            if str(logit_file).endswith('.npz'):
+                # For npz files, try standard array names
+                npz_data = np.load(logit_file)
+                if 'logits' in npz_data:
+                    teacher_logits = npz_data['logits']
+                elif 'teacher_logits' in npz_data:
+                    teacher_logits = npz_data['teacher_logits']
+                elif len(npz_data.files) > 0:
+                    # Just use the first array in the file
+                    teacher_logits = npz_data[npz_data.files[0]]
+                    if self.verbose and not hasattr(self, '_npz_array_reported'):
+                        print(f"Using first array '{npz_data.files[0]}' from NPZ file")
+                        self._npz_array_reported = True
+                else:
+                    raise ValueError(f"No arrays found in {logit_file}")
+            else:
+                # For npy files, load directly with additional error handling
+                try:
+                    teacher_logits = np.load(logit_file)
+                except (ValueError, OSError) as e:
+                    if "corrupt" in str(e).lower():
+                        # Special handling for corrupt files
+                        warnings.warn(f"Corrupt numpy file detected at {logit_file}: {str(e)}")
+                        return None
+                    raise  # Re-raise other errors
+            
+            # Sanity check shape and values
+            if isinstance(teacher_logits, np.ndarray):
+                if self.verbose and not hasattr(self, '_logit_shape_reported'):
+                    print(f"Teacher logits shape: {teacher_logits.shape}, min: {teacher_logits.min()}, max: {teacher_logits.max()}")
+                    self._logit_shape_reported = True
+                
+                # Handle NaN or inf values
+                if np.isnan(teacher_logits).any() or np.isinf(teacher_logits).any():
+                    teacher_logits = np.nan_to_num(teacher_logits, nan=0.0, posinf=100.0, neginf=-100.0)
+                    if self.verbose and not hasattr(self, '_logit_nan_reported'):
+                        print(f"WARNING: NaN or inf values found in teacher logits and replaced")
+                        self._logit_nan_reported = True
+                
+                return teacher_logits
+            else:
+                if self.verbose and not hasattr(self, '_logit_type_warning'):
+                    print(f"WARNING: Loaded teacher logits has unexpected type: {type(teacher_logits)}")
+                    self._logit_type_warning = True
+                return None
+                
+        except Exception as e:
+            warnings.warn(f"Error loading logits file {logit_file}: {str(e)}")
+            
+            # Add more context for the first few errors
+            if not hasattr(self, '_logits_error_count'):
+                self._logits_error_count = 0
+                
+            if self._logits_error_count < 5 and self.verbose:
+                import traceback
+                file_size = "unknown"
+                try:
+                    file_size = os.path.getsize(str(logit_file))
+                    print(f"\nDetailed error loading logits file {logit_file} (size: {file_size} bytes):")
+                    print(traceback.format_exc())
+                except:
+                    print(f"\nDetailed error loading logits file {logit_file} (size could not be determined):")
+                    print(traceback.format_exc())
+                self._logits_error_count += 1
+                
+            return None
     
     def _parse_label_file(self, label_file):
         """Parse a label file into a list of (start_time, end_time, chord) tuples"""
@@ -736,6 +928,8 @@ class SynthDataset(Dataset):
         seg_start, seg_end = self.segment_indices[idx]
         sequence = []
         label_seq = []
+        teacher_logits_seq = []  # Track teacher logits sequence
+        has_teacher_logits = False  # Flag to track if any samples have teacher logits
         
         # Get first sample to determine shape for padding
         first_sample = self.samples[seg_start]
@@ -870,9 +1064,28 @@ class SynthDataset(Dataset):
             'chord_idx': torch.tensor(label_seq, dtype=torch.long)  # [seq_len]
         }
         
-        # If we parsed teacher logits (when defined above), add them to the output
-        if 'logits_tensor' in locals():
-            sample_out['teacher_logits'] = logits_tensor
+        # If we have teacher logits for any samples in this segment, stack them
+        if teacher_logits_seq and len(teacher_logits_seq) == len(sequence):
+            try:
+                sample_out['teacher_logits'] = torch.stack(teacher_logits_seq, dim=0)
+                has_teacher_logits = True
+            except:
+                # Handle case where tensors might be different shapes
+                if self.verbose and not hasattr(self, '_logits_stack_error'):
+                    print("WARNING: Could not stack teacher logits due to shape mismatch")
+                    self._logits_stack_error = True
+        
+        # If no teacher logits were collected but we have logits path, try to load directly
+        if not has_teacher_logits and 'logit_path' in locals():
+            try:
+                logit_data = self._load_logits_file(logit_path)
+                if logit_data is not None:
+                    logits_tensor = torch.tensor(logit_data, dtype=torch.float)
+                    sample_out['teacher_logits'] = logits_tensor
+            except Exception as e:
+                if self.verbose and not hasattr(self, '_logits_load_error'):
+                    print(f"WARNING: Failed to load teacher logits: {e}")
+                    self._logits_load_error = True
         
         return sample_out
     

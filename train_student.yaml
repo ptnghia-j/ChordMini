@@ -208,7 +208,7 @@ spec:
               if [ "${LR_SCHEDULE}" != "" ] && [ "${LR_SCHEDULE}" != "null" ]; then
                 echo "Using ${LR_SCHEDULE} learning rate schedule"
                 LR_SCHEDULE_ARG="--lr_schedule ${LR_SCHEDULE}"
-              elif [ "${USE_WARMUP}" == "true" ]; then
+              elif [ "${USE_WARMUP}" = "true" ]; then
                 echo "Using warm-up learning rate schedule for ${WARMUP_EPOCHS} epochs"
                 LR_SCHEDULE_ARG="--use_warmup --warmup_epochs ${WARMUP_EPOCHS}"
               else
@@ -217,7 +217,7 @@ spec:
               
               # Get focal loss arguments
               FOCAL_LOSS_ARG=""
-              if [ "${USE_FOCAL_LOSS}" == "true" ]; then
+              if [ "${USE_FOCAL_LOSS}" = "true" ]; then
                 echo "Using focal loss with gamma=${FOCAL_GAMMA}"
                 FOCAL_LOSS_ARG="--use_focal_loss --focal_gamma ${FOCAL_GAMMA}"
                 # Add focal_alpha if specified
@@ -228,7 +228,7 @@ spec:
               
               # Get knowledge distillation arguments
               KD_LOSS_ARG=""
-              if [ "${USE_KD_LOSS}" == "true" ]; then
+              if [ "${USE_KD_LOSS}" = "true" ]; then
                 echo "Using knowledge distillation with alpha=${KD_ALPHA} and temperature=${TEMPERATURE}"
                 KD_LOSS_ARG="--use_kd_loss --kd_alpha ${KD_ALPHA} --temperature ${TEMPERATURE} --logits_dir ${DATA_ROOT}/logits/synth"
                 echo "Note: Teacher logits must be included in the batch data"
@@ -245,7 +245,7 @@ spec:
               
               # Handle caching options for memory optimization
               CACHE_ARGS=""
-              if [ "${METADATA_CACHE}" == "true" ]; then
+              if [ "${METADATA_CACHE}" = "true" ]; then
                 echo "Using metadata-only caching to reduce memory usage"
                 CACHE_ARGS="--metadata_cache"
               else
@@ -260,7 +260,7 @@ spec:
               fi
               
               # Handle KD paths when KD is enabled with more flexible configuration
-              if [ "${USE_KD_LOSS}" == "true" ]; then
+              if [ "${USE_KD_LOSS}" = "true" ]; then
                 echo "Knowledge distillation enabled - using teacher logits"
                 
                 # Check if KD_DATA_ROOT exists
@@ -270,7 +270,17 @@ spec:
                   # Define paths based on directory structure
                   if [ -d "${DATA_ROOT}/logits/synth/spectrograms" ] && [ -d "${DATA_ROOT}/logits/synth/labels" ] && [ -d "${DATA_ROOT}/logits/synth/logits" ]; then
                     # Standard structure with separate directories
-                    KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms --label_dir ${DATA_ROOT}/logits/synth/labels --logits_dir ${DATA_ROOT}/logits/synth/logits"
+                    # Check if logits directory has more data and use it if it does
+                    MAIN_SPEC_COUNT=$(find "${DATA_ROOT}/synth/spectrograms" -type f -name "*.npy" 2>/dev/null | wc -l)
+                    LOGITS_SPEC_COUNT=$(find "${DATA_ROOT}/logits/synth/spectrograms" -type f -name "*.npy" 2>/dev/null | wc -l)
+                    
+                    if [ ${MAIN_SPEC_COUNT:-0} -lt ${LOGITS_SPEC_COUNT:-0} ]; then
+                      echo "Using spectrograms and labels from logits directory (more files available)"
+                      KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms --label_dir ${DATA_ROOT}/logits/synth/labels --logits_dir ${DATA_ROOT}/logits/synth/logits"
+                    else
+                      echo "Using spectrograms and labels from main directory with logits from logits directory"
+                      KD_ARGS="--logits_dir ${DATA_ROOT}/logits/synth/logits"
+                    fi
                     echo "Using standard KD directory structure"
                   elif [ -d "${DATA_ROOT}/logits/synth" ]; then
                     # All files might be in the root directory
@@ -284,6 +294,9 @@ spec:
                   echo "WARNING: KD_DATA_ROOT does not exist: ${DATA_ROOT}/logits/synth"
                   echo "Attempting to use default paths"
                   KD_ARGS="--logits_dir /mnt/storage/data/logits/synth/logits"
+                  
+                  # Create parent directories to avoid errors later
+                  mkdir -p "/mnt/storage/data/logits/synth/logits"
                 fi
                 
                 # Log the actual paths being used
