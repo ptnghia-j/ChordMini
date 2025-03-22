@@ -1,0 +1,5 @@
+# Track PyTorch model checkpoints with Git LFS
+*.pth filter=lfs diff=lfs merge=lfs -text
+
+# Track visualization images with Git LFS
+*.png filter=lfs diff=lfs merge=lfs -text
