@@ -237,4 +237,4 @@ __pycache__/
 .DS_Store
 
 # Dataset caches
-dataset_cache_*.pkl
+dataset_cache_*.pklcheckpoints/*.pth
