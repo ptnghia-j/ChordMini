@@ -83,9 +83,9 @@ class StudentTrainer(BaseTrainer):
         self.use_warmup = use_warmup
         self.warmup_epochs = warmup_epochs
         # If warmup_start_lr not provided, use 1/10 of the initial learning rate
-        self.warmup_start_lr = warmup_start_lr if warmup_start_lr is not None else optimizer.param_groups[0]['lr'] / 10.0
+        self.warmup_start_lr = warmup_start_lr if warmup_start_lr is not None else optimizer.param_groups[0]['lr'] / 10.0  # typically 1.0e-5 if initial lr=1.0e-4
         # If warmup_end_lr not provided, use the initial learning rate
-        self.warmup_end_lr = warmup_end_lr if warmup_end_lr is not None else optimizer.param_groups[0]['lr']
+        self.warmup_end_lr = warmup_end_lr if warmup_end_lr is not None else optimizer.param_groups[0]['lr']  # typically 1.0e-4
         # Track original learning rate for later use
         self.initial_lr = optimizer.param_groups[0]['lr']
         
@@ -399,12 +399,18 @@ class StudentTrainer(BaseTrainer):
             # Warm-up complete, set to end LR
             return self._set_lr(self.warmup_end_lr)
         
+        # Convert 1-indexed epoch to 0-indexed for correct linear interpolation
+        # This fixes the issue where warmup wasn't properly increasing from start_lr
+        warmup_progress = (epoch - 1) / max(1, self.warmup_epochs - 1) 
+        
+        # Clamp to ensure we don't go below start_lr or above end_lr due to rounding
+        warmup_progress = max(0.0, min(1.0, warmup_progress))
+        
         # Linear interpolation between start_lr and end_lr
-        progress = epoch / self.warmup_epochs
-        new_lr = self.warmup_start_lr + progress * (self.warmup_end_lr - self.warmup_start_lr)
-        self._log(f"Warm-up epoch {epoch}/{self.warmup_epochs}: LR = {new_lr:.6f}")
+        new_lr = self.warmup_start_lr + warmup_progress * (self.warmup_end_lr - self.warmup_start_lr)
+        self._log(f"Warm-up epoch {epoch}/{self.warmup_epochs}: progress={warmup_progress:.2f}, LR = {new_lr:.6f}")
         return self._set_lr(new_lr)
-    
+
     def _adjust_learning_rate(self, val_acc):
         """Adjust learning rate based on validation accuracy."""
         if self.before_val_acc > val_acc:
@@ -612,6 +618,12 @@ class StudentTrainer(BaseTrainer):
         
         # Reset KD warning flag
         self._kd_warning_logged = False
+        
+        # Handle initial learning rate explicitly (before first epoch)
+        # This ensures we start exactly at warmup_start_lr
+        if self.use_warmup and start_epoch == 1:
+            self._log(f"Setting initial learning rate to warm-up start value: {self.warmup_start_lr:.6f}")
+            self._set_lr(self.warmup_start_lr)
             
         for epoch in range(start_epoch, self.num_epochs + 1):
             # Modified to use the new combined warmup+scheduler method

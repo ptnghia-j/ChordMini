@@ -124,7 +124,7 @@ spec:
             - name: USE_WARMUP
               value: "true"    # Overrides use_warmup in student_config.yaml
             - name: WARMUP_EPOCHS
-              value: "20"       # Overrides warmup_epochs in student_config.yaml
+              value: "10"       # Overrides warmup_epochs in student_config.yaml
             # Focal loss options - overrides student_config.yaml settings
             - name: USE_FOCAL_LOSS
               value: "true"    # Overrides use_focal_loss in student_config.yaml
