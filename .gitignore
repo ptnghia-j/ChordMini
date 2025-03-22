@@ -196,3 +196,45 @@ $RECYCLE.BIN/
 
 #ignore checkpoints folder
 checkpoints/
+
+# Ignore checkpoints directory (alternatively, use Git LFS as shown above)
+# checkpoints/
+
+# Ignore cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+
+# Ignore dataset caches
+dataset_cache_*.pkl
+
+# Ignore temporary files
+tmp_*.lab
+tmp_*.pth
+
+# Ignore large test output files
+*.wav
+*.mp3
+
+# Ignore PyTorch model files
+*.pth
+*.pt
+checkpoints/
+
+# Ignore all checkpoint files
+checkpoints/*.pth
+*.pt
+*.pth
+
+# Ignore large visualization files
+visualizations/*.png
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+
+# Dataset caches
+dataset_cache_*.pkl
