@@ -268,6 +268,12 @@ def main():
     parser.add_argument('--lazy_init', action='store_true',
                       help='Use lazy initialization for dataset to reduce memory usage')
     
+    # Add new arguments for data directories override
+    parser.add_argument('--spec_dir', type=str, default=None,
+                      help='Directory containing spectrograms (overrides config value)')
+    parser.add_argument('--label_dir', type=str, default=None,
+                      help='Directory containing labels (overrides config value)')
+    
     args = parser.parse_args()
 
     # Load configuration from YAML
@@ -319,7 +325,9 @@ def main():
     if args.lr_schedule or config.training.get('lr_schedule'):
         logger.info(f"LR schedule: {args.lr_schedule or config.training.get('lr_schedule')}")
     if args.use_warmup or config.training.get('use_warmup', False):
-        logger.info(f"Using LR warm-up for {args.warmup_epochs or config.training.get('warmup_epochs', 5)} epochs")
+        # Fix: Use the warmup_epochs value from the command line or config, but prioritize command line
+        warmup_epochs = args.warmup_epochs if args.warmup_epochs != 5 else config.training.get('warmup_epochs', 5)
+        logger.info(f"Using LR warm-up for {warmup_epochs} epochs")
         logger.info(f"Warm-up start LR: {args.warmup_start_lr or config.training.get('warmup_start_lr', config.training['learning_rate']/10)}")
     
     # Set random seed for reproducibility
@@ -334,7 +342,7 @@ def main():
 
     # Set up logging
     logger.logging_verbosity(config.misc['logging_level'])
-
+    
     # Get device
     device = get_device() if config.misc['use_cuda'] else torch.device('cpu')
     if device.type == "cuda":
@@ -343,24 +351,24 @@ def main():
     # Get project root directory (important for path resolution)
     project_root = os.path.dirname(os.path.abspath(__file__))
     logger.info(f"Project root: {project_root}")
-
+    
     # Get storage root from config
     storage_root = config.paths.get('storage_root', None)
     logger.info(f"Storage root: {storage_root}")
-
+    
     # Resolve paths using the new function
-    # First, try to get spec_dir and label_dir from config
-    spec_dir_config = config.paths.get('spec_dir', 'data/synth/spectrograms')
-    label_dir_config = config.paths.get('label_dir', 'data/synth/labels')
+    # First, try to get spec_dir and label_dir from config, but allow CLI override
+    spec_dir_config = args.spec_dir or config.paths.get('spec_dir', 'data/synth/spectrograms')
+    label_dir_config = args.label_dir or config.paths.get('label_dir', 'data/synth/labels')
     
     # Resolve the primary paths
     synth_spec_dir = resolve_path(spec_dir_config, storage_root, project_root)
     synth_label_dir = resolve_path(label_dir_config, storage_root, project_root)
-
+    
     # Set up alternative paths if available
     alt_spec_dir = config.paths.get('alt_spec_dir', None)
     alt_label_dir = config.paths.get('alt_label_dir', None)
-
+    
     if alt_spec_dir:
         alt_spec_dir = resolve_path(alt_spec_dir, storage_root, project_root)
     if alt_label_dir:
@@ -369,15 +377,15 @@ def main():
     # Create directories if they don't exist
     os.makedirs(synth_spec_dir, exist_ok=True)
     os.makedirs(synth_label_dir, exist_ok=True)
-
+    
     # Check if directories exist and contain files (including in subdirectories)
     spec_count = count_files_in_subdirectories(synth_spec_dir, "*.npy")
     label_count = count_files_in_subdirectories(synth_label_dir, "*.lab")
-
+    
     # Find sample files to verify we're finding files correctly
     spec_samples = find_sample_files(synth_spec_dir, "*.npy", 5)
     label_samples = find_sample_files(synth_label_dir, "*.lab", 5)
-
+    
     logger.info(f"Loading data from:")
     logger.info(f"  Spectrograms: {synth_spec_dir} ({spec_count} files)")
     if spec_samples:
@@ -385,7 +393,7 @@ def main():
     logger.info(f"  Labels: {synth_label_dir} ({label_count} files)")
     if label_samples:
         logger.info(f"  Example label files: {label_samples}")
-
+    
     # Try alternative paths if specified and primary paths don't have files
     if (spec_count == 0 or label_count == 0) and (alt_spec_dir or alt_label_dir):
         logger.info(f"Primary paths don't have enough data. Checking alternative paths...")
@@ -403,7 +411,7 @@ def main():
                 synth_label_dir = alt_label_dir
                 label_count = alt_label_count
                 logger.info(f"  Using alternative label path: {synth_label_dir}")
-
+    
     # Try one last fallback - check common locations
     if spec_count == 0 or label_count == 0:
         # Check common paths
@@ -411,7 +419,7 @@ def main():
             "/mnt/storage/data/synth/spectrograms",
             "/mnt/storage/data/synth/labels",
             os.path.join(project_root, "data/synth/spectrograms"),
-            os.path.join(project_root, "data/synth/labels")
+            os.path.join(project_root, "data/synth/labels"),
         ]
         logger.info(f"Still missing data. Checking common paths as last resort...")
         for path in common_paths:
@@ -430,11 +438,11 @@ def main():
                     synth_label_dir = path
                     label_count = count
                     break
-
+    
     # Final check - fail if we still don't have data
     if spec_count == 0 or label_count == 0:
         raise RuntimeError(f"ERROR: Missing spectrogram or label files. Found {spec_count} spectrogram files and {label_count} label files.")
-
+    
     # Use the mapping defined in chords.py and invert it so that it is chord->index.
     master_mapping = idx2voca_chord()
     # Invert: keys = chord names, values = unique indices.
@@ -447,13 +455,13 @@ def main():
             logger.info(f"  '{special_chord}' mapped to index {chord_mapping[special_chord]}")
         else:
             logger.warning(f"  '{special_chord}' not found in mapping!")
-
+    
     # Log mapping info
     logger.info(f"\nUsing chord mapping from chords.py with {len(chord_mapping)} unique chords")
     logger.info(f"Sample chord mapping: {dict(list(chord_mapping.items())[:5])}")
-
+    
     # Compute frame_duration from configuration if available,
-    # otherwise default to 0.1 s
+    # otherwise default to 0.1
     frame_duration = config.feature.get('hop_duration', 0.1)
     
     # Resolve checkpoints directory path BEFORE dataset initialization
@@ -487,9 +495,33 @@ def main():
     
     # Initialize SynthDataset with logits path if KD is enabled
     logits_dir = None
+    spec_dir_override = None
+    label_dir_override = None
+    
     if args.use_kd_loss and args.logits_dir:
         logits_dir = resolve_path(args.logits_dir, storage_root, project_root)
         logger.info(f"Knowledge distillation enabled - using teacher logits from: {logits_dir}")
+        
+        # Check if spectrograms and labels exist in the logits directory structure
+        logits_spec_dir = os.path.join(os.path.dirname(logits_dir), "spectrograms")
+        logits_label_dir = os.path.join(os.path.dirname(logits_dir), "labels")
+        
+        if os.path.exists(logits_spec_dir) and os.path.exists(logits_label_dir):
+            # Count files in both locations
+            logits_spec_count = count_files_in_subdirectories(logits_spec_dir, "*.npy")
+            logits_label_count = count_files_in_subdirectories(logits_label_dir, "*.lab")
+            
+            logger.info(f"Found {logits_spec_count} spectrograms and {logits_label_count} labels in logits directory structure")
+            
+            # Use spectrograms and labels from logits dir if they exist and have enough files
+            if logits_spec_count > 0 and logits_label_count > 0:
+                if (spec_count < logits_spec_count) or (label_count < logits_label_count):
+                    logger.info(f"Using spectrograms and labels from logits directory (more files available)")
+                    spec_dir_override = logits_spec_dir
+                    label_dir_override = logits_label_dir
+                    # Update counts for display
+                    spec_count = logits_spec_count
+                    label_count = logits_label_count
         
         # Verify logits directory exists and contains files
         if not os.path.exists(logits_dir):
@@ -503,6 +535,15 @@ def main():
             if logits_count == 0 and args.use_kd_loss:
                 logger.error("No teacher logit files found but knowledge distillation is enabled")
                 raise RuntimeError(f"No teacher logit files found in: {logits_dir}")
+    
+    # Use the overrides if present
+    if spec_dir_override:
+        logger.info(f"Using spectrograms from: {spec_dir_override} (override)")
+        synth_spec_dir = spec_dir_override
+    
+    if label_dir_override:
+        logger.info(f"Using labels from: {label_dir_override} (override)")
+        synth_label_dir = label_dir_override
     
     # Initialize dataset with memory optimization options including lazy_init
     synth_dataset = SynthDataset(
@@ -530,7 +571,7 @@ def main():
         n_chord_count = chord_counter.get("N", 0)
         logger.info(f"'N' chord count: {n_chord_count} ({n_chord_count/len(synth_dataset.samples)*100:.2f}% of total)")
         logger.info(f"Total synthesized samples: {len(synth_dataset.samples)}")
-
+    
     # Create data loaders with optimized settings
     # Determine optimal num_workers
     num_workers = min(4, os.cpu_count()) if torch.cuda.is_available() else 0
@@ -548,7 +589,7 @@ def main():
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available()
     )
-
+    
     # Debug samples - add more detailed shape information
     logger.info("=== Debug: Training set sample ===")
     try:
@@ -564,7 +605,6 @@ def main():
             logger.info(f"Detected Constant-Q Transform (CQT) input with {actual_freq_dim} frequency bins")
         else:
             logger.info(f"Detected STFT input with {actual_freq_dim} frequency bins")
-            
         # Set the frequency dimension to match the actual data
         n_freq = actual_freq_dim
     except Exception as e:
@@ -572,9 +612,10 @@ def main():
         logger.error("This may indicate problems with the data format. Attempting to continue...")
         n_freq = config.model.get('n_freq', 144)
         logger.info(f"Using default frequency dimension: {n_freq}")
-
+    
     # Get the number of unique chords in our dataset for the output layer
     num_unique_chords = len(chord_mapping)
+    
     # Initialize n_classes with the number of unique chords
     n_classes = num_unique_chords
     logger.info(f"Output classes: {n_classes}")
@@ -592,11 +633,11 @@ def main():
                 n_group = candidate
                 break
         logger.warning(f"Adjusted n_group to {n_group} to ensure n_freq ({n_freq}) is divisible")
-
+    
     # Log the feature dimensions
     actual_feature_dim = n_freq // n_group
     logger.info(f"Using n_group={n_group}, resulting in actual feature dimension: {actual_feature_dim}")
-
+    
     # Get model scale factor and compute scaled parameters
     model_scale = config.model.get('scale', 1.0)
     
@@ -611,7 +652,7 @@ def main():
             't_layer': config.model.get('t_layer', 3),
             't_head': config.model.get('t_head', 6),
             'd_layer': config.model.get('d_layer', 3),
-            'd_head': config.model.get('d_head', 6)
+            'd_head': config.model.get('d_head', 6),
         }
     
     # Apply scale to model parameters
@@ -636,17 +677,17 @@ def main():
     # Verify that the scaled parameters maintain dimensional compatibility
     if actual_feature_dim % f_head != 0:
         logger.warning(f"Feature dimension {actual_feature_dim} not divisible by scaled f_head={f_head}")
-        # Find compatible f_head value
+        # Find compatible f_head values
         for head_count in range(f_head, 0, -1):
             if actual_feature_dim % head_count == 0:
                 logger.warning(f"Adjusting f_head from {f_head} to {head_count} for compatibility")
                 f_head = head_count
                 break
-            
+    
     model = ChordNet(
         n_freq=n_freq, 
         n_classes=n_classes, 
-        n_group=n_group,
+        n_group=n_group, 
         f_layer=f_layer, 
         f_head=f_head, 
         t_layer=t_layer, 
@@ -656,7 +697,7 @@ def main():
         dropout=config.model['dropout'],
         #ignore_index=chord_mapping.get("N")
     ).to(device)
-
+    
     # Log model configuration for transparency
     logger.info("Model configuration:")
     logger.info(f"  n_freq: {n_freq}")
@@ -669,18 +710,18 @@ def main():
     logger.info(f"  d_layer: {d_layer}")
     logger.info(f"  d_head: {d_head}")
     logger.info(f"  dropout: {config.model['dropout']}")
-
+    
     if torch.cuda.device_count() > 1 and config.misc['use_cuda']:
         model = torch.nn.DataParallel(model)
         logger.info(f"Using {torch.cuda.device_count()} GPUs for training")
-
+    
     # Create optimizer - match teacher settings
     optimizer = torch.optim.Adam(model.parameters(), 
                                lr=config.training['learning_rate'],    
                                weight_decay=config.training['weight_decay'], 
                                betas=tuple(config.training['betas']), 
                                eps=config.training['epsilon'])
-
+    
     # Calculate class weights to handle imbalanced data
     # Only calculate if not using focal loss
     class_weights = None
@@ -702,7 +743,7 @@ def main():
         logger.info(f"Generated class weights for {len(class_weights)} classes using log(inverse frequency)")
     else:
         logger.info("Using focal loss instead of class weights for handling imbalance")
-
+    
     # Create idx_to_chord mapping for the loss function
     idx_to_chord = {v: k for k, v in chord_mapping.items()}
     
@@ -716,7 +757,6 @@ def main():
         mean += torch.mean(features).item()
         square_mean += torch.mean(features.pow(2)).item()
         k += 1
-
     if k > 0:
         square_mean = square_mean / k
         mean = mean / k
@@ -726,8 +766,8 @@ def main():
         mean = 0.0
         std = 1.0
         logger.warning("Could not calculate mean and std, using defaults")
-
-    # Create our StudentTrainer with all parameters (remove teacher_model parameter)
+    
+    # Create our StudentTrainer with all parameters
     trainer = StudentTrainer(
         model, 
         optimizer, 
@@ -742,7 +782,7 @@ def main():
         checkpoint_dir=checkpoints_dir,
         logger=logger,
         use_warmup=args.use_warmup,
-        warmup_epochs=args.warmup_epochs,
+        warmup_epochs=warmup_epochs,  # Use the corrected warmup_epochs value
         warmup_start_lr=args.warmup_start_lr,
         warmup_end_lr=config.training['learning_rate'],  # Use config LR as warmup end point
         lr_schedule_type=args.lr_schedule,  # Pass the scheduler type
@@ -753,10 +793,10 @@ def main():
         kd_alpha=args.kd_alpha,
         temperature=args.temperature
     )
-
+    
     # Set chord mapping for saving with the checkpoint
     trainer.set_chord_mapping(chord_mapping)
-
+    
     # Check for existing checkpoints to resume training
     start_epoch = 1
     if os.path.exists(checkpoints_dir):
@@ -770,35 +810,27 @@ def main():
                     epoch_numbers.append((epoch_num, f))
                 except ValueError:
                     continue
-            
             if epoch_numbers:
                 # Find the most recent checkpoint
                 latest_epoch, latest_checkpoint = max(epoch_numbers, key=lambda x: x[0])
                 logger.info(f"Found checkpoint from epoch {latest_epoch}. Attempting to resume training...")
-                
                 try:
                     # Load checkpoint
                     checkpoint = torch.load(latest_checkpoint, map_location=device)
-                    
                     # Restore model state
                     model.load_state_dict(checkpoint['model_state_dict'])
-                    
                     # Restore optimizer state
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                    
                     # Restore scheduler if it exists in the checkpoint
                     if 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None and hasattr(trainer, 'smooth_scheduler'):
                         trainer.smooth_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                    
                     # Set starting epoch to the next one
                     start_epoch = latest_epoch + 1
                     logger.info(f"Successfully loaded checkpoint. Training will resume from epoch {start_epoch}.")
-                    
                     # If we have validation stats, restore those too
                     if 'accuracy' in checkpoint:
                         trainer.best_val_acc = checkpoint.get('accuracy', 0)
                         logger.info(f"Restored best validation accuracy: {trainer.best_val_acc:.4f}")
-                    
                 except Exception as e:
                     logger.error(f"Error loading checkpoint: {e}")
                     logger.info("Training will start from scratch.")
@@ -806,18 +838,17 @@ def main():
     
     # Modify train method call to include starting epoch
     trainer.train(train_loader, val_loader, start_epoch=start_epoch)
-
+    
     # Test the model
     logger.info("Starting testing phase...")
     # Load the best model for testing
     trainer.load_best_model()
     test_loader = synth_dataset.get_test_iterator(batch_size=config.training['batch_size'])
-    
     logger.info("=== Debug: Test set sample ===")
     test_batch = next(iter(test_loader))
     logger.info(f"Test spectrogram tensor shape: {test_batch['spectro'].shape}")
     logger.info(f"Test labels: {test_batch['chord_idx'][:10]}")
-
+    
     # Evaluate on test set using the Tester class
     tester = Tester(model, test_loader, device, idx_to_chord=idx_to_chord)
     tester.evaluate()
@@ -837,12 +868,10 @@ def main():
         score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
             valid_dataset=valid_dataset1, config=config, model=model, model_type=args.model, 
             mean=mean, std=std, device=device)
-        
         logger.info(f"Evaluating model on {len(valid_dataset2)} samples in split 2...")
         score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
             valid_dataset=valid_dataset2, config=config, model=model, model_type=args.model, 
             mean=mean, std=std, device=device)
-        
         logger.info(f"Evaluating model on {len(valid_dataset3)} samples in split 3...")
         score_list_dict3, song_length_list3, average_score_dict3 = large_voca_score_calculation(
             valid_dataset=valid_dataset3, config=config, model=model, model_type=args.model, 
@@ -861,7 +890,7 @@ def main():
                 logger.info(f"==== {m} mix average score is {avg:.4f}")
             else:
                 logger.info(f"==== {m} scores couldn't be calculated properly")
-
+    
     # Save the final model
     save_path = os.path.join(checkpoints_dir, "student_model_final.pth")
     torch.save({
@@ -870,9 +899,8 @@ def main():
         'chord_mapping': chord_mapping,
         'idx_to_chord': idx_to_chord,
         'mean': mean,
-        'std': std
+        'std': std,
     }, save_path)
-    
     logger.info(f"Final model saved to {save_path}")
 
 if __name__ == '__main__':

@@ -258,12 +258,17 @@ class StudentTrainer(BaseTrainer):
         # Calculate focal weight
         focal_weight = (1 - p_t) ** gamma
         
-        # Use standard cross entropy but weighted by focal weight
+        # Use standard cross entropy with 'none' reduction
+        # Note: We're not passing alpha as weight anymore
         ce_loss = torch.nn.functional.cross_entropy(
-            logits, targets, weight=alpha, reduction='none')
+            logits, targets, reduction='none')
         
         # Apply the focal weight
         focal_loss = focal_weight * ce_loss
+        
+        # Apply alpha as a scalar multiplier if provided
+        if alpha is not None:
+            focal_loss = alpha * focal_loss
         
         return focal_loss.mean()
 
