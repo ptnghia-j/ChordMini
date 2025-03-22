@@ -67,8 +67,7 @@ class EncoderF(nn.Module):
   def forward(self, x):
     B, T, F = x.shape
     x = x.reshape(B * T, self.n_group, self.d_model)
-    # Replace get_device() with x.device to ensure same device usage
-    pe = positional_encoding(batch_size=x.shape[0], n_time=x.shape[1], n_feature=x.shape[2]).to(x.device)
+    pe = positional_encoding(batch_size=x.shape[0], n_time=x.shape[1], n_feature=x.shape[2]).to(get_device())
     x = x + pe * self.pr  # use out-of-place addition instead of x += pe * self.pr
 
     # Make sure x requires gradients
@@ -113,8 +112,7 @@ class EncoderT(nn.Module):
 
   def forward(self, x):
     B, T, F = x.shape
-    # Replace get_device() with x.device to ensure same device usage
-    x = x + positional_encoding(B, T, F).to(x.device) * self.pr  # out-of-place addition
+    x = x + positional_encoding(B, T, F).to(get_device()) * self.pr  # out-of-place addition
 
     for attn, ff in zip(self.attn_layer, self.ff_layer):
       residual = x
@@ -162,8 +160,7 @@ class Decoder(nn.Module):
           weight = weight.expand(-1, -1, y.shape[-1])
       y = y + weight * self.wr
 
-    # Replace get_device() with y.device to ensure same device usage
-    y = y + positional_encoding(y.shape[0], y.shape[1], y.shape[2]).to(y.device) * self.pr  # out-of-place
+    y = y + positional_encoding(y.shape[0], y.shape[1], y.shape[2]).to(get_device()) * self.pr  # out-of-place
 
     for i in range(self.n_layer):
       residual = y

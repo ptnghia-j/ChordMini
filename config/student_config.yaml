@@ -75,6 +75,13 @@ paths:
   # Output paths
   checkpoints_dir: "checkpoints"
 
+# Data parameters
+data:
+  lazy_init: false           # Controls dataset lazy initialization
+  cache_fraction: 0.1        # Fraction of dataset to cache (default: 0.1 = 10%)
+  metadata_only: true        # Only cache metadata, not full spectrograms
+  disable_cache: false       # Set to true to disable dataset caching
+
 # Miscellaneous
 misc:
   seed: 42
