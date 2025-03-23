@@ -1,6 +1,6 @@
 import sys
 import os
-import torch
+import torch  # Ensure torch is imported at the top level
 import numpy as np
 import argparse
 import glob
@@ -11,13 +11,15 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 
 # Project imports
 from modules.utils.mir_eval_modules import large_voca_score_calculation
-from modules.utils.device import get_device
+# Use more comprehensive imports from device module, is_cuda_available, is_gpu_available, clear_gpu_cache
+from modules.utils.device import get_device, is_cuda_available, is_gpu_available, clear_gpu_cache
 from modules.data.SynthDataset import SynthDataset
 from modules.models.Transformer.ChordNet import ChordNet
 from modules.training.StudentTrainer import StudentTrainer
 from modules.utils import logger
 from modules.utils.hparams import HParams
 from modules.utils.chords import idx2voca_chord
+from modules.training.Tester import Tester
 
 class ListSampler(Sampler):
     def __init__(self, indices):
@@ -286,30 +288,13 @@ def main():
     
     args = parser.parse_args()
 
-    # Configure CUDA settings for better performance
-    if torch.cuda.is_available():
-        # Set CUDA options for optimal performance
-        torch.backends.cudnn.benchmark = True  # Speed up training if input sizes don't change
-        torch.backends.cudnn.enabled = True
-        
-        # Set memory fraction if specified
-        if args.gpu_memory_fraction < 1.0:
-            try:
-                import torch.cuda
-                for device in range(torch.cuda.device_count()):
-                    # Reserve only what we need to avoid OOM
-                    torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction, device)
-                logger.info(f"Set GPU memory fraction to {args.gpu_memory_fraction}")
-            except:
-                logger.warning("Failed to set GPU memory fraction")
-        
-        # Empty cache at the start
-        torch.cuda.empty_cache()
-        
-        # Log GPU info
-        device_name = torch.cuda.get_device_name(0)
-        memory_info = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # Convert to GB
-        logger.info(f"Using GPU: {device_name} with {memory_info:.2f}GB memory")
+    # Use device module functions instead of direct torch.cuda checks
+    if config.misc['use_cuda'] and is_cuda_available():
+        device = get_device()  # This will return cuda if available
+        logger.info(f"Using CUDA for training on device: {torch.cuda.get_device_name(0)}")
+    else:
+        device = torch.device('cpu')
+        logger.info("Using CPU for training")
     
     # Load configuration from YAML
     config = HParams.load(args.config)
@@ -942,7 +927,6 @@ def main():
     os.makedirs(results_dir, exist_ok=True)
     
     # Evaluate on test set using the enhanced Tester class
-    from modules.training.Tester import Tester
     tester = Tester(
         model, 
         test_loader, 

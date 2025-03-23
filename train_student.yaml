@@ -20,7 +20,7 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-A10
+                - NVIDIA-GeForce-RTX-3090
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -117,7 +117,7 @@ spec:
               mountPath: /mnt/storage
       containers:
         - name: student-trainer
-          image: pytorch/pytorch:1.13.1-cuda11.6-cudnn8-runtime
+          image: pytorch/pytorch:1.9.0-cuda11.1-cudnn8-runtime
           workingDir: /mnt/storage/ChordMini
           imagePullPolicy: IfNotPresent
           env:
@@ -168,38 +168,16 @@ spec:
               # Create a minimal requirements.txt if missing
               if [ ! -f requirements.txt ]; then
                 echo "Creating minimal requirements.txt"
-                echo "numpy>=1.21.0" > requirements.txt  # Updated for compatibility
+                echo "numpy==1.22.0" > requirements.txt
                 echo "librosa>=0.8.0" >> requirements.txt
                 echo "torch>=1.9.0" >> requirements.txt
                 echo "tqdm>=4.62.0" >> requirements.txt
                 echo "scikit-learn>=1.0.0" >> requirements.txt
-                echo "pyyaml>=6.0.0" >> requirements.txt
-                echo "mir_eval>=0.6.0" >> requirements.txt # Critical for chord evaluation
+                echo "pyyaml>=6.0.0" >> requirements.txt  # Added for config loading
               fi
               
-              # First install critical dependencies
-              echo "Installing critical dependencies..."
-              pip install --no-cache-dir mir_eval scipy pandas matplotlib
-              
-              # Then install all requirements
               pip install --no-cache-dir -r requirements.txt || { echo "WARNING: Some requirements may have failed"; }
               pip install --no-cache-dir matplotlib tqdm pyyaml librosa scikit-learn || { echo "ERROR: Failed to install additional Python packages"; exit 1; }
-              
-              # Verify GPU is available
-              echo "Checking GPU availability..."
-              python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('GPU device count:', torch.cuda.device_count()); print('GPU device name:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')" || {
-                echo "WARNING: GPU validation failed - proceeding anyway";
-              }
-              
-              # Check for A10 GPU and optimize configurations accordingly
-              if python -c "import torch; import re; is_a10 = torch.cuda.is_available() and bool(re.search('A10', torch.cuda.get_device_name(0), re.IGNORECASE)); print(is_a10)" | grep -q True; then
-                echo "NVIDIA A10 GPU detected - using optimized settings"
-                # A10 has more memory, we can increase batch size
-                BATCH_OVERRIDE="--storage_root /mnt/storage"
-              else
-                echo "Using standard GPU configuration"
-                BATCH_OVERRIDE="--storage_root /mnt/storage"
-              fi
               
               # Verify the data paths from the config
               echo "Checking data paths from config..."
@@ -372,11 +350,11 @@ spec:
           resources:
             requests:
               cpu: "4"             
-              memory: "14Gi"    
+              memory: "16Gi"    
               nvidia.com/gpu: "1"
             limits:
               cpu: "6"             
-              memory: "18Gi" 
+              memory: "32Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage

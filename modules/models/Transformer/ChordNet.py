@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from modules.models.Transformer.BaseTransformer import BaseTransformer
+# Add missing import for device handling
+from modules.utils.device import get_device, to_device
 import warnings
 
 class ChordNet(nn.Module):
@@ -235,24 +237,26 @@ class ChordNet(nn.Module):
                     # Check for reasonable time dimension
                     if time_dim > 10000:  # Sanity check for unreasonably large values
                         warnings.warn(f"Unusually large time dimension: {time_dim}, may indicate a bug")
-                        
+                                
                     return torch.argmax(logits, dim=2)  # [batch, time]
                 
                 # Otherwise use the standard approach with averaging
                 if logits.ndim == 3:
                     logits = logits.mean(dim=1)  # Average over time dimension
-                
+                    
                 return torch.argmax(logits, dim=-1)  # [batch]
             
             except Exception as e:
                 warnings.warn(f"Error during prediction: {e}")
                 # Return fallback prediction of zeros with appropriate shape
                 batch_size = x.size(0)
+                # Get device from input tensor or fall back to utils module
+                device = x.device if hasattr(x, 'device') else get_device()
                 if per_frame and x.dim() > 2:
                     time_steps = x.size(2) if x.dim() > 3 else x.size(1)
-                    return torch.zeros((batch_size, time_steps), device=x.device, dtype=torch.long)
+                    return torch.zeros((batch_size, time_steps), device=device, dtype=torch.long)
                 else:
-                    return torch.zeros(batch_size, device=x.device, dtype=torch.long)
+                    return torch.zeros(batch_size, device=device, dtype=torch.long)
 
 
 if __name__ == '__main__':
