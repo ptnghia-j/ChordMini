@@ -32,13 +32,16 @@ class ListSampler(Sampler):
         return len(self.indices)
 
 class Tester:
-    def __init__(self, model, test_loader, device, idx_to_chord=None):
+    def __init__(self, model, test_loader, device, idx_to_chord=None, normalization=None, output_dir=None, logger=None):
         self.model = model
         self.test_loader = test_loader
         self.device = device
         self.idx_to_chord = idx_to_chord
+        self.normalization = normalization
+        self.output_dir = output_dir
+        self.logger = logger  # Add support for logger parameter
 
-    def evaluate(self):
+    def evaluate(self, save_plots=False):
         self.model.eval()
         all_preds = []
         all_targets = []
@@ -51,20 +54,24 @@ class Tester:
             for batch_idx, batch in enumerate(self.test_loader):
                 inputs = batch['spectro'].to(self.device)
                 targets = batch['chord_idx'].to(self.device)
+                
+                # Apply normalization if available
+                if self.normalization:
+                    inputs = (inputs - self.normalization['mean']) / self.normalization['std']
 
                 # Debug first few batches
                 if batch_idx == 0:
-                    logger.info(f"Input shape: {inputs.shape}, target shape: {targets.shape}")
-                    logger.info(f"First few targets: {targets[:10]}")
+                    self._log(f"Input shape: {inputs.shape}, target shape: {targets.shape}")
+                    self._log(f"First few targets: {targets[:10]}")
 
                 # Get raw logits before prediction
                 logits, _ = self.model(inputs)
 
                 # Check if logits have reasonable values
                 if batch_idx == 0:
-                    logger.info(f"Logits shape: {logits.shape}")
-                    logger.info(f"Logits mean: {logits.mean().item()}, std: {logits.std().item()}")
-                    logger.info(f"First batch sample logits (max 5 values): {logits[0, :5]}")
+                    self._log(f"Logits shape: {logits.shape}")
+                    self._log(f"Logits mean: {logits.mean().item()}, std: {logits.std().item()}")
+                    self._log(f"First batch sample logits (max 5 values): {logits[0, :5]}")
 
                 # Use per-frame predictions if targets have a time dimension
                 use_per_frame = targets.dim() > 1 and targets.shape[1] > 1
@@ -100,19 +107,19 @@ class Tester:
 
                 # Debug first batch predictions vs targets
                 if batch_idx == 0:
-                    logger.info(f"First batch - Predictions: {preds_np[:10]}")
-                    logger.info(f"First batch - Targets: {targets_np[:10]}")
+                    self._log(f"First batch - Predictions: {preds_np[:10]}")
+                    self._log(f"First batch - Targets: {targets_np[:10]}")
 
         # Print distribution statistics
-        logger.info("\nTarget Distribution (top 10):")
+        self._log("\nTarget Distribution (top 10):")
         for idx, count in target_counter.most_common(10):
             chord_name = self.idx_to_chord.get(idx, "Unknown") if self.idx_to_chord else str(idx)
-            logger.info(f"Target {idx} ({chord_name}): {count} occurrences ({count/len(all_targets)*100:.2f}%)")
+            self._log(f"Target {idx} ({chord_name}): {count} occurrences ({count/len(all_targets)*100:.2f}%)")
 
-        logger.info("\nPrediction Distribution (top 10):")
+        self._log("\nPrediction Distribution (top 10):")
         for idx, count in pred_counter.most_common(10):
             chord_name = self.idx_to_chord.get(idx, "Unknown") if self.idx_to_chord else str(idx)
-            logger.info(f"Prediction {idx} ({chord_name}): {count} occurrences ({count/len(all_preds)*100:.2f}%)")
+            self._log(f"Prediction {idx} ({chord_name}): {count} occurrences ({count/len(all_preds)*100:.2f}%)")
 
         # Calculate metrics
         accuracy = accuracy_score(all_targets, all_preds)
@@ -122,7 +129,7 @@ class Tester:
 
         # Print confusion matrix for most common chords (top 10)
         if len(target_counter) > 1:
-            logger.info("\nAnalyzing most common predictions vs targets:")
+            self._log("\nAnalyzing most common predictions vs targets:")
             top_chords = [idx for idx, _ in target_counter.most_common(10)]
             for true_idx in top_chords:
                 true_chord = self.idx_to_chord.get(true_idx, str(true_idx))
@@ -132,13 +139,92 @@ class Tester:
                     most_common_pred = pred_counts.most_common(1)[0][0]
                     most_common_pred_chord = self.idx_to_chord.get(most_common_pred, str(most_common_pred))
                     accuracy_for_chord = pred_counts.get(true_idx, 0) / len(pred_indices)
-                    logger.info(f"True: {true_chord} -> Most common prediction: {most_common_pred_chord} (Accuracy: {accuracy_for_chord:.2f})")
+                    self._log(f"True: {true_chord} -> Most common prediction: {most_common_pred_chord} (Accuracy: {accuracy_for_chord:.2f})")
 
-        logger.info(f"\nTest Metrics:")
-        logger.info(f"Test Accuracy: {accuracy:.4f}")
-        logger.info(f"Test Precision: {precision:.4f}")
-        logger.info(f"Test Recall: {recall:.4f}")
-        logger.info(f"Test F1 Score: {f1:.4f}")
+        self._log(f"\nTest Metrics:")
+        self._log(f"Test Accuracy: {accuracy:.4f}")
+        self._log(f"Test Precision: {precision:.4f}")
+        self._log(f"Test Recall: {recall:.4f}")
+        self._log(f"Test F1 Score: {f1:.4f}")
+        
+        # Save plots if requested and output directory is provided
+        if save_plots and self.output_dir:
+            self._save_confusion_matrix(all_targets, all_preds)
+            
+        # Return metrics as a dictionary for further processing
+        return {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1
+        }
+    
+    def _log(self, message):
+        """Log a message using the logger if available, otherwise print"""
+        if self.logger:
+            self.logger.info(message)
+        else:
+            print(message)
+            
+    def _save_confusion_matrix(self, targets, predictions):
+        """Save confusion matrix visualization if matplotlib is available"""
+        try:
+            import matplotlib.pyplot as plt
+            from sklearn.metrics import confusion_matrix
+            import numpy as np
+            import os
+            
+            # Get the most common classes (up to 10)
+            classes = sorted(set(targets))[:10]
+            if len(classes) > 10:
+                classes = classes[:10]
+                
+            # Filter targets and predictions to only include these classes
+            filtered_targets = []
+            filtered_preds = []
+            for t, p in zip(targets, predictions):
+                if t in classes:
+                    filtered_targets.append(t)
+                    filtered_preds.append(p)
+                    
+            if not filtered_targets:
+                self._log("No data to create confusion matrix")
+                return
+                
+            # Create confusion matrix
+            cm = confusion_matrix(filtered_targets, filtered_preds, labels=classes)
+            
+            # Normalize by row
+            cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+            cm_normalized = np.nan_to_num(cm_normalized)  # Replace NaN with 0
+            
+            # Convert class indices to chord names if possible
+            class_names = [self.idx_to_chord.get(idx, f"Class {idx}") if self.idx_to_chord else f"Class {idx}" 
+                          for idx in classes]
+            
+            # Create plot
+            plt.figure(figsize=(10, 8))
+            plt.imshow(cm_normalized, interpolation='nearest', cmap=plt.cm.Blues)
+            plt.title('Normalized Confusion Matrix')
+            plt.colorbar()
+            tick_marks = np.arange(len(class_names))
+            plt.xticks(tick_marks, class_names, rotation=45, ha='right')
+            plt.yticks(tick_marks, class_names)
+            plt.tight_layout()
+            plt.ylabel('True Chord')
+            plt.xlabel('Predicted Chord')
+            
+            # Create output directory if it doesn't exist
+            if not os.path.exists(self.output_dir):
+                os.makedirs(self.output_dir)
+                
+            # Save the plot
+            plt.savefig(os.path.join(self.output_dir, 'confusion_matrix.png'), dpi=300, bbox_inches='tight')
+            plt.close()
+            self._log(f"Saved confusion matrix to {os.path.join(self.output_dir, 'confusion_matrix.png')}")
+            
+        except Exception as e:
+            self._log(f"Error creating confusion matrix plot: {e}")
 
 def count_files_in_subdirectories(directory, file_pattern):
     """Count files in a directory and all its subdirectories matching a pattern."""
@@ -286,9 +372,16 @@ def main():
     parser.add_argument('--no_pin_memory', action='store_true',
                       help='Disable pin_memory for DataLoader (not recommended)')
     
+    # Add new argument for small dataset percentage
+    parser.add_argument('--small_dataset', type=float, default=None,
+                      help='Use only a small percentage of dataset for quick testing (e.g., 0.01 for 1%%)')
+    
     args = parser.parse_args()
 
-    # Use device module functions instead of direct torch.cuda checks
+    # Load configuration from YAML first before checking CUDA availability
+    config = HParams.load(args.config)
+    
+    # Then check device availability
     if config.misc['use_cuda'] and is_cuda_available():
         device = get_device()  # This will return cuda if available
         logger.info(f"Using CUDA for training on device: {torch.cuda.get_device_name(0)}")
@@ -296,9 +389,6 @@ def main():
         device = torch.device('cpu')
         logger.info("Using CPU for training")
     
-    # Load configuration from YAML
-    config = HParams.load(args.config)
-
     # Override config values with command line arguments if provided
     if args.seed is not None:
         config.misc['seed'] = args.seed
@@ -379,10 +469,41 @@ def main():
     storage_root = config.paths.get('storage_root', None)
     logger.info(f"Storage root: {storage_root}")
     
-    # Resolve paths using the new function
-    # First, try to get spec_dir and label_dir from config, but allow CLI override
-    spec_dir_config = args.spec_dir or config.paths.get('spec_dir', 'data/synth/spectrograms')
-    label_dir_config = args.label_dir or config.paths.get('label_dir', 'data/synth/labels')
+    # Check if using synthetic data
+    if args.use_synthetic_data:
+        synth_dir = os.path.join(project_root, "data/synth_test")
+        synth_spec_dir = os.path.join(synth_dir, "spectrograms")
+        synth_label_dir = os.path.join(synth_dir, "labels")
+        synth_logits_dir = os.path.join(synth_dir, "logits")
+        
+        # Check if synthetic data exists
+        if not os.path.exists(synth_spec_dir) or not os.path.exists(synth_label_dir):
+            logger.info("Synthetic test data not found. Generating now...")
+            try:
+                # Use the generate_test_data script to create synthetic data
+                import subprocess
+                cmd = [sys.executable, os.path.join(project_root, "generate_test_data.py"), 
+                       "--output", synth_dir, "--samples", "20", "--clean"]
+                subprocess.run(cmd, check=True)
+                logger.info("Synthetic data generated successfully")
+            except Exception as e:
+                logger.error(f"Failed to generate synthetic data: {e}")
+                logger.info("Falling back to regular data sources")
+                args.use_synthetic_data = False
+        else:
+            logger.info(f"Using existing synthetic test data from {synth_dir}")
+            
+        if args.use_synthetic_data:
+            # Override paths to use synthetic data
+            spec_dir_config = synth_spec_dir
+            label_dir_config = synth_label_dir
+            if args.use_kd_loss:
+                args.logits_dir = synth_logits_dir
+    else:
+        # Resolve paths using the new function
+        # First, try to get spec_dir and label_dir from config, but allow CLI override
+        spec_dir_config = args.spec_dir or config.paths.get('spec_dir', 'data/synth/spectrograms')
+        label_dir_config = args.label_dir or config.paths.get('label_dir', 'data/synth/labels')
     
     # Resolve the primary paths
     synth_spec_dir = resolve_path(spec_dir_config, storage_root, project_root)
@@ -616,6 +737,12 @@ def main():
             dataset_args['require_teacher_logits'] = True
             logger.info("KD enabled: Enforcing that all samples must have teacher logits")
     
+    # Add small dataset option if specified
+    if args.small_dataset is not None:
+        small_percentage = args.small_dataset
+        dataset_args['small_dataset_percentage'] = small_percentage
+        logger.info(f"Using only {small_percentage*100:.2f}% of dataset for quick testing")
+    
     # Create the dataset
     logger.info(f"Creating dataset with parameters:")
     for key, value in dataset_args.items():
@@ -783,6 +910,32 @@ def main():
         model = torch.nn.DataParallel(model)
         logger.info(f"Using {torch.cuda.device_count()} GPUs for training")
     
+    # Increase batch size based on GPU memory
+    if torch.cuda.is_available():
+        try:
+            # Try to estimate maximum possible batch size for this device
+            orig_batch_size = config.training['batch_size']
+            
+            # Get free GPU memory in MB (conservative estimate)
+            free_mem = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
+            mem_factor = free_mem / 8000  # Normalize against 8GB baseline
+            
+            # Scale batch size up by a factor of 2-3 based on available memory
+            # with a safety margin to avoid OOM errors
+            new_batch_size = min(
+                int(orig_batch_size * min(3.0, max(2.0, mem_factor * 0.8))),
+                orig_batch_size * 4  # Cap at 4x original size for safety
+            )
+            
+            # Always ensure batch size is even for better GPU utilization
+            new_batch_size = (new_batch_size // 2) * 2
+            
+            if new_batch_size > orig_batch_size:
+                logger.info(f"Increasing batch size from {orig_batch_size} to {new_batch_size} for better GPU utilization")
+                config.training['batch_size'] = new_batch_size
+        except Exception as e:
+            logger.warning(f"Failed to auto-adjust batch size: {e}")
+    
     # Create optimizer - match teacher settings
     optimizer = torch.optim.Adam(model.parameters(), 
                                lr=config.training['learning_rate'],    
@@ -926,15 +1079,15 @@ def main():
     results_dir = os.path.join(checkpoints_dir, "results")
     os.makedirs(results_dir, exist_ok=True)
     
-    # Evaluate on test set using the enhanced Tester class
+    # Evaluate on test set using the enhanced Tester class (fixed arguments)
     tester = Tester(
         model, 
         test_loader, 
         device, 
         idx_to_chord=idx_to_chord,
-        logger=logger,
-        normalization={"mean": mean, "std": std},  # Fixed: Always pass the normalization dictionary
-        output_dir=results_dir
+        normalization={"mean": mean, "std": std},
+        output_dir=results_dir,
+        logger=logger  # Pass the logger correctly
     )
     test_metrics = tester.evaluate(save_plots=True)
     
