@@ -788,13 +788,18 @@ class StudentTrainer(BaseTrainer):
             self._log(traceback.format_exc())
 
     def compute_loss(self, logits, targets, teacher_logits=None):
-        """
-        Compute the loss with enhanced dimension handling and error reporting.
-        If KD loss is enabled and teacher_logits are provided, combine standard loss and KD loss.
-        """
+        """Compute loss with optimized GPU operations"""
         try:
             if isinstance(logits, tuple):
                 logits = logits[0]
+            
+            # Ensure all tensors are on the correct device
+            if logits.device != self.device:
+                logits = logits.to(self.device, non_blocking=True)
+            if targets.device != self.device:
+                targets = targets.to(self.device, non_blocking=True)
+            if teacher_logits is not None and teacher_logits.device != self.device:
+                teacher_logits = teacher_logits.to(self.device, non_blocking=True)
             
             # Verify and log input shapes for debugging
             orig_logits_shape = logits.shape
@@ -876,13 +881,39 @@ class StudentTrainer(BaseTrainer):
             # Last resort fallback - provide a dummy loss to avoid training failure
             return torch.tensor(1.0, device=self.device, requires_grad=True)
 
+    def _process_batch(self, batch):
+        """Process a batch to extract inputs and targets with GPU acceleration"""
+        if isinstance(batch, dict):
+            # Extract spectrograms and targets from dictionary
+            inputs = batch.get('spectro')
+            targets = batch.get('chord_idx')
+        else:
+            # Default unpacking
+            inputs, targets = batch
+            
+        # Move to device if not already there
+        if inputs.device != self.device:
+            inputs = inputs.to(self.device, non_blocking=True)
+        if targets.device != self.device:
+            targets = targets.to(self.device, non_blocking=True)
+            
+        return inputs, targets
+
     def train(self, train_loader, val_loader=None, start_epoch=1):
-        """Train the model with support for resuming from checkpoints."""
+        """Train the model with optimized GPU usage"""
         try:
             self.model.train()
             
             # Get actual steps per epoch for scheduler
             num_batches = len(train_loader)
+            
+            # Optimize GPU memory usage by clearing cache before training
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            # Pre-allocate common tensors to avoid repeated allocations
+            if torch.cuda.is_available():
+                self._zero_tensor = torch.zeros(1, device=self.device)
             
             # Update OneCycleLR with actual steps if needed
             if isinstance(self.smooth_scheduler, OneCycleLR):
@@ -989,6 +1020,16 @@ class StudentTrainer(BaseTrainer):
                 # Get number of batches for fractional epoch calculation
                 num_batches = len(train_loader)
                 
+                # Use torch.cuda.amp.autocast for mixed precision training if available
+                if hasattr(torch.cuda, 'amp') and torch.cuda.is_available():
+                    autocast = torch.cuda.amp.autocast
+                    scaler = torch.cuda.amp.GradScaler()
+                    using_amp = True
+                    if epoch == start_epoch:
+                        self._log("Using mixed precision training with automatic mixed precision")
+                else:
+                    using_amp = False
+                
                 for batch_idx, batch in enumerate(train_loader):
                     # Update learning rate with batch info for smooth updates
                     if self.lr_schedule_type or self.use_warmup:
@@ -1001,7 +1042,7 @@ class StudentTrainer(BaseTrainer):
                     # Extract teacher logits from batch if provided
                     teacher_logits = None
                     if self.use_kd_loss and 'teacher_logits' in batch:
-                        teacher_logits = batch['teacher_logits'].to(self.device)
+                        teacher_logits = batch['teacher_logits'].to(self.device, non_blocking=True)
                         kd_batches += 1
                     
                     total_batches += 1
@@ -1018,67 +1059,131 @@ class StudentTrainer(BaseTrainer):
                                 self._log("You should stop training and fix the logits loading issue.")
                     
                     if self.normalization:
-                        inputs = (inputs - self.normalization['mean']) / self.normalization['std']
+                        # Move normalization to GPU and use broadcasting for efficiency
+                        if not hasattr(self, '_norm_mean_tensor') or not hasattr(self, '_norm_std_tensor'):
+                            self._norm_mean_tensor = torch.tensor(self.normalization['mean'], 
+                                                                device=self.device, dtype=torch.float)
+                            self._norm_std_tensor = torch.tensor(self.normalization['std'], 
+                                                               device=self.device, dtype=torch.float)
+                        
+                        # Apply normalization on GPU with in-place operations where possible
+                        inputs = (inputs - self._norm_mean_tensor) / self._norm_std_tensor
                         
                     self.optimizer.zero_grad(set_to_none=True)
                     
                     try:
-                        outputs = self.model(inputs)
-                        
-                        if isinstance(outputs, tuple):
-                            logits = outputs[0]
-                        else:
-                            logits = outputs
-
-                        # For per-frame supervision, flatten logits and targets when needed
-                        if logits.ndim == 3 and targets.ndim == 2:
-                            # Store original shape for adapting teacher_logits if needed
-                            orig_logits_shape = logits.shape
-                            
-                            logits = logits.reshape(-1, logits.size(-1))
-                            targets = targets.reshape(-1)
-                            
-                            # If we have teacher logits, reshape them too
-                            if teacher_logits is not None and teacher_logits.ndim == 3:
-                                if teacher_logits.shape[0:2] == orig_logits_shape[0:2]:
-                                    teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
+                        # Use mixed precision if available for faster computation
+                        if using_amp:
+                            with autocast():
+                                outputs = self.model(inputs)
+                                
+                                if isinstance(outputs, tuple):
+                                    logits = outputs[0]
                                 else:
-                                    self._log(f"Shape mismatch between student ({orig_logits_shape}) and teacher ({teacher_logits.shape}) logits")
-                                    # Try time dimension averaging as fallback 
-                                    if teacher_logits.shape[0] == orig_logits_shape[0]:
-                                        teacher_logits = teacher_logits.mean(dim=1)
-                                    elif teacher_logits.ndim > 2:
-                                        teacher_logits = teacher_logits.mean(dim=1).reshape(-1, teacher_logits.size(-1))
+                                    logits = outputs
 
-                        # Use our custom compute_loss method with teacher_logits if available
-                        loss = self.compute_loss(logits, targets, teacher_logits)
-                        
-                        # Skip invalid losses (avoid NaN propagation)
-                        if loss is not None and not torch.isnan(loss) and torch.isfinite(loss):
-                            loss.backward()
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                            self.optimizer.step()
-                            
-                            preds = logits.argmax(dim=1)
-                            batch_correct = (preds == targets).sum().item()
-                            train_correct += batch_correct
-                            train_total += targets.size(0)
-                            epoch_loss += loss.item()
-                            
-                            if batch_idx % 20 == 0:
-                                # Log current LR and indicate whether KD is being used for this batch
-                                current_lr = self.optimizer.param_groups[0]['lr']
-                                batch_acc = batch_correct / targets.size(0) if targets.size(0) > 0 else 0
-                                kd_status = " (with KD)" if teacher_logits is not None else ""
-                                self._log(f"Epoch {epoch}/{self.num_epochs} | Batch {batch_idx}/{len(train_loader)} | Loss: {loss.item():.4f} | Batch Acc: {batch_acc:.4f}{kd_status} | LR: {current_lr:.7f}")
+                                # For per-frame supervision, flatten logits and targets when needed
+                                if logits.ndim == 3 and targets.ndim == 2:
+                                    # Store original shape for adapting teacher_logits if needed
+                                    orig_logits_shape = logits.shape
+                                    
+                                    logits = logits.reshape(-1, logits.size(-1))
+                                    targets = targets.reshape(-1)
+                                    
+                                    # If we have teacher logits, reshape them too
+                                    if teacher_logits is not None and teacher_logits.ndim == 3:
+                                        if teacher_logits.shape[0:2] == orig_logits_shape[0:2]:
+                                            teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
+                                        else:
+                                            self._log(f"Shape mismatch between student ({orig_logits_shape}) and teacher ({teacher_logits.shape}) logits")
+                                            # Try time dimension averaging as fallback 
+                                            if teacher_logits.shape[0] == orig_logits_shape[0]:
+                                                teacher_logits = teacher_logits.mean(dim=1)
+                                            elif teacher_logits.ndim > 2:
+                                                teacher_logits = teacher_logits.mean(dim=1).reshape(-1, teacher_logits.size(-1))
+
+                                # Use our custom compute_loss method with teacher_logits if available
+                                loss = self.compute_loss(logits, targets, teacher_logits)
+                                
+                                # Skip invalid losses (avoid NaN propagation)
+                                if loss is not None and not torch.isnan(loss) and torch.isfinite(loss):
+                                    # Use scaler for mixed precision
+                                    scaler.scale(loss).backward()
+                                    scaler.unscale_(self.optimizer)  # Unscale before clipping
+                                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                                    scaler.step(self.optimizer)
+                                    scaler.update()
+                                    
+                                    with torch.no_grad():
+                                        preds = logits.argmax(dim=1)
+                                        batch_correct = (preds == targets).sum().item()
+                                        train_correct += batch_correct
+                                        train_total += targets.size(0)
+                                        epoch_loss += loss.item()
+                                else:
+                                    self._log(f"WARNING: Skipping batch {batch_idx} due to invalid loss: {loss}")
                         else:
-                            self._log(f"WARNING: Skipping batch {batch_idx} due to invalid loss: {loss}")
+                            # Standard full-precision training
+                            outputs = self.model(inputs)
+                            
+                            if isinstance(outputs, tuple):
+                                logits = outputs[0]
+                            else:
+                                logits = outputs
+
+                            # For per-frame supervision, flatten logits and targets when needed
+                            if logits.ndim == 3 and targets.ndim == 2:
+                                # Store original shape for adapting teacher_logits if needed
+                                orig_logits_shape = logits.shape
+                                
+                                logits = logits.reshape(-1, logits.size(-1))
+                                targets = targets.reshape(-1)
+                                
+                                # If we have teacher logits, reshape them too
+                                if teacher_logits is not None and teacher_logits.ndim == 3:
+                                    if teacher_logits.shape[0:2] == orig_logits_shape[0:2]:
+                                        teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
+                                    else:
+                                        self._log(f"Shape mismatch between student ({orig_logits_shape}) and teacher ({teacher_logits.shape}) logits")
+                                        # Try time dimension averaging as fallback 
+                                        if teacher_logits.shape[0] == orig_logits_shape[0]:
+                                            teacher_logits = teacher_logits.mean(dim=1)
+                                        elif teacher_logits.ndim > 2:
+                                            teacher_logits = teacher_logits.mean(dim=1).reshape(-1, teacher_logits.size(-1))
+
+                            # Use our custom compute_loss method with teacher_logits if available
+                            loss = self.compute_loss(logits, targets, teacher_logits)
+                            
+                            # Skip invalid losses (avoid NaN propagation)
+                            if loss is not None and not torch.isnan(loss) and torch.isfinite(loss):
+                                loss.backward()
+                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                                self.optimizer.step()
+                                
+                                preds = logits.argmax(dim=1)
+                                batch_correct = (preds == targets).sum().item()
+                                train_correct += batch_correct
+                                train_total += targets.size(0)
+                                epoch_loss += loss.item()
+                                
+                                if batch_idx % 20 == 0:
+                                    # Log current LR and indicate whether KD is being used for this batch
+                                    current_lr = self.optimizer.param_groups[0]['lr']
+                                    batch_acc = batch_correct / targets.size(0) if targets.size(0) > 0 else 0
+                                    kd_status = " (with KD)" if teacher_logits is not None else ""
+                                    self._log(f"Epoch {epoch}/{self.num_epochs} | Batch {batch_idx}/{len(train_loader)} | Loss: {loss.item():.4f} | Batch Acc: {batch_acc:.4f}{kd_status} | LR: {current_lr:.7f}")
+                            else:
+                                self._log(f"WARNING: Skipping batch {batch_idx} due to invalid loss: {loss}")
                             
                     except Exception as e:
                         self._log(f"Error in training batch {batch_idx}: {str(e)}")
                         import traceback
                         self._log(traceback.format_exc())
                         continue  # Skip this batch if there's an error
+                
+                # After each epoch, clear CUDA cache to prevent memory fragmentation
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 
                 # Log KD usage statistics 
                 if self.use_kd_loss:

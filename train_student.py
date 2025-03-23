@@ -274,8 +274,43 @@ def main():
     parser.add_argument('--label_dir', type=str, default=None,
                       help='Directory containing labels (overrides config value)')
     
+    # Add new GPU acceleration options
+    parser.add_argument('--gpu_memory_fraction', type=float, default=0.9,
+                      help='Fraction of GPU memory to use (default: 0.9)')
+    parser.add_argument('--batch_gpu_cache', action='store_true',
+                      help='Cache batches on GPU for repeated access patterns')
+    parser.add_argument('--prefetch_factor', type=int, default=2,
+                      help='Number of batches to prefetch (default: 2)')
+    parser.add_argument('--no_pin_memory', action='store_true',
+                      help='Disable pin_memory for DataLoader (not recommended)')
+    
     args = parser.parse_args()
 
+    # Configure CUDA settings for better performance
+    if torch.cuda.is_available():
+        # Set CUDA options for optimal performance
+        torch.backends.cudnn.benchmark = True  # Speed up training if input sizes don't change
+        torch.backends.cudnn.enabled = True
+        
+        # Set memory fraction if specified
+        if args.gpu_memory_fraction < 1.0:
+            try:
+                import torch.cuda
+                for device in range(torch.cuda.device_count()):
+                    # Reserve only what we need to avoid OOM
+                    torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction, device)
+                logger.info(f"Set GPU memory fraction to {args.gpu_memory_fraction}")
+            except:
+                logger.warning("Failed to set GPU memory fraction")
+        
+        # Empty cache at the start
+        torch.cuda.empty_cache()
+        
+        # Log GPU info
+        device_name = torch.cuda.get_device_name(0)
+        memory_info = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # Convert to GB
+        logger.info(f"Using GPU: {device_name} with {memory_info:.2f}GB memory")
+    
     # Load configuration from YAML
     config = HParams.load(args.config)
 
@@ -343,10 +378,13 @@ def main():
     # Set up logging
     logger.logging_verbosity(config.misc['logging_level'])
     
-    # Get device
-    device = get_device() if config.misc['use_cuda'] else torch.device('cpu')
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
+    # Get device with more explicit options for GPU
+    if config.misc['use_cuda'] and torch.cuda.is_available():
+        device = torch.device('cuda')
+        logger.info(f"Using CUDA for training on device: {torch.cuda.get_device_name(0)}")
+    else:
+        device = torch.device('cpu')
+        logger.info("Using CPU for training")
     
     # Get project root directory (important for path resolution)
     project_root = os.path.dirname(os.path.abspath(__file__))
@@ -545,7 +583,7 @@ def main():
         logger.info(f"Using labels from: {label_dir_override} (override)")
         synth_label_dir = label_dir_override
     
-    # Dataset initialization
+    # Dataset initialization with GPU optimization options
     logger.info("\n=== Creating dataset ===")
     # Set up dataset initialization parameters
     dataset_args = {
@@ -555,7 +593,11 @@ def main():
         'seq_len': config.training['seq_len'],
         'stride': config.training['seq_stride'],
         'frame_duration': frame_duration,
-        'verbose': True
+        'verbose': True,
+        'device': device,  # Pass the device for GPU acceleration
+        'pin_memory': not args.no_pin_memory,  # Enable by default
+        'prefetch_factor': args.prefetch_factor,
+        'batch_gpu_cache': args.batch_gpu_cache
     }
     
     # Add cache parameters
@@ -607,22 +649,27 @@ def main():
         logger.info(f"'N' chord count: {n_chord_count} ({n_chord_count/len(synth_dataset.samples)*100:.2f}% of total)")
         logger.info(f"Total synthesized samples: {len(synth_dataset.samples)}")
     
-    # Create data loaders with optimized settings
-    # Determine optimal num_workers
-    num_workers = min(4, os.cpu_count()) if torch.cuda.is_available() else 0
+    # Create data loaders with optimized settings for GPU
+    # Determine optimal num_workers based on CPU and GPU
+    if torch.cuda.is_available():
+        # For GPU training, we want enough workers to keep the GPU fed
+        num_workers = min(4, os.cpu_count() or 1)
+    else:
+        # For CPU training, fewer workers to avoid contention
+        num_workers = 1 if os.cpu_count() <= 2 else 2
     
     train_loader = synth_dataset.get_train_iterator(
         batch_size=config.training['batch_size'], 
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available()
+        pin_memory=not args.no_pin_memory
     )
     
     val_loader = synth_dataset.get_eval_iterator(
         batch_size=config.training['batch_size'], 
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available()
+        pin_memory=not args.no_pin_memory
     )
     
     # Debug samples - add more detailed shape information
@@ -803,6 +850,11 @@ def main():
         std = 1.0
         logger.warning("Could not calculate mean and std, using defaults")
     
+    # Create normalized tensors on GPU once and reuse
+    mean = torch.tensor(mean, device=device)
+    std = torch.tensor(std, device=device)
+    normalization = {'mean': mean, 'std': std}
+    
     # Create our StudentTrainer with all parameters
     trainer = StudentTrainer(
         model, 
@@ -811,7 +863,7 @@ def main():
         num_epochs=config.training['max_epochs'],
         class_weights=class_weights,  # Will be None if using focal loss
         idx_to_chord=idx_to_chord,
-        normalization={'mean': mean, 'std': std},
+        normalization=normalization,  # Now using GPU tensors
         early_stopping_patience=config.training.get('early_stopping_patience', 5),
         lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
         min_lr=config.training.get('min_lr', 5e-6),
