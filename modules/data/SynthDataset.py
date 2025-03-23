@@ -13,6 +13,7 @@ import pickle
 import warnings
 from tqdm import tqdm
 import hashlib
+import re
 
 class SynthDataset(Dataset):
     """
@@ -78,6 +79,9 @@ class SynthDataset(Dataset):
         else:
             self.chord_to_idx = {}
             
+        # Calculate and store the numeric ID regex pattern (6 digits)
+        self.numeric_id_pattern = re.compile(r'(\d{6})')
+        
         # Only load data if not using lazy initialization
         if not self.lazy_init:
             self._load_data()
@@ -87,45 +91,58 @@ class SynthDataset(Dataset):
             self.samples = []
             self.segment_indices = []
             
-            # Store file paths for lazy loading
-            self.spec_files = list(Path(spec_dir).glob("**/*.npy"))
-            if verbose:
-                print(f"Found {len(self.spec_files)} spectrogram files (lazy mode)")
+            # First, find all valid spectrogram files with numeric ID pattern
+            if self.verbose:
+                print("Scanning for files with 6-digit numeric IDs...")
             
-            # Create a fast mapping of label files for lookup (same as in _load_data)
-            label_files = {}
+            # Create a mapping of label files for quick lookup
+            label_files_dict = {}
             for label_path in Path(label_dir).glob("**/*.lab"):
-                key = label_path.stem
-                if key.endswith("_lab"):
-                    key = key[:-4]  # Remove '_lab' suffix
-                label_files[key] = label_path
+                # Extract the 6-digit ID from the filename
+                numeric_match = self.numeric_id_pattern.search(str(label_path.stem))
+                if numeric_match:
+                    numeric_id = numeric_match.group(1)
+                    label_files_dict[numeric_id] = label_path
             
+            if self.verbose:
+                print(f"Found {len(label_files_dict)} label files with valid numeric IDs")
+            
+            # Store file paths for lazy loading, focusing on files with numeric IDs
+            self.spec_files = []
+            for spec_path in Path(spec_dir).glob("**/*.npy"):
+                # Extract the 6-digit ID from the filename
+                numeric_match = self.numeric_id_pattern.search(str(spec_path.stem))
+                if numeric_match:
+                    numeric_id = numeric_match.group(1)
+                    # Only include files that have matching label files
+                    if numeric_id in label_files_dict:
+                        self.spec_files.append((spec_path, numeric_id))
+            
+            if self.verbose:
+                print(f"Found {len(self.spec_files)} spectrogram files with valid numeric IDs (lazy mode)")
+            
+            # Track which song IDs we've processed to avoid duplicates
+            processed_song_ids = set()
             # Build minimal metadata for each file without loading content
             song_samples = {}  # Group indices by song_id
             
-            for spec_file in self.spec_files:
-                # Extract file name for matching
-                base_name = spec_file.stem
-                if base_name.endswith("_spec"):
-                    base_name = base_name[:-5]  # Remove '_spec' suffix
+            for spec_file, numeric_id in self.spec_files:
+                # Skip if we've already processed this numeric ID
+                if numeric_id in processed_song_ids:
+                    continue
                 
-                # Find matching label file
-                label_file = label_files.get(base_name)
+                # Get the 3-digit directory prefix
+                dir_prefix = numeric_id[:3]
+                
+                # Construct the exact paths to the label file
+                label_file = label_files_dict.get(numeric_id)
                 if not label_file or not label_file.exists():
-                    # Try alternative names
-                    found = False
-                    for suffix in ["", "_lab"]:
-                        alt_name = f"{base_name}{suffix}"
-                        if alt_name in label_files:
-                            label_file = label_files[alt_name]
-                            found = True
-                            break
-                    
-                    if not found:
-                        continue  # Skip if no label found
+                    continue  # Skip if no matching label file
                 
                 # Parse the label file
                 chord_labels = self._parse_label_file(label_file)
+                if not chord_labels:
+                    continue  # Skip if label file is empty or invalid
                 
                 # Get shape info without loading the full data
                 try:
@@ -133,8 +150,7 @@ class SynthDataset(Dataset):
                     spec_info = np.load(spec_file, mmap_mode='r')
                     spec_shape = spec_info.shape
                     
-                    # Create metadata for each frame (like in _process_file but without loading content)
-                    sample_indices = []
+                    # Create metadata for each frame
                     for t in range(spec_shape[0] if len(spec_shape) > 1 else 1):
                         frame_time = t * self.frame_duration
                         chord_label = self._find_chord_at_time(chord_labels, frame_time)
@@ -148,17 +164,29 @@ class SynthDataset(Dataset):
                         
                         # Store metadata (not the actual spectrogram)
                         sample_idx = len(self.samples)
-                        self.samples.append({
+                        sample_data = {
                             'spec_path': str(spec_file),
                             'chord_label': chord_label,
-                            'song_id': base_name,
-                            'frame_idx': t
-                        })
+                            'song_id': numeric_id,
+                            'frame_idx': t,
+                            'dir_prefix': dir_prefix  # Store the directory prefix for faster lookup
+                        }
+                        
+                        # Add logits path if logits directory is provided
+                        if self.logits_dir is not None:
+                            logits_path = self.logits_dir / dir_prefix / f"{numeric_id}_logits.npy"
+                            if os.path.exists(logits_path):
+                                sample_data['logit_path'] = str(logits_path)
+                        
+                        self.samples.append(sample_data)
                         
                         # Track this sample in the song group for segmenting
-                        if base_name not in song_samples:
-                            song_samples[base_name] = []
-                        song_samples[base_name].append(sample_idx)
+                        if numeric_id not in song_samples:
+                            song_samples[numeric_id] = []
+                        song_samples[numeric_id].append(sample_idx)
+                    
+                    # Mark this song ID as processed
+                    processed_song_ids.add(numeric_id)
                         
                 except Exception as e:
                     if verbose:
@@ -261,28 +289,66 @@ class SynthDataset(Dataset):
         # Find spectrogram files faster with specific pattern
         if self.verbose:
             print("Finding spectrogram files (this may take a moment)...")
-            
-        # Create a fast mapping of label files for lookup
-        label_files = {}
+        
+        # First, create a mapping of label files by numeric ID
+        label_files_dict = {}
         for label_path in self.label_dir.glob("**/*.lab"):
-            key = label_path.stem
-            if key.endswith("_lab"):
-                key = key[:-4]  # Remove '_lab' suffix
-            label_files[key] = label_path
+            # Extract the 6-digit ID from the filename
+            numeric_match = self.numeric_id_pattern.search(str(label_path.stem))
+            if numeric_match:
+                numeric_id = numeric_match.group(1)
+                label_files_dict[numeric_id] = label_path
         
         if self.verbose:
-            print(f"Found {len(label_files)} label files")
-            
-        # Find all spectrogram files once
-        spec_files = list(self.spec_dir.glob("**/*.npy"))
+            print(f"Found {len(label_files_dict)} label files with valid numeric IDs")
         
-        if not spec_files:
-            warnings.warn("No spectrogram files found. Check your data paths.")
+        # Find all spectrogram files with numeric IDs
+        valid_spec_files = []
+        
+        # Look for the specific format first: {dir_prefix}/{numeric_id}_spec.npy
+        for prefix_dir in self.spec_dir.glob("**/"):
+            if prefix_dir.is_dir() and len(prefix_dir.name) == 3 and prefix_dir.name.isdigit():
+                # This is a 3-digit directory prefix
+                dir_prefix = prefix_dir.name
+                # Look for files with pattern {numeric_id}_spec.npy where numeric_id starts with dir_prefix
+                for spec_path in prefix_dir.glob(f"{dir_prefix}???_spec.npy"):
+                    # Extract the 6-digit ID from the filename
+                    filename = spec_path.stem
+                    if filename.endswith("_spec"):
+                        filename = filename[:-5]  # Remove '_spec' suffix
+                    
+                    numeric_match = self.numeric_id_pattern.search(filename)
+                    if numeric_match:
+                        numeric_id = numeric_match.group(1)
+                        # Only include files that have matching label files
+                        if numeric_id in label_files_dict:
+                            valid_spec_files.append((spec_path, numeric_id))
+        
+        # If we didn't find any files with the specific pattern, fall back to the general search
+        if not valid_spec_files and self.verbose:
+            print("No spectrogram files found with pattern {dir_prefix}/{numeric_id}_spec.npy, trying general search...")
+            
+            for spec_path in self.spec_dir.glob("**/*.npy"):
+                # Extract the 6-digit ID from the filename
+                numeric_match = self.numeric_id_pattern.search(str(spec_path.stem))
+                if numeric_match:
+                    numeric_id = numeric_match.group(1)
+                    # Only include files that have matching label files
+                    if numeric_id in label_files_dict:
+                        valid_spec_files.append((spec_path, numeric_id))
+        
+        if not valid_spec_files:
+            warnings.warn("No spectrogram files found with valid numeric IDs. Check your data paths.")
             return
             
         if self.verbose:
-            print(f"Found {len(spec_files)} spectrogram files")
-            
+            print(f"Found {len(valid_spec_files)} spectrogram files with valid numeric IDs")
+            # Print sample paths to help diagnose directory structure
+            if valid_spec_files:
+                print("Sample spectrogram paths:")
+                for i, (path, _) in enumerate(valid_spec_files[:3]):
+                    print(f"  {i+1}. {path}")
+                    
         # Process files in parallel with memory-optimized handling
         try:
             # Add counters for tracking skipped files
@@ -295,17 +361,17 @@ class SynthDataset(Dataset):
                 'format_error': 0
             }
             
-            if self.num_workers > 1 and len(spec_files) > 10:
+            if self.num_workers > 1 and len(valid_spec_files) > 10:
                 # Split files into chunks for parallel processing
-                chunk_size = max(1, len(spec_files) // self.num_workers)
-                chunks = [spec_files[i:i + chunk_size] for i in range(0, len(spec_files), chunk_size)]
+                chunk_size = max(1, len(valid_spec_files) // self.num_workers)
+                chunks = [valid_spec_files[i:i + chunk_size] for i in range(0, len(valid_spec_files), chunk_size)]
                 
                 if self.verbose:
                     print(f"Processing files with {self.num_workers} workers ({len(chunks)} chunks)")
                 
                 # Use context manager to ensure pool is properly closed
                 with multiprocessing.Pool(processes=self.num_workers) as pool:
-                    worker_func = partial(self._process_file_chunk, label_files=label_files)
+                    worker_func = partial(self._process_file_chunk, label_files_dict=label_files_dict)
                     
                     # Process chunks and collect results with a timeout to prevent hangs
                     all_samples = []
@@ -323,9 +389,9 @@ class SynthDataset(Dataset):
             else:
                 # Fall back to sequential processing if needed
                 self.samples = []
-                for spec_file in tqdm(spec_files, desc="Loading data", disable=not self.verbose):
+                for spec_file, numeric_id in tqdm(valid_spec_files, desc="Loading data", disable=not self.verbose):
                     self.total_processed += 1
-                    processed = self._process_file(spec_file, label_files)
+                    processed = self._process_file(spec_file, numeric_id, label_files_dict)
                     if processed:
                         self.samples.extend(processed)
                     else:
@@ -338,9 +404,9 @@ class SynthDataset(Dataset):
             if self.verbose:
                 print(f"Parallel processing failed: {e}")
                 print("Falling back to sequential processing...")
-            for spec_file in tqdm(spec_files, desc="Loading data", disable=not self.verbose):
+            for spec_file, numeric_id in tqdm(valid_spec_files, desc="Loading data", disable=not self.verbose):
                 self.total_processed += 1
-                processed = self._process_file(spec_file, label_files)
+                processed = self._process_file(spec_file, numeric_id, label_files_dict)
                 if processed:
                     self.samples.extend(processed)
                 else:
@@ -358,19 +424,6 @@ class SynthDataset(Dataset):
                         if count > 0:
                             reason_pct = (count / self.total_skipped) * 100 if self.total_skipped > 0 else 0
                             print(f"    - {reason}: {count} ({reason_pct:.1f}%)")
-                
-                # Warning if too many files are skipped
-                if skip_percentage > 50:
-                    print("\nWARNING: More than 50% of files were skipped!")
-                    print("This may indicate a mismatch between your spectrogram, label, and logits naming conventions.")
-                    print("Please check that your file naming patterns match your actual data.")
-                    
-                    # Show example of expected patterns
-                    print("\nExpected matching patterns:")
-                    print("  Spectrogram: [base_name]_spec.npy or [base_name].npy")
-                    print("  Label:       [base_name].lab or [base_name]_lab.lab")
-                    if self.logits_dir is not None:
-                        print("  Logits:      [base_name].npy, [base_name]_logits.npy, [base_name]_teacher.npy, etc.")
         
         # Cache the dataset for future use with proper error handling
         if self.samples and self.use_cache:
@@ -468,7 +521,7 @@ class SynthDataset(Dataset):
         else:
             warnings.warn("No samples loaded. Check your data paths and structure.")
     
-    def _process_file_chunk(self, spec_files, label_files):
+    def _process_file_chunk(self, spec_files_with_ids, label_files_dict):
         """Process a chunk of files for parallel processing"""
         chunk_samples = []
         chunk_processed = 0
@@ -480,9 +533,9 @@ class SynthDataset(Dataset):
             'format_error': 0
         }
         
-        for spec_file in spec_files:
+        for spec_file, numeric_id in spec_files_with_ids:
             chunk_processed += 1
-            processed, skip_reason = self._process_file(spec_file, label_files, return_skip_reason=True)
+            processed, skip_reason = self._process_file(spec_file, numeric_id, label_files_dict, return_skip_reason=True)
             if processed:
                 chunk_samples.extend(processed)
             else:
@@ -498,132 +551,46 @@ class SynthDataset(Dataset):
             'skipped_reasons': skipped_reasons
         }
         
-    def _process_file(self, spec_file, label_files, return_skip_reason=False):
-        """Process a single spectrogram file and its matching label file with memory optimization"""
+    def _process_file(self, spec_file, numeric_id, label_files_dict, return_skip_reason=False):
+        """Process a single spectrogram file with 6-digit ID pattern"""
         samples = []
         skip_reason = None
         
         try:
-            # Extract file name for matching
-            base_name = spec_file.stem
-            if base_name.endswith("_spec"):
-                base_name = base_name[:-5]  # Remove '_spec' suffix
+            # We already have the numeric ID extracted from the calling function
+            # Get the 3-digit directory prefix
+            dir_prefix = numeric_id[:3]
             
-            # IMPORTANT: First check if we have all three required components before processing:
-            # 1. Spectrogram (we already have this since spec_file is passed in)
-            # 2. Label file
-            # 3. Logits file (if KD is enabled)
-            
-            # Check for matching label file with expanded patterns
-            label_file = None
-            label_patterns = [
-                f"{base_name}",       # Base name
-                f"{base_name}_lab",   # With _lab suffix 
-                f"{base_name}",       # Try without suffix
-                # Additional patterns specific to your data format
-                f"{base_name.replace('_spec', '')}", # In case base_name still has _spec
-                f"{base_name.split('_')[0]}"  # Try just the first part before any underscore
-            ]
-            
-            for pattern in label_patterns:
-                if pattern in label_files:
-                    label_file = label_files[pattern]
-                    if label_file.exists():
-                        break
-            
+            # Get the matching label file directly from the dictionary
+            label_file = label_files_dict.get(numeric_id)
             if not label_file or not os.path.exists(str(label_file)):
-                # No matching label file - skip this entire file
-                if self.verbose and not hasattr(self, '_missing_label_pattern_warning'):
-                    print(f"\nWARNING: No matching label file found for base name: {base_name}")
-                    print(f"Tried patterns: {label_patterns}")
-                    print(f"Label file mapping contains {len(label_files)} entries with keys like: {list(label_files.keys())[:5]}")
-                    self._missing_label_pattern_warning = True
-                
                 if hasattr(self, 'skipped_reasons'):
                     self.skipped_reasons['missing_label'] += 1
                 skip_reason = 'missing_label'
                 if return_skip_reason:
                     return [], skip_reason
-                return []  # Return empty list to skip this file
+                return []
             
             # Find matching logit file if logits_dir is provided
             logit_file = None
             if self.logits_dir is not None:
-                # Expanded patterns to match more file naming conventions
-                possible_patterns = [
-                    f"{base_name}.npy",         # Simple base name
-                    f"{base_name}_logits.npy",  # With _logits suffix
-                    f"{base_name}_teacher.npy", # With _teacher suffix
-                    f"{base_name}_soft.npy",    # With _soft suffix
-                    f"{base_name}.npz",         # NPZ format with simple base name
-                    f"{base_name}_logits.npz",  # NPZ format with _logits suffix
-                    # Additional patterns specific to your data format
-                    f"{base_name.replace('_spec', '')}.npy",  # Remove _spec if present
-                    f"{base_name.replace('_spec', '')}_logits.npy",
-                    f"{base_name.split('_')[0]}.npy",  # Try just first part before underscore
-                    f"{base_name.split('_')[0]}_logits.npy"
-                ]
+                # Construct the expected logits path using the fixed pattern
+                logit_file = self.logits_dir / dir_prefix / f"{numeric_id}_logits.npy"
                 
-                # First check logits subdirectory if it exists
-                logits_subdir = self.logits_dir / "logits"
-                if logits_subdir.exists() and logits_subdir.is_dir():
-                    for pattern in possible_patterns:
-                        candidate = logits_subdir / pattern
-                        if os.path.exists(str(candidate)):
-                            logit_file = candidate
-                            if self.verbose and not hasattr(self, '_logit_file_found'):
-                                print(f"Found teacher logits file in logits subfolder: {logit_file}")
-                                self._logit_file_found = True
-                            break
-                
-                # If not found in logits subfolder, check main directory and other subfolders
-                if logit_file is None:
-                    # Check subdirectories if needed (up to 1 level)
-                    search_dirs = [self.logits_dir]
-                    for subdir in self.logits_dir.glob("*/"):
-                        if subdir.is_dir() and subdir != logits_subdir:
-                            search_dirs.append(subdir)
-                    
-                    # Try all combinations of directories and patterns
-                    for directory in search_dirs:
-                        for pattern in possible_patterns:
-                            candidate = directory / pattern
-                            if os.path.exists(str(candidate)):
-                                logit_file = candidate
-                                if self.verbose and not hasattr(self, '_logit_file_found'):
-                                    print(f"Found teacher logits file: {logit_file} (format: {candidate.suffix})")
-                                    self._logit_file_found = True
-                                break
-                        if logit_file:
-                            break
-                
-                # If we couldn't find a matching logits file, skip this file entirely
-                if logit_file is None:
-                    if self.verbose and not hasattr(self, '_missing_logits_pattern_warning'):
-                        print(f"\nWARNING: No matching teacher logits file found for base name: {base_name}")
-                        print(f"Tried patterns: {possible_patterns}")
-                        print(f"Searched directories: {[str(d) for d in search_dirs]}")
-                        # If this happens often, show the first few files in the logits directory
-                        sample_files = []
-                        try:
-                            for d in search_dirs:
-                                if os.path.exists(str(d)):
-                                    sample_files.extend([os.path.basename(str(f)) for f in list(d.glob("*.npy"))[:5]])
-                            if sample_files:
-                                print(f"Sample files in logits directory: {sample_files}")
-                        except Exception as e:
-                            print(f"Error listing logits directory: {e}")
-                        self._missing_logits_pattern_warning = True
+                # Check if the logits file exists
+                if not os.path.exists(logit_file):
+                    if self.verbose and not hasattr(self, '_missing_logits_warning'):
+                        print(f"WARNING: No matching logits file found at {logit_file}")
+                        self._missing_logits_warning = True
                     
                     if hasattr(self, 'skipped_reasons'):
                         self.skipped_reasons['missing_logits'] += 1
                     skip_reason = 'missing_logits'
                     if return_skip_reason:
                         return [], skip_reason
-                    return []  # Return empty list to skip this file
+                    return []
             
             # At this point, we have all required components (spec, label, and logits if enabled)
-            # Now proceed with processing as before
             
             # Load spectrogram data - if metadata_only, we'll store the path instead
             if self.metadata_only:
@@ -647,15 +614,20 @@ class SynthDataset(Dataset):
                             warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
                             chord_label = "N"
                             
+                        # Store the correct path format including _spec suffix
+                        expected_spec_path = str(self.spec_dir / dir_prefix / f"{numeric_id}_spec.npy")
+                        
                         samples.append({
-                            'spec_path': str(spec_file),
+                            'spec_path': str(spec_file),  # Keep original path for loading
+                            'expected_spec_path': expected_spec_path,  # Store the expected format path
                             'chord_label': chord_label,
-                            'song_id': base_name,
-                            'frame_idx': t
+                            'song_id': numeric_id,
+                            'frame_idx': t,
+                            'dir_prefix': dir_prefix  # Store the directory prefix for faster lookup
                         })
                         
-                        # Record logit path if available (it should always be available here)
-                        if logit_file:
+                        # Record logit path if available
+                        if logit_file is not None:
                             samples[-1]['logit_path'] = str(logit_file)
             else:
                 # Original behavior - load full spectrogram
@@ -665,10 +637,6 @@ class SynthDataset(Dataset):
                 if np.isnan(spec).any():
                     warnings.warn(f"NaN values found in {spec_file}, replacing with zeros")
                     spec = np.nan_to_num(spec, nan=0.0)
-                
-                # Check for extreme values
-                if np.abs(spec).max() > 1000:
-                    warnings.warn(f"Extreme values found in {spec_file}, max: {np.abs(spec).max()}")
                 
                 # Load label file
                 chord_labels = self._parse_label_file(label_file)
@@ -688,11 +656,12 @@ class SynthDataset(Dataset):
                     sample_dict = {
                         'spectro': spec,
                         'chord_label': chord_label,
-                        'song_id': base_name
+                        'song_id': numeric_id,
+                        'dir_prefix': dir_prefix
                     }
                     
-                    # Add logits if available (should always be available here)
-                    if logit_file:
+                    # Add logits if available
+                    if logit_file is not None:
                         try:
                             teacher_logits = self._load_logits_file(logit_file)
                             if teacher_logits is not None:
@@ -705,7 +674,7 @@ class SynthDataset(Dataset):
                 else:  # Multiple frames
                     # Pre-load logits for frame-wise access
                     teacher_logits = None
-                    if logit_file:
+                    if logit_file is not None:
                         try:
                             teacher_logits = self._load_logits_file(logit_file)
                         except Exception as e:
@@ -727,7 +696,9 @@ class SynthDataset(Dataset):
                         sample_dict = {
                             'spectro': spec[t],
                             'chord_label': chord_label,
-                            'song_id': base_name
+                            'song_id': numeric_id,
+                            'dir_prefix': dir_prefix,
+                            'frame_idx': t
                         }
                         
                         # Add frame-specific logits if available
@@ -775,32 +746,15 @@ class SynthDataset(Dataset):
     def _load_logits_file(self, logit_file):
         """Load logits from file with format detection and error handling"""
         try:
-            # Check file extension to handle different formats
-            if str(logit_file).endswith('.npz'):
-                # For npz files, try standard array names
-                npz_data = np.load(logit_file)
-                if 'logits' in npz_data:
-                    teacher_logits = npz_data['logits']
-                elif 'teacher_logits' in npz_data:
-                    teacher_logits = npz_data['teacher_logits']
-                elif len(npz_data.files) > 0:
-                    # Just use the first array in the file
-                    teacher_logits = npz_data[npz_data.files[0]]
-                    if self.verbose and not hasattr(self, '_npz_array_reported'):
-                        print(f"Using first array '{npz_data.files[0]}' from NPZ file")
-                        self._npz_array_reported = True
-                else:
-                    raise ValueError(f"No arrays found in {logit_file}")
-            else:
-                # For npy files, load directly with additional error handling
-                try:
-                    teacher_logits = np.load(logit_file)
-                except (ValueError, OSError) as e:
-                    if "corrupt" in str(e).lower():
-                        # Special handling for corrupt files
-                        warnings.warn(f"Corrupt numpy file detected at {logit_file}: {str(e)}")
-                        return None
-                    raise  # Re-raise other errors
+            # For npy files, load directly with additional error handling
+            try:
+                teacher_logits = np.load(logit_file)
+            except (ValueError, OSError) as e:
+                if "corrupt" in str(e).lower():
+                    # Special handling for corrupt files
+                    warnings.warn(f"Corrupt numpy file detected at {logit_file}: {str(e)}")
+                    return None
+                raise  # Re-raise other errors
             
             # Sanity check shape and values
             if isinstance(teacher_logits, np.ndarray):
@@ -831,14 +785,8 @@ class SynthDataset(Dataset):
                 
             if self._logits_error_count < 5 and self.verbose:
                 import traceback
-                file_size = "unknown"
-                try:
-                    file_size = os.path.getsize(str(logit_file))
-                    print(f"\nDetailed error loading logits file {logit_file} (size: {file_size} bytes):")
-                    print(traceback.format_exc())
-                except:
-                    print(f"\nDetailed error loading logits file {logit_file} (size could not be determined):")
-                    print(traceback.format_exc())
+                print(f"\nDetailed error loading logits file {logit_file}:")
+                print(traceback.format_exc())
                 self._logits_error_count += 1
                 
             return None
@@ -938,7 +886,18 @@ class SynthDataset(Dataset):
         # Lazy loading for first sample to determine shape
         if 'spectro' not in first_sample and 'spec_path' in first_sample:
             try:
+                # Try the original path first
                 spec_path = first_sample['spec_path']
+                
+                # If loading fails and we have an expected path, try that instead
+                if 'expected_spec_path' in first_sample and not os.path.exists(spec_path):
+                    expected_path = first_sample['expected_spec_path']
+                    if os.path.exists(expected_path):
+                        spec_path = expected_path
+                        if self.verbose and not hasattr(self, '_using_expected_path'):
+                            print(f"Using expected path format: {expected_path}")
+                            self._using_expected_path = True
+                
                 # Use memory-mapped mode first to get the shape without loading full data
                 with np.load(spec_path, mmap_mode='r') as mmap_spec:
                     if first_sample.get('frame_idx') is not None and len(mmap_spec.shape) > 1:
@@ -1013,22 +972,8 @@ class SynthDataset(Dataset):
                 if 'logit_path' in sample_i and 'teacher_logits' not in sample_i:
                     try:
                         logit_path = sample_i['logit_path']
-                        # Check file extension to handle different formats
-                        if str(logit_path).endswith('.npz'):
-                            # For npz files, try standard array names
-                            with np.load(logit_path) as npz_data:
-                                if 'logits' in npz_data:
-                                    teacher_logits = npz_data['logits']
-                                elif 'teacher_logits' in npz_data:
-                                    teacher_logits = npz_data['teacher_logits']
-                                elif len(npz_data.files) > 0:
-                                    # Just use the first array in the file
-                                    teacher_logits = npz_data[npz_data.files[0]]
-                                else:
-                                    raise ValueError(f"No arrays found in {logit_path}")
-                        else:
-                            # For npy files, load directly
-                            teacher_logits = np.load(logit_path)
+                        # Load the logits
+                        teacher_logits = np.load(logit_path)
                         
                         # Process multi-frame logits
                         if len(teacher_logits.shape) > 1 and 'frame_idx' in sample_i:
@@ -1038,12 +983,14 @@ class SynthDataset(Dataset):
                         
                         # Convert to tensor
                         logits_tensor = torch.tensor(teacher_logits, dtype=torch.float)
-                        
-                        # Add to sample output if we created it already
-                        if 'sample_out' in locals():
-                            sample_out['teacher_logits'] = logits_tensor
+                        teacher_logits_seq.append(logits_tensor)
+                        has_teacher_logits = True
                     except Exception as e:
                         warnings.warn(f"Error loading teacher logits from {logit_path}: {e}")
+                elif 'teacher_logits' in sample_i:
+                    # Use stored teacher logits if available
+                    teacher_logits_seq.append(torch.tensor(sample_i['teacher_logits'], dtype=torch.float))
+                    has_teacher_logits = True
             else:
                 # We've reached the end of the dataset, pad with zeros
                 padding_shape = sequence[-1].shape if sequence else first_spec.shape
@@ -1064,28 +1011,15 @@ class SynthDataset(Dataset):
             'chord_idx': torch.tensor(label_seq, dtype=torch.long)  # [seq_len]
         }
         
-        # If we have teacher logits for any samples in this segment, stack them
-        if teacher_logits_seq and len(teacher_logits_seq) == len(sequence):
+        # If we have teacher logits, add them to the output
+        if has_teacher_logits and len(teacher_logits_seq) == len(sequence):
             try:
                 sample_out['teacher_logits'] = torch.stack(teacher_logits_seq, dim=0)
-                has_teacher_logits = True
             except:
                 # Handle case where tensors might be different shapes
                 if self.verbose and not hasattr(self, '_logits_stack_error'):
                     print("WARNING: Could not stack teacher logits due to shape mismatch")
                     self._logits_stack_error = True
-        
-        # If no teacher logits were collected but we have logits path, try to load directly
-        if not has_teacher_logits and 'logit_path' in locals():
-            try:
-                logit_data = self._load_logits_file(logit_path)
-                if logit_data is not None:
-                    logits_tensor = torch.tensor(logit_data, dtype=torch.float)
-                    sample_out['teacher_logits'] = logits_tensor
-            except Exception as e:
-                if self.verbose and not hasattr(self, '_logits_load_error'):
-                    print(f"WARNING: Failed to load teacher logits: {e}")
-                    self._logits_load_error = True
         
         return sample_out
     
