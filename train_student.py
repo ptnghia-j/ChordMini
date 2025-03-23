@@ -849,9 +849,22 @@ def main():
     logger.info(f"Test spectrogram tensor shape: {test_batch['spectro'].shape}")
     logger.info(f"Test labels: {test_batch['chord_idx'][:10]}")
     
-    # Evaluate on test set using the Tester class
-    tester = Tester(model, test_loader, device, idx_to_chord=idx_to_chord)
-    tester.evaluate()
+    # Create results directory for saving plots and metrics
+    results_dir = os.path.join(checkpoints_dir, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    
+    # Evaluate on test set using the enhanced Tester class
+    from modules.training.Tester import Tester
+    tester = Tester(
+        model, 
+        test_loader, 
+        device, 
+        idx_to_chord=idx_to_chord,
+        logger=logger,
+        normalization={"mean": mean, "std": std},  # Fixed: Always pass the normalization dictionary
+        output_dir=results_dir
+    )
+    test_metrics = tester.evaluate(save_plots=True)
     
     score_metrics = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
     dataset_length = len(synth_dataset.samples)

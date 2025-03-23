@@ -314,11 +314,11 @@ spec:
           resources:
             requests:
               cpu: "4"             
-              memory: "16Gi"    
+              memory: "14Gi"    
               nvidia.com/gpu: "1"
             limits:
               cpu: "6"             
-              memory: "24Gi" 
+              memory: "18Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage
