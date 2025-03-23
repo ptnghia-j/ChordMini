@@ -16,6 +16,14 @@ import hashlib
 import re
 from modules.utils.device import get_device, to_device, clear_gpu_cache
 
+# Fix: Set multiprocessing start method to 'spawn' at import time to avoid CUDA re-initialization errors
+if __name__ == "__main__" or multiprocessing.get_start_method(allow_none=True) is None:
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+        print("Set multiprocessing start method to 'spawn' for CUDA compatibility")
+    except RuntimeError:
+        warnings.warn("Could not set multiprocessing start method to 'spawn'. Some CUDA operations may fail.")
+
 class SynthDataset(Dataset):
     """
     Dataset for loading preprocessed spectrograms and chord labels.
@@ -25,7 +33,8 @@ class SynthDataset(Dataset):
                  frame_duration=0.1, num_workers=None, cache_file=None, verbose=True,
                  use_cache=True, metadata_only=True, cache_fraction=0.1, logits_dir=None,
                  lazy_init=False, require_teacher_logits=False, device=None,
-                 pin_memory=True, prefetch_factor=2, batch_gpu_cache=False):
+                 pin_memory=True, prefetch_factor=2, batch_gpu_cache=False,
+                 small_dataset_percentage=None):
         """
         Initialize the dataset with optimized settings for GPU acceleration.
         
@@ -49,7 +58,15 @@ class SynthDataset(Dataset):
             pin_memory: Whether to pin memory for faster GPU transfer
             prefetch_factor: Number of batches to prefetch (for DataLoader)
             batch_gpu_cache: Whether to cache batches on GPU for repeated access patterns
+            small_dataset_percentage: Optional percentage of the dataset to use (0-1.0)
         """
+        # Check for CUDA availability early and inform about multiprocessing
+        self.cuda_available = torch.cuda.is_available()
+        if self.cuda_available and multiprocessing.get_start_method() != 'spawn':
+            warnings.warn("CUDA detected but multiprocessing start method is not 'spawn'. "
+                         "This might cause 'Cannot re-initialize CUDA in forked subprocess' errors. "
+                         "Call 'multiprocessing.set_start_method(\"spawn\", force=True)' before creating this dataset.")
+        
         self.spec_dir = Path(spec_dir)
         self.label_dir = Path(label_dir)
         self.logits_dir = Path(logits_dir) if logits_dir is not None else None
@@ -68,6 +85,7 @@ class SynthDataset(Dataset):
         self.pin_memory = pin_memory
         self.prefetch_factor = prefetch_factor
         self.batch_gpu_cache = batch_gpu_cache
+        self.small_dataset_percentage = small_dataset_percentage
         
         # Map from chord name to index
         if self.chord_mapping is not None:
@@ -118,20 +136,26 @@ class SynthDataset(Dataset):
                 # Start with CPU count but cap at reasonable values
                 self.num_workers = min(4, os.cpu_count() or 1)
                 
+                # If using CUDA, enforce only 1 worker unless we're sure spawn method is used
+                if self.cuda_available and multiprocessing.get_start_method() != 'spawn':
+                    self.num_workers = 0
+                    if verbose:
+                        print("CUDA detected with fork method - disabling workers to prevent CUDA errors")
+                
                 # Check if we're running in a container with limited resources
                 if os.path.exists('/sys/fs/cgroup/memory/memory.limit_in_bytes'):
                     with open('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'r') as f:
                         mem_limit = int(f.read().strip()) / (1024 * 1024 * 1024)  # Convert to GB
                         # If less than 4GB memory, reduce workers to avoid OOM
                         if mem_limit < 4:
-                            self.num_workers = 1
+                            self.num_workers = 0
                             if verbose:
-                                print(f"Limited memory detected ({mem_limit:.1f}GB), using single worker")
+                                print(f"Limited memory detected ({mem_limit:.1f}GB), disabling workers")
             except Exception as e:
-                # Fallback to safe default
-                self.num_workers = 1
+                # Fallback to safe default - with CUDA, use 0 workers to be safe
+                self.num_workers = 0 if self.cuda_available else 1
                 if verbose:
-                    print(f"Error determining CPU count: {e}, using single worker")
+                    print(f"Error determining CPU count: {e}, using {self.num_workers} worker(s)")
         else:
             self.num_workers = num_workers
             
@@ -465,6 +489,28 @@ class SynthDataset(Dataset):
                 for i, (path, _) in enumerate(valid_spec_files[:3]):
                     print(f"  {i+1}. {path}")
                     
+        # If small_dataset_percentage is set, sample a small portion of the dataset
+        if self.small_dataset_percentage is not None:
+            # Ensure consistent sampling by using a fixed seed
+            np.random.seed(42)
+            
+            # Get file count based on percentage
+            sample_size = max(1, int(len(valid_spec_files) * self.small_dataset_percentage))
+            
+            # Sample files - prefer deterministic subset
+            if sample_size < len(valid_spec_files):
+                # First sort files for deterministic behavior
+                valid_spec_files.sort(key=lambda x: str(x[0]))
+                
+                # Then take the first portion based on percentage
+                valid_spec_files = valid_spec_files[:sample_size]
+                
+                if self.verbose:
+                    print(f"Using {sample_size} files ({self.small_dataset_percentage*100:.2f}% of dataset) for quick testing")
+                    print(f"First file: {valid_spec_files[0][0]}")
+                    if len(valid_spec_files) > 1:
+                        print(f"Last file: {valid_spec_files[-1][0]}")
+        
         # Process files in parallel with memory-optimized handling
         try:
             # Add counters for tracking skipped files
@@ -477,6 +523,13 @@ class SynthDataset(Dataset):
                 'format_error': 0
             }
             
+            # CRITICAL FIX: For CUDA compatibility, use sequential processing if workers > 0
+            # Only use parallelism if we're sure multiprocessing is set to 'spawn' mode
+            if self.cuda_available and multiprocessing.get_start_method() != 'spawn':
+                if self.verbose:
+                    print("CUDA detected with non-spawn multiprocessing - forcing sequential processing")
+                self.num_workers = 0
+            
             if self.num_workers > 1 and len(valid_spec_files) > 10:
                 # Split files into chunks for parallel processing
                 chunk_size = max(1, len(valid_spec_files) // self.num_workers)
@@ -484,6 +537,7 @@ class SynthDataset(Dataset):
                 
                 if self.verbose:
                     print(f"Processing files with {self.num_workers} workers ({len(chunks)} chunks)")
+                    print(f"Multiprocessing mode: {multiprocessing.get_start_method()}")
                 
                 # Use context manager to ensure pool is properly closed
                 with multiprocessing.Pool(processes=self.num_workers) as pool:
@@ -1449,7 +1503,19 @@ class SynthDataset(Dataset):
         """Get an optimized DataLoader for the training set"""
         # Use class defaults if not specified
         pin_memory_val = self.pin_memory if pin_memory is None else pin_memory
-        num_workers_val = self.num_workers if num_workers is None else num_workers
+        
+        # Fix for CUDA + multiprocessing issues:
+        # Only use workers if we're in spawn mode
+        if num_workers is None:
+            if self.cuda_available and multiprocessing.get_start_method() != 'spawn':
+                num_workers_val = 0  # Disable workers if using CUDA without spawn
+                if self.verbose and not hasattr(self, '_worker_warning_logged'):
+                    print("Warning: Disabling DataLoader workers due to CUDA + fork compatibility issues")
+                    self._worker_warning_logged = True
+            else:
+                num_workers_val = self.num_workers
+        else:
+            num_workers_val = num_workers
         
         if not self.train_indices:
             warnings.warn("No training segments available")
@@ -1474,7 +1540,16 @@ class SynthDataset(Dataset):
         """Get an optimized DataLoader for the evaluation set"""
         # Use class defaults if not specified
         pin_memory_val = self.pin_memory if pin_memory is None else pin_memory
-        num_workers_val = self.num_workers if num_workers is None else num_workers
+        
+        # Fix for CUDA + multiprocessing issues:
+        # Only use workers if we're in spawn mode
+        if num_workers is None:
+            if self.cuda_available and multiprocessing.get_start_method() != 'spawn':
+                num_workers_val = 0  # Disable workers if using CUDA without spawn
+            else:
+                num_workers_val = self.num_workers
+        else:
+            num_workers_val = num_workers
         
         if not self.eval_indices:
             warnings.warn("No evaluation segments available")
@@ -1499,7 +1574,16 @@ class SynthDataset(Dataset):
         """Get an optimized DataLoader for the test set"""
         # Use class defaults if not specified
         pin_memory_val = self.pin_memory if pin_memory is None else pin_memory
-        num_workers_val = self.num_workers if num_workers is None else num_workers
+        
+        # Fix for CUDA + multiprocessing issues:
+        # Only use workers if we're in spawn mode
+        if num_workers is None:
+            if self.cuda_available and multiprocessing.get_start_method() != 'spawn':
+                num_workers_val = 0  # Disable workers if using CUDA without spawn
+            else:
+                num_workers_val = self.num_workers
+        else:
+            num_workers_val = num_workers
         
         if not self.test_indices:
             warnings.warn("No test segments available")

@@ -340,7 +340,7 @@ spec:
               # Run the student training script with all options
               echo "Starting student training with GPU optimization and all options..."
               python train_student.py --config ./config/student_config.yaml --save_dir checkpoints/student \
-                ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} \
+                ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} --small_dataset\
                 ${GPU_ARGS} ${BATCH_OVERRIDE}
               
               echo "=== Student model training complete ==="
@@ -349,12 +349,12 @@ spec:
               python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
             requests:
-              cpu: "4"             
-              memory: "16Gi"    
+              cpu: "3"             
+              memory: "12Gi"    
               nvidia.com/gpu: "1"
             limits:
               cpu: "6"             
-              memory: "32Gi" 
+              memory: "24Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage
