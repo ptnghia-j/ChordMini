@@ -469,41 +469,10 @@ def main():
     storage_root = config.paths.get('storage_root', None)
     logger.info(f"Storage root: {storage_root}")
     
-    # Check if using synthetic data
-    if args.use_synthetic_data:
-        synth_dir = os.path.join(project_root, "data/synth_test")
-        synth_spec_dir = os.path.join(synth_dir, "spectrograms")
-        synth_label_dir = os.path.join(synth_dir, "labels")
-        synth_logits_dir = os.path.join(synth_dir, "logits")
-        
-        # Check if synthetic data exists
-        if not os.path.exists(synth_spec_dir) or not os.path.exists(synth_label_dir):
-            logger.info("Synthetic test data not found. Generating now...")
-            try:
-                # Use the generate_test_data script to create synthetic data
-                import subprocess
-                cmd = [sys.executable, os.path.join(project_root, "generate_test_data.py"), 
-                       "--output", synth_dir, "--samples", "20", "--clean"]
-                subprocess.run(cmd, check=True)
-                logger.info("Synthetic data generated successfully")
-            except Exception as e:
-                logger.error(f"Failed to generate synthetic data: {e}")
-                logger.info("Falling back to regular data sources")
-                args.use_synthetic_data = False
-        else:
-            logger.info(f"Using existing synthetic test data from {synth_dir}")
-            
-        if args.use_synthetic_data:
-            # Override paths to use synthetic data
-            spec_dir_config = synth_spec_dir
-            label_dir_config = synth_label_dir
-            if args.use_kd_loss:
-                args.logits_dir = synth_logits_dir
-    else:
-        # Resolve paths using the new function
-        # First, try to get spec_dir and label_dir from config, but allow CLI override
-        spec_dir_config = args.spec_dir or config.paths.get('spec_dir', 'data/synth/spectrograms')
-        label_dir_config = args.label_dir or config.paths.get('label_dir', 'data/synth/labels')
+    # Resolve paths using the new function
+    # First, try to get spec_dir and label_dir from config, but allow CLI override
+    spec_dir_config = args.spec_dir or config.paths.get('spec_dir', 'data/synth/spectrograms')
+    label_dir_config = args.label_dir or config.paths.get('label_dir', 'data/synth/labels')
     
     # Resolve the primary paths
     synth_spec_dir = resolve_path(spec_dir_config, storage_root, project_root)
@@ -741,7 +710,11 @@ def main():
     if args.small_dataset is not None:
         small_percentage = args.small_dataset
         dataset_args['small_dataset_percentage'] = small_percentage
-        logger.info(f"Using only {small_percentage*100:.2f}% of dataset for quick testing")
+        logger.info(f"Using only {small_percentage*100:.2f}% of dataset for quick testing (from command line)")
+    elif hasattr(config, 'data') and config.data.get('small_dataset_percentage') is not None:
+        small_percentage = config.data.get('small_dataset_percentage')
+        dataset_args['small_dataset_percentage'] = small_percentage
+        logger.info(f"Using only {small_percentage*100:.2f}% of dataset for quick testing (from config)")
     
     # Create the dataset
     logger.info(f"Creating dataset with parameters:")
@@ -910,31 +883,31 @@ def main():
         model = torch.nn.DataParallel(model)
         logger.info(f"Using {torch.cuda.device_count()} GPUs for training")
     
-    # Increase batch size based on GPU memory
-    if torch.cuda.is_available():
-        try:
-            # Try to estimate maximum possible batch size for this device
-            orig_batch_size = config.training['batch_size']
+    # # Increase batch size based on GPU memory
+    # if torch.cuda.is_available():
+    #     try:
+    #         # Try to estimate maximum possible batch size for this device
+    #         orig_batch_size = config.training['batch_size']
             
-            # Get free GPU memory in MB (conservative estimate)
-            free_mem = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
-            mem_factor = free_mem / 8000  # Normalize against 8GB baseline
+    #         # Get free GPU memory in MB (conservative estimate)
+    #         free_mem = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
+    #         mem_factor = free_mem / 8000  # Normalize against 8GB baseline
             
-            # Scale batch size up by a factor of 2-3 based on available memory
-            # with a safety margin to avoid OOM errors
-            new_batch_size = min(
-                int(orig_batch_size * min(3.0, max(2.0, mem_factor * 0.8))),
-                orig_batch_size * 4  # Cap at 4x original size for safety
-            )
+    #         # Scale batch size up by a factor of 2-3 based on available memory
+    #         # with a safety margin to avoid OOM errors
+    #         new_batch_size = min(
+    #             int(orig_batch_size * min(2.0, max(1.5, mem_factor * 0.8))),
+    #             orig_batch_size * 2.5  # Cap at 2.5x original size for safety
+    #         )
             
-            # Always ensure batch size is even for better GPU utilization
-            new_batch_size = (new_batch_size // 2) * 2
+    #         # Always ensure batch size is even for better GPU utilization
+    #         new_batch_size = (new_batch_size // 2) * 2
             
-            if new_batch_size > orig_batch_size:
-                logger.info(f"Increasing batch size from {orig_batch_size} to {new_batch_size} for better GPU utilization")
-                config.training['batch_size'] = new_batch_size
-        except Exception as e:
-            logger.warning(f"Failed to auto-adjust batch size: {e}")
+    #         if new_batch_size > orig_batch_size:
+    #             logger.info(f"Increasing batch size from {orig_batch_size} to {new_batch_size} for better GPU utilization")
+    #             config.training['batch_size'] = new_batch_size
+    #     except Exception as e:
+    #         logger.warning(f"Failed to auto-adjust batch size: {e}")
     
     # Create optimizer - match teacher settings
     optimizer = torch.optim.Adam(model.parameters(), 

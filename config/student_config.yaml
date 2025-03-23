@@ -77,10 +77,12 @@ paths:
 
 # Data parameters
 data:
-  lazy_init: true           # Controls dataset lazy initialization
+  lazy_init: false           # Controls dataset lazy initialization
   cache_fraction: 0.1        # Fraction of dataset to cache (default: 0.1 = 10%)
   metadata_only: true        # Only cache metadata, not full spectrograms
   disable_cache: false       # Set to true to disable dataset caching
+  # New parameter for small dataset testing
+  small_dataset_percentage: 0.01  # Set to a value like 0.01 for 1% or null to use full dataset
 
 # Miscellaneous
 misc:
