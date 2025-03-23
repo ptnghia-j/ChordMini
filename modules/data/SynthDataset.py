@@ -876,8 +876,8 @@ class SynthDataset(Dataset):
         seg_start, seg_end = self.segment_indices[idx]
         sequence = []
         label_seq = []
-        teacher_logits_seq = []  # Track teacher logits sequence
-        has_teacher_logits = False  # Flag to track if any samples have teacher logits
+        teacher_logits_seq = []  # Always track teacher logits sequence
+        has_teacher_logits = False  # Track if any samples have teacher logits
         
         # Get first sample to determine shape for padding
         first_sample = self.samples[seg_start]
@@ -918,6 +918,9 @@ class SynthDataset(Dataset):
         else:
             # Default fallback
             first_spec = np.zeros((144,))
+
+        # Check for teacher logits availability in the dataset
+        check_for_logits = self.logits_dir is not None or any('teacher_logits' in s or 'logit_path' in s for s in self.samples[:100])
         
         # Process remaining samples in the segment
         start_song_id = self.samples[seg_start]['song_id']
@@ -934,6 +937,15 @@ class SynthDataset(Dataset):
                     for _ in range(padding_needed):
                         sequence.append(torch.zeros(padding_shape, dtype=torch.float))
                         label_seq.append(self.chord_to_idx.get("N", 0))
+                        # Also add padding to teacher_logits_seq if we have any logits
+                        if has_teacher_logits or check_for_logits:
+                            if teacher_logits_seq and teacher_logits_seq[0].shape:
+                                logit_shape = teacher_logits_seq[0].shape
+                                teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float))
+                            else:
+                                # Default class count if we don't have shape information yet
+                                default_classes = 170  # Default to a reasonable number of chord classes
+                                teacher_logits_seq.append(torch.zeros(default_classes, dtype=torch.float))
                     break
                     
                 # Lazy load spectrogram if needed - most important part for memory efficiency
@@ -969,6 +981,7 @@ class SynthDataset(Dataset):
                 label_seq.append(chord_idx)
                 
                 # Also handle lazy loading for teacher logits
+                has_logits_for_this_sample = False
                 if 'logit_path' in sample_i and 'teacher_logits' not in sample_i:
                     try:
                         logit_path = sample_i['logit_path']
@@ -984,18 +997,46 @@ class SynthDataset(Dataset):
                         # Convert to tensor
                         logits_tensor = torch.tensor(teacher_logits, dtype=torch.float)
                         teacher_logits_seq.append(logits_tensor)
+                        has_logits_for_this_sample = True
                         has_teacher_logits = True
                     except Exception as e:
-                        warnings.warn(f"Error loading teacher logits from {logit_path}: {e}")
+                        # Only log the first few errors to avoid spam
+                        if not hasattr(self, '_logit_load_errors'):
+                            self._logit_load_errors = 0
+                        if self._logit_load_errors < 5:
+                            warnings.warn(f"Error loading teacher logits from {logit_path}: {e}")
+                            self._logit_load_errors += 1
                 elif 'teacher_logits' in sample_i:
                     # Use stored teacher logits if available
                     teacher_logits_seq.append(torch.tensor(sample_i['teacher_logits'], dtype=torch.float))
+                    has_logits_for_this_sample = True
                     has_teacher_logits = True
+                
+                # Add zero tensor if we're collecting logits but this sample doesn't have any
+                if (has_teacher_logits or check_for_logits) and not has_logits_for_this_sample:
+                    # Use shape from previous logit if available, otherwise use default
+                    if teacher_logits_seq and len(teacher_logits_seq) > 0:
+                        logit_shape = teacher_logits_seq[0].shape
+                        teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float))
+                    else:
+                        # Default class count if we have no prior information
+                        default_classes = 170  # Default to a reasonable number of chord classes
+                        teacher_logits_seq.append(torch.zeros(default_classes, dtype=torch.float))
             else:
                 # We've reached the end of the dataset, pad with zeros
                 padding_shape = sequence[-1].shape if sequence else first_spec.shape
                 sequence.append(torch.zeros(padding_shape, dtype=torch.float))
                 label_seq.append(self.chord_to_idx.get("N", 0))
+                
+                # Also add zero padding to teacher logits if needed
+                if has_teacher_logits or check_for_logits:
+                    if teacher_logits_seq and len(teacher_logits_seq) > 0:
+                        logit_shape = teacher_logits_seq[0].shape
+                        teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float))
+                    else:
+                        # Default class count if we have no prior information
+                        default_classes = 170  # Default to a reasonable number of chord classes
+                        teacher_logits_seq.append(torch.zeros(default_classes, dtype=torch.float))
         
         # Ensure we have exactly seq_len frames
         if len(sequence) < self.seq_len:
@@ -1004,6 +1045,16 @@ class SynthDataset(Dataset):
             for _ in range(padding_needed):
                 sequence.append(torch.zeros(padding_shape, dtype=torch.float))
                 label_seq.append(self.chord_to_idx.get("N", 0))
+                
+                # Add padding to teacher logits if needed
+                if has_teacher_logits or check_for_logits:
+                    if teacher_logits_seq and len(teacher_logits_seq) > 0:
+                        logit_shape = teacher_logits_seq[0].shape
+                        teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float))
+                    else:
+                        # Default class count if we have no prior information
+                        default_classes = 170  # Default to a reasonable number of chord classes
+                        teacher_logits_seq.append(torch.zeros(default_classes, dtype=torch.float))
         
         # Create sample output with the collected data
         sample_out = {
@@ -1011,15 +1062,41 @@ class SynthDataset(Dataset):
             'chord_idx': torch.tensor(label_seq, dtype=torch.long)  # [seq_len]
         }
         
-        # If we have teacher logits, add them to the output
-        if has_teacher_logits and len(teacher_logits_seq) == len(sequence):
+        # Always include teacher_logits if we're supposed to have them or found any
+        if has_teacher_logits or check_for_logits:
             try:
-                sample_out['teacher_logits'] = torch.stack(teacher_logits_seq, dim=0)
-            except:
-                # Handle case where tensors might be different shapes
+                # Ensure all teacher logits have the same shape
+                if all(tensor.shape == teacher_logits_seq[0].shape for tensor in teacher_logits_seq):
+                    sample_out['teacher_logits'] = torch.stack(teacher_logits_seq, dim=0)
+                else:
+                    # If shapes don't match, log the first occurrence and standardize shapes
+                    if self.verbose and not hasattr(self, '_logits_shape_mismatch'):
+                        self._logits_shape_mismatch = True
+                        shapes = [tensor.shape for tensor in teacher_logits_seq]
+                        print(f"WARNING: Teacher logits shape mismatch: {shapes}")
+                    
+                    # Use the most common shape as a fallback
+                    shape_counter = Counter([tensor.shape for tensor in teacher_logits_seq])
+                    most_common_shape = shape_counter.most_common(1)[0][0]
+                    
+                    # Create uniform tensors with the most common shape
+                    uniform_logits = []
+                    for tensor in teacher_logits_seq:
+                        if tensor.shape == most_common_shape:
+                            uniform_logits.append(tensor)
+                        else:
+                            uniform_logits.append(torch.zeros(most_common_shape, dtype=torch.float))
+                            
+                    sample_out['teacher_logits'] = torch.stack(uniform_logits, dim=0)
+            except Exception as e:
+                # If stacking fails for any reason, provide an empty tensor with correct shape
                 if self.verbose and not hasattr(self, '_logits_stack_error'):
-                    print("WARNING: Could not stack teacher logits due to shape mismatch")
+                    print(f"WARNING: Could not stack teacher logits: {e}")
                     self._logits_stack_error = True
+                
+                # Create a dummy logits tensor with the correct sequence length
+                num_classes = 170  # Default number of classes
+                sample_out['teacher_logits'] = torch.zeros((len(sequence), num_classes), dtype=torch.float)
         
         return sample_out
     
