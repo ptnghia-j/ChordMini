@@ -919,6 +919,23 @@ class StudentTrainer(BaseTrainer):
             # Log KD status at the beginning of training
             if self.use_kd_loss:
                 self._log(f"Knowledge Distillation enabled: α={self.kd_alpha}, temperature={self.temperature}")
+                
+                # Check first batch for teacher logits - early verification
+                try:
+                    self._log("Verifying teacher logits availability in first batch...")
+                    first_batch = next(iter(train_loader))
+                    if 'teacher_logits' not in first_batch:
+                        self._log("WARNING: KD is enabled but teacher_logits are missing from the first batch!")
+                        self._log("This will cause training to fall back to standard CE loss and may lead to poor results.")
+                        self._log("Please ensure your dataset properly includes teacher logits for all samples.")
+                    else:
+                        teacher_shape = first_batch['teacher_logits'].shape
+                        self._log(f"Teacher logits verified with shape: {teacher_shape}")
+                        # Check if we have non-zero values in teacher logits
+                        if first_batch['teacher_logits'].abs().sum().item() == 0:
+                            self._log("WARNING: Teacher logits contain all zeros! Check your logits loading process.")
+                except Exception as e:
+                    self._log(f"Error checking first batch for teacher logits: {e}")
             else:
                 self._log("Knowledge Distillation disabled, using standard loss")
             
@@ -984,15 +1001,21 @@ class StudentTrainer(BaseTrainer):
                     teacher_logits = None
                     if self.use_kd_loss and 'teacher_logits' in batch:
                         teacher_logits = batch['teacher_logits'].to(self.device)
-                        if batch_idx % 50 == 0:
-                            self._log(f"Teacher logits shape: {teacher_logits.shape}")
                         kd_batches += 1
                     
                     total_batches += 1
                     
-                    if self.use_kd_loss and teacher_logits is None and batch_idx == 0:
-                        self._log("WARNING: KD enabled but no teacher logits found in batch")
-                        
+                    # Enhanced KD logging and error checking
+                    if self.use_kd_loss and teacher_logits is None:
+                        if batch_idx == 0 or batch_idx % 100 == 0:
+                            self._log(f"WARNING: KD enabled but no teacher logits found in batch {batch_idx}")
+                            
+                            # If this keeps happening, report it clearly
+                            if batch_idx >= 100 and kd_batches == 0:
+                                self._log("CRITICAL ERROR: Knowledge Distillation is enabled but NO teacher logits found in any batches so far!")
+                                self._log("This indicates a problem with your dataset or logits loading. Training will continue with standard loss.")
+                                self._log("You should stop training and fix the logits loading issue.")
+                    
                     if self.normalization:
                         inputs = (inputs - self.normalization['mean']) / self.normalization['std']
                         
@@ -1060,6 +1083,13 @@ class StudentTrainer(BaseTrainer):
                 if self.use_kd_loss:
                     kd_percent = (kd_batches / total_batches) * 100 if total_batches > 0 else 0
                     self._log(f"KD usage: {kd_batches}/{total_batches} batches ({kd_percent:.1f}%)")
+                    
+                    # Warn if KD usage is low, as this indicates a potential problem 
+                    if kd_percent < 50 and total_batches > 10:
+                        self._log(f"WARNING: KD is enabled but only {kd_percent:.1f}% of batches had teacher logits!")
+                        self._log("This means most batches are falling back to standard CE loss, which may impact results.")
+                        if kd_percent == 0:
+                            self._log("CRITICAL: No batches had teacher logits despite KD being enabled!")
                 
                 # Log training metrics for this epoch
                 avg_train_loss = epoch_loss / max(1, len(train_loader))

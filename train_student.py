@@ -612,6 +612,7 @@ def main():
         logger.error("This may indicate problems with the data format. Attempting to continue...")
         n_freq = config.model.get('n_freq', 144)
         logger.info(f"Using default frequency dimension: {n_freq}")
+        is_cqt = n_freq <= 256
     
     # Get the number of unique chords in our dataset for the output layer
     num_unique_chords = len(chord_mapping)
