@@ -340,7 +340,7 @@ spec:
               # Run the student training script with all options
               echo "Starting student training with GPU optimization and all options..."
               python train_student.py --config ./config/student_config.yaml --save_dir checkpoints/student \
-                ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} --small_dataset\
+                ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS}\
                 ${GPU_ARGS} ${BATCH_OVERRIDE}
               
               echo "=== Student model training complete ==="
