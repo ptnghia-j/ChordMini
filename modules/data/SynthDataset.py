@@ -23,7 +23,7 @@ class SynthDataset(Dataset):
     def __init__(self, spec_dir, label_dir, chord_mapping=None, seq_len=10, stride=None, 
                  frame_duration=0.1, num_workers=None, cache_file=None, verbose=True,
                  use_cache=True, metadata_only=True, cache_fraction=0.1, logits_dir=None,
-                 lazy_init=False):  # Removed shard_idx and total_shards parameters
+                 lazy_init=False, require_teacher_logits=False):  # Added require_teacher_logits parameter
         self.spec_dir = Path(spec_dir)
         self.label_dir = Path(label_dir)
         self.logits_dir = Path(logits_dir) if logits_dir is not None else None
@@ -38,6 +38,11 @@ class SynthDataset(Dataset):
         self.metadata_only = metadata_only  # Only cache metadata, not full spectrograms
         self.cache_fraction = cache_fraction  # Fraction of samples to cache (default: 10%)
         self.lazy_init = lazy_init
+        self.require_teacher_logits = require_teacher_logits  # Flag to require teacher logits
+        
+        # Safety check: if require_teacher_logits is True, logits_dir must be provided
+        if self.require_teacher_logits and self.logits_dir is None:
+            raise ValueError("require_teacher_logits=True requires a valid logits_dir")
         
         # Safely determine number of workers based on environment
         if num_workers is None:
@@ -830,6 +835,30 @@ class SynthDataset(Dataset):
         if not self.samples:
             warnings.warn("No samples to generate segments from")
             return
+        
+        # Optional filtering of samples that don't have teacher logits when required
+        if self.require_teacher_logits:
+            original_count = len(self.samples)
+            filtered_samples = []
+            for sample in self.samples:
+                # Include sample only if it has teacher logits or a valid logit path
+                if 'teacher_logits' in sample or ('logit_path' in sample and os.path.exists(sample['logit_path'])):
+                    filtered_samples.append(sample)
+            
+            # Update samples with the filtered list
+            self.samples = filtered_samples
+            
+            if self.verbose:
+                new_count = len(self.samples)
+                removed = original_count - new_count
+                removed_percent = (removed / original_count * 100) if original_count > 0 else 0
+                print(f"Filtered out {removed} samples without teacher logits ({removed_percent:.1f}%)")
+                print(f"Remaining samples with teacher logits: {new_count}")
+                
+                # Check if we filtered too aggressively
+                if new_count < original_count * 0.1:  # Less than 10% samples remain
+                    warnings.warn(f"WARNING: Only {new_count} samples ({new_count/original_count*100:.1f}%) have teacher logits.")
+                    warnings.warn(f"This may indicate an issue with logits availability or paths.")
         
         # Group samples by song_id
         song_samples = {}

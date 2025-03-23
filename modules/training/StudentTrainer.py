@@ -4,6 +4,7 @@ import numpy as np
 from modules.training.Trainer import BaseTrainer
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, OneCycleLR, CosineAnnealingWarmRestarts
 import torch.nn.functional as F
+import matplotlib.pyplot as plt  # Add missing matplotlib import
 
 class StudentTrainer(BaseTrainer):
     """

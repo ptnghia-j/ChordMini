@@ -545,22 +545,57 @@ def main():
         logger.info(f"Using labels from: {label_dir_override} (override)")
         synth_label_dir = label_dir_override
     
-    # Initialize dataset with memory optimization options including lazy_init
-    synth_dataset = SynthDataset(
-        synth_spec_dir,
-        synth_label_dir, 
-        chord_mapping=chord_mapping, 
-        seq_len=config.training['seq_len'], 
-        stride=config.training['seq_stride'],
-        frame_duration=frame_duration,
-        num_workers=min(8, os.cpu_count() or 1),  # Limit to 8 workers maximum
-        cache_file=cache_file,
-        use_cache=not args.disable_cache,
-        metadata_only=use_metadata_only,
-        cache_fraction=args.cache_fraction,
-        logits_dir=logits_dir,  # Pass logits_dir to the dataset
-        lazy_init=lazy_init     # Add lazy initialization parameter
-    )
+    # Dataset initialization
+    logger.info("\n=== Creating dataset ===")
+    # Set up dataset initialization parameters
+    dataset_args = {
+        'spec_dir': synth_spec_dir,
+        'label_dir': synth_label_dir,
+        'chord_mapping': chord_mapping,
+        'seq_len': config.training['seq_len'],
+        'stride': config.training['seq_stride'],
+        'frame_duration': frame_duration,
+        'verbose': True
+    }
+    
+    # Add cache parameters
+    if args.disable_cache or config.data.get('disable_cache', False):
+        dataset_args['use_cache'] = False
+        logger.info("Dataset caching disabled to reduce memory usage")
+    else:
+        dataset_args['use_cache'] = True
+        
+        # Add metadata_cache option to only store metadata, not spectrograms
+        if args.metadata_cache:
+            dataset_args['metadata_only'] = True
+            logger.info("Using metadata-only caching to reduce memory usage")
+        
+        # Add cache_fraction option to cache only a portion of the dataset
+        if args.cache_fraction != 0.1:  # Only log if different from default
+            dataset_args['cache_fraction'] = args.cache_fraction
+            logger.info(f"Caching {args.cache_fraction * 100}% of dataset to reduce memory usage")
+    
+    # Add lazy initialization option
+    if args.lazy_init or config.data.get('lazy_init', False):
+        dataset_args['lazy_init'] = True
+        logger.info("Using lazy initialization to reduce memory usage")
+    
+    # Add logits directory for knowledge distillation if available
+    if logits_dir:
+        dataset_args['logits_dir'] = logits_dir
+        
+        # When KD is enabled, require teacher logits to be present for all samples
+        if use_kd:
+            dataset_args['require_teacher_logits'] = True
+            logger.info("KD enabled: Enforcing that all samples must have teacher logits")
+    
+    # Create the dataset
+    logger.info(f"Creating dataset with parameters:")
+    for key, value in dataset_args.items():
+        if key not in ['chord_mapping', 'verbose']:  # Skip verbose outputs
+            logger.info(f"  {key}: {value}")
+    
+    synth_dataset = SynthDataset(**dataset_args)
     
     # After loading dataset, verify chord distribution matches expected mapping
     if len(synth_dataset.samples) == 0:
