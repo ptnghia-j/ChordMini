@@ -18,12 +18,37 @@ import re
 class SynthDataset(Dataset):
     """
     Dataset for loading preprocessed spectrograms and chord labels.
-    Optimized implementation with multiprocessing and caching.
+    Optimized implementation with multiprocessing, caching, and GPU acceleration.
     """
     def __init__(self, spec_dir, label_dir, chord_mapping=None, seq_len=10, stride=None, 
                  frame_duration=0.1, num_workers=None, cache_file=None, verbose=True,
                  use_cache=True, metadata_only=True, cache_fraction=0.1, logits_dir=None,
-                 lazy_init=False, require_teacher_logits=False):  # Added require_teacher_logits parameter
+                 lazy_init=False, require_teacher_logits=False, device=None,
+                 pin_memory=True, prefetch_factor=2, batch_gpu_cache=False):
+        """
+        Initialize the dataset with optimized settings for GPU acceleration.
+        
+        Args:
+            spec_dir: Directory containing spectrograms
+            label_dir: Directory containing labels
+            chord_mapping: Mapping of chord names to indices
+            seq_len: Sequence length for segmentation
+            stride: Stride for segmentation (default: same as seq_len)
+            frame_duration: Duration of each frame in seconds
+            num_workers: Number of workers for data loading
+            cache_file: Path to cache file
+            verbose: Whether to print verbose output
+            use_cache: Whether to use caching
+            metadata_only: Whether to cache only metadata
+            cache_fraction: Fraction of samples to cache
+            logits_dir: Directory containing teacher logits
+            lazy_init: Whether to use lazy initialization
+            require_teacher_logits: Whether to require teacher logits
+            device: Device to use (default: auto-detect)
+            pin_memory: Whether to pin memory for faster GPU transfer
+            prefetch_factor: Number of batches to prefetch (for DataLoader)
+            batch_gpu_cache: Whether to cache batches on GPU for repeated access patterns
+        """
         self.spec_dir = Path(spec_dir)
         self.label_dir = Path(label_dir)
         self.logits_dir = Path(logits_dir) if logits_dir is not None else None
@@ -38,7 +63,22 @@ class SynthDataset(Dataset):
         self.metadata_only = metadata_only  # Only cache metadata, not full spectrograms
         self.cache_fraction = cache_fraction  # Fraction of samples to cache (default: 10%)
         self.lazy_init = lazy_init
-        self.require_teacher_logits = require_teacher_logits  # Flag to require teacher logits
+        self.require_teacher_logits = require_teacher_logits
+        self.pin_memory = pin_memory
+        self.prefetch_factor = prefetch_factor
+        self.batch_gpu_cache = batch_gpu_cache
+        
+        # Auto-detect device if not provided
+        if device is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = device
+            
+        if self.verbose:
+            print(f"Using device: {self.device}")
+            
+        # GPU caching for batches - improves performance for repeated access patterns
+        self.gpu_batch_cache = {} if self.batch_gpu_cache else None
         
         # Safety check: if require_teacher_logits is True, logits_dir must be provided
         if self.require_teacher_logits and self.logits_dir is None:
@@ -69,7 +109,6 @@ class SynthDataset(Dataset):
         
         # Generate a safer cache file name using hashing if none provided
         if cache_file is None:
-            # Removed shard suffix
             cache_key = f"{spec_dir}_{label_dir}_{seq_len}_{stride}_{frame_duration}"
             cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
             self.cache_file = f"dataset_cache_{cache_hash}.pkl"
@@ -226,6 +265,45 @@ class SynthDataset(Dataset):
         self.eval_indices = list(range(int(total_segs * 0.8), int(total_segs * 0.9)))
         self.test_indices = list(range(int(total_segs * 0.9), total_segs))
         
+        # Pre-allocate tensors for common shapes to reduce allocations
+        self._zero_spec_cache = {}
+        self._zero_logit_cache = {}
+        
+        # Create a thread-local tensor cache to store commonly accessed tensors on GPU
+        # This minimizes CPU-GPU transfers for frequently used tensors
+        if torch.cuda.is_available():
+            self._init_gpu_cache()
+            
+    def _init_gpu_cache(self):
+        """Initialize GPU cache for common tensors to minimize transfers"""
+        if torch.cuda.is_available():
+            try:
+                # Common zero tensors for different dimensions
+                freq_dims = [144, 128, 256, 512]  # Common frequency dimensions
+                for dim in freq_dims:
+                    # Allocate once and reuse - more efficient than creating each time
+                    self._zero_spec_cache[dim] = torch.zeros(dim, device=self.device)
+                
+                # Common zero tensors for logits
+                logit_dims = [25, 72, 170]  # Common chord class counts
+                for dim in logit_dims:
+                    self._zero_logit_cache[dim] = torch.zeros(dim, device=self.device)
+                
+                # Cache chord indices for quick lookup
+                if self.chord_mapping:
+                    self._n_chord_idx = torch.tensor(self.chord_to_idx.get("N", 0), 
+                                                    device=self.device, dtype=torch.long)
+                else:
+                    self._n_chord_idx = torch.tensor(0, device=self.device, dtype=torch.long)
+                    
+                if self.verbose:
+                    cache_mb = sum(tensor.element_size() * tensor.nelement() 
+                                  for tensor in list(self._zero_spec_cache.values()) + 
+                                  list(self._zero_logit_cache.values())) / (1024 * 1024)
+                    print(f"Allocated {cache_mb:.2f}MB for GPU tensor cache")
+            except Exception as e:
+                warnings.warn(f"Failed to initialize GPU cache: {str(e)}")
+
     def _load_data(self):
         """Optimized data loading with caching, multiprocessing"""
         start_time = time.time()
@@ -894,13 +972,55 @@ class SynthDataset(Dataset):
             end_time = time.time()
             print(f"Generated {total_segments} segments in {end_time - start_time:.2f} seconds")
     
+    def _get_zero_tensor(self, shape, tensor_type='spec'):
+        """
+        Get a zero tensor of the given shape from cache for efficient reuse.
+        
+        Args:
+            shape: Shape or dimension (int) for the zero tensor
+            tensor_type: 'spec' for spectrogram, 'logit' for logits
+            
+        Returns:
+            torch.Tensor: Zero tensor of the given shape on the appropriate device
+        """
+        # Handle scalar dimension or tuple shapes
+        if isinstance(shape, (list, tuple)):
+            if len(shape) == 1:
+                dim = shape[0]
+            else:
+                # For multi-dimensional shapes, we create a new tensor
+                return torch.zeros(shape, device=self.device, dtype=torch.float)
+        else:
+            dim = shape
+            
+        # Use cached tensor if available
+        if tensor_type == 'spec' and dim in self._zero_spec_cache:
+            return self._zero_spec_cache[dim].clone()
+        elif tensor_type == 'logit' and dim in self._zero_logit_cache:
+            return self._zero_logit_cache[dim].clone()
+        
+        # Otherwise create a new tensor and consider caching it for future use
+        zero_tensor = torch.zeros(dim, device=self.device, dtype=torch.float)
+        
+        # Only cache common sizes to avoid memory bloat
+        if tensor_type == 'spec' and dim in [144, 128, 256, 512]:
+            self._zero_spec_cache[dim] = zero_tensor.clone()
+        elif tensor_type == 'logit' and dim in [25, 72, 170]:
+            self._zero_logit_cache[dim] = zero_tensor.clone()
+            
+        return zero_tensor
+
     def __len__(self):
         return len(self.segment_indices)
     
     def __getitem__(self, idx):
-        """Get a segment by index, with proper padding for song boundaries and lazy loading"""
+        """Get a segment by index, with proper padding and direct GPU loading"""
         if not self.segment_indices:
             raise IndexError("Dataset is empty - no segments available")
+        
+        # Use the GPU batch cache if enabled and the item is cached
+        if self.batch_gpu_cache and idx in self.gpu_batch_cache:
+            return self.gpu_batch_cache[idx]
             
         seg_start, seg_end = self.segment_indices[idx]
         sequence = []
@@ -911,6 +1031,7 @@ class SynthDataset(Dataset):
         # Get first sample to determine shape for padding
         first_sample = self.samples[seg_start]
         first_spec = None
+        expected_dim = 144  # Default expected frequency dimension
         
         # Lazy loading for first sample to determine shape
         if 'spectro' not in first_sample and 'spec_path' in first_sample:
@@ -937,19 +1058,43 @@ class SynthDataset(Dataset):
                     else:
                         # Single-frame spectrogram
                         first_spec = np.array(mmap_spec)
+                        
+                # Convert numpy to PyTorch tensor and move to GPU immediately
+                first_spec = torch.tensor(first_spec, dtype=torch.float, device=self.device)
+                
+                # Validate the shape after loading
+                if first_spec is not None:
+                    if first_spec.dim() != 1 or first_spec.shape[0] < 10:
+                        if self.verbose and not hasattr(self, '_shape_warning_logged'):
+                            print(f"Warning: Unusual first_spec shape: {first_spec.shape}, expected 1D tensor with {expected_dim} elements")
+                            self._shape_warning_logged = True
+                        
+                        # If shape is unreasonable, fall back to expected shape
+                        if first_spec.dim() == 0 or first_spec.shape[0] < 10:
+                            first_spec = self._get_zero_tensor(expected_dim, 'spec')
+                else:
+                    first_spec = self._get_zero_tensor(expected_dim, 'spec')
+                
             except Exception as e:
                 # Fallback to zeros with a reasonable shape on error
                 warnings.warn(f"Error loading first sample: {e}, using zero padding")
-                first_spec = np.zeros((144,))
+                # Use cached zero tensor of common shape
+                first_spec = self._get_zero_tensor(expected_dim, 'spec')
         elif 'spectro' in first_sample:
-            # Use stored spectrogram if available
-            first_spec = first_sample.get('spectro', np.zeros((144,)))
+            # Use stored spectrogram if available - move to GPU immediately
+            if isinstance(first_sample['spectro'], np.ndarray):
+                first_spec = torch.tensor(first_sample['spectro'], 
+                                         dtype=torch.float, device=self.device)
+            else:
+                # Already a tensor - just move to the right device
+                first_spec = first_sample['spectro'].to(self.device)
         else:
-            # Default fallback
-            first_spec = np.zeros((144,))
+            # Default fallback - use cached zero tensor
+            first_spec = self._get_zero_tensor(expected_dim, 'spec')
 
         # Check for teacher logits availability in the dataset
-        check_for_logits = self.logits_dir is not None or any('teacher_logits' in s or 'logit_path' in s for s in self.samples[:100])
+        check_for_logits = self.logits_dir is not None or any('teacher_logits' in s or 'logit_path' in s 
+                                                           for s in self.samples[:min(100, len(self.samples))])
         
         # Process remaining samples in the segment
         start_song_id = self.samples[seg_start]['song_id']
@@ -962,54 +1107,82 @@ class SynthDataset(Dataset):
                 if sample_i['song_id'] != start_song_id:
                     # We've crossed a song boundary, pad the rest of the sequence
                     padding_needed = seg_end - i
-                    padding_shape = sequence[-1].shape if sequence else first_spec.shape
+                    
+                    # Get the padding shape, with better validation
+                    if sequence and sequence[-1].dim() > 0:
+                        padding_shape = sequence[-1].shape
+                    elif first_spec is not None and first_spec.dim() > 0:
+                        padding_shape = first_spec.shape
+                    else:
+                        # If all else fails, use a default expected shape
+                        padding_shape = (expected_dim,)
+                    
+                    # Use cached zero tensors for padding (avoids repeated GPU transfers)
                     for _ in range(padding_needed):
-                        sequence.append(torch.zeros(padding_shape, dtype=torch.float))
-                        label_seq.append(self.chord_to_idx.get("N", 0))
-                        # Also add padding to teacher_logits_seq if we have any logits
+                        padding_tensor = self._get_zero_tensor(padding_shape, 'spec')
+                        sequence.append(padding_tensor)
+                        # Use cached N chord index
+                        label_seq.append(self._n_chord_idx)
+                        
+                        # Also add padding to teacher_logits_seq
                         if has_teacher_logits or check_for_logits:
                             if teacher_logits_seq and teacher_logits_seq[0].shape:
                                 logit_shape = teacher_logits_seq[0].shape
-                                teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float))
+                                teacher_logits_seq.append(self._get_zero_tensor(logit_shape, 'logit'))
                             else:
-                                # Default class count if we don't have shape information yet
-                                default_classes = 170  # Default to a reasonable number of chord classes
-                                teacher_logits_seq.append(torch.zeros(default_classes, dtype=torch.float))
+                                # Default to common logit dimension
+                                teacher_logits_seq.append(self._get_zero_tensor(170, 'logit'))
                     break
                     
-                # Lazy load spectrogram if needed - most important part for memory efficiency
+                # Lazy load spectrogram directly to GPU
                 if 'spectro' not in sample_i and 'spec_path' in sample_i:
                     try:
                         spec_path = sample_i['spec_path']
                         spec = np.load(spec_path)
+                        
                         # For multi-frame spectrograms, extract the specific frame
                         if sample_i.get('frame_idx') is not None and len(spec.shape) > 1:
                             frame_idx = sample_i['frame_idx']
                             if frame_idx < spec.shape[0]:
-                                spec_vec = torch.tensor(spec[frame_idx], dtype=torch.float)
+                                # Create tensor directly on GPU to avoid CPU->GPU transfer
+                                spec_vec = torch.tensor(spec[frame_idx], 
+                                                      dtype=torch.float, device=self.device)
                             else:
-                                # Handle out of range index
-                                warnings.warn(f"Frame index {frame_idx} out of range for {spec_path} with shape {spec.shape}")
-                                spec_vec = torch.zeros(first_spec.shape, dtype=torch.float)
+                                # Handle out of range index using cached zero tensor
+                                padding_shape = sequence[-1].shape if sequence else first_spec.shape
+                                spec_vec = self._get_zero_tensor(padding_shape, 'spec')
                         else:
-                            spec_vec = torch.tensor(spec, dtype=torch.float)
+                            # Create tensor directly on GPU
+                            spec_vec = torch.tensor(spec, dtype=torch.float, device=self.device)
                     except Exception as e:
-                        # Use zeros on error
+                        # Use cached zero tensor on error
                         warnings.warn(f"Error loading {sample_i['spec_path']}: {e}")
                         padding_shape = sequence[-1].shape if sequence else first_spec.shape
-                        spec_vec = torch.zeros(padding_shape, dtype=torch.float)
+                        spec_vec = self._get_zero_tensor(padding_shape, 'spec')
                 else:
                     # Use stored spectrogram if available
-                    spec_vec = torch.tensor(sample_i.get('spectro', np.zeros_like(first_spec)), dtype=torch.float)
+                    if 'spectro' in sample_i:
+                        if isinstance(sample_i['spectro'], np.ndarray):
+                            # Convert numpy array to tensor on GPU
+                            spec_vec = torch.tensor(sample_i['spectro'], dtype=torch.float, device=self.device)
+                        else:
+                            # Already a tensor - just move to the right device
+                            spec_vec = sample_i['spectro'].to(self.device)
+                    else:
+                        # Create a zero tensor on GPU using cached tensors
+                        padding_shape = sequence[-1].shape if sequence else first_spec.shape
+                        spec_vec = self._get_zero_tensor(padding_shape, 'spec')
                 
                 # Get chord label and convert to index
                 chord_label = sample_i['chord_label']
                 chord_idx = self.chord_to_idx.get(chord_label, self.chord_to_idx.get("N", 0))
+                # Create the tensor directly on GPU
+                chord_idx_tensor = torch.tensor(chord_idx, dtype=torch.long, device=self.device)
                 
                 sequence.append(spec_vec)
-                label_seq.append(chord_idx)
+                label_seq.append(chord_idx_tensor)
                 
-                # Also handle lazy loading for teacher logits
+                # Also handle lazy loading for teacher logits directly to GPU
                 has_logits_for_this_sample = False
                 if 'logit_path' in sample_i and 'teacher_logits' not in sample_i:
                     try:
@@ -1023,88 +1196,90 @@ class SynthDataset(Dataset):
                             if frame_idx < teacher_logits.shape[0]:
                                 teacher_logits = teacher_logits[frame_idx]
                         
-                        # Convert to tensor
-                        logits_tensor = torch.tensor(teacher_logits, dtype=torch.float)
+                        # Convert directly to GPU tensor
+                        logits_tensor = torch.tensor(teacher_logits, dtype=torch.float, device=self.device)
                         teacher_logits_seq.append(logits_tensor)
                         has_logits_for_this_sample = True
                         has_teacher_logits = True
                     except Exception as e:
-                        # Only log the first few errors to avoid spam
                         if not hasattr(self, '_logit_load_errors'):
                             self._logit_load_errors = 0
                         if self._logit_load_errors < 5:
                             warnings.warn(f"Error loading teacher logits from {logit_path}: {e}")
                             self._logit_load_errors += 1
                 elif 'teacher_logits' in sample_i:
-                    # Use stored teacher logits if available
-                    teacher_logits_seq.append(torch.tensor(sample_i['teacher_logits'], dtype=torch.float))
+                    # Use stored teacher logits and move to GPU
+                    if isinstance(sample_i['teacher_logits'], np.ndarray):
+                        logits_tensor = torch.tensor(sample_i['teacher_logits'], 
+                                                   dtype=torch.float, device=self.device)
+                    else:
+                        # Already a tensor - just move to device
+                        logits_tensor = sample_i['teacher_logits'].to(self.device)
+                        
+                    teacher_logits_seq.append(logits_tensor)
                     has_logits_for_this_sample = True
                     has_teacher_logits = True
                 
-                # Add zero tensor if we're collecting logits but this sample doesn't have any
+                # Add zero tensor on GPU if we're collecting logits but this sample doesn't have any
                 if (has_teacher_logits or check_for_logits) and not has_logits_for_this_sample:
                     # Use shape from previous logit if available, otherwise use default
                     if teacher_logits_seq and len(teacher_logits_seq) > 0:
                         logit_shape = teacher_logits_seq[0].shape
-                        teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float))
+                        teacher_logits_seq.append(self._get_zero_tensor(logit_shape, 'logit'))
                     else:
                         # Default class count if we have no prior information
-                        default_classes = 170  # Default to a reasonable number of chord classes
-                        teacher_logits_seq.append(torch.zeros(default_classes, dtype=torch.float))
+                        teacher_logits_seq.append(self._get_zero_tensor(170, 'logit'))
             else:
                 # We've reached the end of the dataset, pad with zeros
                 padding_shape = sequence[-1].shape if sequence else first_spec.shape
-                sequence.append(torch.zeros(padding_shape, dtype=torch.float))
-                label_seq.append(self.chord_to_idx.get("N", 0))
+                sequence.append(self._get_zero_tensor(padding_shape, 'spec'))
+                label_seq.append(self._n_chord_idx)
                 
                 # Also add zero padding to teacher logits if needed
                 if has_teacher_logits or check_for_logits:
                     if teacher_logits_seq and len(teacher_logits_seq) > 0:
                         logit_shape = teacher_logits_seq[0].shape
-                        teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float))
+                        teacher_logits_seq.append(self._get_zero_tensor(logit_shape, 'logit'))
                     else:
-                        # Default class count if we have no prior information
-                        default_classes = 170  # Default to a reasonable number of chord classes
-                        teacher_logits_seq.append(torch.zeros(default_classes, dtype=torch.float))
+                        # Default logit shape
+                        teacher_logits_seq.append(self._get_zero_tensor(170, 'logit'))
         
         # Ensure we have exactly seq_len frames
         if len(sequence) < self.seq_len:
             padding_needed = self.seq_len - len(sequence)
             padding_shape = sequence[-1].shape if sequence else first_spec.shape
             for _ in range(padding_needed):
-                sequence.append(torch.zeros(padding_shape, dtype=torch.float))
-                label_seq.append(self.chord_to_idx.get("N", 0))
+                sequence.append(self._get_zero_tensor(padding_shape, 'spec'))
+                label_seq.append(self._n_chord_idx)
                 
                 # Add padding to teacher logits if needed
                 if has_teacher_logits or check_for_logits:
                     if teacher_logits_seq and len(teacher_logits_seq) > 0:
                         logit_shape = teacher_logits_seq[0].shape
-                        teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float))
+                        teacher_logits_seq.append(self._get_zero_tensor(logit_shape, 'logit'))
                     else:
-                        # Default class count if we have no prior information
-                        default_classes = 170  # Default to a reasonable number of chord classes
-                        teacher_logits_seq.append(torch.zeros(default_classes, dtype=torch.float))
+                        teacher_logits_seq.append(self._get_zero_tensor(170, 'logit'))
         
-        # Create sample output with the collected data
+        # Create sample output with the collected data - directly stacked on GPU
         sample_out = {
             'spectro': torch.stack(sequence, dim=0),       # [seq_len, feature_dim]
-            'chord_idx': torch.tensor(label_seq, dtype=torch.long)  # [seq_len]
+            'chord_idx': torch.stack(label_seq, dim=0)     # [seq_len]
         }
         
         # Always include teacher_logits if we're supposed to have them or found any
         if has_teacher_logits or check_for_logits:
             try:
-                # Ensure all teacher logits have the same shape
+                # We've already put all tensors on GPU, so stacking is more efficient
                 if all(tensor.shape == teacher_logits_seq[0].shape for tensor in teacher_logits_seq):
                     sample_out['teacher_logits'] = torch.stack(teacher_logits_seq, dim=0)
                 else:
-                    # If shapes don't match, log the first occurrence and standardize shapes
+                    # If shapes don't match, standardize shapes first
                     if self.verbose and not hasattr(self, '_logits_shape_mismatch'):
                         self._logits_shape_mismatch = True
                         shapes = [tensor.shape for tensor in teacher_logits_seq]
                         print(f"WARNING: Teacher logits shape mismatch: {shapes}")
                     
-                    # Use the most common shape as a fallback
+                    # Use the most common shape
                     shape_counter = Counter([tensor.shape for tensor in teacher_logits_seq])
                     most_common_shape = shape_counter.most_common(1)[0][0]
                     
@@ -1114,79 +1289,111 @@ class SynthDataset(Dataset):
                         if tensor.shape == most_common_shape:
                             uniform_logits.append(tensor)
                         else:
-                            uniform_logits.append(torch.zeros(most_common_shape, dtype=torch.float))
+                            uniform_logits.append(self._get_zero_tensor(most_common_shape, 'logit'))
                             
                     sample_out['teacher_logits'] = torch.stack(uniform_logits, dim=0)
             except Exception as e:
-                # If stacking fails for any reason, provide an empty tensor with correct shape
+                # Provide an empty tensor on GPU with correct shape
                 if self.verbose and not hasattr(self, '_logits_stack_error'):
                     print(f"WARNING: Could not stack teacher logits: {e}")
                     self._logits_stack_error = True
                 
-                # Create a dummy logits tensor with the correct sequence length
-                num_classes = 170  # Default number of classes
-                sample_out['teacher_logits'] = torch.zeros((len(sequence), num_classes), dtype=torch.float)
+                # Create a dummy logits tensor directly on GPU
+                logits_shape = (len(sequence), 170)  # Default shape
+                sample_out['teacher_logits'] = torch.zeros(logits_shape, 
+                                                         dtype=torch.float, device=self.device)
+        
+        # Store in GPU batch cache if enabled
+        if self.batch_gpu_cache:
+            self.gpu_batch_cache[idx] = sample_out
+            
+            # Limit cache size to avoid OOM
+            max_cached_items = 100
+            if len(self.gpu_batch_cache) > max_cached_items:
+                # Get the oldest key (the first item that was inserted)
+                oldest_key = next(iter(self.gpu_batch_cache))
+                # Remove it from the cache to make space for newer items
+                del self.gpu_batch_cache[oldest_key]
+                
+                # Note: This doesn't remove the item from the dataset,
+                # it just means it will be loaded from scratch next time it's needed
+                # instead of being retrieved from the GPU cache
         
         return sample_out
     
-    def get_train_iterator(self, batch_size=128, shuffle=True, num_workers=4, pin_memory=True):
+    def get_train_iterator(self, batch_size=128, shuffle=True, num_workers=None, pin_memory=None):
         """Get an optimized DataLoader for the training set"""
+        # Use class defaults if not specified
+        pin_memory_val = self.pin_memory if pin_memory is None else pin_memory
+        num_workers_val = self.num_workers if num_workers is None else num_workers
+        
         if not self.train_indices:
             warnings.warn("No training segments available")
             return DataLoader(
                 SynthSegmentSubset(self, []),
                 batch_size=batch_size,
                 shuffle=shuffle,
-                pin_memory=pin_memory
+                pin_memory=pin_memory_val
             )
             
         return DataLoader(
             SynthSegmentSubset(self, self.train_indices),
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=num_workers,  # Use multiple workers for data loading
-            pin_memory=pin_memory,   # Pin memory for faster GPU transfer
-            persistent_workers=True if num_workers > 0 else False  # Keep workers alive between epochs
+            num_workers=num_workers_val,
+            pin_memory=pin_memory_val,
+            persistent_workers=True if num_workers_val > 0 else False,
+            prefetch_factor=self.prefetch_factor if num_workers_val > 0 else None
         )
     
-    def get_eval_iterator(self, batch_size=128, shuffle=False, num_workers=4, pin_memory=True):
+    def get_eval_iterator(self, batch_size=128, shuffle=False, num_workers=None, pin_memory=None):
         """Get an optimized DataLoader for the evaluation set"""
+        # Use class defaults if not specified
+        pin_memory_val = self.pin_memory if pin_memory is None else pin_memory
+        num_workers_val = self.num_workers if num_workers is None else num_workers
+        
         if not self.eval_indices:
             warnings.warn("No evaluation segments available")
             return DataLoader(
                 SynthSegmentSubset(self, []),
                 batch_size=batch_size,
                 shuffle=shuffle,
-                pin_memory=pin_memory
+                pin_memory=pin_memory_val
             )
             
         return DataLoader(
             SynthSegmentSubset(self, self.eval_indices),
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=True if num_workers > 0 else False
+            num_workers=num_workers_val,
+            pin_memory=pin_memory_val,
+            persistent_workers=True if num_workers_val > 0 else False,
+            prefetch_factor=self.prefetch_factor if num_workers_val > 0 else None
         )
     
-    def get_test_iterator(self, batch_size=128, shuffle=False, num_workers=4, pin_memory=True):
+    def get_test_iterator(self, batch_size=128, shuffle=False, num_workers=None, pin_memory=None):
         """Get an optimized DataLoader for the test set"""
+        # Use class defaults if not specified
+        pin_memory_val = self.pin_memory if pin_memory is None else pin_memory
+        num_workers_val = self.num_workers if num_workers is None else num_workers
+        
         if not self.test_indices:
             warnings.warn("No test segments available")
             return DataLoader(
                 SynthSegmentSubset(self, []),
                 batch_size=batch_size,
                 shuffle=shuffle,
-                pin_memory=pin_memory
+                pin_memory=pin_memory_val
             )
             
         return DataLoader(
             SynthSegmentSubset(self, self.test_indices),
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=True if num_workers > 0 else False
+            num_workers=num_workers_val,
+            pin_memory=pin_memory_val,
+            persistent_workers=True if num_workers_val > 0 else False,
+            prefetch_factor=self.prefetch_factor if num_workers_val > 0 else None
         )
 
 

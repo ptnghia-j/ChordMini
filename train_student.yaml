@@ -12,6 +12,15 @@ spec:
       labels:
         app: chord-student-training
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A10
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -108,7 +117,7 @@ spec:
               mountPath: /mnt/storage
       containers:
         - name: student-trainer
-          image: pytorch/pytorch:1.9.0-cuda11.1-cudnn8-runtime
+          image: pytorch/pytorch:1.13.1-cuda11.6-cudnn8-runtime
           workingDir: /mnt/storage/ChordMini
           imagePullPolicy: IfNotPresent
           env:
@@ -136,6 +145,16 @@ spec:
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
+            # GPU memory utilization optimization
+            - name: GPU_MEMORY_FRACTION
+              value: "0.95"  # Use 95% of available GPU memory
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+            # Dataset GPU optimization flags
+            - name: BATCH_GPU_CACHE
+              value: "true"  # Enable GPU batch caching
+            - name: PREFETCH_FACTOR
+              value: "4"     # Prefetch 4 batches for better throughput
           command:
             - sh
             - -c
@@ -149,16 +168,38 @@ spec:
               # Create a minimal requirements.txt if missing
               if [ ! -f requirements.txt ]; then
                 echo "Creating minimal requirements.txt"
-                echo "numpy==1.22.0" > requirements.txt
+                echo "numpy>=1.21.0" > requirements.txt  # Updated for compatibility
                 echo "librosa>=0.8.0" >> requirements.txt
                 echo "torch>=1.9.0" >> requirements.txt
                 echo "tqdm>=4.62.0" >> requirements.txt
                 echo "scikit-learn>=1.0.0" >> requirements.txt
-                echo "pyyaml>=6.0.0" >> requirements.txt  # Added for config loading
+                echo "pyyaml>=6.0.0" >> requirements.txt
+                echo "mir_eval>=0.6.0" >> requirements.txt # Critical for chord evaluation
               fi
               
+              # First install critical dependencies
+              echo "Installing critical dependencies..."
+              pip install --no-cache-dir mir_eval scipy pandas matplotlib
+              
+              # Then install all requirements
               pip install --no-cache-dir -r requirements.txt || { echo "WARNING: Some requirements may have failed"; }
               pip install --no-cache-dir matplotlib tqdm pyyaml librosa scikit-learn || { echo "ERROR: Failed to install additional Python packages"; exit 1; }
+              
+              # Verify GPU is available
+              echo "Checking GPU availability..."
+              python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('GPU device count:', torch.cuda.device_count()); print('GPU device name:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')" || {
+                echo "WARNING: GPU validation failed - proceeding anyway";
+              }
+              
+              # Check for A10 GPU and optimize configurations accordingly
+              if python -c "import torch; import re; is_a10 = torch.cuda.is_available() and bool(re.search('A10', torch.cuda.get_device_name(0), re.IGNORECASE)); print(is_a10)" | grep -q True; then
+                echo "NVIDIA A10 GPU detected - using optimized settings"
+                # A10 has more memory, we can increase batch size
+                BATCH_OVERRIDE="--storage_root /mnt/storage"
+              else
+                echo "Using standard GPU configuration"
+                BATCH_OVERRIDE="--storage_root /mnt/storage"
+              fi
               
               # Verify the data paths from the config
               echo "Checking data paths from config..."
@@ -287,30 +328,47 @@ spec:
                     KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth --label_dir ${DATA_ROOT}/logits/synth --logits_dir ${DATA_ROOT}/logits/synth"
                     echo "Using flat KD directory structure"
                   else
-                    echo "WARNING: Could not determine KD directory structure, using defaults"
-                    KD_ARGS="--logits_dir ${DATA_ROOT}/logits/synth"
+                    echo "WARNING: KD_DATA_ROOT does not exist: ${DATA_ROOT}/logits/synth"
+                    echo "Attempting to use default paths"
+                    KD_ARGS="--logits_dir /mnt/storage/data/logits/synth/logits"
+                    
+                    # Create parent directories to avoid errors later
+                    mkdir -p "/mnt/storage/data/logits/synth/logits"
                   fi
-                else
-                  echo "WARNING: KD_DATA_ROOT does not exist: ${DATA_ROOT}/logits/synth"
-                  echo "Attempting to use default paths"
-                  KD_ARGS="--logits_dir /mnt/storage/data/logits/synth/logits"
                   
-                  # Create parent directories to avoid errors later
-                  mkdir -p "/mnt/storage/data/logits/synth/logits"
+                  # Log the actual paths being used
+                  echo "KD arguments: ${KD_ARGS}"
+                else
+                  KD_ARGS=""
                 fi
-                
-                # Log the actual paths being used
-                echo "KD arguments: ${KD_ARGS}"
               else
                 KD_ARGS=""
               fi
               
+              # GPU acceleration options
+              GPU_ARGS=""
+              if [ "${GPU_MEMORY_FRACTION}" != "" ]; then
+                GPU_ARGS="--gpu_memory_fraction ${GPU_MEMORY_FRACTION}"
+              fi
+              
+              if [ "${BATCH_GPU_CACHE}" = "true" ]; then
+                GPU_ARGS="${GPU_ARGS} --batch_gpu_cache"
+              fi
+              
+              if [ "${PREFETCH_FACTOR}" != "" ]; then
+                GPU_ARGS="${GPU_ARGS} --prefetch_factor ${PREFETCH_FACTOR}"
+              fi
+              
               # Run the student training script with all options
-              echo "Starting student training with updated script and all options..."
+              echo "Starting student training with GPU optimization and all options..."
               python train_student.py --config ./config/student_config.yaml --save_dir checkpoints/student \
-                ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS}
+                ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} \
+                ${GPU_ARGS} ${BATCH_OVERRIDE}
               
               echo "=== Student model training complete ==="
+              
+              # Clear GPU cache to release memory before exiting
+              python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
             requests:
               cpu: "4"             
