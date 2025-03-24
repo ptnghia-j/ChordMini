@@ -61,6 +61,14 @@ class SynthDataset(Dataset):
             batch_gpu_cache: Whether to cache batches on GPU for repeated access patterns
             small_dataset_percentage: Optional percentage of the dataset to use (0-1.0)
         """
+        # First, log initialization time start to track potential timeout issues
+        import time
+        init_start_time = time.time()
+        if verbose:
+            print(f"SynthDataset initialization started at {time.strftime('%H:%M:%S')}")
+            print(f"Using spec_dir: {spec_dir}")
+            print(f"Using label_dir: {label_dir}")
+        
         # Check for CUDA availability
         self.cuda_available = torch.cuda.is_available()
         
@@ -150,9 +158,14 @@ class SynthDataset(Dataset):
             
         # Only load data if not using lazy initialization
         if not self.lazy_init:
+            if verbose:
+                print(f"Starting full data loading at {time.time() - init_start_time:.1f}s from init start")
+                print("This may take a while - consider using lazy_init=True for faster startup")
             self._load_data()
             self._generate_segments()
         else:
+            if verbose:
+                print(f"Using lazy initialization (faster startup) at {time.time() - init_start_time:.1f}s from init start")
             # In lazy mode, scan paths and build lightweight metadata, but don't load files
             self.samples = []
             self.segment_indices = []
@@ -305,6 +318,17 @@ class SynthDataset(Dataset):
                 self._zero_spec_cache = {}
                 self._zero_logit_cache = {}
                 self.batch_gpu_cache = None
+        
+        # Report total initialization time
+        init_time = time.time() - init_start_time
+        if verbose:
+            print(f"Dataset initialization completed in {init_time:.2f} seconds")
+            # Add a warning if initialization was slow
+            if init_time > 60:  # More than a minute
+                print(f"NOTE: Slow initialization detected ({init_time:.1f}s). For large datasets, consider:")
+                print("1. Using lazy_init=True to speed up startup")
+                print("2. Using metadata_only=True to reduce memory usage")
+                print("3. Using a smaller dataset with small_dataset_percentage=0.01")
 
     def _init_gpu_cache(self):
         """Initialize GPU cache for common tensors to minimize transfers with enhanced error handling"""
@@ -334,72 +358,65 @@ class SynthDataset(Dataset):
                                  list(self._zero_logit_cache.values())) / (1024 * 1024)
                     print(f"Allocated {cache_mb:.2f}MB for GPU tensor cache")
             except Exception as e:
-                warnings.warn(f"Failed to initialize GPU cache: {str(e)}")
-                # Reset cache structures to avoid issues
+                if self.verbose:
+                    print(f"Error initializing GPU cache: {e}")
                 self._zero_spec_cache = {}
                 self._zero_logit_cache = {}
-                # Store scalar for N chord index as fallback
-                self._n_chord_idx = 0
 
     def _load_data(self):
-        """Optimized data loading with caching for single worker"""
+        """Load data from files or cache with optimized memory usage and error handling"""
         start_time = time.time()
         
-        # Try to load from cache first
+        # Try to load data from cache first
         if self.use_cache and os.path.exists(self.cache_file):
-            if self.verbose:
-                print(f"Loading dataset from cache: {self.cache_file}")
             try:
                 with open(self.cache_file, 'rb') as f:
                     cache_data = pickle.load(f)
-                    # Validate and use cache data
-                    if ('samples' in cache_data and 'chord_to_idx' in cache_data and 
-                        isinstance(cache_data['samples'], list) and 
-                        isinstance(cache_data['chord_to_idx'], dict)):
-                        
-                        # Cache validation successful, load the data
-                        self.samples = cache_data['samples']
-                        self.chord_to_idx = cache_data['chord_to_idx']
-                        
-                        # IMPORTANT: Check if we're using small_dataset_percentage and if cache is not already filtered
-                        if self.small_dataset_percentage is not None and self.small_dataset_percentage < 1.0:
-                            original_count = len(self.samples)
-                            if 'small_dataset_percentage' not in cache_data or cache_data.get('small_dataset_percentage') != self.small_dataset_percentage:
-                                if self.verbose:
-                                    print(f"NOTE: Cache was created with full dataset but now using small_dataset_percentage={self.small_dataset_percentage}")
-                                    print(f"Will filter samples from {original_count} to {int(original_count * self.small_dataset_percentage)} (approx)")
-                                
-                                # Group samples by song_id to maintain song integrity in the subset
-                                song_groups = {}
-                                for sample in self.samples:
-                                    song_id = sample['song_id']
-                                    if song_id not in song_groups:
-                                        song_groups[song_id] = []
-                                    song_groups[song_id].append(sample)
-                                
-                                # Select only the percentage of songs needed
-                                songs_to_keep = max(1, int(len(song_groups) * self.small_dataset_percentage))
-                                selected_song_ids = list(song_groups.keys())[:songs_to_keep]
-                                
-                                # Filter samples to only those from selected songs
-                                filtered_samples = []
-                                for song_id in selected_song_ids:
-                                    filtered_samples.extend(song_groups[song_id])
-                                
-                                # Update samples with filtered set
-                                self.samples = filtered_samples
-                                if self.verbose:
-                                    print(f"Filtered from {original_count} to {len(self.samples)} samples ({len(self.samples)/original_count*100:.1f}%)")
-                            else:
-                                if self.verbose:
-                                    print(f"Cache already filtered to small_dataset_percentage={cache_data.get('small_dataset_percentage')}")
-                        
-                        if self.verbose:
-                            print(f"Loaded {len(self.samples)} samples from cache in {time.time() - start_time:.2f}s")
-                        
-                        return
-                    else:
-                        print("Cache format invalid, rebuilding dataset")
+                
+                # Verify cache format
+                if isinstance(cache_data, dict) and 'samples' in cache_data and 'chord_to_idx' in cache_data:
+                    self.samples = cache_data['samples']
+                    self.chord_to_idx = cache_data['chord_to_idx']
+                    
+                    # IMPORTANT: Check if we're using small_dataset_percentage and if cache is not already filtered
+                    if self.small_dataset_percentage is not None and self.small_dataset_percentage < 1.0:
+                        original_count = len(self.samples)
+                        if 'small_dataset_percentage' not in cache_data or cache_data.get('small_dataset_percentage') != self.small_dataset_percentage:
+                            if self.verbose:
+                                print(f"NOTE: Cache was created with full dataset but now using small_dataset_percentage={self.small_dataset_percentage}")
+                                print(f"Will filter samples from {original_count} to {int(original_count * self.small_dataset_percentage)} (approx)")
+                            
+                            # Group samples by song_id to maintain song integrity in the subset
+                            song_groups = {}
+                            for sample in self.samples:
+                                song_id = sample['song_id']
+                                if song_id not in song_groups:
+                                    song_groups[song_id] = []
+                                song_groups[song_id].append(sample)
+                            
+                            # Select only the percentage of songs needed
+                            songs_to_keep = max(1, int(len(song_groups) * self.small_dataset_percentage))
+                            selected_song_ids = list(song_groups.keys())[:songs_to_keep]
+                            
+                            # Filter samples to only those from selected songs
+                            filtered_samples = []
+                            for song_id in selected_song_ids:
+                                filtered_samples.extend(song_groups[song_id])
+                            
+                            # Update samples with filtered set
+                            self.samples = filtered_samples
+                            if self.verbose:
+                                print(f"Filtered from {original_count} to {len(self.samples)} samples ({len(self.samples)/original_count*100:.1f}%)")
+                        else:
+                            if self.verbose:
+                                print(f"Cache already filtered to small_dataset_percentage={cache_data.get('small_dataset_percentage')}")
+                    
+                    if self.verbose:
+                        print(f"Loaded {len(self.samples)} samples from cache in {time.time() - start_time:.2f}s")
+                    
+                    return
+                else:
+                    print("Cache format invalid, rebuilding dataset")
             except Exception as e:
                 if self.verbose:
                     print(f"Error loading cache, rebuilding dataset: {e}")
@@ -1347,15 +1364,8 @@ class SynthDataset(Dataset):
             
             return sample_out
         
-        except TimeoutError:
-            # This is coming from the timeout handler in main() - we should pass it up
-            raise
         except Exception as e:
-            # Check if this is a timeout error from signal handler, which we should propagate
-            if "Training function took too long to start" in str(e):
-                raise  # Re-raise the timeout error to be handled properly
-                
-            # For other errors, log but don't generate dummy data
+            # For all errors, log but don't generate dummy data
             if self.verbose:
                 print(f"Error in dataset.__getitem__: {e}")
                 
