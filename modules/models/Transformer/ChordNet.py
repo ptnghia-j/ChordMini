@@ -204,59 +204,46 @@ class ChordNet(nn.Module):
 
         return logits, o if loss is None else (logits, loss)
 
-    def predict(self, x, weight=None, per_frame=False):
+    def predict(self, x):
         """
-        Make chord predictions from input spectrograms with enhanced dimension handling.
+        Generate frame-by-frame predictions for input sequences.
         
         Args:
-            x: Input tensor
-            weight: Optional weight parameter
-            per_frame: If True, return predictions per frame (time step)
-                       If False (default), average over time dimension
+            x: Input tensor of shape [batch_size, seq_len, freq_dim]
+               or [batch_size, 1, seq_len, freq_dim]
         
         Returns:
-            Tensor of predictions with shape [batch] or [batch, time] depending on per_frame
+            Predicted chord indices for each frame in the sequence: [batch_size * seq_len]
         """
+        self.eval()
         with torch.no_grad():
-            try:
-                logits, _ = self.forward(x, weight)
-                
-                # Input validation - ensure we have valid logits
-                if torch.isnan(logits).any():
-                    warnings.warn("NaN values detected in prediction logits! Replacing with zeros.")
-                    logits = torch.nan_to_num(logits, nan=0.0)
-                
-                # Return per-frame predictions if requested and available
-                if per_frame and logits.ndim == 3:
-                    # Add check to verify time dimension exists and has expected size
-                    time_dim = logits.size(1)
-                    if time_dim == 0:
-                        warnings.warn("Empty time dimension detected, returning batch predictions")
-                        return torch.argmax(logits.squeeze(1), dim=-1)
-                        
-                    # Check for reasonable time dimension
-                    if time_dim > 10000:  # Sanity check for unreasonably large values
-                        warnings.warn(f"Unusually large time dimension: {time_dim}, may indicate a bug")
-                                
-                    return torch.argmax(logits, dim=2)  # [batch, time]
-                
-                # Otherwise use the standard approach with averaging
-                if logits.ndim == 3:
-                    logits = logits.mean(dim=1)  # Average over time dimension
-                    
-                return torch.argmax(logits, dim=-1)  # [batch]
+            # Make sure input has the right shape
+            if x.dim() == 4:  # [batch, channels, seq_len, freq_dim]
+                x = x.squeeze(1)  # Remove channel dimension if present
             
-            except Exception as e:
-                warnings.warn(f"Error during prediction: {e}")
-                # Return fallback prediction of zeros with appropriate shape
-                batch_size = x.size(0)
-                # Get device from input tensor or fall back to utils module
-                device = x.device if hasattr(x, 'device') else get_device()
-                if per_frame and x.dim() > 2:
-                    time_steps = x.size(2) if x.dim() > 3 else x.size(1)
-                    return torch.zeros((batch_size, time_steps), device=device, dtype=torch.long)
-                else:
-                    return torch.zeros(batch_size, device=device, dtype=torch.long)
+            # Original forward pass
+            logits = self.forward(x)
+            
+            # Get the predictions for each frame
+            if isinstance(logits, tuple):
+                # Some models might return (logits, hidden_states)
+                logits = logits[0]
+            
+            # Check if we have a 3D tensor [batch, seq, classes]
+            if logits.dim() == 3:
+                # Get predictions for each frame in the sequence
+                batch_size, seq_len, n_classes = logits.shape
+                
+                # Reshape to [batch_size * seq_len, n_classes] for frame-by-frame prediction
+                logits = logits.reshape(-1, n_classes)
+                
+                # Get the most likely chord for each frame
+                frame_predictions = torch.argmax(logits, dim=1)
+                
+                return frame_predictions
+            else:
+                # Fallback for models that already output flattened predictions
+                return torch.argmax(logits, dim=1)
 
 
 if __name__ == '__main__':

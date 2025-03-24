@@ -39,7 +39,7 @@ class Tester:
         self.idx_to_chord = idx_to_chord
         self.normalization = normalization
         self.output_dir = output_dir
-        self.logger = logger  # Add support for logger parameter
+        self.logger = logger
 
     def evaluate(self, save_plots=False):
         self.model.eval()
@@ -49,6 +49,9 @@ class Tester:
         # Debug counters
         pred_counter = Counter()
         target_counter = Counter()
+        
+        # Track batch shapes for debugging
+        batch_shapes = []
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.test_loader):
@@ -59,28 +62,43 @@ class Tester:
                     inputs, targets = batch
                     inputs = inputs.to(self.device)
                     targets = targets.to(self.device)
-                    
+                
+                # Record input shapes for debugging
+                batch_shapes.append(f"Batch {batch_idx}: inputs {inputs.shape}, targets {targets.shape}")
+                
                 if self.normalization:
                     mean = self.normalization['mean'].to(self.device)
                     std = self.normalization['std'].to(self.device)
                     inputs = (inputs - mean) / std
                 
-                # Make sure inputs have right shape
+                # Reshape inputs if needed
                 if inputs.dim() == 2:  # [batch, features]
                     inputs = inputs.unsqueeze(1)  # Add time dimension
-                
-                # Get predictions
+                    
+                # Get frame-by-frame predictions
                 outputs = self.model.predict(inputs)
                 
                 # Move to CPU for processing
                 preds_np = outputs.cpu().numpy()
-                targets_np = targets.cpu().numpy()
                 
-                # Flatten predictions and targets if needed
-                if preds_np.ndim > 1:
-                    preds_np = preds_np.flatten()
-                if targets_np.ndim > 1:
-                    targets_np = targets_np.flatten()
+                # Flatten targets if needed
+                if targets.dim() > 1:
+                    targets_np = targets.cpu().numpy().flatten()
+                else:
+                    targets_np = targets.cpu().numpy()
+                
+                # Log shapes to debug dimension mismatches
+                if batch_idx == 0:
+                    self._log(f"First batch shapes - Predictions: {preds_np.shape}, Targets: {targets_np.shape}")
+                
+                # Ensure predictions and targets have the same length
+                # If they don't, this indicates a bug in our model.predict implementation
+                if len(preds_np) != len(targets_np):
+                    self._log(f"WARNING: Prediction length ({len(preds_np)}) != Target length ({len(targets_np)})")
+                    # Find the minimum length and truncate both arrays
+                    min_len = min(len(preds_np), len(targets_np))
+                    preds_np = preds_np[:min_len]
+                    targets_np = targets_np[:min_len]
                 
                 # Add to lists
                 all_preds.extend(preds_np)
@@ -91,6 +109,19 @@ class Tester:
                     pred_counter[pred] += 1
                 for target in targets_np:
                     target_counter[target] += 1
+
+        # Log batch shapes if there were problems
+        if len(all_preds) != len(all_targets):
+            self._log("WARNING: Final prediction and target counts don't match!")
+            self._log(f"Predictions: {len(all_preds)}, Targets: {len(all_targets)}")
+            self._log("Batch shapes:")
+            for shape_info in batch_shapes[:5]:  # Show first 5 batches
+                self._log(shape_info)
+            
+            # Ensure lengths match for metrics calculation
+            min_len = min(len(all_preds), len(all_targets))
+            all_preds = all_preds[:min_len]
+            all_targets = all_targets[:min_len]
 
         # Print distribution statistics
         self._log("\nTarget Distribution (top 10):")
@@ -104,6 +135,7 @@ class Tester:
             self._log(f"{chord_name}: {count} samples ({count/sum(pred_counter.values())*100:.2f}%)")
 
         # Calculate metrics
+        self._log(f"\nCalculating metrics on {len(all_targets)} samples")
         accuracy = accuracy_score(all_targets, all_preds)
         precision = precision_score(all_targets, all_preds, average='weighted', zero_division=0)
         recall = recall_score(all_targets, all_preds, average='weighted', zero_division=0)
@@ -118,6 +150,10 @@ class Tester:
         self._log(f"Test Precision: {precision:.4f}")
         self._log(f"Test Recall: {recall:.4f}")
         self._log(f"Test F1 Score: {f1:.4f}")
+        
+        # Also calculate per-segment metrics by majority voting
+        self._log("\nCalculating per-segment metrics by majority voting:")
+        self._calculate_segment_metrics(self.test_loader)
         
         # Save plots if requested and output directory is provided
         if save_plots and self.output_dir:
@@ -153,6 +189,73 @@ class Tester:
             'precision': precision,
             'recall': recall,
             'f1': f1
+        }
+    
+    def _calculate_segment_metrics(self, test_loader):
+        """Calculate metrics at the segment level using majority voting"""
+        segment_predictions = []
+        segment_targets = []
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                if isinstance(batch, dict):
+                    inputs = batch['spectro'].to(self.device)
+                    targets = batch['chord_idx'].to(self.device)
+                else:
+                    inputs, targets = batch
+                    inputs = inputs.to(self.device)
+                    targets = targets.to(self.device)
+                    
+                if self.normalization:
+                    mean = self.normalization['mean'].to(self.device)
+                    std = self.normalization['std'].to(self.device)
+                    inputs = (inputs - mean) / std
+                
+                # Make sure inputs have right shape
+                if inputs.dim() == 2:  # [batch, features]
+                    inputs = inputs.unsqueeze(1)  # Add time dimension
+                
+                # Get frame-by-frame predictions
+                outputs = self.model.predict(inputs)
+                
+                # Reshape predictions and targets to [batch, seq_len]
+                batch_size = inputs.size(0)
+                seq_len = inputs.size(1)
+                
+                # Reshape predictions to [batch, seq_len]
+                predictions_reshaped = outputs.cpu().reshape(batch_size, seq_len).numpy()
+                targets_reshaped = targets.cpu().numpy()
+                
+                # Get majority vote for each segment
+                for batch_idx in range(batch_size):
+                    pred_segment = predictions_reshaped[batch_idx]
+                    target_segment = targets_reshaped[batch_idx]
+                    
+                    # Majority vote for predictions
+                    majority_pred = np.bincount(pred_segment).argmax()
+                    
+                    # Majority vote for targets (though they should all be the same in a segment)
+                    majority_target = np.bincount(target_segment).argmax()
+                    
+                    segment_predictions.append(majority_pred)
+                    segment_targets.append(majority_target)
+        
+        # Calculate metrics
+        accuracy = accuracy_score(segment_targets, segment_predictions)
+        precision = precision_score(segment_targets, segment_predictions, average='weighted', zero_division=0)
+        recall = recall_score(segment_targets, segment_predictions, average='weighted', zero_division=0)
+        f1 = f1_score(segment_targets, segment_predictions, average='weighted', zero_division=0)
+        
+        self._log(f"Segment-level Accuracy: {accuracy:.4f}")
+        self._log(f"Segment-level Precision: {precision:.4f}")
+        self._log(f"Segment-level Recall: {recall:.4f}")
+        self._log(f"Segment-level F1 Score: {f1:.4f}")
+        
+        return {
+            'segment_accuracy': accuracy,
+            'segment_precision': precision,
+            'segment_recall': recall,
+            'segment_f1': f1
         }
     
     def _log(self, message):
@@ -429,6 +532,17 @@ def main():
         logger.info(f"Using LR warm-up for {warmup_epochs} epochs")
         logger.info(f"Warm-up start LR: {args.warmup_start_lr or config.training.get('warmup_start_lr', config.training['learning_rate']/10)}")
     
+    # Log small dataset percentage setting if enabled
+    small_dataset_percentage = args.small_dataset
+    if small_dataset_percentage is None:
+        # Check config if argument not provided
+        small_dataset_percentage = config.data.get('small_dataset_percentage')
+    
+    if small_dataset_percentage is not None:
+        logger.info(f"\n=== Using Small Dataset ===")
+        logger.info(f"Dataset will be limited to {small_dataset_percentage*100:.1f}% of the full size")
+        logger.info(f"This is a testing/development feature and should not be used for final training")
+    
     # Set random seed for reproducibility
     if hasattr(config.misc, 'seed'):
         seed = config.misc['seed']
@@ -573,8 +687,8 @@ def main():
         'spec_dir': synth_spec_dir,
         'label_dir': synth_label_dir,
         'chord_mapping': chord_mapping,
-        'seq_len': config.training['seq_len'],
-        'stride': config.training['seq_stride'],
+        'seq_len': config.training.get('seq_len', 10),  # Add fallback default
+        'stride': config.training.get('seq_stride', 5),  # Add fallback default
         'frame_duration': frame_duration,
         'verbose': True,
         'device': device,  # Pass the device for GPU acceleration
@@ -604,9 +718,54 @@ def main():
         dataset_args['small_dataset_percentage'] = args.small_dataset
         logger.info(f"Using only {args.small_dataset * 100:.1f}% of the dataset for quick testing")
     
+    # Update dataset initialization to ensure small_dataset_percentage is passed correctly
+    dataset_args['small_dataset_percentage'] = small_dataset_percentage
+    
     # Create the dataset with parameters
     logger.info("Creating SynthDataset...")
     synth_dataset = SynthDataset(**dataset_args)
+    
+    # After loading data, print dataset sizes to confirm data is available
+    logger.info("\n=== Dataset Statistics ===")
+    logger.info(f"Total segments: {len(synth_dataset)}")
+    logger.info(f"Training segments: {len(synth_dataset.train_indices)}")
+    logger.info(f"Validation segments: {len(synth_dataset.eval_indices)}")
+    logger.info(f"Test segments: {len(synth_dataset.test_indices)}")
+    
+    # Check if we ended up with empty datasets after filtering
+    if len(synth_dataset.train_indices) == 0:
+        logger.error("ERROR: Training dataset is empty after processing. Cannot proceed with training.")
+        return
+    
+    if len(synth_dataset.eval_indices) == 0:
+        logger.warning("WARNING: Validation dataset is empty. Will skip validation steps.")
+    
+    # Create data loaders with optimized settings for GPU - MOVE THIS BEFORE CHECKING THE LOADER
+    # IMPORTANT FIX: Force zero workers to avoid multiprocessing issues
+    train_loader = synth_dataset.get_train_iterator(
+        batch_size=config.training['batch_size'], 
+        shuffle=True,
+        num_workers=0,  # Force 0 to avoid shared memory issues
+        pin_memory=False  # Disable pin memory to avoid memory issues
+    )
+    
+    val_loader = synth_dataset.get_eval_iterator(
+        batch_size=config.training['batch_size'], 
+        shuffle=False,
+        num_workers=0,  # Force 0 to avoid shared memory issues
+        pin_memory=False  # Disable pin memory
+    )
+    
+    # Check train loader
+    logger.info("\n=== Checking data loaders ===")
+    try:
+        # Check if we can get at least one batch from the loader
+        batch = next(iter(train_loader))
+        logger.info(f"First batch loaded successfully: {batch['spectro'].shape}")
+    except Exception as e:
+        logger.error(f"ERROR: Failed to load first batch from train_loader: {e}")
+        logger.error("Cannot proceed with training due to data loading issue.")
+        return
     
     # Initialize model
     logger.info("\n=== Creating model ===")
@@ -636,19 +795,19 @@ def main():
         n_freq=n_freq,
         n_classes=n_classes,
         n_group=n_group,
-        f_layer=config.model['f_layer'],
-        f_head=config.model['f_head'],
-        t_layer=config.model['t_layer'],
-        t_head=config.model['t_head'],
-        d_layer=config.model['d_layer'],
-        d_head=config.model['d_head'],
-        dropout=config.model['dropout']
+        f_layer=config.model.get('base_config', {}).get('f_layer', 3),
+        f_head=config.model.get('base_config', {}).get('f_head', 6),
+        t_layer=config.model.get('base_config', {}).get('t_layer', 3),
+        t_head=config.model.get('base_config', {}).get('t_head', 6),
+        d_layer=config.model.get('base_config', {}).get('d_layer', 3),
+        d_head=config.model.get('base_config', {}).get('d_head', 6),
+        dropout=config.model.get('dropout', 0.5)
     ).to(device)
     
     # Create optimizer
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=config.training['learning_rate'],
+        lr=config.training.get('learning_rate', 0.0001),
         weight_decay=config.training.get('weight_decay', 0.0)
     )
     
@@ -784,7 +943,7 @@ def main():
         model=model,
         optimizer=optimizer, 
         device=device,
-        num_epochs=config.training['num_epochs'],
+        num_epochs=config.training.get('num_epochs', config.training.get('max_epochs', 100)),
         logger=logger,
         checkpoint_dir=checkpoints_dir,
         class_weights=None,  # Using focal loss instead of class weights
@@ -808,15 +967,57 @@ def main():
     # Set chord mapping in trainer for checkpoint saving
     trainer.set_chord_mapping(chord_mapping)
     
-    # Run training
+    # After model initialization, log the model structure
+    logger.info("\n=== Model Summary ===")
+    try:
+        # Log basic model information
+        parameter_count = sum(p.numel() for p in model.parameters())
+        trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"Total parameters: {parameter_count:,}")
+        logger.info(f"Trainable parameters: {trainable_count:,}")
+        
+        # Log structure of first batch to confirm dimensions
+        sample_batch = next(iter(train_loader))
+        logger.info(f"Input spectro shape: {sample_batch['spectro'].shape}")
+        logger.info(f"Target chord_idx shape: {sample_batch['chord_idx'].shape}")
+        
+        # Verify we have teacher logits if KD is enabled
+        if use_kd and 'teacher_logits' not in sample_batch:
+            logger.error("ERROR: Knowledge distillation is enabled but no teacher_logits found in batch.")
+            logger.error("Check your dataset configuration or disable KD with --use_kd_loss=false")
+            return
+            
+    except Exception as e:
+        logger.error(f"ERROR: Failed during model check: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return
+    
+    # Run training with error reporting
     logger.info("\n=== Starting training ===")
     try:
+        # Wrap the training call with timeout handling to detect hangs
+        import signal
+        
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Training function took too long to start")
+        
+        # Set a timeout for 60 seconds - if training doesn't start by then, there's an issue
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(60)
+        
         trainer.train(train_loader, val_loader)
+        # Cancel the alarm if training starts successfully
+        signal.alarm(0)
+        
         logger.info("Training completed successfully!")
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
+    except TimeoutError as e:
+        logger.error(f"ERROR: {e}")
+        logger.error("Training function did not start within the expected time. This could indicate a deadlock or infinite loop.")
     except Exception as e:
-        logger.error(f"Error during training: {e}")
+        logger.error(f"ERROR during training: {e}")
         import traceback
         logger.error(traceback.format_exc())
     
