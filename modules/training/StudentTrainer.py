@@ -5,6 +5,7 @@ from modules.training.Trainer import BaseTrainer
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, OneCycleLR, CosineAnnealingWarmRestarts
 import torch.nn.functional as F
 import matplotlib.pyplot as plt  # Add missing matplotlib import
+from collections import Counter
 
 class StudentTrainer(BaseTrainer):
     """
@@ -416,6 +417,8 @@ class StudentTrainer(BaseTrainer):
             
             # Standard cross entropy loss for hard targets
             ce_loss = F.cross_entropy(student_logits, targets)
+            # focal loss
+            # f_loss = self.focal_loss(student_logits, targets, gamma=self.focal_gamma, alpha=self.focal_alpha)
             
             # Combine losses with alpha weighting
             combined_loss = alpha * kl_loss + (1 - alpha) * ce_loss
@@ -658,10 +661,6 @@ class StudentTrainer(BaseTrainer):
             return
             
         try:
-            import numpy as np
-            from collections import Counter
-            import os
-            
             # Try to import visualization module
             try:
                 from modules.utils.visualize import plot_confusion_matrix
