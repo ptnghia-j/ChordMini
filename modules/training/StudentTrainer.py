@@ -229,23 +229,21 @@ class StudentTrainer(BaseTrainer):
         elif self.lr_schedule_type:
             # After warmup, use the selected scheduler with adjusted epoch numbering
             if self.use_warmup:
-                # Calculate effective epoch for scheduler - adjust to 0-indexed relative to warmup end
-                effective_epoch = epoch - self.warmup_epochs - 1
-                
                 # For fractional updates within an epoch (some schedulers support this)
                 if batch_idx is not None and num_batches is not None and isinstance(self.smooth_scheduler, (OneCycleLR, CosineAnnealingWarmRestarts)):
-                    fractional_epoch = effective_epoch + (batch_idx / num_batches)
+                    fractional_epoch = epoch - self.warmup_epochs - 1 + (batch_idx / num_batches)
                     self.smooth_scheduler.step(fractional_epoch)
                     self._scheduler_step_count += 1
                     self._log(f"Fractional scheduler step at epoch {epoch}, batch {batch_idx}/{num_batches}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
                 else:
                     # Just use regular epoch-based steps (CosineAnnealingLR, LambdaLR)
                     # Only step if we haven't already stepped for this epoch
-                    if not hasattr(self, '_last_stepped_epoch') or self._last_stepped_epoch != effective_epoch:
-                        self.smooth_scheduler.step(effective_epoch)
-                        self._last_stepped_epoch = effective_epoch
+                    if not hasattr(self, '_last_stepped_epoch') or self._last_stepped_epoch != (epoch - self.warmup_epochs - 1):
+                        # Use step() without epoch parameter to avoid deprecation warning
+                        self.smooth_scheduler.step()
+                        self._last_stepped_epoch = epoch - self.warmup_epochs - 1
                         self._scheduler_step_count += 1
-                        self._log(f"Full scheduler step at adjusted epoch {effective_epoch}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
+                        self._log(f"Full scheduler step at adjusted epoch {epoch - self.warmup_epochs - 1}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
             else:
                 # No warmup - use standard scheduler stepping
                 if batch_idx is not None and num_batches is not None and isinstance(self.smooth_scheduler, (OneCycleLR, CosineAnnealingWarmRestarts)):
@@ -254,7 +252,7 @@ class StudentTrainer(BaseTrainer):
                     self._scheduler_step_count += 1
                     self._log(f"Fractional scheduler step (no warmup) at epoch {epoch}, batch {batch_idx}/{num_batches}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
                 else:
-                    # Just use regular epoch-based steps 
+                    # Just use regular epoch-based steps without epoch parameter
                     if not hasattr(self, '_last_stepped_epoch') or self._last_stepped_epoch != (epoch - 1):
                         self.smooth_scheduler.step()
                         self._last_stepped_epoch = epoch - 1
@@ -1028,8 +1026,15 @@ class StudentTrainer(BaseTrainer):
             elif self.use_warmup and start_epoch > self.warmup_epochs and self.lr_schedule_type:
                 # Resuming after warmup, need to advance scheduler to the right point
                 effective_epoch = start_epoch - self.warmup_epochs - 1
-                # Use epoch=None to avoid deprecation warning
-                self.smooth_scheduler.step(effective_epoch)
+                
+                # For OneCycleLR and CosineAnnealingWarmRestarts that need explicit epoch values
+                if isinstance(self.smooth_scheduler, (OneCycleLR, CosineAnnealingWarmRestarts)):
+                    self.smooth_scheduler.step(effective_epoch)
+                else:
+                    # For other schedulers, step multiple times without epoch parameter
+                    for _ in range(effective_epoch):
+                        self.smooth_scheduler.step()
+                        
                 self._log(f"Resuming after warmup at epoch {start_epoch} (scheduler epoch {effective_epoch}) with LR: {self.optimizer.param_groups[0]['lr']:.6f}")
                 
             # Debug values for warmup
@@ -1252,7 +1257,7 @@ class StudentTrainer(BaseTrainer):
                 # Step epoch-based schedulers
                 if self.lr_schedule_type and isinstance(self.smooth_scheduler, (CosineAnnealingLR, LambdaLR)):
                     if not (self.use_warmup and epoch <= self.warmup_epochs):
-                        # Fix: Use scheduler.step() without epoch parameter to avoid deprecation warning
+                        # Use step() without epoch parameter to avoid deprecation warning
                         self.smooth_scheduler.step()
                         current_lr = self.optimizer.param_groups[0]['lr']
                         self._log(f"Scheduler stepped to LR: {current_lr:.7f}")

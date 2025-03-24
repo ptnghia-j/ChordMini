@@ -1046,6 +1046,12 @@ def main():
                 pin_memory=False
             )
             
+            logger.info("=== Debug: Test set sample ===")
+            test_batch = next(iter(test_loader))
+            logger.info(f"Test spectrogram tensor shape: {test_batch['spectro'].shape}")
+            logger.info(f"Test labels: {test_batch['chord_idx'][:10]}")
+            
+            # Basic testing with Tester class
             tester = Tester(
                 model=model,
                 test_loader=test_loader,
@@ -1067,6 +1073,71 @@ def main():
                 logger.info(f"Test metrics saved to {metrics_path}")
             except Exception as e:
                 logger.error(f"Error saving test metrics: {e}")
+            
+            # Advanced testing with mir_eval module
+            logger.info("\n=== MIR evaluation ===")
+            score_metrics = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
+            dataset_length = len(synth_dataset.samples)
+            
+            if dataset_length < 3:
+                logger.info("Not enough validation samples to compute chord metrics.")
+            else:
+                # Create balanced splits of the samples
+                split = dataset_length // 3
+                valid_dataset1 = synth_dataset.samples[:split]
+                valid_dataset2 = synth_dataset.samples[split:2*split]
+                valid_dataset3 = synth_dataset.samples[2*split:]
+                
+                logger.info(f"Evaluating model on {len(valid_dataset1)} samples in split 1...")
+                score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
+                    valid_dataset=valid_dataset1, config=config, model=model, model_type=args.model, 
+                    mean=mean, std=std, device=device)
+                
+                logger.info(f"Evaluating model on {len(valid_dataset2)} samples in split 2...")
+                score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
+                    valid_dataset=valid_dataset2, config=config, model=model, model_type=args.model, 
+                    mean=mean, std=std, device=device)
+                
+                logger.info(f"Evaluating model on {len(valid_dataset3)} samples in split 3...")
+                score_list_dict3, song_length_list3, average_score_dict3 = large_voca_score_calculation(
+                    valid_dataset=valid_dataset3, config=config, model=model, model_type=args.model, 
+                    mean=mean, std=std, device=device)
+                
+                # Calculate and report the weighted average scores
+                mir_eval_results = {}
+                for m in score_metrics:
+                    if song_length_list1 and song_length_list2 and song_length_list3:
+                        # Calculate weighted average based on song lengths
+                        avg = (np.sum(song_length_list1) * average_score_dict1[m] +
+                               np.sum(song_length_list2) * average_score_dict2[m] +
+                               np.sum(song_length_list3) * average_score_dict3[m]) / (
+                               np.sum(song_length_list1) + np.sum(song_length_list2) + np.sum(song_length_list3))
+                        
+                        # Log individual split scores
+                        logger.info(f"==== {m} score 1 is {average_score_dict1[m]:.4f}")
+                        logger.info(f"==== {m} score 2 is {average_score_dict2[m]:.4f}")
+                        logger.info(f"==== {m} score 3 is {average_score_dict3[m]:.4f}")
+                        logger.info(f"==== {m} mix average score is {avg:.4f}")
+                        
+                        # Store in results dictionary
+                        mir_eval_results[m] = {
+                            'split1': float(average_score_dict1[m]),
+                            'split2': float(average_score_dict2[m]),
+                            'split3': float(average_score_dict3[m]),
+                            'weighted_avg': float(avg)
+                        }
+                    else:
+                        logger.info(f"==== {m} scores couldn't be calculated properly")
+                        mir_eval_results[m] = {'error': 'Calculation failed'}
+                
+                # Save MIR-eval metrics to a separate file
+                try:
+                    mir_eval_path = os.path.join(checkpoints_dir, "mir_eval_metrics.json")
+                    with open(mir_eval_path, 'w') as f:
+                        json.dump(mir_eval_results, f, indent=2)
+                    logger.info(f"MIR evaluation metrics saved to {mir_eval_path}")
+                except Exception as e:
+                    logger.error(f"Error saving MIR evaluation metrics: {e}")
                 
         else:
             logger.warning("Could not load best model for testing")
@@ -1074,6 +1145,21 @@ def main():
         logger.error(f"Error during testing: {e}")
         import traceback
         logger.error(traceback.format_exc())
+    
+    # Save the final model
+    try:
+        save_path = os.path.join(checkpoints_dir, "student_model_final.pth")
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'chord_mapping': chord_mapping,
+            'idx_to_chord': master_mapping,
+            'mean': normalization['mean'].cpu().numpy() if hasattr(normalization['mean'], 'cpu') else normalization['mean'],
+            'std': normalization['std'].cpu().numpy() if hasattr(normalization['std'], 'cpu') else normalization['std']
+        }, save_path)
+        logger.info(f"Final model saved to {save_path}")
+    except Exception as e:
+        logger.error(f"Error saving final model: {e}")
     
     logger.info("Student training and evaluation complete!")
 

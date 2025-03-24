@@ -10,7 +10,7 @@ training:
   weight_decay: 1.0e-5
   betas: [0.9, 0.98]
   epsilon: 1.0e-9
-  early_stopping_patience: 10
+  early_stopping_patience: 15
   seq_len: 108
   seq_stride: 36
   save_checkpoint_interval: 10
@@ -82,7 +82,7 @@ data:
   metadata_only: true        # Only cache metadata, not full spectrograms
   disable_cache: false       # Set to true to disable dataset caching
   # New parameter for small dataset testing
-  small_dataset_percentage: 0.01  # Set to a value like 0.01 for 1% or null to use full dataset
+  small_dataset_percentage: 0.02  # Set to a value like 0.01 for 1% or null to use full dataset
 
 # Miscellaneous
 misc:
