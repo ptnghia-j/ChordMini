@@ -4,85 +4,122 @@ import torch
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
 import itertools
+from collections import Counter
 
-def plot_confusion_matrix(y_true, y_pred, class_names=None, normalize=False, 
-                          title='Confusion Matrix', figsize=(12, 10), cmap=plt.cm.Blues,
-                          max_classes=15):
+def plot_confusion_matrix(y_true, y_pred, class_names=None, normalize=True, title=None, max_classes=20, figsize=(12,10)):
     """
     Generate a confusion matrix visualization.
     
     Args:
-        y_true: True labels
-        y_pred: Predicted labels
-        class_names: List of class names (optional)
-        normalize: Whether to normalize values
-        title: Plot title
-        figsize: Figure size
-        cmap: Color map
-        max_classes: Maximum number of classes to display
-    
+        y_true: True labels (array-like)
+        y_pred: Predicted labels (array-like)
+        class_names: Dictionary mapping class indices to class names, or None for default names
+        normalize: Whether to normalize by row (true label frequency)
+        title: Title for plot
+        max_classes: Maximum number of classes to include (limit to most common)
+        figsize: Figure size as (width, height)
+        
     Returns:
-        matplotlib figure
+        Figure object with the plot
     """
-    # Convert tensors to numpy if needed
-    if isinstance(y_true, torch.Tensor):
-        y_true = y_true.cpu().numpy()
-    if isinstance(y_pred, torch.Tensor):
-        y_pred = y_pred.cpu().numpy()
+
     
-    # Get unique classes from both predictions and targets
-    unique_classes = np.unique(np.concatenate([y_true, y_pred]))
+    if len(y_true) == 0 or len(y_pred) == 0:
+        # Create an empty figure if there's no data
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.text(0.5, 0.5, "No data to plot", horizontalalignment='center', 
+                verticalalignment='center', fontsize=14)
+        return fig
     
-    # If we have too many classes, focus on the most common ones
-    if len(unique_classes) > max_classes:
-        # Count class occurrences
-        class_counts = np.bincount(y_true)
-        # Get indices of top N most common classes
-        common_classes = np.argsort(class_counts)[-max_classes:]
-        # Create a mask for samples that belong to these classes
-        mask = np.isin(y_true, common_classes)
-        y_true = y_true[mask]
-        y_pred = y_pred[mask]
-        unique_classes = common_classes
+    # Count true labels and get the most common ones
+    counter = Counter(y_true)
+    most_common = [cls for cls, _ in counter.most_common(max_classes)]
+    
+    # Mask to include only the most common classes
+    mask_true = np.isin(y_true, most_common)
+    mask_pred = np.isin(y_pred, most_common)
+    
+    # Get indices for both true and predicted being in the top classes
+    indices = np.where(mask_true)[0]
+    
+    if len(indices) == 0:
+        # If no samples match the filter, create empty figure
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.text(0.5, 0.5, "No common classes found", horizontalalignment='center', 
+                verticalalignment='center', fontsize=14)
+        return fig
+    
+    # Filter the labels
+    filtered_y_true = np.array(y_true)[indices]
+    filtered_y_pred = np.array(y_pred)[indices]
     
     # Compute confusion matrix
-    cm = confusion_matrix(y_true, y_pred, labels=unique_classes)
+    cm = confusion_matrix(filtered_y_true, filtered_y_pred, labels=most_common)
     
-    # Normalize if requested
+    # Normalize the confusion matrix if requested
     if normalize:
-        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-        fmt = '.2f'
+        # FIX: Handle division by zero when normalizing
+        row_sums = cm.sum(axis=1)
+        # Add small epsilon to avoid division by zero
+        row_sums = np.where(row_sums == 0, 1e-10, row_sums)  # Replace zeros with small value
+        cm = cm.astype('float') / row_sums[:, np.newaxis]
+        
+        # Additional fix: Replace NaN values with zeros for better visualization
+        cm = np.nan_to_num(cm, nan=0.0)
+    
+    # Create figure and axes
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Generate class labels for plotting
+    if class_names is not None:
+        # Convert class indices to names for the most common classes
+        label_names = []
+        for cls in most_common:
+            # Handle cases where the class may not be in the mapping
+            if class_names is None:
+                label_names.append(f"Class-{cls}")
+            elif isinstance(class_names, dict):
+                label_names.append(class_names.get(cls, f"Class-{cls}"))
+            else:
+                try:
+                    # For list/array-like class_names
+                    label_names.append(class_names[cls])
+                except (IndexError, TypeError):
+                    label_names.append(f"Class-{cls}")
     else:
-        fmt = 'd'
+        # Default to class indices if no mapping provided
+        label_names = [f"Class-{cls}" for cls in most_common]
     
-    # Create figure
-    plt.figure(figsize=figsize)
-    sns.set(font_scale=1.2)
+    # Plot confusion matrix with improved handling of NaN values
+    try:
+        # Use robust min/max values to avoid seaborn warnings
+        vmin = np.nanmin(cm[~np.isnan(cm)]) if np.any(~np.isnan(cm)) else 0
+        vmax = np.nanmax(cm[~np.isnan(cm)]) if np.any(~np.isnan(cm)) else 1
+        
+        # Create heatmap with robust parameters
+        sns.heatmap(cm, annot=True, fmt='.2f' if normalize else 'd', cmap='Blues',
+                    xticklabels=label_names, yticklabels=label_names, ax=ax,
+                    vmin=vmin, vmax=vmax)
+    except ValueError as e:
+        # Fallback to a simpler heatmap without vmin/vmax if there's an error
+        sns.heatmap(cm, annot=True, fmt='.2f' if normalize else 'd', cmap='Blues',
+                    xticklabels=label_names, yticklabels=label_names, ax=ax)
+        ax.text(0.5, 0.5, f"Warning: {str(e)}", transform=ax.transAxes, 
+                horizontalalignment='center', color='red', alpha=0.7)
+        
+    # Set title and labels
+    if title:
+        ax.set_title(title)
+    ax.set_ylabel('True label')
+    ax.set_xlabel('Predicted label')
     
-    # If class names are provided, use them
-    if class_names and len(class_names) >= len(unique_classes):
-        display_names = [class_names[i] for i in unique_classes]
-    else:
-        display_names = [str(i) for i in unique_classes]
+    # Rotate x-axis labels for readability
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
     
-    # Plot heatmap
-    sns.heatmap(cm, annot=True, fmt=fmt, cmap=cmap, 
-                xticklabels=display_names,
-                yticklabels=display_names,
-                linewidths=.5)
+    # Tight layout to ensure all labels are visible
+    fig.tight_layout()
     
-    plt.title(title, fontsize=16)
-    plt.ylabel('True label', fontsize=14)
-    plt.xlabel('Predicted label', fontsize=14)
-    
-    # Attempt to improve readability by rotating tick labels
-    plt.xticks(rotation=45, ha='right')
-    plt.yticks(rotation=45)
-    
-    # Tight layout to ensure everything fits
-    plt.tight_layout()
-    
-    return plt.gcf()
+    return fig
 
 def plot_class_distribution(class_counts, class_names=None, title='Class Distribution', 
                            figsize=(12, 8), max_classes=20):
