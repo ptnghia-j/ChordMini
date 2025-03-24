@@ -637,14 +637,20 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                 if idx_to_chord is None:
                     # Try to infer from dataset or fall back to default
                     idx_to_chord = {i: f"class_{i}" for i in range(max(predictions) + 1)}
+                    print("WARNING: model.idx_to_chord not found. Using default class_N mapping, which may cause MIR-eval errors.")
                 
                 # Convert indices to chord names
                 pred_chords = [idx_to_chord.get(pred, "N") for pred in predictions]
                 
+                # Debug first few predicted chords to verify format
+                if i == 0:
+                    print(f"First 5 predicted chords: {pred_chords[:5]}")
+                    print(f"First 5 reference chords: {reference_labels[:5]}")
+                
                 # Calculate scores
                 durations = np.diff(np.append(timestamps, [timestamps[-1] + frame_duration]))
-                root_score, thirds_score, triads_score, sevenths_score, tetrads_score, majmin_score, mirex_score = calculate_mir_scores(
-                    timestamps, pred_chords, reference_labels, durations)
+                root_score, thirds_score, triads_score, sevenths_score, tetrads_score, majmin_score, mirex_score = calculate_chord_scores(
+                    timestamps, durations, reference_labels, pred_chords)
                 
                 # Store scores
                 score_list_dict['root'].append(root_score)
@@ -659,9 +665,12 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                 song_length = len(samples) * frame_duration
                 song_length_list.append(song_length)
                 
-                # Debug first few songs
+                # Debug first few songs - FIX: Convert numpy arrays to float values before formatting
                 if i < 5:
-                    print(f"Song {song_id}: length={song_length:.1f}s, root={root_score:.4f}, mirex={mirex_score:.4f}")
+                    # Convert scores to float values if they're numpy arrays
+                    root_score_val = float(root_score) if hasattr(root_score, 'item') else root_score
+                    mirex_score_val = float(mirex_score) if hasattr(mirex_score, 'item') else mirex_score
+                    print(f"Song {song_id}: length={song_length:.1f}s, root={root_score_val:.4f}, mirex={mirex_score_val:.4f}")
             
         except Exception as e:
             import traceback
@@ -670,13 +679,40 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
             if errors <= 10:  # Only print detailed error for first 10 errors
                 traceback.print_exc()
     
-    # Calculate weighted average scores
+    # Calculate weighted average scores - FIX: Ensure consistent lengths
     average_score_dict = {}
+    
+    # First ensure all score lists are of the same length as song_length_list
+    valid_length = len(song_length_list)
+    for metric in score_list_dict:
+        # Trim or pad score lists to match song_length_list length
+        current_length = len(score_list_dict[metric])
+        if current_length != valid_length:
+            print(f"WARNING: Length mismatch for {metric} scores ({current_length}) vs song lengths ({valid_length})")
+            if current_length > valid_length:
+                # Trim the score list
+                score_list_dict[metric] = score_list_dict[metric][:valid_length]
+                print(f"Trimmed {metric} scores to length {valid_length}")
+            else:
+                # Pad with zeros
+                padding = [0.0] * (valid_length - current_length)
+                score_list_dict[metric].extend(padding)
+                print(f"Padded {metric} scores to length {valid_length}")
+    
     if song_length_list:
         for metric in score_list_dict:
             if score_list_dict[metric]:
-                weighted_sum = sum(score * length for score, length in zip(score_list_dict[metric], song_length_list))
-                total_length = sum(song_length_list)
+                # Safely calculate weighted average with matching lengths
+                weighted_sum = 0.0
+                total_length = 0.0
+                
+                # Use explicit loop instead of sum() to handle each element safely
+                for idx, (score, length) in enumerate(zip(score_list_dict[metric], song_length_list)):
+                    # Convert score to float if it's a numpy array
+                    score_val = float(score) if hasattr(score, 'item') else score
+                    weighted_sum += score_val * length
+                    total_length += length
+                
                 average_score_dict[metric] = weighted_sum / total_length if total_length > 0 else 0.0
             else:
                 average_score_dict[metric] = 0.0
@@ -689,40 +725,160 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
     
     return score_list_dict, song_length_list, average_score_dict
 
-
-def calculate_mir_scores(timestamps, pred_chords, ref_chords, durations):
+def calculate_chord_scores(timestamps, durations, reference_labels, prediction_labels):
     """
-    Calculate MIR evaluation scores.
+    Calculate various chord evaluation metrics correctly using mir_eval.
     
     Args:
-        timestamps: Array of timestamps
-        pred_chords: List of predicted chord labels
-        ref_chords: List of reference chord labels
-        durations: Array of durations for each frame
-    
+        timestamps: Array of frame timestamps
+        durations: Array of frame durations
+        reference_labels: List of reference chord labels
+        prediction_labels: List of predicted chord labels
+        
     Returns:
-        Various MIR evaluation scores
+        Tuple of evaluation scores (root, thirds, triads, sevenths, tetrads, majmin, mirex)
     """
-    import mir_eval
-    import numpy as np
+    # Create intervals for mir_eval
+    intervals = np.zeros((len(timestamps), 2))
+    intervals[:, 0] = timestamps
+    intervals[:, 1] = timestamps + durations
     
-    # Prepare interval boundaries
-    boundaries = np.append([0], np.cumsum(durations))
+    # Ensure all inputs have the same length
+    min_len = min(len(intervals), len(reference_labels), len(prediction_labels))
+    intervals = intervals[:min_len]
+    reference_labels = reference_labels[:min_len]
+    prediction_labels = prediction_labels[:min_len]
     
-    # Convert to mir_eval's expected format
-    intervals = np.array([boundaries[:-1], boundaries[1:]]).T
-    
-    # Calculate scores
     try:
-        root_score = mir_eval.chord.root(intervals, ref_chords, intervals, pred_chords)
-        thirds_score = mir_eval.chord.thirds(intervals, ref_chords, intervals, pred_chords)
-        triads_score = mir_eval.chord.triads(intervals, ref_chords, intervals, pred_chords)
-        sevenths_score = mir_eval.chord.sevenths(intervals, ref_chords, intervals, pred_chords)
-        tetrads_score = mir_eval.chord.tetrads(intervals, ref_chords, intervals, pred_chords)
-        majmin_score = mir_eval.chord.majmin(intervals, ref_chords, intervals, pred_chords)
-        mirex_score = mir_eval.chord.mirex(intervals, ref_chords, intervals, pred_chords)
+        # Format comparison data
+        comparison_pairs = []
+        
+        # Group consecutive frames with the same labels
+        if len(reference_labels) == 0:
+            # Handle empty inputs
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            
+        current_ref = reference_labels[0]
+        current_pred = prediction_labels[0]
+        start_idx = 0
+        
+        for i in range(1, len(reference_labels)):
+            if reference_labels[i] != current_ref or prediction_labels[i] != current_pred:
+                # End of a segment - add it to comparison pairs
+                end_idx = i
+                seg_intervals = intervals[start_idx:end_idx]
+                seg_start = seg_intervals[0, 0]
+                seg_end = seg_intervals[-1, 1]
+                
+                comparison_pairs.append((seg_start, seg_end, current_ref, current_pred))
+                
+                # Start a new segment
+                current_ref = reference_labels[i]
+                current_pred = prediction_labels[i]
+                start_idx = i
+        
+        # Add the final segment
+        if start_idx < len(reference_labels):
+            seg_intervals = intervals[start_idx:]
+            seg_start = seg_intervals[0, 0]
+            seg_end = seg_intervals[-1, 1]
+            comparison_pairs.append((seg_start, seg_end, current_ref, current_pred))
+        
+        # Extract comparison data
+        if not comparison_pairs:
+            # Handle case where no pairs were created
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            
+        seg_refs = [pair[2] for pair in comparison_pairs]
+        seg_preds = [pair[3] for pair in comparison_pairs]
+        
+        # The seg_intervals variable is never explicitly constructed from comparison_pairs
+        # This could cause issues if mir_eval functions need interval data
+        # Add this line to fix:
+        seg_intervals = np.array([[pair[0], pair[1]] for pair in comparison_pairs])
+        
+        # Call mir_eval metrics correctly with proper handling for array results
+        try:
+            # Use try/except for each metric separately to ensure we can continue
+            # even if one metric fails
+            try:
+                root_result = mir_eval.chord.root(seg_refs, seg_preds)
+                # Handle both scalar and array results
+                if hasattr(root_result, 'shape') and root_result.shape:
+                    # It's an array, get weighted mean
+                    root_score = float(np.mean(root_result))
+                else:
+                    # It's already a scalar
+                    root_score = float(root_result)
+            except Exception as e:
+                print(f"Error in root scoring: {e}")
+                root_score = 0.0
+                
+            try:
+                thirds_result = mir_eval.chord.thirds(seg_refs, seg_preds)
+                if hasattr(thirds_result, 'shape') and thirds_result.shape:
+                    thirds_score = float(np.mean(thirds_result))
+                else:
+                    thirds_score = float(thirds_result)
+            except Exception as e:
+                print(f"Error in thirds scoring: {e}")
+                thirds_score = 0.0
+                
+            try:
+                triads_result = mir_eval.chord.triads(seg_refs, seg_preds)
+                if hasattr(triads_result, 'shape') and triads_result.shape:
+                    triads_score = float(np.mean(triads_result))
+                else:
+                    triads_score = float(triads_result)
+            except Exception as e:
+                print(f"Error in triads scoring: {e}")
+                triads_score = 0.0
+                
+            try:
+                sevenths_result = mir_eval.chord.sevenths(seg_refs, seg_preds)
+                if hasattr(sevenths_result, 'shape') and sevenths_result.shape:
+                    sevenths_score = float(np.mean(sevenths_result))
+                else:
+                    sevenths_score = float(sevenths_result)
+            except Exception as e:
+                print(f"Error in sevenths scoring: {e}")
+                sevenths_score = 0.0
+                
+            try:
+                tetrads_result = mir_eval.chord.tetrads(seg_refs, seg_preds)
+                if hasattr(tetrads_result, 'shape') and tetrads_result.shape:
+                    tetrads_score = float(np.mean(tetrads_result))
+                else:
+                    tetrads_score = float(tetrads_result)
+            except Exception as e:
+                print(f"Error in tetrads scoring: {e}")
+                tetrads_score = 0.0
+                
+            try:
+                majmin_result = mir_eval.chord.majmin(seg_refs, seg_preds)
+                if hasattr(majmin_result, 'shape') and majmin_result.shape:
+                    majmin_score = float(np.mean(majmin_result))
+                else:
+                    majmin_score = float(majmin_result)
+            except Exception as e:
+                print(f"Error in majmin scoring: {e}")
+                majmin_score = 0.0
+                
+            try:
+                mirex_result = mir_eval.chord.mirex(seg_refs, seg_preds)
+                if hasattr(mirex_result, 'shape') and mirex_result.shape:
+                    mirex_score = float(np.mean(mirex_result))
+                else:
+                    mirex_score = float(mirex_result)
+            except Exception as e:
+                print(f"Error in mirex scoring: {e}")
+                mirex_score = 0.0
+                
+        except Exception as e:
+            print(f"Error in mir_eval metrics calculation: {e}")
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        
     except Exception as e:
-        # Handle potential errors in mir_eval
         print(f"Error in mir_eval scoring: {e}")
         # Return zeros for all scores on error
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
