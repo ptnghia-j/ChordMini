@@ -16,24 +16,25 @@ import hashlib
 import re
 from modules.utils.device import get_device, to_device, clear_gpu_cache
 
-# Fix: Set multiprocessing start method to 'spawn' at import time to avoid CUDA re-initialization errors
-if __name__ == "__main__" or multiprocessing.get_start_method(allow_none=True) is None:
+# We can simplify the multiprocessing setup since we're using a single worker
+# This code is still useful for the __main__ case to ensure proper testing behavior
+if __name__ == "__main__":
     try:
         multiprocessing.set_start_method('spawn', force=True)
-        print("Set multiprocessing start method to 'spawn' for CUDA compatibility")
+        print("Set multiprocessing start method to 'spawn' for testing")
     except RuntimeError:
-        warnings.warn("Could not set multiprocessing start method to 'spawn'. Some CUDA operations may fail.")
+        warnings.warn("Could not set multiprocessing start method to 'spawn'.")
 
 class SynthDataset(Dataset):
     """
     Dataset for loading preprocessed spectrograms and chord labels.
-    Optimized implementation with multiprocessing, caching, and GPU acceleration.
+    Optimized implementation for GPU acceleration with single worker.
     """
     def __init__(self, spec_dir, label_dir, chord_mapping=None, seq_len=10, stride=None, 
-                 frame_duration=0.1, num_workers=None, cache_file=None, verbose=True,
+                 frame_duration=0.1, num_workers=0, cache_file=None, verbose=True,
                  use_cache=True, metadata_only=True, cache_fraction=0.1, logits_dir=None,
                  lazy_init=False, require_teacher_logits=False, device=None,
-                 pin_memory=True, prefetch_factor=2, batch_gpu_cache=False,
+                 pin_memory=False, prefetch_factor=2, batch_gpu_cache=False,
                  small_dataset_percentage=None):
         """
         Initialize the dataset with optimized settings for GPU acceleration.
@@ -45,7 +46,7 @@ class SynthDataset(Dataset):
             seq_len: Sequence length for segmentation
             stride: Stride for segmentation (default: same as seq_len)
             frame_duration: Duration of each frame in seconds
-            num_workers: Number of workers for data loading
+            num_workers: Number of workers for data loading (forced to 0 for GPU compatibility)
             cache_file: Path to cache file
             verbose: Whether to print verbose output
             use_cache: Whether to use caching
@@ -60,13 +61,15 @@ class SynthDataset(Dataset):
             batch_gpu_cache: Whether to cache batches on GPU for repeated access patterns
             small_dataset_percentage: Optional percentage of the dataset to use (0-1.0)
         """
-        # Check for CUDA availability early and inform about multiprocessing
+        # Check for CUDA availability
         self.cuda_available = torch.cuda.is_available()
-        if self.cuda_available and multiprocessing.get_start_method() != 'spawn':
-            warnings.warn("CUDA detected but multiprocessing start method is not 'spawn'. "
-                         "This might cause 'Cannot re-initialize CUDA in forked subprocess' errors. "
-                         "Call 'multiprocessing.set_start_method(\"spawn\", force=True)' before creating this dataset.")
         
+        # Force num_workers to 0 for GPU compatibility
+        self.num_workers = 0
+        if num_workers is not None and num_workers > 0 and verbose:
+            print(f"Forcing num_workers to 0 (was {num_workers}) for single-worker GPU optimization")
+        
+        # Initialize basic parameters
         self.spec_dir = Path(spec_dir)
         self.label_dir = Path(label_dir)
         self.logits_dir = Path(logits_dir) if logits_dir is not None else None
@@ -82,7 +85,12 @@ class SynthDataset(Dataset):
         self.cache_fraction = cache_fraction  # Fraction of samples to cache (default: 10%)
         self.lazy_init = lazy_init
         self.require_teacher_logits = require_teacher_logits
-        self.pin_memory = pin_memory
+        
+        # Disable pin_memory since we're using a single worker
+        self.pin_memory = False
+        if pin_memory and verbose:
+            print("Disabling pin_memory since we're using a single worker")
+            
         self.prefetch_factor = prefetch_factor
         self.batch_gpu_cache = batch_gpu_cache
         self.small_dataset_percentage = small_dataset_percentage
@@ -129,35 +137,6 @@ class SynthDataset(Dataset):
         
         # Cache the N chord index
         self._n_chord_idx = 0  # Default value, will be updated later if needed
-        
-        # Safely determine number of workers based on environment
-        if num_workers is None:
-            try:
-                # Start with CPU count but cap at reasonable values
-                self.num_workers = min(4, os.cpu_count() or 1)
-                
-                # If using CUDA, enforce only 1 worker unless we're sure spawn method is used
-                if self.cuda_available and multiprocessing.get_start_method() != 'spawn':
-                    self.num_workers = 0
-                    if verbose:
-                        print("CUDA detected with fork method - disabling workers to prevent CUDA errors")
-                
-                # Check if we're running in a container with limited resources
-                if os.path.exists('/sys/fs/cgroup/memory/memory.limit_in_bytes'):
-                    with open('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'r') as f:
-                        mem_limit = int(f.read().strip()) / (1024 * 1024 * 1024)  # Convert to GB
-                        # If less than 4GB memory, reduce workers to avoid OOM
-                        if mem_limit < 4:
-                            self.num_workers = 0
-                            if verbose:
-                                print(f"Limited memory detected ({mem_limit:.1f}GB), disabling workers")
-            except Exception as e:
-                # Fallback to safe default - with CUDA, use 0 workers to be safe
-                self.num_workers = 0 if self.cuda_available else 1
-                if verbose:
-                    print(f"Error determining CPU count: {e}, using {self.num_workers} worker(s)")
-        else:
-            self.num_workers = num_workers
             
         # Generate a safer cache file name using hashing if none provided
         if cache_file is None:
@@ -301,7 +280,8 @@ class SynthDataset(Dataset):
                     print(f"Generated {len(self.segment_indices)} segments in lazy mode")
             else:
                 warnings.warn("No valid samples found in lazy mode initialization")
-        
+
+            
         # Split data for train/eval/test
         total_segs = len(self.segment_indices)
         self.train_indices = list(range(0, int(total_segs * 0.8)))
@@ -325,7 +305,7 @@ class SynthDataset(Dataset):
                 self._zero_spec_cache = {}
                 self._zero_logit_cache = {}
                 self.batch_gpu_cache = None
-                
+
     def _init_gpu_cache(self):
         """Initialize GPU cache for common tensors to minimize transfers with enhanced error handling"""
         if self.device.type == 'cuda':
@@ -362,58 +342,29 @@ class SynthDataset(Dataset):
                 self._n_chord_idx = 0
 
     def _load_data(self):
-        """Optimized data loading with caching, multiprocessing"""
+        """Optimized data loading with caching for single worker"""
         start_time = time.time()
         
-        # Try to load from cache first, with shard-specific naming if applicable
+        # Try to load from cache first
         if self.use_cache and os.path.exists(self.cache_file):
             if self.verbose:
                 print(f"Loading dataset from cache: {self.cache_file}")
             try:
                 with open(self.cache_file, 'rb') as f:
                     cache_data = pickle.load(f)
-                    # Validate cache data has expected format
+                    # Validate and use cache data
                     if ('samples' in cache_data and 'chord_to_idx' in cache_data and 
                         isinstance(cache_data['samples'], list) and 
                         isinstance(cache_data['chord_to_idx'], dict)):
                         
-                        # Check if this is a partial cache
-                        is_partial_cache = cache_data.get('is_partial_cache', False)
-                        
-                        # Handle metadata-only cache (no spectrograms stored)
-                        if self.metadata_only and 'metadata_only' in cache_data and cache_data['metadata_only']:
-                            # Load actual spectrogram files as needed
-                            self.samples = []
-                            for sample_meta in cache_data['samples']:
-                                # Load spectrogram on-demand
-                                spec_path = sample_meta.get('spec_path')
-                                if spec_path and os.path.exists(spec_path):
-                                    try:
-                                        spec = np.load(spec_path)
-                                        # Create complete sample
-                                        sample = sample_meta.copy()
-                                        sample['spectro'] = spec
-                                        self.samples.append(sample)
-                                    except Exception as e:
-                                        if self.verbose:
-                                            print(f"Error loading {spec_path}: {e}")
-                                                           
-                        else:
-                            # Full cache including spectrograms
-                            self.samples = cache_data['samples']
-                            
+                        # Cache validation successful, load the data
+                        self.samples = cache_data['samples']
                         self.chord_to_idx = cache_data['chord_to_idx']
                         
                         if self.verbose:
                             print(f"Loaded {len(self.samples)} samples from cache in {time.time() - start_time:.2f}s")
-                            if is_partial_cache:
-                                print(f"Note: This is a partial cache ({self.cache_fraction*100:.1f}% of full dataset)")
                         
-                        # If this is a partial cache and cache_fraction is 1.0, we need to load the rest
-                        if is_partial_cache and self.cache_fraction == 1.0:
-                            print("Partial cache detected but full dataset requested. Continuing to load remaining files...")
-                        else:
-                            return
+                        return
                     else:
                         print("Cache format invalid, rebuilding dataset")
             except Exception as e:
@@ -448,7 +399,6 @@ class SynthDataset(Dataset):
         # Look for the specific format first: {dir_prefix}/{numeric_id}_spec.npy
         for prefix_dir in self.spec_dir.glob("**/"):
             if prefix_dir.is_dir() and len(prefix_dir.name) == 3 and prefix_dir.name.isdigit():
-                # This is a 3-digit directory prefix
                 dir_prefix = prefix_dir.name
                 # Look for files with pattern {numeric_id}_spec.npy where numeric_id starts with dir_prefix
                 for spec_path in prefix_dir.glob(f"{dir_prefix}???_spec.npy"):
@@ -488,8 +438,8 @@ class SynthDataset(Dataset):
                 print("Sample spectrogram paths:")
                 for i, (path, _) in enumerate(valid_spec_files[:3]):
                     print(f"  {i+1}. {path}")
-                    
-        # If small_dataset_percentage is set, sample a small portion of the dataset
+        
+        # Handle small dataset percentage option
         if self.small_dataset_percentage is not None:
             # Ensure consistent sampling by using a fixed seed
             np.random.seed(42)
@@ -499,88 +449,33 @@ class SynthDataset(Dataset):
             
             # Sample files - prefer deterministic subset
             if sample_size < len(valid_spec_files):
-                # First sort files for deterministic behavior
+                # Sort files for deterministic behavior
                 valid_spec_files.sort(key=lambda x: str(x[0]))
                 
-                # Then take the first portion based on percentage
+                # Take the first portion based on percentage
                 valid_spec_files = valid_spec_files[:sample_size]
                 
                 if self.verbose:
                     print(f"Using {sample_size} files ({self.small_dataset_percentage*100:.2f}% of dataset) for quick testing")
-                    print(f"First file: {valid_spec_files[0][0]}")
-                    if len(valid_spec_files) > 1:
-                        print(f"Last file: {valid_spec_files[-1][0]}")
         
-        # Process files in parallel with memory-optimized handling
-        try:
-            # Add counters for tracking skipped files
-            self.total_processed = 0
-            self.total_skipped = 0
-            self.skipped_reasons = {
-                'missing_label': 0,
-                'missing_logits': 0,
-                'load_error': 0,
-                'format_error': 0
-            }
-            
-            # CRITICAL FIX: For CUDA compatibility, use sequential processing if workers > 0
-            # Only use parallelism if we're sure multiprocessing is set to 'spawn' mode
-            if self.cuda_available and multiprocessing.get_start_method() != 'spawn':
-                if self.verbose:
-                    print("CUDA detected with non-spawn multiprocessing - forcing sequential processing")
-                self.num_workers = 0
-            
-            if self.num_workers > 1 and len(valid_spec_files) > 10:
-                # Split files into chunks for parallel processing
-                chunk_size = max(1, len(valid_spec_files) // self.num_workers)
-                chunks = [valid_spec_files[i:i + chunk_size] for i in range(0, len(valid_spec_files), chunk_size)]
-                
-                if self.verbose:
-                    print(f"Processing files with {self.num_workers} workers ({len(chunks)} chunks)")
-                    print(f"Multiprocessing mode: {multiprocessing.get_start_method()}")
-                
-                # Use context manager to ensure pool is properly closed
-                with multiprocessing.Pool(processes=self.num_workers) as pool:
-                    worker_func = partial(self._process_file_chunk, label_files_dict=label_files_dict)
-                    
-                    # Process chunks and collect results with a timeout to prevent hangs
-                    all_samples = []
-                    for chunk_result in tqdm(pool.imap(worker_func, chunks), 
-                                            total=len(chunks), 
-                                            desc="Loading data",
-                                            disable=not self.verbose):
-                        all_samples.extend(chunk_result['samples'])
-                        self.total_processed += chunk_result['processed']
-                        self.total_skipped += chunk_result['skipped']
-                        for reason, count in chunk_result['skipped_reasons'].items():
-                            self.skipped_reasons[reason] += count
-                
-                self.samples = all_samples
+        # Sequential processing 
+        self.samples = []
+        self.total_processed = 0
+        self.total_skipped = 0
+        self.skipped_reasons = {
+            'missing_label': 0,
+            'missing_logits': 0,
+            'load_error': 0,
+            'format_error': 0
+        }
+        
+        for spec_file, numeric_id in tqdm(valid_spec_files, desc="Loading data", disable=not self.verbose):
+            self.total_processed += 1
+            processed = self._process_file(spec_file, numeric_id, label_files_dict)
+            if processed:
+                self.samples.extend(processed)
             else:
-                # Fall back to sequential processing if needed
-                self.samples = []
-                for spec_file, numeric_id in tqdm(valid_spec_files, desc="Loading data", disable=not self.verbose):
-                    self.total_processed += 1
-                    processed = self._process_file(spec_file, numeric_id, label_files_dict)
-                    if processed:
-                        self.samples.extend(processed)
-                    else:
-                        self.total_skipped += 1
-        except Exception as e:
-            # If parallel processing fails, fall back to sequential
-            self.samples = []
-            self.total_processed = 0
-            self.total_skipped = 0
-            if self.verbose:
-                print(f"Parallel processing failed: {e}")
-                print("Falling back to sequential processing...")
-            for spec_file, numeric_id in tqdm(valid_spec_files, desc="Loading data", disable=not self.verbose):
-                self.total_processed += 1
-                processed = self._process_file(spec_file, numeric_id, label_files_dict)
-                if processed:
-                    self.samples.extend(processed)
-                else:
-                    self.total_skipped += 1
+                self.total_skipped += 1
         
         # Log statistics about skipped files
         if hasattr(self, 'total_processed') and self.total_processed > 0:
@@ -674,10 +569,37 @@ class SynthDataset(Dataset):
                 
         # Report on spectrogram dimensions
         if self.samples:
-            # Analyze the first sample
-            first_spec = self.samples[0]['spectro']
-            freq_dim = first_spec.shape[-1] if len(first_spec.shape) > 0 else 0
+            # Safely analyze the first sample to determine dimensions
+            first_sample = self.samples[0]
+            
+            # Check if 'spectro' key exists in the sample, and if not, try to load it from path
+            if 'spectro' in first_sample:
+                first_spec = first_sample['spectro']
+            elif 'spec_path' in first_sample and os.path.exists(first_sample['spec_path']):
+                try:
+                    # Load the spectrogram from file
+                    first_spec = np.load(first_sample['spec_path'])
+                    # If it's a multi-frame spectrogram and we have a frame index, get that frame
+                    if 'frame_idx' in first_sample and len(first_spec.shape) > 1:
+                        frame_idx = first_sample['frame_idx']
+                        if frame_idx < first_spec.shape[0]:
+                            first_spec = first_spec[frame_idx]
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Error loading first spectrogram for dimension check: {e}")
+                    # Use default expected dimensions
+                    first_spec = np.zeros((144,))  # Default expected CQT shape
+            else:
+                # If no spectrogram data is available, use default shape
+                first_spec = np.zeros((144,))  # Default expected CQT shape
+                if self.verbose:
+                    print("WARNING: Could not determine spectrogram shape from first sample")
+                    print("Using default frequency dimension of 144")
+            
+            # Now safely determine frequency dimension from the loaded/created spectrogram
+            freq_dim = first_spec.shape[-1] if hasattr(first_spec, 'shape') and len(first_spec.shape) > 0 else 144
             spec_type = "CQT (Constant-Q Transform)" if freq_dim <= 256 else "STFT"
+            
             if self.verbose:
                 print(f"Loaded {len(self.samples)} valid samples")
                 print(f"Spectrogram frequency dimension: {freq_dim} (likely {spec_type})")
@@ -691,36 +613,6 @@ class SynthDataset(Dataset):
         else:
             warnings.warn("No samples loaded. Check your data paths and structure.")
     
-    def _process_file_chunk(self, spec_files_with_ids, label_files_dict):
-        """Process a chunk of files for parallel processing"""
-        chunk_samples = []
-        chunk_processed = 0
-        chunk_skipped = 0
-        skipped_reasons = {
-            'missing_label': 0,
-            'missing_logits': 0,
-            'load_error': 0,
-            'format_error': 0
-        }
-        
-        for spec_file, numeric_id in spec_files_with_ids:
-            chunk_processed += 1
-            processed, skip_reason = self._process_file(spec_file, numeric_id, label_files_dict, return_skip_reason=True)
-            if processed:
-                chunk_samples.extend(processed)
-            else:
-                chunk_skipped += 1
-                if skip_reason in skipped_reasons:
-                    skipped_reasons[skip_reason] += 1
-                
-        # Return both samples and statistics
-        return {
-            'samples': chunk_samples,
-            'processed': chunk_processed,
-            'skipped': chunk_skipped,
-            'skipped_reasons': skipped_reasons
-        }
-        
     def _process_file(self, spec_file, numeric_id, label_files_dict, return_skip_reason=False):
         """Process a single spectrogram file with 6-digit ID pattern"""
         samples = []
@@ -1141,6 +1033,11 @@ class SynthDataset(Dataset):
         first_spec = None
         expected_dim = 144  # Default expected frequency dimension
         
+        # Check for teacher logits availability in the dataset
+        # FIX: Explicitly initialize check_for_logits variable
+        check_for_logits = self.logits_dir is not None or any('teacher_logits' in s or 'logit_path' in s 
+                                                           for s in self.samples[:min(100, len(self.samples))])
+        
         # Lazy loading for first sample to determine shape - Fix the context manager issue
         if 'spectro' not in first_sample and 'spec_path' in first_sample:
             try:
@@ -1423,7 +1320,47 @@ class SynthDataset(Dataset):
                 if has_teacher_logits or check_for_logits:
                     if teacher_logits_seq:
                         try:
-                            sample_out['teacher_logits'] = torch.stack(teacher_logits_seq, dim=0)
+                            # FIX: Ensure all tensors have consistent dimensions before stacking
+                            # Check the shapes and standardize them
+                            fixed_logits_seq = []
+                            if len(teacher_logits_seq) > 0:
+                                # Get the first shape to use as reference
+                                first_logit = teacher_logits_seq[0]
+                                first_shape = first_logit.shape
+                                
+                                # Process all logits to ensure consistent dimensionality
+                                for logit in teacher_logits_seq:
+                                    logit_shape = logit.shape
+                                    
+                                    # Handle dimension mismatch
+                                    if len(logit_shape) != len(first_shape):
+                                        # If tensor has extra dimension (e.g., [1, 432, 170] vs [432, 170])
+                                        if len(logit_shape) > len(first_shape) and logit_shape[0] == 1:
+                                            # Remove the extra dimension
+                                            logit = logit.squeeze(0)
+                                        elif len(logit_shape) < len(first_shape) and first_shape[0] == 1:
+                                            # Add missing dimension
+                                            logit = logit.unsqueeze(0)
+                                    
+                                    # Ensure exact shape match (for length/width)
+                                    if logit.shape != first_shape:
+                                        if self.verbose and not hasattr(self, '_shape_mismatch_warning'):
+                                            print(f"Teacher logits shape mismatch: found {logit.shape} and {first_shape}")
+                                            self._shape_mismatch_warning = True
+                                        
+                                        # If shape is unreasonable, fall back to expected shape
+                                        if logit.shape != first_shape:
+                                            logit = self._get_zero_tensor(first_shape, 'logit')
+                                    
+                                    fixed_logits_seq.append(logit)
+                                
+                                # Now stack the standardized tensors
+                                sample_out['teacher_logits'] = torch.stack(fixed_logits_seq, dim=0)
+                            else:
+                                # Create a fallback tensor if we have an empty sequence
+                                logits_shape = (len(sequence), 170)
+                                sample_out['teacher_logits'] = torch.zeros(logits_shape, 
+                                                                     dtype=torch.float, device=self.device)
                         except Exception as e:
                             # Create a fallback tensor if stacking fails
                             if self.verbose:
@@ -1432,23 +1369,32 @@ class SynthDataset(Dataset):
                             sample_out['teacher_logits'] = torch.zeros(logits_shape, 
                                                                      dtype=torch.float, device=self.device)
                 
-                # Store in GPU batch cache if enabled
-                if self.batch_gpu_cache and torch.cuda.is_available():
-                    try:
-                        self.gpu_batch_cache[idx] = sample_out
-                        
-                        # Limit cache size to avoid OOM
-                        max_cached_items = 100
-                        if len(self.gpu_batch_cache) > max_cached_items:
-                            oldest_key = next(iter(self.gpu_batch_cache))
-                            del self.gpu_batch_cache[oldest_key]
-                    except Exception as e:
-                        # If caching fails, clear the cache and continue
-                        if self.verbose and not hasattr(self, '_cache_write_error'):
-                            print(f"Error writing to GPU cache: {e}")
-                            print("Clearing GPU cache")
-                            self._cache_write_error = True
-                        self.gpu_batch_cache = {}
+                # FIX: Critical fix for CUDA OOM - when running with workers,
+                # move everything to CPU before returning to avoid shared memory issues
+                if self.num_workers > 0 and self.cuda_available:
+                    # Move data to CPU for safe multiprocessing (only if using workers)
+                    for key in sample_out:
+                        if isinstance(sample_out[key], torch.Tensor) and sample_out[key].device.type == 'cuda':
+                            # Explicitly clone to ensure memory is not shared before moving to CPU
+                            sample_out[key] = sample_out[key].clone().cpu()
+                else:
+                    # Store in GPU batch cache if enabled and not using workers
+                    if self.batch_gpu_cache and torch.cuda.is_available():
+                        try:
+                            self.gpu_batch_cache[idx] = sample_out
+                            
+                            # Limit cache size to avoid OOM
+                            max_cached_items = 100
+                            if len(self.gpu_batch_cache) > max_cached_items:
+                                oldest_key = next(iter(self.gpu_batch_cache))
+                                del self.gpu_batch_cache[oldest_key]
+                        except Exception as e:
+                            # If caching fails, clear the cache and continue
+                            if self.verbose and not hasattr(self, '_cache_write_error'):
+                                print(f"Error writing to GPU cache: {e}")
+                                print("Clearing GPU cache")
+                                self._cache_write_error = True
+                            self.gpu_batch_cache = {}
                 
                 return sample_out
                 
@@ -1470,8 +1416,37 @@ class SynthDataset(Dataset):
                 if has_teacher_logits or check_for_logits:
                     if teacher_logits_seq:
                         try:
-                            logits_cpu = [t.cpu() if t.device.type == 'cuda' else t for t in teacher_logits_seq]
-                            sample_out['teacher_logits'] = torch.stack(logits_cpu, dim=0)
+                            # Move logits to CPU and standardize shapes before stacking
+                            fixed_logits_seq = []
+                            if len(teacher_logits_seq) > 0:
+                                # Get the first shape to use as reference
+                                first_logit = teacher_logits_seq[0].cpu()
+                                first_shape = first_logit.shape
+                                
+                                # Process all logits to ensure consistent dimensionality
+                                for logit in teacher_logits_seq:
+                                    logit = logit.cpu() if logit.device.type == 'cuda' else logit
+                                    logit_shape = logit.shape
+                                    
+                                    # Handle dimension mismatch (same logic as GPU path)
+                                    if len(logit_shape) != len(first_shape):
+                                        if len(logit_shape) > len(first_shape) and logit_shape[0] == 1:
+                                            logit = logit.squeeze(0)
+                                        elif len(logit_shape) < len(first_shape) and first_shape[0] == 1:
+                                            logit = logit.unsqueeze(0)
+                                    
+                                    # Ensure exact shape match
+                                    if logit.shape != first_shape:
+                                        logit = self._reshape_tensor_to_match(logit, first_shape)
+                                    
+                                    fixed_logits_seq.append(logit)
+                                
+                                # Now stack the standardized tensors
+                                sample_out['teacher_logits'] = torch.stack(fixed_logits_seq, dim=0)
+                            else:
+                                # Default placeholder for teacher logits
+                                logits_shape = (len(sequence), 170)
+                                sample_out['teacher_logits'] = torch.zeros(logits_shape, dtype=torch.float)
                         except Exception:
                             # Default placeholder for teacher logits
                             logits_shape = (len(sequence), 170)
@@ -1494,28 +1469,81 @@ class SynthDataset(Dataset):
                 'chord_idx': chord_idx
             }
             
+            # FIX: Make sure check_for_logits is defined in this exception handler
+            if 'check_for_logits' not in locals():
+                check_for_logits = self.logits_dir is not None
+            
             if has_teacher_logits or check_for_logits:
                 sample_out['teacher_logits'] = torch.zeros((self.seq_len, 170), dtype=torch.float)
             
+            # FIX: Ensure we return CPU tensors when using workers
+            if self.num_workers > 0 and self.cuda_available:
+                for key in sample_out:
+                    if isinstance(sample_out[key], torch.Tensor) and sample_out[key].device.type == 'cuda':
+                        sample_out[key] = sample_out[key].cpu()
+            
             return sample_out
+
+    def _reshape_tensor_to_match(self, tensor, target_shape):
+        """Helper method to reshape a tensor to match a target shape by padding/trimming as needed."""
+        try:
+            result_tensor = tensor
+            
+            # Handle different number of dimensions
+            if len(result_tensor.shape) != len(target_shape):
+                # If tensor has more dimensions than target, try to squeeze
+                if len(result_tensor.shape) > len(target_shape):
+                    # Squeeze dimensions of size 1
+                    result_tensor = result_tensor.squeeze()
+                    # If still not matching, add error handling here
+                    if len(result_tensor.shape) != len(target_shape):
+                        # Create new tensor with target shape
+                        return torch.zeros(target_shape, dtype=tensor.dtype, device=tensor.device)
+                # If tensor has fewer dimensions than target, try to unsqueeze
+                else:
+                    # Add dimensions until we match target
+                    while len(result_tensor.shape) < len(target_shape):
+                        result_tensor = result_tensor.unsqueeze(0)
+            
+            # Handle dimension sizes
+            if result_tensor.shape != target_shape:
+                new_tensor = torch.zeros(target_shape, dtype=tensor.dtype, device=tensor.device)
+                
+                # Copy data with size limiting to avoid out-of-bounds
+                # Handle each dimension separately
+                if len(target_shape) == 1:
+                    # 1D tensor
+                    copy_size = min(result_tensor.shape[0], target_shape[0])
+                    new_tensor[:copy_size] = result_tensor[:copy_size]
+                elif len(target_shape) == 2:
+                    # 2D tensor
+                    copy_size0 = min(result_tensor.shape[0], target_shape[0])
+                    copy_size1 = min(result_tensor.shape[1], target_shape[1])
+                    new_tensor[:copy_size0, :copy_size1] = result_tensor[:copy_size0, :copy_size1]
+                elif len(target_shape) == 3:
+                    # 3D tensor
+                    copy_size0 = min(result_tensor.shape[0], target_shape[0])
+                    copy_size1 = min(result_tensor.shape[1], target_shape[1])
+                    copy_size2 = min(result_tensor.shape[2], target_shape[2])
+                    new_tensor[:copy_size0, :copy_size1, :copy_size2] = result_tensor[:copy_size0, :copy_size1, :copy_size2]
+                
+                result_tensor = new_tensor
+            
+            return result_tensor
+        except Exception as e:
+            # If reshaping fails, return a zero tensor with the target shape
+            if self.verbose and not hasattr(self, '_reshape_error_logged'):
+                print(f"Error reshaping tensor: {e}")
+                self._reshape_error_logged = True
+            return torch.zeros(target_shape, dtype=tensor.dtype, device=tensor.device)
 
     def get_train_iterator(self, batch_size=128, shuffle=True, num_workers=None, pin_memory=None):
         """Get an optimized DataLoader for the training set"""
-        # Use class defaults if not specified
-        pin_memory_val = self.pin_memory if pin_memory is None else pin_memory
+        # Always use a single worker (0) for GPU compatibility
+        num_workers_val = 0
         
-        # Fix for CUDA + multiprocessing issues:
-        # Only use workers if we're in spawn mode
-        if num_workers is None:
-            if self.cuda_available and multiprocessing.get_start_method() != 'spawn':
-                num_workers_val = 0  # Disable workers if using CUDA without spawn
-                if self.verbose and not hasattr(self, '_worker_warning_logged'):
-                    print("Warning: Disabling DataLoader workers due to CUDA + fork compatibility issues")
-                    self._worker_warning_logged = True
-            else:
-                num_workers_val = self.num_workers
-        else:
-            num_workers_val = num_workers
+        # Always disable pin_memory for single worker
+        pin_memory_val = False
         
         if not self.train_indices:
             warnings.warn("No training segments available")
@@ -1523,33 +1551,25 @@ class SynthDataset(Dataset):
                 SynthSegmentSubset(self, []),
                 batch_size=batch_size,
                 shuffle=shuffle,
-                pin_memory=pin_memory_val
+                pin_memory=pin_memory_val,
+                num_workers=num_workers_val
             )
-            
+        
         return DataLoader(
             SynthSegmentSubset(self, self.train_indices),
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers_val,
-            pin_memory=pin_memory_val,
-            persistent_workers=True if num_workers_val > 0 else False,
-            prefetch_factor=self.prefetch_factor if num_workers_val > 0 else None
+            pin_memory=pin_memory_val
         )
     
     def get_eval_iterator(self, batch_size=128, shuffle=False, num_workers=None, pin_memory=None):
         """Get an optimized DataLoader for the evaluation set"""
-        # Use class defaults if not specified
-        pin_memory_val = self.pin_memory if pin_memory is None else pin_memory
+        # Always use a single worker (0) for GPU compatibility
+        num_workers_val = 0
         
-        # Fix for CUDA + multiprocessing issues:
-        # Only use workers if we're in spawn mode
-        if num_workers is None:
-            if self.cuda_available and multiprocessing.get_start_method() != 'spawn':
-                num_workers_val = 0  # Disable workers if using CUDA without spawn
-            else:
-                num_workers_val = self.num_workers
-        else:
-            num_workers_val = num_workers
+        # Always disable pin_memory for single worker
+        pin_memory_val = False
         
         if not self.eval_indices:
             warnings.warn("No evaluation segments available")
@@ -1557,7 +1577,8 @@ class SynthDataset(Dataset):
                 SynthSegmentSubset(self, []),
                 batch_size=batch_size,
                 shuffle=shuffle,
-                pin_memory=pin_memory_val
+                pin_memory=pin_memory_val,
+                num_workers=num_workers_val
             )
             
         return DataLoader(
@@ -1565,25 +1586,16 @@ class SynthDataset(Dataset):
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers_val,
-            pin_memory=pin_memory_val,
-            persistent_workers=True if num_workers_val > 0 else False,
-            prefetch_factor=self.prefetch_factor if num_workers_val > 0 else None
+            pin_memory=pin_memory_val
         )
     
     def get_test_iterator(self, batch_size=128, shuffle=False, num_workers=None, pin_memory=None):
         """Get an optimized DataLoader for the test set"""
-        # Use class defaults if not specified
-        pin_memory_val = self.pin_memory if pin_memory is None else pin_memory
+        # Always use a single worker (0) for GPU compatibility
+        num_workers_val = 0
         
-        # Fix for CUDA + multiprocessing issues:
-        # Only use workers if we're in spawn mode
-        if num_workers is None:
-            if self.cuda_available and multiprocessing.get_start_method() != 'spawn':
-                num_workers_val = 0  # Disable workers if using CUDA without spawn
-            else:
-                num_workers_val = self.num_workers
-        else:
-            num_workers_val = num_workers
+        # Always disable pin_memory for single worker
+        pin_memory_val = False
         
         if not self.test_indices:
             warnings.warn("No test segments available")
@@ -1591,7 +1603,8 @@ class SynthDataset(Dataset):
                 SynthSegmentSubset(self, []),
                 batch_size=batch_size,
                 shuffle=shuffle,
-                pin_memory=pin_memory_val
+                pin_memory=pin_memory_val,
+                num_workers=num_workers_val
             )
             
         return DataLoader(
@@ -1599,11 +1612,8 @@ class SynthDataset(Dataset):
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers_val,
-            pin_memory=pin_memory_val,
-            persistent_workers=True if num_workers_val > 0 else False,
-            prefetch_factor=self.prefetch_factor if num_workers_val > 0 else None
+            pin_memory=pin_memory_val
         )
-
 
 class SynthSegmentSubset(Dataset):
     """Subset of the SynthDataset based on specified indices"""
@@ -1618,31 +1628,6 @@ class SynthSegmentSubset(Dataset):
         if idx >= len(self.indices):
             raise IndexError(f"Index {idx} out of range for dataset with {len(self.indices)} indices")
         return self.dataset[self.indices[idx]]
-
-
-def visualize_spectrogram(spec):
-    """Visualize a spectrogram sample"""
-    plt.figure(figsize=(10, 6))
-    plt.imshow(spec.T, aspect='auto', origin='lower')
-    plt.colorbar(format='%+2.0f dB')
-    plt.xlabel('Time')
-    plt.ylabel('Frequency')
-    plt.title('Spectrogram')
-    plt.tight_layout()
-    plt.show()
-
-
-def analyze_chord_distribution(dataset):
-    """Analyze and print chord distribution from dataset"""
-    chord_counter = Counter()
-    
-    for sample in dataset.samples:
-        chord_counter[sample['chord_label']] += 1
-    
-    total = sum(chord_counter.values())
-    print(f"\nChord distribution (total: {total}):")
-    for chord, count in chord_counter.most_common(20):
-        print(f"{chord}: {count} ({count/total*100:.2f}%)")
 
 
 if __name__ == "__main__":
@@ -1686,9 +1671,6 @@ if __name__ == "__main__":
     print(f"  Eval segments: {len(dataset.eval_indices)}")
     print(f"  Test segments: {len(dataset.test_indices)}")
     
-    # Analyze chord distribution
-    analyze_chord_distribution(dataset)
-    
     # Test loaders
     train_loader = dataset.get_train_iterator(batch_size=16, shuffle=True)
     val_loader = dataset.get_eval_iterator(batch_size=16)
@@ -1698,14 +1680,6 @@ if __name__ == "__main__":
     sample_batch = next(iter(train_loader))
     print(f"\nSample batch:")
     print(f"  Spectrogram shape: {sample_batch['spectro'].shape}")
-    print(f"  Target chord indices: {sample_batch['chord_idx']}")
+    print(f"  Target chord indices: {sample_batch['chord_idx'].shape}")
     
-    # Visualize a spectrogram if possible
-    try:
-        print("\nVisualizing first spectrogram in batch...")
-        visualize_spectrogram(sample_batch['spectro'][0])
-    except Exception as e:
-        print(f"Could not visualize spectrogram: {e}")
-        
-
     print("\nTest complete!")
