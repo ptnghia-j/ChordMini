@@ -52,74 +52,56 @@ class Tester:
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.test_loader):
-                inputs = batch['spectro'].to(self.device)
-                targets = batch['chord_idx'].to(self.device)
-                
-                # Apply normalization if available
-                if self.normalization:
-                    inputs = (inputs - self.normalization['mean']) / self.normalization['std']
-
-                # Debug first few batches
-                if batch_idx == 0:
-                    self._log(f"Input shape: {inputs.shape}, target shape: {targets.shape}")
-                    self._log(f"First few targets: {targets[:10]}")
-
-                # Get raw logits before prediction
-                logits, _ = self.model(inputs)
-
-                # Check if logits have reasonable values
-                if batch_idx == 0:
-                    self._log(f"Logits shape: {logits.shape}")
-                    self._log(f"Logits mean: {logits.mean().item()}, std: {logits.std().item()}")
-                    self._log(f"First batch sample logits (max 5 values): {logits[0, :5]}")
-
-                # Use per-frame predictions if targets have a time dimension
-                use_per_frame = targets.dim() > 1 and targets.shape[1] > 1
-                preds = self.model.predict(inputs, per_frame=use_per_frame)
-
-                # Process predictions based on their dimensions
-                if targets.dim() > 1:
-                    if preds.dim() > 1:
-                        # Both are frame-level: flatten both
-                        preds_np = preds.cpu().numpy().flatten()
-                        targets_np = targets.cpu().numpy().flatten()
-                    else:
-                        # Targets are frame-level but preds are segment-level
-                        # Use most common target for each sequence
-                        seq_targets = []
-                        for i in range(targets.shape[0]):
-                            labels, counts = torch.unique(targets[i], return_counts=True)
-                            most_common_idx = torch.argmax(counts)
-                            seq_targets.append(labels[most_common_idx].item())
-                        targets_np = np.array(seq_targets)
-                        preds_np = preds.cpu().numpy()
+                if isinstance(batch, dict):
+                    inputs = batch['spectro'].to(self.device)
+                    targets = batch['chord_idx'].to(self.device)
                 else:
-                    # Standard case - both are segment-level
-                    preds_np = preds.cpu().numpy().flatten()
-                    targets_np = targets.cpu().numpy().flatten()
-
-                # Count distribution using the adjusted arrays
-                pred_counter.update(preds_np.tolist())
-                target_counter.update(targets_np.tolist())
-
+                    inputs, targets = batch
+                    inputs = inputs.to(self.device)
+                    targets = targets.to(self.device)
+                    
+                if self.normalization:
+                    mean = self.normalization['mean'].to(self.device)
+                    std = self.normalization['std'].to(self.device)
+                    inputs = (inputs - mean) / std
+                
+                # Make sure inputs have right shape
+                if inputs.dim() == 2:  # [batch, features]
+                    inputs = inputs.unsqueeze(1)  # Add time dimension
+                
+                # Get predictions
+                outputs = self.model.predict(inputs)
+                
+                # Move to CPU for processing
+                preds_np = outputs.cpu().numpy()
+                targets_np = targets.cpu().numpy()
+                
+                # Flatten predictions and targets if needed
+                if preds_np.ndim > 1:
+                    preds_np = preds_np.flatten()
+                if targets_np.ndim > 1:
+                    targets_np = targets_np.flatten()
+                
+                # Add to lists
                 all_preds.extend(preds_np)
                 all_targets.extend(targets_np)
-
-                # Debug first batch predictions vs targets
-                if batch_idx == 0:
-                    self._log(f"First batch - Predictions: {preds_np[:10]}")
-                    self._log(f"First batch - Targets: {targets_np[:10]}")
+                
+                # Count occurrences for analysis
+                for pred in preds_np:
+                    pred_counter[pred] += 1
+                for target in targets_np:
+                    target_counter[target] += 1
 
         # Print distribution statistics
         self._log("\nTarget Distribution (top 10):")
         for idx, count in target_counter.most_common(10):
-            chord_name = self.idx_to_chord.get(idx, "Unknown") if self.idx_to_chord else str(idx)
-            self._log(f"Target {idx} ({chord_name}): {count} occurrences ({count/len(all_targets)*100:.2f}%)")
+            chord_name = self.idx_to_chord.get(idx, f"Unknown-{idx}") if self.idx_to_chord else f"Class-{idx}"
+            self._log(f"{chord_name}: {count} samples ({count/sum(target_counter.values())*100:.2f}%)")
 
         self._log("\nPrediction Distribution (top 10):")
         for idx, count in pred_counter.most_common(10):
-            chord_name = self.idx_to_chord.get(idx, "Unknown") if self.idx_to_chord else str(idx)
-            self._log(f"Prediction {idx} ({chord_name}): {count} occurrences ({count/len(all_preds)*100:.2f}%)")
+            chord_name = self.idx_to_chord.get(idx, f"Unknown-{idx}") if self.idx_to_chord else f"Class-{idx}"
+            self._log(f"{chord_name}: {count} samples ({count/sum(pred_counter.values())*100:.2f}%)")
 
         # Calculate metrics
         accuracy = accuracy_score(all_targets, all_preds)
@@ -129,17 +111,7 @@ class Tester:
 
         # Print confusion matrix for most common chords (top 10)
         if len(target_counter) > 1:
-            self._log("\nAnalyzing most common predictions vs targets:")
-            top_chords = [idx for idx, _ in target_counter.most_common(10)]
-            for true_idx in top_chords:
-                true_chord = self.idx_to_chord.get(true_idx, str(true_idx))
-                pred_indices = [p for t, p in zip(all_targets, all_preds) if t == true_idx]
-                if pred_indices:
-                    pred_counts = Counter(pred_indices)
-                    most_common_pred = pred_counts.most_common(1)[0][0]
-                    most_common_pred_chord = self.idx_to_chord.get(most_common_pred, str(most_common_pred))
-                    accuracy_for_chord = pred_counts.get(true_idx, 0) / len(pred_indices)
-                    self._log(f"True: {true_chord} -> Most common prediction: {most_common_pred_chord} (Accuracy: {accuracy_for_chord:.2f})")
+            self._save_confusion_matrix(all_targets, all_preds)
 
         self._log(f"\nTest Metrics:")
         self._log(f"Test Accuracy: {accuracy:.4f}")
@@ -149,7 +121,31 @@ class Tester:
         
         # Save plots if requested and output directory is provided
         if save_plots and self.output_dir:
-            self._save_confusion_matrix(all_targets, all_preds)
+            try:
+                import matplotlib.pyplot as plt
+                import seaborn as sns
+                import numpy as np
+                
+                # Create a figure directory
+                figures_dir = os.path.join(self.output_dir, "figures")
+                os.makedirs(figures_dir, exist_ok=True)
+                
+                # Plot class distribution
+                plt.figure(figsize=(12, 6))
+                top_classes = [self.idx_to_chord.get(idx, f"Class-{idx}") 
+                              for idx, _ in target_counter.most_common(15)]
+                counts = [count for _, count in target_counter.most_common(15)]
+                
+                plt.bar(top_classes, counts)
+                plt.title("Class Distribution (Top 15)")
+                plt.xticks(rotation=45, ha="right")
+                plt.tight_layout()
+                plt.savefig(os.path.join(figures_dir, "class_distribution.png"))
+                plt.close()
+                
+                self._log(f"Saved distribution plot to {figures_dir}")
+            except Exception as e:
+                self._log(f"Error creating plots: {e}")
             
         # Return metrics as a dictionary for further processing
         return {
@@ -170,61 +166,54 @@ class Tester:
         """Save confusion matrix visualization if matplotlib is available"""
         try:
             import matplotlib.pyplot as plt
-            from sklearn.metrics import confusion_matrix
+            import seaborn as sns
             import numpy as np
-            import os
+            from sklearn.metrics import confusion_matrix
             
-            # Get the most common classes (up to 10)
-            classes = sorted(set(targets))[:10]
-            if len(classes) > 10:
-                classes = classes[:10]
-                
-            # Filter targets and predictions to only include these classes
-            filtered_targets = []
-            filtered_preds = []
-            for t, p in zip(targets, predictions):
-                if t in classes:
-                    filtered_targets.append(t)
-                    filtered_preds.append(p)
-                    
-            if not filtered_targets:
-                self._log("No data to create confusion matrix")
-                return
-                
-            # Create confusion matrix
-            cm = confusion_matrix(filtered_targets, filtered_preds, labels=classes)
+            # Get the most common classes in the targets
+            target_counter = Counter(targets)
+            top_classes = [idx for idx, _ in target_counter.most_common(10)]
             
-            # Normalize by row
+            # Create class name mapping
+            class_names = {}
+            if self.idx_to_chord:
+                for cls in top_classes:
+                    class_names[cls] = self.idx_to_chord.get(cls, f"Class-{cls}")
+            else:
+                class_names = {cls: f"Class-{cls}" for cls in top_classes}
+                
+            # Filter data to include only top classes
+            mask = np.isin(targets, top_classes)
+            filtered_targets = np.array(targets)[mask]
+            filtered_preds = np.array(predictions)[mask]
+            
+            # Compute confusion matrix
+            cm = confusion_matrix(filtered_targets, filtered_preds, labels=top_classes)
+            
+            # Normalize the confusion matrix
             cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-            cm_normalized = np.nan_to_num(cm_normalized)  # Replace NaN with 0
             
-            # Convert class indices to chord names if possible
-            class_names = [self.idx_to_chord.get(idx, f"Class {idx}") if self.idx_to_chord else f"Class {idx}" 
-                          for idx in classes]
-            
-            # Create plot
+            # Create figure
             plt.figure(figsize=(10, 8))
-            plt.imshow(cm_normalized, interpolation='nearest', cmap=plt.cm.Blues)
-            plt.title('Normalized Confusion Matrix')
-            plt.colorbar()
-            tick_marks = np.arange(len(class_names))
-            plt.xticks(tick_marks, class_names, rotation=45, ha='right')
-            plt.yticks(tick_marks, class_names)
+            sns.heatmap(cm_normalized, annot=True, fmt='.2f', cmap='Blues',
+                        xticklabels=[class_names[cls] for cls in top_classes],
+                        yticklabels=[class_names[cls] for cls in top_classes])
+            plt.xlabel('Predicted')
+            plt.ylabel('True')
+            plt.title('Confusion Matrix (Top 10 Classes)')
             plt.tight_layout()
-            plt.ylabel('True Chord')
-            plt.xlabel('Predicted Chord')
             
-            # Create output directory if it doesn't exist
-            if not os.path.exists(self.output_dir):
-                os.makedirs(self.output_dir)
-                
-            # Save the plot
-            plt.savefig(os.path.join(self.output_dir, 'confusion_matrix.png'), dpi=300, bbox_inches='tight')
+            # Save if output directory is provided
+            if self.output_dir:
+                figures_dir = os.path.join(self.output_dir, "figures")
+                os.makedirs(figures_dir, exist_ok=True)
+                plt.savefig(os.path.join(figures_dir, "confusion_matrix.png"), dpi=300)
+                self._log(f"Saved confusion matrix to {figures_dir}")
+            
             plt.close()
-            self._log(f"Saved confusion matrix to {os.path.join(self.output_dir, 'confusion_matrix.png')}")
             
         except Exception as e:
-            self._log(f"Error creating confusion matrix plot: {e}")
+            self._log(f"Error creating confusion matrix: {e}")
 
 def count_files_in_subdirectories(directory, file_pattern):
     """Count files in a directory and all its subdirectories matching a pattern."""
@@ -240,7 +229,7 @@ def count_files_in_subdirectories(directory, file_pattern):
     # Count files in subdirectories
     for root, dirs, files in os.walk(directory):
         for file in files:
-            if file.endswith(file_pattern[1:]):  # Strip the * from pattern
+            if file.endswith(file_pattern.replace("*", "")):
                 count += 1
 
     return count
@@ -254,7 +243,7 @@ def find_sample_files(directory, file_pattern, max_samples=5):
     # Find files in all subdirectories
     for root, dirs, files in os.walk(directory):
         for file in files:
-            if file.endswith(file_pattern[1:]):  # Strip the * from pattern
+            if file.endswith(file_pattern.replace("*", "")):
                 samples.append(os.path.join(root, file))
                 if len(samples) >= max_samples:
                     return samples
@@ -414,9 +403,9 @@ def main():
         logger.info(f"KD alpha: {kd_alpha} (weighting between KD and CE loss)")
         logger.info(f"Temperature: {temperature} (for softening distributions)")
         if args.logits_dir:
-            logger.info(f"Teacher logits directory: {args.logits_dir}")
+            logger.info(f"Using teacher logits from directory: {args.logits_dir}")
         else:
-            logger.warning("No teacher logits directory specified! KD may not work correctly.")
+            logger.info("No logits directory specified - teacher logits must be in batch data")
     else:
         logger.info("Knowledge distillation is disabled, using standard loss")
     
@@ -512,18 +501,16 @@ def main():
         logger.info(f"Primary paths don't have enough data. Checking alternative paths...")
         if alt_spec_dir:
             alt_spec_count = count_files_in_subdirectories(alt_spec_dir, "*.npy")
-            logger.info(f"  Alt spectrograms path: {alt_spec_dir} ({alt_spec_count} files)")
-            if alt_spec_count > 0 and spec_count == 0:
+            if alt_spec_count > 0:
+                logger.info(f"Found {alt_spec_count} spectrogram files in alternative path {alt_spec_dir}")
                 synth_spec_dir = alt_spec_dir
                 spec_count = alt_spec_count
-                logger.info(f"  Using alternative spectrogram path: {synth_spec_dir}")
         if alt_label_dir:
             alt_label_count = count_files_in_subdirectories(alt_label_dir, "*.lab")
-            logger.info(f"  Alt labels path: {alt_label_dir} ({alt_label_count} files)")
-            if alt_label_count > 0 and label_count == 0:
+            if alt_label_count > 0:
+                logger.info(f"Found {alt_label_count} label files in alternative path {alt_label_dir}")
                 synth_label_dir = alt_label_dir
                 label_count = alt_label_count
-                logger.info(f"  Using alternative label path: {synth_label_dir}")
     
     # Try one last fallback - check common locations
     if spec_count == 0 or label_count == 0:
@@ -536,21 +523,17 @@ def main():
         ]
         logger.info(f"Still missing data. Checking common paths as last resort...")
         for path in common_paths:
-            if "spectrogram" in path and spec_count == 0 and os.path.exists(path):
-                count = count_files_in_subdirectories(path, "*.npy")
-                if count > 0:
-                    logger.info(f"  Found {count} spectrogram files at {path}")
+            if path.endswith("/spectrograms") and spec_count == 0 and os.path.exists(path):
+                spec_count = count_files_in_subdirectories(path, "*.npy")
+                if spec_count > 0:
+                    logger.info(f"Found {spec_count} spectrogram files in fallback path {path}")
                     synth_spec_dir = path
-                    spec_count = count
-                    break
         for path in common_paths:
-            if "label" in path and label_count == 0 and os.path.exists(path):
-                count = count_files_in_subdirectories(path, "*.lab")
-                if count > 0:
-                    logger.info(f"  Found {count} label files at {path}")
+            if path.endswith("/labels") and label_count == 0 and os.path.exists(path):
+                label_count = count_files_in_subdirectories(path, "*.lab")
+                if label_count > 0:
+                    logger.info(f"Found {label_count} label files in fallback path {path}")
                     synth_label_dir = path
-                    label_count = count
-                    break
     
     # Final check - fail if we still don't have data
     if spec_count == 0 or label_count == 0:
@@ -565,9 +548,9 @@ def main():
     logger.info(f"Mapping of special chords:")
     for special_chord in ["N", "X"]:
         if special_chord in chord_mapping:
-            logger.info(f"  '{special_chord}' mapped to index {chord_mapping[special_chord]}")
+            logger.info(f"  {special_chord} chord is mapped to index {chord_mapping[special_chord]}")
         else:
-            logger.warning(f"  '{special_chord}' not found in mapping!")
+            logger.info(f"  {special_chord} chord is not in the mapping - this may cause issues")
     
     # Log mapping info
     logger.info(f"\nUsing chord mapping from chords.py with {len(chord_mapping)} unique chords")
@@ -583,82 +566,7 @@ def main():
     os.makedirs(checkpoints_dir, exist_ok=True)
     logger.info(f"Checkpoints will be saved to: {checkpoints_dir}")
     
-    # Now we can safely use checkpoints_dir in the dataset initialization
-    # Load synthesized dataset with optimized parameters
-    cache_file = os.path.join(checkpoints_dir, "dataset_cache.pkl") if not args.disable_cache else None
-    
-    # Memory optimization: if we have an OOM issue, prioritize metadata-only caching
-    use_metadata_only = True  # Default to metadata-only to avoid OOM
-    if args.metadata_cache:
-        use_metadata_only = True
-        logger.info("Using metadata-only caching to reduce memory usage")
-    elif args.disable_cache:
-        use_metadata_only = False  # Doesn't matter if cache is disabled
-        logger.info("Dataset caching disabled to reduce memory usage")
-    
-    # Get lazy_init from config or command line
-    lazy_init = config.data.get('lazy_init', False) if hasattr(config, 'data') else False
-    if args.lazy_init:
-        lazy_init = True
-    
-    if lazy_init:
-        logger.info("Using lazy initialization to reduce memory usage at startup")
-    
-    logger.info(f"Using partial dataset caching: {args.cache_fraction*100:.1f}% of samples")
-    
-    # Initialize SynthDataset with logits path if KD is enabled
-    logits_dir = None
-    spec_dir_override = None
-    label_dir_override = None
-    
-    if args.use_kd_loss and args.logits_dir:
-        logits_dir = resolve_path(args.logits_dir, storage_root, project_root)
-        logger.info(f"Knowledge distillation enabled - using teacher logits from: {logits_dir}")
-        
-        # Check if spectrograms and labels exist in the logits directory structure
-        logits_spec_dir = os.path.join(os.path.dirname(logits_dir), "spectrograms")
-        logits_label_dir = os.path.join(os.path.dirname(logits_dir), "labels")
-        
-        if os.path.exists(logits_spec_dir) and os.path.exists(logits_label_dir):
-            # Count files in both locations
-            logits_spec_count = count_files_in_subdirectories(logits_spec_dir, "*.npy")
-            logits_label_count = count_files_in_subdirectories(logits_label_dir, "*.lab")
-            
-            logger.info(f"Found {logits_spec_count} spectrograms and {logits_label_count} labels in logits directory structure")
-            
-            # Use spectrograms and labels from logits dir if they exist and have enough files
-            if logits_spec_count > 0 and logits_label_count > 0:
-                if (spec_count < logits_spec_count) or (label_count < logits_label_count):
-                    logger.info(f"Using spectrograms and labels from logits directory (more files available)")
-                    spec_dir_override = logits_spec_dir
-                    label_dir_override = logits_label_dir
-                    # Update counts for display
-                    spec_count = logits_spec_count
-                    label_count = logits_label_count
-        
-        # Verify logits directory exists and contains files
-        if not os.path.exists(logits_dir):
-            logger.warning(f"Logits directory does not exist: {logits_dir}")
-            if args.use_kd_loss:
-                logger.error("Knowledge distillation requires valid logits directory")
-                raise RuntimeError(f"Logits directory not found: {logits_dir}")
-        else:
-            logits_count = count_files_in_subdirectories(logits_dir, "*.npy")
-            logger.info(f"Found {logits_count} teacher logit files in {logits_dir}")
-            if logits_count == 0 and args.use_kd_loss:
-                logger.error("No teacher logit files found but knowledge distillation is enabled")
-                raise RuntimeError(f"No teacher logit files found in: {logits_dir}")
-    
-    # Use the overrides if present
-    if spec_dir_override:
-        logger.info(f"Using spectrograms from: {spec_dir_override} (override)")
-        synth_spec_dir = spec_dir_override
-    
-    if label_dir_override:
-        logger.info(f"Using labels from: {label_dir_override} (override)")
-        synth_label_dir = label_dir_override
-    
-    # Dataset initialization with GPU optimization options
+    # Initialize SynthDataset with GPU optimization options
     logger.info("\n=== Creating dataset ===")
     # Set up dataset initialization parameters
     dataset_args = {
@@ -670,449 +578,290 @@ def main():
         'frame_duration': frame_duration,
         'verbose': True,
         'device': device,  # Pass the device for GPU acceleration
-        'pin_memory': not args.no_pin_memory,  # Enable by default
-        'prefetch_factor': args.prefetch_factor,
-        'batch_gpu_cache': args.batch_gpu_cache
+        'pin_memory': False,  # IMPORTANT FIX: Disable pin_memory to avoid memory issues
+        'prefetch_factor': 1,  # IMPORTANT FIX: Reduce prefetch factor
+        'batch_gpu_cache': False  # IMPORTANT FIX: Disable GPU caching to avoid memory issues
     }
     
-    # Add cache parameters
-    if args.disable_cache or config.data.get('disable_cache', False):
-        dataset_args['use_cache'] = False
-        logger.info("Dataset caching disabled to reduce memory usage")
-    else:
-        dataset_args['use_cache'] = True
-        
-        # Add metadata_cache option to only store metadata, not spectrograms
-        if args.metadata_cache:
-            dataset_args['metadata_only'] = True
-            logger.info("Using metadata-only caching to reduce memory usage")
-        
-        # Add cache_fraction option to cache only a portion of the dataset
-        if args.cache_fraction != 0.1:  # Only log if different from default
-            dataset_args['cache_fraction'] = args.cache_fraction
-            logger.info(f"Caching {args.cache_fraction * 100}% of dataset to reduce memory usage")
+    # IMPORTANT FIX: Force worker count to 0 for safer operation
+    dataset_args['num_workers'] = 0  # Disable workers to avoid shared memory issues
+    logger.info("Using 0 workers to avoid CUDA shared memory issues")
     
-    # Add lazy initialization option
-    if args.lazy_init or config.data.get('lazy_init', False):
-        dataset_args['lazy_init'] = True
-        logger.info("Using lazy initialization to reduce memory usage")
-    
-    # Add logits directory for knowledge distillation if available
-    if logits_dir:
+    # Apply knowledge distillation settings
+    if use_kd and args.logits_dir:
+        logits_dir = resolve_path(args.logits_dir, storage_root, project_root)
+        logger.info(f"Using teacher logits from: {logits_dir}")
         dataset_args['logits_dir'] = logits_dir
-        
-        # When KD is enabled, require teacher logits to be present for all samples
-        if use_kd:
-            dataset_args['require_teacher_logits'] = True
-            logger.info("KD enabled: Enforcing that all samples must have teacher logits")
     
-    # Add small dataset option if specified
+    # Apply dataset optimization settings from command line
+    dataset_args['use_cache'] = not args.disable_cache
+    dataset_args['metadata_only'] = args.metadata_cache
+    dataset_args['cache_fraction'] = args.cache_fraction
+    dataset_args['lazy_init'] = args.lazy_init
+    
+    # If we're using a small dataset for quick testing, set the percentage
     if args.small_dataset is not None:
-        small_percentage = args.small_dataset
-        dataset_args['small_dataset_percentage'] = small_percentage
-        logger.info(f"Using only {small_percentage*100:.2f}% of dataset for quick testing (from command line)")
-    elif hasattr(config, 'data') and config.data.get('small_dataset_percentage') is not None:
-        small_percentage = config.data.get('small_dataset_percentage')
-        dataset_args['small_dataset_percentage'] = small_percentage
-        logger.info(f"Using only {small_percentage*100:.2f}% of dataset for quick testing (from config)")
+        dataset_args['small_dataset_percentage'] = args.small_dataset
+        logger.info(f"Using only {args.small_dataset * 100:.1f}% of the dataset for quick testing")
     
-    # Create the dataset
-    logger.info(f"Creating dataset with parameters:")
-    for key, value in dataset_args.items():
-        if key not in ['chord_mapping', 'verbose']:  # Skip verbose outputs
-            logger.info(f"  {key}: {value}")
-    
+    # Create the dataset with parameters
+    logger.info("Creating SynthDataset...")
     synth_dataset = SynthDataset(**dataset_args)
     
-    # After loading dataset, verify chord distribution matches expected mapping
-    if len(synth_dataset.samples) == 0:
-        logger.warning("No samples loaded from SynthDataset (lazy mode). Skipping chord distribution calculation.")
+    # Initialize model
+    logger.info("\n=== Creating model ===")
+    
+    # Detect frequency dimension from dataset
+    n_freq = getattr(config.feature, 'freq_bins', 144)  # Default to 144 if not specified
+    n_classes = len(chord_mapping)
+    logger.info(f"Using default frequency dimension: {n_freq}")
+    logger.info(f"Output classes: {n_classes}")
+    
+    # Apply model scale factor (from CLI args or config)
+    model_scale = args.model_scale or config.model.get('scale', 1.0)
+    
+    # Adjust model size based on scale factor
+    if model_scale != 1.0:
+        n_group = int(32 * model_scale)  # Scale n_group
+        if n_group < 1:
+            n_group = 1
+        logger.info(f"Using n_group={n_group}, resulting in actual feature dimension: {n_freq // n_group}")
     else:
-        chord_counter = Counter([sample['chord_label'] for sample in synth_dataset.samples])
-        logger.info("\nChord distribution in loaded dataset:")
-        n_chord_count = chord_counter.get("N", 0)
-        logger.info(f"'N' chord count: {n_chord_count} ({n_chord_count/len(synth_dataset.samples)*100:.2f}% of total)")
-        logger.info(f"Total synthesized samples: {len(synth_dataset.samples)}")
+        n_group = config.model.get('n_group', 32)
+    
+    logger.info(f"Using model scale: {model_scale}")
+    
+    # Create model instance
+    model = ChordNet(
+        n_freq=n_freq,
+        n_classes=n_classes,
+        n_group=n_group,
+        f_layer=config.model['f_layer'],
+        f_head=config.model['f_head'],
+        t_layer=config.model['t_layer'],
+        t_head=config.model['t_head'],
+        d_layer=config.model['d_layer'],
+        d_head=config.model['d_head'],
+        dropout=config.model['dropout']
+    ).to(device)
+    
+    # Create optimizer
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=config.training['learning_rate'],
+        weight_decay=config.training.get('weight_decay', 0.0)
+    )
+    
+    # IMPORTANT FIX: Reduce batch size to avoid OOM
+    original_batch_size = config.training['batch_size']
+    if torch.cuda.is_available():
+        try:
+            # Get available memory and set a conservative batch size
+            free_mem = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024 * 1024)  # in GB
+            # Calculate safer batch size
+            if free_mem < 8:  # Less than 8GB
+                new_batch_size = min(original_batch_size, 16)
+            elif free_mem < 16:  # 8-16GB
+                new_batch_size = min(original_batch_size, 32)
+            else:  # More than 16GB
+                new_batch_size = min(original_batch_size, 64)
+                
+            # Make sure batch size is a multiple of 8 for efficiency
+            new_batch_size = (new_batch_size // 8) * 8
+            if new_batch_size < 8:
+                new_batch_size = 8  # Minimum batch size of 8
+                
+            if new_batch_size < original_batch_size:
+                logger.info(f"Reducing batch size from {original_batch_size} to {new_batch_size} to avoid CUDA OOM errors")
+                config.training['batch_size'] = new_batch_size
+        except Exception as e:
+            logger.warning(f"Error determining batch size: {e}")
+    
+    # IMPORTANT FIX: Add memory cleanup before training
+    if torch.cuda.is_available():
+        logger.info("Performing CUDA memory cleanup before training")
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        # Print memory stats
+        allocated = torch.cuda.memory_allocated() / (1024 * 1024 * 1024)
+        max_allocated = torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)
+        reserved = torch.cuda.memory_reserved() / (1024 * 1024 * 1024)
+        max_reserved = torch.cuda.max_memory_reserved() / (1024 * 1024 * 1024)
+        logger.info(f"CUDA memory stats (GB): allocated={allocated:.2f}, max_allocated={max_allocated:.2f}")
+        logger.info(f"CUDA memory stats (GB): reserved={reserved:.2f}, max_reserved={max_reserved:.2f}")
     
     # Create data loaders with optimized settings for GPU
-    # Determine optimal num_workers based on CPU and GPU
-    if torch.cuda.is_available():
-        # For GPU training, we want enough workers to keep the GPU fed
-        num_workers = min(4, os.cpu_count() or 1)
-    else:
-        # For CPU training, fewer workers to avoid contention
-        num_workers = 1 if os.cpu_count() <= 2 else 2
-    
+    # IMPORTANT FIX: Force zero workers to avoid multiprocessing issues
     train_loader = synth_dataset.get_train_iterator(
         batch_size=config.training['batch_size'], 
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=not args.no_pin_memory
+        num_workers=0,  # Force 0 to avoid shared memory issues
+        pin_memory=False  # Disable pin memory to avoid memory issues
     )
     
     val_loader = synth_dataset.get_eval_iterator(
         batch_size=config.training['batch_size'], 
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=not args.no_pin_memory
+        num_workers=0,  # Force 0 to avoid shared memory issues
+        pin_memory=False  # Disable pin memory
     )
     
-    # Debug samples - add more detailed shape information
-    logger.info("=== Debug: Training set sample ===")
-    try:
-        train_batch = next(iter(train_loader))
-        logger.info(f"Training spectrogram tensor shape: {train_batch['spectro'].shape}")
-        # Determine if we're using CQT or STFT based on frequency dimension
-        actual_freq_dim = train_batch['spectro'].shape[-1]
-        logger.info(f"Detected frequency dimension in data: {actual_freq_dim}")
-        # For CQT, frequency dimension is typically around 144
-        # For STFT, it's typically much higher (e.g., 1024 or 2048)
-        is_cqt = actual_freq_dim <= 256
-        if is_cqt:
-            logger.info(f"Detected Constant-Q Transform (CQT) input with {actual_freq_dim} frequency bins")
-        else:
-            logger.info(f"Detected STFT input with {actual_freq_dim} frequency bins")
-        # Set the frequency dimension to match the actual data
-        n_freq = actual_freq_dim
-    except Exception as e:
-        logger.error(f"Error processing training batch: {e}")
-        logger.error("This may indicate problems with the data format. Attempting to continue...")
-        n_freq = config.model.get('n_freq', 144)
-        logger.info(f"Using default frequency dimension: {n_freq}")
-        is_cqt = n_freq <= 256
-    
-    # Get the number of unique chords in our dataset for the output layer
-    num_unique_chords = len(chord_mapping)
-    
-    # Initialize n_classes with the number of unique chords
-    n_classes = num_unique_chords
-    logger.info(f"Output classes: {n_classes}")
-    
-    # Determine n_group based on frequency dimension for CQT vs STFT
-    # For CQT, we'll use n_group=12 to get actual_feature_dim=12 (for 144 bins)
-    # For STFT, we'll use the config value or default to 32
-    n_group = 12 if is_cqt else config.model.get('n_group', 32)
-    
-    # Ensure n_freq is divisible by n_group
-    if n_freq % n_group != 0:
-        # Find a suitable n_group that divides n_freq
-        for candidate in [12, 16, 24, 32, 48]:
-            if n_freq % candidate == 0:
-                n_group = candidate
-                break
-        logger.warning(f"Adjusted n_group to {n_group} to ensure n_freq ({n_freq}) is divisible")
-    
-    # Log the feature dimensions
-    actual_feature_dim = n_freq // n_group
-    logger.info(f"Using n_group={n_group}, resulting in actual feature dimension: {actual_feature_dim}")
-    
-    # Get model scale factor and compute scaled parameters
-    model_scale = config.model.get('scale', 1.0)
-    
-    # Get base configuration for the model
-    base_config = config.model.get('base_config', {})
-    
-    # If base_config is not specified, fall back to direct model parameters
-    if not base_config:
-        base_config = {
-            'f_layer': config.model.get('f_layer', 3),
-            'f_head': config.model.get('f_head', 6),
-            't_layer': config.model.get('t_layer', 3),
-            't_head': config.model.get('t_head', 6),
-            'd_layer': config.model.get('d_layer', 3),
-            'd_head': config.model.get('d_head', 6),
-        }
-    
-    # Apply scale to model parameters
-    f_layer = max(1, int(round(base_config['f_layer'] * model_scale)))
-    f_head = max(1, int(round(base_config['f_head'] * model_scale)))
-    t_layer = max(1, int(round(base_config['t_layer'] * model_scale)))
-    t_head = max(1, int(round(base_config['t_head'] * model_scale)))
-    d_layer = max(1, int(round(base_config['d_layer'] * model_scale)))
-    d_head = max(1, int(round(base_config['d_head'] * model_scale)))
-    
-    # Log model scaling information
-    logger.info(f"Using model scale: {model_scale}")
-    if model_scale != 1.0:
-        logger.info("Scaled model configuration:")
-        logger.info(f"  f_layer: {base_config['f_layer']} -> {f_layer}")
-        logger.info(f"  f_head: {base_config['f_head']} -> {f_head}")
-        logger.info(f"  t_layer: {base_config['t_layer']} -> {t_layer}")
-        logger.info(f"  t_head: {base_config['t_head']} -> {t_head}")
-        logger.info(f"  d_layer: {base_config['d_layer']} -> {d_layer}")
-        logger.info(f"  d_head: {base_config['d_head']} -> {d_head}")
-    
-    # Verify that the scaled parameters maintain dimensional compatibility
-    if actual_feature_dim % f_head != 0:
-        logger.warning(f"Feature dimension {actual_feature_dim} not divisible by scaled f_head={f_head}")
-        # Find compatible f_head values
-        for head_count in range(f_head, 0, -1):
-            if actual_feature_dim % head_count == 0:
-                logger.warning(f"Adjusting f_head from {f_head} to {head_count} for compatibility")
-                f_head = head_count
-                break
-    
-    model = ChordNet(
-        n_freq=n_freq, 
-        n_classes=n_classes, 
-        n_group=n_group, 
-        f_layer=f_layer, 
-        f_head=f_head, 
-        t_layer=t_layer, 
-        t_head=t_head, 
-        d_layer=d_layer, 
-        d_head=d_head, 
-        dropout=config.model['dropout'],
-        #ignore_index=chord_mapping.get("N")
-    ).to(device)
-    
-    # Log model configuration for transparency
-    logger.info("Model configuration:")
-    logger.info(f"  n_freq: {n_freq}")
-    logger.info(f"  n_classes: {n_classes}")
-    logger.info(f"  n_group: {n_group}")
-    logger.info(f"  f_layer: {f_layer}")
-    logger.info(f"  f_head: {f_head}")
-    logger.info(f"  t_layer: {t_layer}")
-    logger.info(f"  t_head: {t_head}")
-    logger.info(f"  d_layer: {d_layer}")
-    logger.info(f"  d_head: {d_head}")
-    logger.info(f"  dropout: {config.model['dropout']}")
-    
-    if torch.cuda.device_count() > 1 and config.misc['use_cuda']:
-        model = torch.nn.DataParallel(model)
-        logger.info(f"Using {torch.cuda.device_count()} GPUs for training")
-    
-    # # Increase batch size based on GPU memory
-    # if torch.cuda.is_available():
-    #     try:
-    #         # Try to estimate maximum possible batch size for this device
-    #         orig_batch_size = config.training['batch_size']
-            
-    #         # Get free GPU memory in MB (conservative estimate)
-    #         free_mem = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
-    #         mem_factor = free_mem / 8000  # Normalize against 8GB baseline
-            
-    #         # Scale batch size up by a factor of 2-3 based on available memory
-    #         # with a safety margin to avoid OOM errors
-    #         new_batch_size = min(
-    #             int(orig_batch_size * min(2.0, max(1.5, mem_factor * 0.8))),
-    #             orig_batch_size * 2.5  # Cap at 2.5x original size for safety
-    #         )
-            
-    #         # Always ensure batch size is even for better GPU utilization
-    #         new_batch_size = (new_batch_size // 2) * 2
-            
-    #         if new_batch_size > orig_batch_size:
-    #             logger.info(f"Increasing batch size from {orig_batch_size} to {new_batch_size} for better GPU utilization")
-    #             config.training['batch_size'] = new_batch_size
-    #     except Exception as e:
-    #         logger.warning(f"Failed to auto-adjust batch size: {e}")
-    
-    # Create optimizer - match teacher settings
-    optimizer = torch.optim.Adam(model.parameters(), 
-                               lr=config.training['learning_rate'],    
-                               weight_decay=config.training['weight_decay'], 
-                               betas=tuple(config.training['betas']), 
-                               eps=config.training['epsilon'])
-    
-    # Calculate class weights to handle imbalanced data
-    # Only calculate if not using focal loss
-    class_weights = None
-    if not args.use_focal_loss and not config.training.get('use_focal_loss', False):
-        dist_counter = Counter([sample['chord_label'] for sample in synth_dataset.samples])
-        sorted_chords = sorted(chord_mapping.keys())
-        total_samples = sum(dist_counter.values())
-        ignore_index=chord_mapping.get("N")
-        logger.info(f"Total chord instances: {total_samples}")
-        for ch in sorted_chords[:10]:
-            ratio = dist_counter.get(ch, 0) / total_samples * 100
-            logger.info(f"Chord: {ch}, Count: {dist_counter.get(ch, 0)}, Percentage: {ratio:.4f}%")
-        
-        # The issue is here - using max on a single value. Let's fix with a safer approach:
-        class_weights = np.array([
-            0.0 if ch not in dist_counter else np.log(total_samples / max(1, dist_counter.get(ch, 1)) + 1)
-            for ch in sorted_chords
-        ], dtype=np.float32)
-        logger.info(f"Generated class weights for {len(class_weights)} classes using log(inverse frequency)")
-    else:
-        logger.info("Using focal loss instead of class weights for handling imbalance")
-    
-    # Create idx_to_chord mapping for the loss function
-    idx_to_chord = {v: k for k, v in chord_mapping.items()}
-    
     # Calculate global mean and std for normalization (as done in teacher model)
-    mean = 0
-    square_mean = 0
-    k = 0
-    logger.info("Calculating global mean and std for normalization...")
-    for i, data in enumerate(train_loader):
-        features = data['spectro'].to(device)
-        mean += torch.mean(features).item()
-        square_mean += torch.mean(features.pow(2)).item()
-        k += 1
-    if k > 0:
-        square_mean = square_mean / k
-        mean = mean / k
-        std = np.sqrt(square_mean - mean * mean)
-        logger.info(f"Global mean: {mean}, std: {std}")
-    else:
+    # IMPORTANT FIX: Use safer memory handling when calculating stats
+    try:
+        # Use a smaller batch size and safer approach
+        logger.info("Calculating global mean and std for normalization...")
+        stats_batch_size = min(16, config.training['batch_size'])
+        # Create a smaller loader just for stats calculation
+        stats_loader = synth_dataset.get_train_iterator(
+            batch_size=stats_batch_size, 
+            shuffle=True,
+            num_workers=0,
+            pin_memory=False
+        )
+        
+        mean = 0
+        square_mean = 0
+        k = 0
+        # Limit the number of batches to process - 100 batches should be enough
+        max_stats_batches = 100
+        
+        for i, data in enumerate(stats_loader):
+            if i >= max_stats_batches:
+                break
+                
+            try:
+                # Use CPU for calculations to avoid GPU OOM
+                features = data['spectro'].to('cpu')
+                mean += torch.mean(features).item()
+                square_mean += torch.mean(features.pow(2)).item()
+                k += 1
+                
+                # Explicitly delete tensors to free memory
+                del features
+                # Force garbage collection
+                if i % 10 == 0 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception as e:
+                logger.warning(f"Error processing batch {i} for stats: {e}")
+                continue
+                
+        if k > 0:
+            square_mean = square_mean / k
+            mean = mean / k
+            std = np.sqrt(square_mean - mean * mean)
+            logger.info(f"Global mean: {mean}, std: {std}")
+        else:
+            mean = 0.0
+            std = 1.0
+            logger.warning("Could not calculate mean and std, using defaults")
+    except Exception as e:
+        logger.error(f"Error calculating statistics: {e}")
         mean = 0.0
         std = 1.0
-        logger.warning("Could not calculate mean and std, using defaults")
+        logger.warning("Using default mean=0.0, std=1.0 due to calculation error")
     
     # Create normalized tensors on GPU once and reuse
-    mean = torch.tensor(mean, device=device)
-    std = torch.tensor(std, device=device)
-    normalization = {'mean': mean, 'std': std}
+    try:
+        mean = torch.tensor(mean, device=device)
+        std = torch.tensor(std, device=device)
+        normalization = {'mean': mean, 'std': std}
+    except Exception as e:
+        logger.error(f"Error creating normalization tensors: {e}")
+        # Fall back to CPU tensors
+        mean = torch.tensor(mean)
+        std = torch.tensor(std)
+        normalization = {'mean': mean, 'std': std}
     
-    # Create our StudentTrainer with all parameters
+    # IMPORTANT FIX: Clear memory again before starting training
+    if torch.cuda.is_available():
+        logger.info("Final CUDA memory cleanup before training")
+        torch.cuda.empty_cache()
+    
+    # Create StudentTrainer with enhanced loss functions
     trainer = StudentTrainer(
-        model, 
-        optimizer, 
-        device=device, 
-        num_epochs=config.training['max_epochs'],
-        class_weights=class_weights,  # Will be None if using focal loss
-        idx_to_chord=idx_to_chord,
-        normalization=normalization,  # Now using GPU tensors
+        model=model,
+        optimizer=optimizer, 
+        device=device,
+        num_epochs=config.training['num_epochs'],
+        logger=logger,
+        checkpoint_dir=checkpoints_dir,
+        class_weights=None,  # Using focal loss instead of class weights
+        idx_to_chord=master_mapping,
+        normalization=normalization,
         early_stopping_patience=config.training.get('early_stopping_patience', 5),
         lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
         min_lr=config.training.get('min_lr', 5e-6),
-        checkpoint_dir=checkpoints_dir,
-        logger=logger,
-        use_warmup=args.use_warmup,
-        warmup_epochs=warmup_epochs,  # Use the corrected warmup_epochs value
-        warmup_start_lr=args.warmup_start_lr,
-        warmup_end_lr=config.training['learning_rate'],  # Use config LR as warmup end point
-        lr_schedule_type=args.lr_schedule,  # Pass the scheduler type
+        use_warmup=args.use_warmup or config.training.get('use_warmup', False),
+        warmup_epochs=args.warmup_epochs or config.training.get('warmup_epochs', 5),
+        warmup_start_lr=args.warmup_start_lr or config.training.get('warmup_start_lr', None),
+        lr_schedule_type=args.lr_schedule or config.training.get('lr_schedule', None),
         use_focal_loss=args.use_focal_loss or config.training.get('use_focal_loss', False),
         focal_gamma=args.focal_gamma or config.training.get('focal_gamma', 2.0),
         focal_alpha=args.focal_alpha or config.training.get('focal_alpha', None),
-        use_kd_loss=args.use_kd_loss,
-        kd_alpha=args.kd_alpha,
-        temperature=args.temperature
+        use_kd_loss=use_kd,
+        kd_alpha=kd_alpha,
+        temperature=temperature
     )
     
-    # Set chord mapping for saving with the checkpoint
+    # Set chord mapping in trainer for checkpoint saving
     trainer.set_chord_mapping(chord_mapping)
     
-    # Check for existing checkpoints to resume training
-    start_epoch = 1
-    if os.path.exists(checkpoints_dir):
-        checkpoint_files = glob.glob(os.path.join(checkpoints_dir, "student_model_epoch_*.pth"))
-        if checkpoint_files:
-            # Extract epoch numbers and find the highest one
-            epoch_numbers = []
-            for f in checkpoint_files:
-                try:
-                    epoch_num = int(os.path.basename(f).replace("student_model_epoch_", "").replace(".pth", ""))
-                    epoch_numbers.append((epoch_num, f))
-                except ValueError:
-                    continue
-            if epoch_numbers:
-                # Find the most recent checkpoint
-                latest_epoch, latest_checkpoint = max(epoch_numbers, key=lambda x: x[0])
-                logger.info(f"Found checkpoint from epoch {latest_epoch}. Attempting to resume training...")
-                try:
-                    # Load checkpoint
-                    checkpoint = torch.load(latest_checkpoint, map_location=device)
-                    # Restore model state
-                    model.load_state_dict(checkpoint['model_state_dict'])
-                    # Restore optimizer state
-                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                    # Restore scheduler if it exists in the checkpoint
-                    if 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None and hasattr(trainer, 'smooth_scheduler'):
-                        trainer.smooth_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                    # Set starting epoch to the next one
-                    start_epoch = latest_epoch + 1
-                    logger.info(f"Successfully loaded checkpoint. Training will resume from epoch {start_epoch}.")
-                    # If we have validation stats, restore those too
-                    if 'accuracy' in checkpoint:
-                        trainer.best_val_acc = checkpoint.get('accuracy', 0)
-                        logger.info(f"Restored best validation accuracy: {trainer.best_val_acc:.4f}")
-                except Exception as e:
-                    logger.error(f"Error loading checkpoint: {e}")
-                    logger.info("Training will start from scratch.")
-                    start_epoch = 1
+    # Run training
+    logger.info("\n=== Starting training ===")
+    try:
+        trainer.train(train_loader, val_loader)
+        logger.info("Training completed successfully!")
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user")
+    except Exception as e:
+        logger.error(f"Error during training: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
     
-    # Modify train method call to include starting epoch
-    trainer.train(train_loader, val_loader, start_epoch=start_epoch)
+    # Final evaluation on test set
+    logger.info("\n=== Testing ===")
+    try:
+        # Load best model before testing
+        if trainer.load_best_model():
+            test_loader = synth_dataset.get_test_iterator(
+                batch_size=config.training['batch_size'],
+                shuffle=False,
+                num_workers=0,
+                pin_memory=False
+            )
+            
+            tester = Tester(
+                model=model,
+                test_loader=test_loader,
+                device=device,
+                idx_to_chord=master_mapping,
+                normalization=normalization,
+                output_dir=checkpoints_dir,
+                logger=logger
+            )
+            
+            test_metrics = tester.evaluate(save_plots=True)
+            
+            # Save test metrics
+            try:
+                import json
+                metrics_path = os.path.join(checkpoints_dir, "test_metrics.json") 
+                with open(metrics_path, 'w') as f:
+                    json.dump(test_metrics, f, indent=2)
+                logger.info(f"Test metrics saved to {metrics_path}")
+            except Exception as e:
+                logger.error(f"Error saving test metrics: {e}")
+                
+        else:
+            logger.warning("Could not load best model for testing")
+    except Exception as e:
+        logger.error(f"Error during testing: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
     
-    # Test the model
-    logger.info("Starting testing phase...")
-    # Load the best model for testing
-    trainer.load_best_model()
-    test_loader = synth_dataset.get_test_iterator(batch_size=config.training['batch_size'])
-    logger.info("=== Debug: Test set sample ===")
-    test_batch = next(iter(test_loader))
-    logger.info(f"Test spectrogram tensor shape: {test_batch['spectro'].shape}")
-    logger.info(f"Test labels: {test_batch['chord_idx'][:10]}")
-    
-    # Create results directory for saving plots and metrics
-    results_dir = os.path.join(checkpoints_dir, "results")
-    os.makedirs(results_dir, exist_ok=True)
-    
-    # Evaluate on test set using the enhanced Tester class (fixed arguments)
-    tester = Tester(
-        model, 
-        test_loader, 
-        device, 
-        idx_to_chord=idx_to_chord,
-        normalization={"mean": mean, "std": std},
-        output_dir=results_dir,
-        logger=logger  # Pass the logger correctly
-    )
-    test_metrics = tester.evaluate(save_plots=True)
-    
-    score_metrics = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
-    dataset_length = len(synth_dataset.samples)
-    if dataset_length < 3:
-        logger.info("Not enough validation samples to compute chord metrics.")
-    else:
-        # Create balanced splits of the samples
-        split = dataset_length // 3
-        valid_dataset1 = synth_dataset.samples[:split]
-        valid_dataset2 = synth_dataset.samples[split:2*split]
-        valid_dataset3 = synth_dataset.samples[2*split:]
-        
-        logger.info(f"Evaluating model on {len(valid_dataset1)} samples in split 1...")
-        score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
-            valid_dataset=valid_dataset1, config=config, model=model, model_type=args.model, 
-            mean=mean, std=std, device=device)
-        logger.info(f"Evaluating model on {len(valid_dataset2)} samples in split 2...")
-        score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
-            valid_dataset=valid_dataset2, config=config, model=model, model_type=args.model, 
-            mean=mean, std=std, device=device)
-        logger.info(f"Evaluating model on {len(valid_dataset3)} samples in split 3...")
-        score_list_dict3, song_length_list3, average_score_dict3 = large_voca_score_calculation(
-            valid_dataset=valid_dataset3, config=config, model=model, model_type=args.model, 
-            mean=mean, std=std, device=device)
-        
-        # Calculate and report the weighted average scores
-        for m in score_metrics:
-            if song_length_list1 and song_length_list2 and song_length_list3:
-                avg = (np.sum(song_length_list1) * average_score_dict1[m] +
-                       np.sum(song_length_list2) * average_score_dict2[m] +
-                       np.sum(song_length_list3) * average_score_dict3[m]) / (
-                       np.sum(song_length_list1) + np.sum(song_length_list2) + np.sum(song_length_list3))
-                logger.info(f"==== {m} score 1 is {average_score_dict1[m]:.4f}")
-                logger.info(f"==== {m} score 2 is {average_score_dict2[m]:.4f}")
-                logger.info(f"==== {m} score 3 is {average_score_dict3[m]:.4f}")
-                logger.info(f"==== {m} mix average score is {avg:.4f}")
-            else:
-                logger.info(f"==== {m} scores couldn't be calculated properly")
-    
-    # Save the final model
-    save_path = os.path.join(checkpoints_dir, "student_model_final.pth")
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'chord_mapping': chord_mapping,
-        'idx_to_chord': idx_to_chord,
-        'mean': mean,
-        'std': std,
-    }, save_path)
-    logger.info(f"Final model saved to {save_path}")
+    logger.info("Student training and evaluation complete!")
 
 if __name__ == '__main__':
     main()
