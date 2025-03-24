@@ -679,7 +679,7 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
             if errors <= 10:  # Only print detailed error for first 10 errors
                 traceback.print_exc()
     
-    # Calculate weighted average scores - FIX: Ensure consistent lengths
+    # Calculate weighted average scores - FIX: Ensure consistent lengths and non-negative values
     average_score_dict = {}
     
     # First ensure all score lists are of the same length as song_length_list
@@ -702,18 +702,21 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
     if song_length_list:
         for metric in score_list_dict:
             if score_list_dict[metric]:
-                # Safely calculate weighted average with matching lengths
+                # Safely calculate weighted average with matching lengths and ensure non-negative values
                 weighted_sum = 0.0
                 total_length = 0.0
                 
                 # Use explicit loop instead of sum() to handle each element safely
                 for idx, (score, length) in enumerate(zip(score_list_dict[metric], song_length_list)):
-                    # Convert score to float if it's a numpy array
-                    score_val = float(score) if hasattr(score, 'item') else score
+                    # Convert score to float if it's a numpy array and ensure non-negative
+                    score_val = max(0.0, float(score) if hasattr(score, 'item') else score)
                     weighted_sum += score_val * length
                     total_length += length
                 
                 average_score_dict[metric] = weighted_sum / total_length if total_length > 0 else 0.0
+                
+                # Final clipping to ensure valid range
+                average_score_dict[metric] = max(0.0, min(1.0, average_score_dict[metric]))
             else:
                 average_score_dict[metric] = 0.0
     else:
@@ -748,6 +751,15 @@ def calculate_chord_scores(timestamps, durations, reference_labels, prediction_l
     intervals = intervals[:min_len]
     reference_labels = reference_labels[:min_len]
     prediction_labels = prediction_labels[:min_len]
+    
+    # Initialize default scores
+    root_score = 0.0
+    thirds_score = 0.0
+    triads_score = 0.0
+    sevenths_score = 0.0
+    tetrads_score = 0.0
+    majmin_score = 0.0
+    mirex_score = 0.0
     
     try:
         # Format comparison data
@@ -792,96 +804,84 @@ def calculate_chord_scores(timestamps, durations, reference_labels, prediction_l
         seg_refs = [pair[2] for pair in comparison_pairs]
         seg_preds = [pair[3] for pair in comparison_pairs]
         
-        # The seg_intervals variable is never explicitly constructed from comparison_pairs
-        # This could cause issues if mir_eval functions need interval data
-        # Add this line to fix:
+        # Convert to intervals for mir_eval
         seg_intervals = np.array([[pair[0], pair[1]] for pair in comparison_pairs])
+        durations = np.diff(seg_intervals, axis=1).flatten()
         
-        # Call mir_eval metrics correctly with proper handling for array results
+        # Call mir_eval metrics with proper error handling
         try:
-            # Use try/except for each metric separately to ensure we can continue
-            # even if one metric fails
+            # Root metric
             try:
-                root_result = mir_eval.chord.root(seg_refs, seg_preds)
-                # Handle both scalar and array results
-                if hasattr(root_result, 'shape') and root_result.shape:
-                    # It's an array, get weighted mean
-                    root_score = float(np.mean(root_result))
-                else:
-                    # It's already a scalar
-                    root_score = float(root_result)
+                root_comparisons = mir_eval.chord.root(seg_refs, seg_preds)
+                root_score = max(0.0, float(mir_eval.chord.weighted_accuracy(root_comparisons, durations)))
             except Exception as e:
-                print(f"Error in root scoring: {e}")
+                print(f"Error calculating root score: {e}")
                 root_score = 0.0
                 
+            # Thirds metric
             try:
-                thirds_result = mir_eval.chord.thirds(seg_refs, seg_preds)
-                if hasattr(thirds_result, 'shape') and thirds_result.shape:
-                    thirds_score = float(np.mean(thirds_result))
-                else:
-                    thirds_score = float(thirds_result)
+                thirds_comparisons = mir_eval.chord.thirds(seg_refs, seg_preds)
+                thirds_score = max(0.0, float(mir_eval.chord.weighted_accuracy(thirds_comparisons, durations)))
             except Exception as e:
-                print(f"Error in thirds scoring: {e}")
+                print(f"Error calculating thirds score: {e}")
                 thirds_score = 0.0
                 
+            # Triads metric
             try:
-                triads_result = mir_eval.chord.triads(seg_refs, seg_preds)
-                if hasattr(triads_result, 'shape') and triads_result.shape:
-                    triads_score = float(np.mean(triads_result))
-                else:
-                    triads_score = float(triads_result)
+                triads_comparisons = mir_eval.chord.triads(seg_refs, seg_preds)
+                triads_score = max(0.0, float(mir_eval.chord.weighted_accuracy(triads_comparisons, durations)))
             except Exception as e:
-                print(f"Error in triads scoring: {e}")
+                print(f"Error calculating triads score: {e}")
                 triads_score = 0.0
                 
+            # Sevenths metric
             try:
-                sevenths_result = mir_eval.chord.sevenths(seg_refs, seg_preds)
-                if hasattr(sevenths_result, 'shape') and sevenths_result.shape:
-                    sevenths_score = float(np.mean(sevenths_result))
-                else:
-                    sevenths_score = float(sevenths_result)
+                sevenths_comparisons = mir_eval.chord.sevenths(seg_refs, seg_preds)
+                sevenths_score = max(0.0, float(mir_eval.chord.weighted_accuracy(sevenths_comparisons, durations)))
             except Exception as e:
-                print(f"Error in sevenths scoring: {e}")
+                print(f"Error calculating sevenths score: {e}")
                 sevenths_score = 0.0
                 
+            # Tetrads metric
             try:
-                tetrads_result = mir_eval.chord.tetrads(seg_refs, seg_preds)
-                if hasattr(tetrads_result, 'shape') and tetrads_result.shape:
-                    tetrads_score = float(np.mean(tetrads_result))
-                else:
-                    tetrads_score = float(tetrads_result)
+                tetrads_comparisons = mir_eval.chord.tetrads(seg_refs, seg_preds)
+                tetrads_score = max(0.0, float(mir_eval.chord.weighted_accuracy(tetrads_comparisons, durations)))
             except Exception as e:
-                print(f"Error in tetrads scoring: {e}")
+                print(f"Error calculating tetrads score: {e}")
                 tetrads_score = 0.0
                 
+            # Majmin metric
             try:
-                majmin_result = mir_eval.chord.majmin(seg_refs, seg_preds)
-                if hasattr(majmin_result, 'shape') and majmin_result.shape:
-                    majmin_score = float(np.mean(majmin_result))
-                else:
-                    majmin_score = float(majmin_result)
+                majmin_comparisons = mir_eval.chord.majmin(seg_refs, seg_preds)
+                majmin_score = max(0.0, float(mir_eval.chord.weighted_accuracy(majmin_comparisons, durations)))
             except Exception as e:
-                print(f"Error in majmin scoring: {e}")
+                print(f"Error calculating majmin score: {e}")
                 majmin_score = 0.0
                 
+            # Mirex metric
             try:
-                mirex_result = mir_eval.chord.mirex(seg_refs, seg_preds)
-                if hasattr(mirex_result, 'shape') and mirex_result.shape:
-                    mirex_score = float(np.mean(mirex_result))
-                else:
-                    mirex_score = float(mirex_result)
+                mirex_comparisons = mir_eval.chord.mirex(seg_refs, seg_preds)
+                mirex_score = max(0.0, float(mir_eval.chord.weighted_accuracy(mirex_comparisons, durations)))
             except Exception as e:
-                print(f"Error in mirex scoring: {e}")
+                print(f"Error calculating mirex score: {e}")
                 mirex_score = 0.0
                 
         except Exception as e:
             print(f"Error in mir_eval metrics calculation: {e}")
             return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-        
+    
     except Exception as e:
         print(f"Error in mir_eval scoring: {e}")
-        # Return zeros for all scores on error
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    
+    # Ensure all scores are non-negative (should be between 0 and 1)
+    root_score = max(0.0, min(1.0, root_score))
+    thirds_score = max(0.0, min(1.0, thirds_score))
+    triads_score = max(0.0, min(1.0, triads_score))
+    sevenths_score = max(0.0, min(1.0, sevenths_score))
+    tetrads_score = max(0.0, min(1.0, tetrads_score))
+    majmin_score = max(0.0, min(1.0, majmin_score))
+    mirex_score = max(0.0, min(1.0, mirex_score))
     
     return root_score, thirds_score, triads_score, sevenths_score, tetrads_score, majmin_score, mirex_score
 

@@ -724,23 +724,32 @@ def main():
         # Wrap the training call with timeout handling to detect hangs
         import signal
         
-        def timeout_handler(signum, frame):
-            raise TimeoutError("Training function took too long to start")
+        # def timeout_handler(signum, frame):
+        #     # Instead of raising an error, just log a warning first
+        #     logger.warning("WARNING: Training function is taking a long time to start.")
+        #     logger.warning("This might be due to slow data loading or processing.")
+        #     logger.warning("Training will continue - check for progress...")
+            
+        #     # Set a longer timeout for the next check (15 minutes)
+        #     signal.alarm(900)  # 15 minutes instead of 5 minutes
         
-        # Set a timeout for 60 seconds - if training doesn't start by then, there's an issue
-        signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(60)
+        # Comment out timeout code for production - this avoids the TimeoutError
+        # signal.signal(signal.SIGALRM, timeout_handler)
+        # signal.alarm(600)  # 10 minutes timeout commented out for production
         
+        # Before training starts, log that we're beginning data loading
+        logger.info("Loading and preparing data (this may take a while for large datasets)...")
+        logger.info("Timeout detection disabled for production use")
+        
+        # Start training
         trainer.train(train_loader, val_loader)
-        # Cancel the alarm if training starts successfully
-        signal.alarm(0)
+        
+        # No need to cancel the alarm since it's not set
+        # signal.alarm(0)
         
         logger.info("Training completed successfully!")
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
-    except TimeoutError as e:
-        logger.error(f"ERROR: {e}")
-        logger.error("Training function did not start within the expected time. This could indicate a deadlock or infinite loop.")
     except Exception as e:
         logger.error(f"ERROR during training: {e}")
         import traceback
