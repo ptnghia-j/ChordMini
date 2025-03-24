@@ -2,9 +2,10 @@ import torch
 import numpy as np
 import os
 from collections import Counter
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 import matplotlib.pyplot as plt
 from modules.utils.visualize import plot_confusion_matrix, plot_class_distribution
+import seaborn as sns
 
 class Tester:
     def __init__(self, model, test_loader, device, idx_to_chord=None, logger=None, 
@@ -239,3 +240,118 @@ class Tester:
             
         except Exception as e:
             self._log(f"Error generating plots: {str(e)}")
+
+    def _save_confusion_matrix(self, targets, predictions):
+        """Save confusion matrix visualization if matplotlib is available"""
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            import numpy as np
+            # Get the most common classes in the targets
+            target_counter = Counter(targets)
+            top_classes = [idx for idx, _ in target_counter.most_common(10)]
+            
+            # Create class name mapping with consistent formatting
+            class_names = {}
+            if self.idx_to_chord:
+                for cls in top_classes:
+                    # Always use the chord mapping if available, never fall back to "Class-X" format
+                    if cls in self.idx_to_chord:
+                        class_names[cls] = self.idx_to_chord[cls]
+                    else:
+                        class_names[cls] = f"Unknown-{cls}"
+            else:
+                class_names = {cls: f"Class-{cls}" for cls in top_classes}
+                
+            # Also create a mapping for ALL classes in predictions for consistent reporting
+            all_class_names = {}
+            if self.idx_to_chord:
+                # Build a complete mapping for all encountered classes
+                for cls in set(list(targets) + list(predictions)):
+                    if cls in self.idx_to_chord:
+                        all_class_names[cls] = self.idx_to_chord[cls]
+                    else:
+                        all_class_names[cls] = f"Unknown-{cls}"
+            else:
+                all_class_names = {cls: f"Class-{cls}" for cls in set(list(targets) + list(predictions))}
+            
+            # Print detailed per-class accuracy analysis
+            self._log("\nConfusion Matrix Analysis (Top Classes):")
+            self._log(f"{'True Class':<20} | {'Accuracy':<10} | {'Most Predicted':<20} | {'Correct/Total'}")
+            self._log(f"{'-'*20} | {'-'*10} | {'-'*20} | {'-'*15}")
+            
+            # Calculate per-class accuracy and most common predictions
+            for cls in top_classes:
+                # Get indices where the true class is this class
+                mask = np.array(targets) == cls
+                if not any(mask):
+                    continue
+                    
+                # Get the predictions for this class
+                cls_preds = np.array(predictions)[mask]
+                
+                # Calculate accuracy for this class
+                correct = (cls_preds == cls).sum()
+                total = len(cls_preds)
+                accuracy = correct / total if total > 0 else 0
+                
+                # Find most common prediction for this class
+                pred_counter = Counter(cls_preds)
+                most_common_pred, most_common_count = pred_counter.most_common(1)[0] if pred_counter else (None, 0)
+                
+                # Get the readable names using the consistent mapping
+                cls_name = all_class_names.get(cls, f"Class-{cls}")
+                most_common_name = all_class_names.get(most_common_pred, f"Class-{most_common_pred}") if most_common_pred is not None else "N/A"
+                
+                # Log the class stats
+                self._log(f"{cls_name:<20} | {accuracy:.4f}     | {most_common_name:<20} | {correct}/{total}")
+                
+            # Filter data to include only top classes
+            mask = np.isin(targets, top_classes)
+            filtered_targets = np.array(targets)[mask]
+            filtered_preds = np.array(predictions)[mask]
+            
+            # Compute confusion matrix
+            cm = confusion_matrix(filtered_targets, filtered_preds, labels=top_classes)
+            
+            # Normalize the confusion matrix - FIX: Handle division by zero and NaN values
+            row_sums = cm.sum(axis=1)
+            # Add small epsilon to avoid division by zero
+            row_sums = np.where(row_sums == 0, 1e-10, row_sums)
+            cm_normalized = cm.astype('float') / row_sums[:, np.newaxis]
+            
+            # Replace NaN values with zeros for better visualization
+            cm_normalized = np.nan_to_num(cm_normalized, nan=0.0)
+            
+            # Create figure with robust min/max values
+            plt.figure(figsize=(10, 8))
+            
+            # Use robust min/max values to avoid seaborn warnings
+            vmin = np.nanmin(cm_normalized[~np.isnan(cm_normalized)]) if np.any(~np.isnan(cm_normalized)) else 0
+            vmax = np.nanmax(cm_normalized[~np.isnan(cm_normalized)]) if np.any(~np.isnan(cm_normalized)) else 1
+            
+            # Get readable names for the confusion matrix labels using our consistent mapping
+            x_labels = [all_class_names.get(cls, f"Class-{cls}") for cls in top_classes]
+            y_labels = [all_class_names.get(cls, f"Class-{cls}") for cls in top_classes]
+            
+            # Create heatmap with robust parameters
+            sns.heatmap(cm_normalized, annot=True, fmt='.2f', cmap='Blues',
+                        vmin=vmin, vmax=vmax,
+                        xticklabels=x_labels,
+                        yticklabels=y_labels)
+            plt.xlabel('Predicted')
+            plt.ylabel('True')
+            plt.title('Confusion Matrix (Top 10 Classes)')
+            plt.tight_layout()
+            
+            # Save if output directory is provided
+            if self.output_dir:
+                figures_dir = os.path.join(self.output_dir, "figures")
+                os.makedirs(figures_dir, exist_ok=True)
+                plt.savefig(os.path.join(figures_dir, "confusion_matrix.png"), dpi=300)
+                self._log(f"Saved confusion matrix to {figures_dir}")
+            
+            plt.close()
+            
+        except Exception as e:
+            self._log(f"Error creating confusion matrix: {e}")
