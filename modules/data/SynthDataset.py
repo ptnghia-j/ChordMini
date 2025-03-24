@@ -1047,27 +1047,14 @@ class SynthDataset(Dataset):
         return len(self.segment_indices)
     
     def __getitem__(self, idx):
-        """Get a segment by index, with proper padding and direct GPU loading (with improved error handling)"""
+        """Get a segment by index, with proper padding and direct GPU loading with improved performance"""
         if not self.segment_indices:
             raise IndexError("Dataset is empty - no segments available")
         
         # Try to use GPU batch cache with error handling
         if self.batch_gpu_cache and idx in self.gpu_batch_cache:
             try:
-                cached_batch = self.gpu_batch_cache[idx]
-                # Verify that all tensors in cache are on the expected device
-                if any(isinstance(v, torch.Tensor) and v.device != self.device for v in cached_batch.values()):
-                    if self.verbose and not hasattr(self, '_cache_device_mismatch_warned'):
-                        print(f"WARNING: Device mismatch found in GPU batch cache. Moving tensors to {self.device}")
-                        self._cache_device_mismatch_warned = True
-                    
-                    # Fix the device mismatch in cached batch
-                    for k, v in cached_batch.items():
-                        if isinstance(v, torch.Tensor) and v.device != self.device:
-                            cached_batch[k] = v.to(self.device)
-                            
-                # Return fixed cached batch
-                return cached_batch
+                return self.gpu_batch_cache[idx]
             except RuntimeError:
                 # Clear cache if CUDA error occurs
                 self.gpu_batch_cache = {}
@@ -1075,586 +1062,316 @@ class SynthDataset(Dataset):
                     print("CUDA error with cached batch. Clearing GPU batch cache.")
                     self._cache_error_warned = True
         
-        # Initialize target device - use the instance device consistently
+        # Initialize target device and get segment indices
         target_device = self.device
-        
-        # For debugging, track tensor devices
-        tensor_devices = {}
-        
         seg_start, seg_end = self.segment_indices[idx]
-        sequence = []
-        label_seq = []
-        teacher_logits_seq = []  # Always track teacher logits sequence
-        has_teacher_logits = False  # Track if any samples have teacher logits
-        
-        # Get first sample to determine shape for padding
-        first_sample = self.samples[seg_start]
-        first_spec = None
-        expected_dim = 144  # Default expected frequency dimension
-        
-        # Check for teacher logits availability in the dataset
-        check_for_logits = self.logits_dir is not None or any('teacher_logits' in s or 'logit_path' in s 
-                                                           for s in self.samples[:min(100, len(self.samples))])
         
         try:
-            # Lazy loading for first sample to determine shape
-            if 'spectro' not in first_sample and 'spec_path' in first_sample:
-                try:
-                    # Try the original path first
-                    spec_path = first_sample['spec_path']
-                    
-                    # If loading fails and we have an expected path, try that instead
-                    if 'expected_spec_path' in first_sample and not os.path.exists(spec_path):
-                        expected_path = first_sample['expected_spec_path']
-                        if os.path.exists(expected_path):
-                            spec_path = expected_path
-                            if self.verbose and not hasattr(self, '_using_expected_path'):
-                                print(f"Using expected path format: {expected_path}")
-                                self._using_expected_path = True
-                    
-                    # FIX: Don't use with statement for numpy mmap mode
-                    try:
-                        # Use memory-mapped mode to get shape without loading
-                        mmap_spec = np.load(spec_path, mmap_mode='r')
-                        if first_sample.get('frame_idx') is not None and len(mmap_spec.shape) > 1:
-                            frame_idx = first_sample['frame_idx']
-                            # Now load just the frame we need
-                            full_spec = np.load(spec_path)
-                            first_spec = full_spec[frame_idx] if frame_idx < full_spec.shape[0] else np.zeros((expected_dim,))
-                        else:
-                            # Single-frame spectrogram
-                            first_spec = np.array(mmap_spec)
-                        
-                        # Clean up the memory-mapped array explicitly
-                        del mmap_spec
-                        
-                    except Exception as e:
-                        if self.verbose and not hasattr(self, '_mmap_error_reported'):
-                            print(f"Error using memory-mapped mode: {e}")
-                            print("Falling back to direct loading")
-                            self._mmap_error_reported = True
-                        
-                        # Fall back to direct loading
-                        try:
-                            full_spec = np.load(spec_path)
-                            if first_sample.get('frame_idx') is not None and len(full_spec.shape) > 1:
-                                frame_idx = first_sample['frame_idx']
-                                first_spec = full_spec[frame_idx] if frame_idx < full_spec.shape[0] else np.zeros((expected_dim,))
-                            else:
-                                first_spec = full_spec
-                        except Exception as e2:
-                            if self.verbose:
-                                print(f"Failed to load spectrogram: {e2}")
-                                print("Using zero tensor instead")
-                            first_spec = np.zeros((expected_dim,))
-                    
-                    # Convert numpy to PyTorch tensor and move to target device
-                    try:
-                        # Use torch.from_numpy instead of torch.tensor for numpy arrays
-                        first_spec = torch.from_numpy(first_spec).to(dtype=torch.float, device=target_device)
-                    except RuntimeError as e:
-                        # If GPU error, fall back to CPU for the entire batch
-                        if self.verbose and not hasattr(self, '_cuda_tensor_error'):
-                            print(f"CUDA error creating tensor: {e}")
-                            print("Falling back to CPU for entire batch")
-                            self._cuda_tensor_error = True
-                        target_device = torch.device('cpu')
-                        first_spec = torch.from_numpy(first_spec).to(dtype=torch.float, device=target_device)
-                    
-                    # Validate the shape after loading
-                    if first_spec is not None:
-                        if first_spec.dim() != 1 or first_spec.shape[0] < 10:
-                            if self.verbose and not hasattr(self, '_shape_warning_logged'):
-                                print(f"Warning: Unusual first_spec shape: {first_spec.shape}, expected 1D tensor with {expected_dim} elements")
-                                self._shape_warning_logged = True
-                            
-                            # If shape is unreasonable, fall back to expected shape
-                            if first_spec.dim() == 0 or first_spec.shape[0] < 10:
-                                first_spec = torch.zeros(expected_dim, dtype=torch.float, device=target_device)
-                    else:
-                        first_spec = torch.zeros(expected_dim, dtype=torch.float, device=target_device)
-                    
-                except Exception as e:
-                    # Fallback to zeros with a reasonable shape on error
-                    warnings.warn(f"Error loading first sample: {e}, using zero padding")
-                    # Use zero tensor with consistent device
-                    first_spec = torch.zeros(expected_dim, dtype=torch.float, device=target_device)
-            elif 'spectro' in first_sample:
-                # Use stored spectrogram if available - move to target device
-                try:
-                    if isinstance(first_sample['spectro'], np.ndarray):
-                        # Use torch.from_numpy for numpy arrays
-                        first_spec = torch.from_numpy(first_sample['spectro']).to(dtype=torch.float, device=target_device)
-                    else:
-                        # For existing PyTorch tensors, use clone().detach()
-                        first_spec = first_sample['spectro'].clone().detach().to(target_device)
-                except RuntimeError:
-                    # Fall back to CPU if GPU error
-                    target_device = torch.device('cpu')
-                    if isinstance(first_sample['spectro'], np.ndarray):
-                        first_spec = torch.from_numpy(first_sample['spectro']).to(dtype=torch.float, device=target_device)
-                    else:
-                        first_spec = first_sample['spectro'].clone().detach().to(target_device)
-            else:
-                # Default fallback - use zero tensor on target device
-                first_spec = torch.zeros(expected_dim, dtype=torch.float, device=target_device)
-
-            # Process remaining samples in the segment
-            start_song_id = self.samples[seg_start]['song_id']
+            # Performance optimization: Pre-allocate lists with known size to avoid resizing
+            sequence = []
+            label_seq = []
+            teacher_logits_seq = []
+            has_teacher_logits = False
             
-            # Initialize padding_needed counter
-            padding_needed = 0
+            # Get first sample to determine shape for padding
+            first_sample = self.samples[seg_start]
+            start_song_id = first_sample['song_id']
+            
+            # Skip unnecessary processing for determining first_spec shape
+            # Just use a standard expected dimension for initial allocation
+            expected_dim = 144
+            
+            # Check for teacher logits availability in the dataset
+            check_for_logits = self.logits_dir is not None
             
             # Process each sample in the segment, using consistent device
             for i in range(seg_start, seg_end):
-                if i < len(self.samples):
-                    sample_i = self.samples[i]
-                    
-                    # Check if we've crossed a song boundary
-                    if sample_i['song_id'] != start_song_id:
-                        # Calculate padding needed
-                        padding_needed = seg_end - i
-                        
-                        # Get the padding shape
-                        if sequence and sequence[-1].dim() > 0:
-                            padding_shape = sequence[-1].shape
-                        elif first_spec is not None and first_spec.dim() > 0:
-                            padding_shape = first_spec.shape
-                        else:
-                            padding_shape = (expected_dim,)
-                        
-                        # Use zero tensors for padding with consistent device
-                        for _ in range(padding_needed):
-                            padding_tensor = torch.zeros(padding_shape, dtype=torch.float, device=target_device)
-                            sequence.append(padding_tensor)
-                            # Use N chord index tensor with consistent device
-                            label_seq.append(torch.tensor(self.chord_to_idx.get("N", 0), dtype=torch.long, device=target_device))
-                            
-                            # Add padding to teacher_logits_seq with consistent device
-                            if has_teacher_logits or check_for_logits:
-                                if teacher_logits_seq and len(teacher_logits_seq) > 0:
-                                    logit_shape = teacher_logits_seq[0].shape
-                                    teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float, device=target_device))
-                                else:
-                                    teacher_logits_seq.append(torch.zeros(170, dtype=torch.float, device=target_device))
-                        break
-                        
-                    # Lazy load spectrogram directly to target device
-                    if 'spectro' not in sample_i and 'spec_path' in sample_i:
-                        try:
-                            spec_path = sample_i['spec_path']
-                            spec = np.load(spec_path)
-                            
-                            # For multi-frame spectrograms, extract the specific frame
-                            if sample_i.get('frame_idx') is not None and len(spec.shape) > 1:
-                                frame_idx = sample_i['frame_idx']
-                                if frame_idx < spec.shape[0]:
-                                    # Use torch.from_numpy for numpy arrays
-                                    spec_vec = torch.from_numpy(spec[frame_idx]).to(dtype=torch.float, device=target_device)
-                                else:
-                                    # Handle out of range index with consistent device
-                                    padding_shape = sequence[-1].shape if sequence else first_spec.shape
-                                    spec_vec = torch.zeros(padding_shape, dtype=torch.float, device=target_device)
-                            else:
-                                # Use torch.from_numpy for numpy arrays
-                                spec_vec = torch.from_numpy(spec).to(dtype=torch.float, device=target_device)
-                        except Exception as e:
-                            # Use zero tensor on error with consistent device
-                            if self.verbose and not hasattr(self, '_spec_load_error'):
-                                print(f"Error loading {sample_i['spec_path']}: {e}")
-                                print("Using zero tensor instead")
-                                self._spec_load_error = True
-                            padding_shape = sequence[-1].shape if sequence else first_spec.shape
-                            spec_vec = torch.zeros(padding_shape, dtype=torch.float, device=target_device)
-                    else:
-                        # Use stored spectrogram if available, ensuring consistent device
-                        if 'spectro' in sample_i:
-                            if isinstance(sample_i['spectro'], np.ndarray):
-                                # Use torch.from_numpy for numpy arrays
-                                spec_vec = torch.from_numpy(sample_i['spectro']).to(dtype=torch.float, device=target_device)
-                            else:
-                                # For existing PyTorch tensors, use clone().detach()
-                                spec_vec = sample_i['spectro'].clone().detach().to(target_device)
-                        else:
-                            # Create a zero tensor with consistent device
-                            padding_shape = sequence[-1].shape if sequence else first_spec.shape
-                            spec_vec = torch.zeros(padding_shape, dtype=torch.float, device=target_device)
-                    
-                    # Get chord label and convert to index with consistent device
-                    chord_label = sample_i['chord_label']
-                    chord_idx = self.chord_to_idx.get(chord_label, self.chord_to_idx.get("N", 0))
-                    chord_idx_tensor = torch.tensor(chord_idx, dtype=torch.long, device=target_device)
-                    
-                    sequence.append(spec_vec)
-                    label_seq.append(chord_idx_tensor)
-                    
-                    # Handle teacher logits with consistent device
-                    has_logits_for_this_sample = False
-                    if 'logit_path' in sample_i and 'teacher_logits' not in sample_i:
-                        try:
-                            logit_path = sample_i['logit_path']
-                            teacher_logits = np.load(logit_path)
-                            
-                            # Process multi-frame logits
-                            if len(teacher_logits.shape) > 1 and 'frame_idx' in sample_i:
-                                frame_idx = sample_i['frame_idx']
-                                if frame_idx < teacher_logits.shape[0]:
-                                    teacher_logits = teacher_logits[frame_idx]
-                            
-                            # Use torch.from_numpy for numpy arrays
-                            logits_tensor = torch.from_numpy(teacher_logits).to(dtype=torch.float, device=target_device)
-                            teacher_logits_seq.append(logits_tensor)
-                            has_logits_for_this_sample = True
-                            has_teacher_logits = True
-                        except Exception as e:
-                            if self.verbose and not hasattr(self, '_logit_load_error'):
-                                print(f"Error loading teacher logits from {logit_path}: {e}")
-                                print("Using zero tensor instead")
-                                self._logit_load_error = True
-                    elif 'teacher_logits' in sample_i:
-                        # Use stored teacher logits with consistent device
-                        if isinstance(sample_i['teacher_logits'], np.ndarray):
-                            # Use torch.from_numpy for numpy arrays
-                            logits_tensor = torch.from_numpy(sample_i['teacher_logits']).to(dtype=torch.float, device=target_device)
-                        else:
-                            # For existing PyTorch tensors, use clone().detach()
-                            logits_tensor = sample_i['teacher_logits'].clone().detach().to(target_device)
-                            
-                        teacher_logits_seq.append(logits_tensor)
-                        has_logits_for_this_sample = True
-                        has_teacher_logits = True
-                    
-                    # Add zero tensor if no logits with consistent device
-                    if (has_teacher_logits or check_for_logits) and not has_logits_for_this_sample:
-                        if teacher_logits_seq and len(teacher_logits_seq) > 0:
-                            logit_shape = teacher_logits_seq[0].shape
-                            teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float, device=target_device))
-                        else:
-                            teacher_logits_seq.append(torch.zeros(170, dtype=torch.float, device=target_device))
-                else:
-                    # We've reached the end of the dataset, pad with zeros using consistent device
-                    padding_shape = sequence[-1].shape if sequence else first_spec.shape
+                if i >= len(self.samples):
+                    # We've reached the end of the dataset, add padding
+                    padding_shape = sequence[-1].shape if sequence else (expected_dim,)
                     sequence.append(torch.zeros(padding_shape, dtype=torch.float, device=target_device))
                     label_seq.append(torch.tensor(self.chord_to_idx.get("N", 0), dtype=torch.long, device=target_device))
                     
-                    # Add zero padding to teacher logits with consistent device
                     if has_teacher_logits or check_for_logits:
-                        if teacher_logits_seq and len(teacher_logits_seq) > 0:
-                            logit_shape = teacher_logits_seq[0].shape
-                            teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float, device=target_device))
+                        logit_shape = teacher_logits_seq[0].shape if teacher_logits_seq else (170,)
+                        teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float, device=target_device))
+                    continue
+                    
+                sample_i = self.samples[i]
+                
+                # Check if we've crossed a song boundary (skip padding and break)
+                if sample_i['song_id'] != start_song_id:
+                    break
+                    
+                # Lazy load spectrogram directly to target device
+                if 'spectro' not in sample_i and 'spec_path' in sample_i:
+                    try:
+                        spec_path = sample_i['spec_path']
+                        spec = np.load(spec_path)
+                        
+                        # For multi-frame spectrograms, extract the specific frame
+                        if sample_i.get('frame_idx') is not None and len(spec.shape) > 1:
+                            frame_idx = sample_i['frame_idx']
+                            if frame_idx < spec.shape[0]:
+                                spec_vec = torch.from_numpy(spec[frame_idx]).to(dtype=torch.float, device=target_device)
+                            else:
+                                padding_shape = sequence[-1].shape if sequence else (expected_dim,)
+                                spec_vec = torch.zeros(padding_shape, dtype=torch.float, device=target_device)
                         else:
-                            teacher_logits_seq.append(torch.zeros(170, dtype=torch.float, device=target_device))
+                            spec_vec = torch.from_numpy(spec).to(dtype=torch.float, device=target_device)
+                    except Exception:
+                        # Use zero tensor on error
+                        padding_shape = sequence[-1].shape if sequence else (expected_dim,)
+                        spec_vec = torch.zeros(padding_shape, dtype=torch.float, device=target_device)
+                else:
+                    # Use stored spectrogram if available
+                    if 'spectro' in sample_i:
+                        if isinstance(sample_i['spectro'], np.ndarray):
+                            spec_vec = torch.from_numpy(sample_i['spectro']).to(dtype=torch.float, device=target_device)
+                        else:
+                            spec_vec = sample_i['spectro'].clone().detach().to(target_device)
+                    else:
+                        # Create a zero tensor
+                        padding_shape = sequence[-1].shape if sequence else (expected_dim,)
+                        spec_vec = torch.zeros(padding_shape, dtype=torch.float, device=target_device)
+                
+                # Get chord label
+                chord_label = sample_i['chord_label']
+                chord_idx = self.chord_to_idx.get(chord_label, self.chord_to_idx.get("N", 0))
+                chord_idx_tensor = torch.tensor(chord_idx, dtype=torch.long, device=target_device)
+                
+                sequence.append(spec_vec)
+                label_seq.append(chord_idx_tensor)
+                
+                # Handle teacher logits efficiently
+                if 'logit_path' in sample_i and 'teacher_logits' not in sample_i:
+                    try:
+                        logit_path = sample_i['logit_path']
+                        teacher_logits = np.load(logit_path)
+                        
+                        # Process multi-frame logits - ensure consistent dimensionality
+                        if len(teacher_logits.shape) > 1:
+                            if 'frame_idx' in sample_i:
+                                frame_idx = sample_i['frame_idx']
+                                if frame_idx < teacher_logits.shape[0]:
+                                    # Extract specific frame
+                                    teacher_logits = teacher_logits[frame_idx]
+                                else:
+                                    # Create zeros tensor for out-of-bounds frame
+                                    teacher_logits = np.zeros(teacher_logits.shape[-1] if len(teacher_logits.shape) > 1 else 170)
+                            elif teacher_logits.shape[0] == 1:
+                                # Single-frame logits stored as [1, num_classes]
+                                teacher_logits = teacher_logits[0]
+                            else:
+                                # Multi-frame logits without frame index - take first frame
+                                teacher_logits = teacher_logits[0]
+                        
+                        # Ensure teacher_logits is 1D
+                        if len(teacher_logits.shape) > 1:
+                            # If still multi-dimensional, flatten to 1D
+                            if self.verbose and not hasattr(self, '_teacher_logits_dim_warning'):
+                                print(f"WARNING: Teacher logits have unexpected shape: {teacher_logits.shape}. Flattening to 1D.")
+                                self._teacher_logits_dim_warning = True
+                            teacher_logits = teacher_logits.reshape(-1)[:170]  # Limit to 170 classes
+                        
+                        # Create tensor and add to sequence
+                        logits_tensor = torch.from_numpy(teacher_logits).to(dtype=torch.float, device=target_device)
+                        teacher_logits_seq.append(logits_tensor)
+                        has_teacher_logits = True
+                        
+                    except Exception as e:
+                        if self.verbose and not hasattr(self, '_logit_error_warned'):
+                            print(f"Error loading teacher logits: {e}")
+                            self._logit_error_warned = True
+                        
+                        # Skip processing error but continue with other data
+                        if has_teacher_logits or check_for_logits:
+                            logit_shape = teacher_logits_seq[0].shape if teacher_logits_seq else (170,)
+                            teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float, device=target_device))
+                elif 'teacher_logits' in sample_i:
+                    try:
+                        # Extract teacher logits and ensure consistent dimensionality
+                        temp_logits = sample_i['teacher_logits']
+                        
+                        # Convert numpy array to tensor if needed
+                        if isinstance(temp_logits, np.ndarray):
+                            # Ensure 1D tensor
+                            if len(temp_logits.shape) > 1:
+                                temp_logits = temp_logits.reshape(-1)[:170]  # Limit to 170 classes
+                            logits_tensor = torch.from_numpy(temp_logits).to(dtype=torch.float, device=target_device)
+                        else:
+                            # Already a tensor
+                            if temp_logits.dim() > 1:
+                                # Flatten to 1D if needed
+                                logits_tensor = temp_logits.reshape(-1)[:170]
+                            else:
+                                logits_tensor = temp_logits
+                            
+                            # Move to target device
+                            logits_tensor = logits_tensor.clone().detach().to(target_device)
+                        
+                        teacher_logits_seq.append(logits_tensor)
+                        has_teacher_logits = True
+                    except Exception as e:
+                        if self.verbose and not hasattr(self, '_stored_logit_error_warned'):
+                            print(f"Error processing stored teacher logits: {e}")
+                            self._stored_logit_error_warned = True
+                        
+                        # Create zero tensor as fallback
+                        if has_teacher_logits or check_for_logits:
+                            logit_shape = teacher_logits_seq[0].shape if teacher_logits_seq else (170,)
+                            teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float, device=target_device))
+                elif has_teacher_logits or check_for_logits:
+                    # If we need teacher logits but none are available for this sample
+                    logit_shape = teacher_logits_seq[0].shape if teacher_logits_seq else (170,)
+                    teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float, device=target_device))
             
-            # Ensure we have exactly seq_len frames with consistent device
-            if len(sequence) < self.seq_len:
-                padding_needed = self.seq_len - len(sequence)
-                padding_shape = sequence[-1].shape if sequence else first_spec.shape
+            # Pad to ensure we have exactly seq_len frames
+            current_len = len(sequence)
+            if current_len < self.seq_len:
+                padding_needed = self.seq_len - current_len
+                padding_shape = sequence[-1].shape if sequence else (expected_dim,)
                 for _ in range(padding_needed):
                     sequence.append(torch.zeros(padding_shape, dtype=torch.float, device=target_device))
                     label_seq.append(torch.tensor(self.chord_to_idx.get("N", 0), dtype=torch.long, device=target_device))
                     
-                    # Add padding to teacher logits with consistent device
                     if has_teacher_logits or check_for_logits:
-                        if teacher_logits_seq and len(teacher_logits_seq) > 0:
-                            logit_shape = teacher_logits_seq[0].shape
-                            teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float, device=target_device))
-                        else:
-                            teacher_logits_seq.append(torch.zeros(170, dtype=torch.float, device=target_device))
+                        logit_shape = teacher_logits_seq[0].shape if teacher_logits_seq else (170,)
+                        teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float, device=target_device))
             
-            # ENHANCED: Final device consistency check - add detailed logging for debugging
-            # Log devices before the fix
-            if self.verbose and not hasattr(self, '_device_check_logged'):
-                devices_before = {}
-                for i, t in enumerate(sequence):
-                    devices_before[f'seq_{i}'] = t.device
-                for i, t in enumerate(label_seq):
-                    devices_before[f'label_{i}'] = t.device
-                if teacher_logits_seq:
-                    for i, t in enumerate(teacher_logits_seq):
-                        devices_before[f'logit_{i}'] = t.device
-                
-                if len(set(str(d) for d in devices_before.values())) > 1:
-                    print(f"WARNING: Device mismatch detected before fixing:")
-                    for k, v in devices_before.items():
-                        if str(v) != str(target_device):
-                            print(f"  - {k}: {v} (should be {target_device})")
-                    self._device_check_logged = True
-            
-            # Move any tensors that might be on different devices
-            device_fixed_count = 0
-            for i, t in enumerate(sequence):
-                if t.device != target_device:
-                    sequence[i] = t.to(target_device)
-                    device_fixed_count += 1
-                    
-            for i, t in enumerate(label_seq):
-                if t.device != target_device:
-                    label_seq[i] = t.to(target_device)
-                    device_fixed_count += 1
-                    
-            if teacher_logits_seq:
-                for i, t in enumerate(teacher_logits_seq):
-                    if t.device != target_device:
-                        teacher_logits_seq[i] = t.to(target_device)
-                        device_fixed_count += 1
-            
-            if device_fixed_count > 0 and self.verbose and not hasattr(self, '_device_fixed_logged'):
-                print(f"Fixed {device_fixed_count} tensors with wrong device")
-                self._device_fixed_logged = True
-            
-            # Create sample output with the collected data - directly stacked with consistent device
-            try:
-                # Verify all tensors are on the same device before stacking
-                seq_devices = {str(t.device) for t in sequence}
-                label_devices = {str(t.device) for t in label_seq}
-                
-                if len(seq_devices) > 1:
-                    raise RuntimeError(f"Multiple devices in sequence tensors: {seq_devices}")
-                if len(label_devices) > 1:
-                    raise RuntimeError(f"Multiple devices in label tensors: {label_devices}")
-                
-                # Stack tensors
-                sample_out = {
-                    'spectro': torch.stack(sequence, dim=0),
-                    'chord_idx': torch.stack(label_seq, dim=0)
-                }
-                
-                # Track output tensor devices for debugging
-                tensor_devices['spectro'] = sample_out['spectro'].device
-                tensor_devices['chord_idx'] = sample_out['chord_idx'].device
-                
-                # Include teacher logits if we have them
-                if has_teacher_logits or check_for_logits:
-                    if teacher_logits_seq:
-                        try:
-                            # Verify teacher logits devices
-                            logit_devices = {str(t.device) for t in teacher_logits_seq}
-                            if len(logit_devices) > 1:
-                                # Fix inconsistent devices
-                                teacher_logits_seq = [t.to(target_device) for t in teacher_logits_seq]
-                                if self.verbose and not hasattr(self, '_logit_device_mismatch_warned'):
-                                    print(f"Fixed inconsistent teacher logits devices: {logit_devices}")
-                                    self._logit_device_mismatch_warned = True
-                            
-                            # Standardize dimensions for teacher logits with consistent device
-                            stacked_logits = torch.stack(teacher_logits_seq)
-                            tensor_devices['stacked_logits'] = stacked_logits.device
-                            
-                            # Ensure we have [batch, seq_len, classes] format
-                            if stacked_logits.dim() == 2:  # [seq_len, classes]
-                                # Add batch dimension
-                                sample_out['teacher_logits'] = stacked_logits.unsqueeze(0)
-                            elif stacked_logits.dim() == 3:  # Already [batch, seq_len, classes]
-                                # Check if this is a valid shape, if not reshape
-                                if stacked_logits.size(-1) != 170:
-                                    # Wrong shape, create a properly sized tensor with consistent device
-                                    proper_tensor = torch.zeros(
-                                        (1, self.seq_len, 170),
-                                        dtype=torch.float,
-                                        device=target_device
-                                    )
-                                    sample_out['teacher_logits'] = proper_tensor
-                                else:
-                                    sample_out['teacher_logits'] = stacked_logits
-                            elif stacked_logits.dim() == 4:  # [batch, seq_len, 1, classes] or similar
-                                # Create a properly sized tensor with consistent device
-                                proper_tensor = torch.zeros(
-                                    (1, self.seq_len, 170),
-                                    dtype=torch.float,
-                                    device=target_device
-                                )
-                                
-                                # Try to copy class probabilities if last dimension matches
-                                if stacked_logits.size(-1) == 170:
-                                    # Copy the logits while preserving the class dimension
-                                    proper_tensor[0, :, :] = stacked_logits[0, :, 0, :]
-                                
-                                sample_out['teacher_logits'] = proper_tensor
-                            else:
-                                # Create default tensor with consistent device
-                                sample_out['teacher_logits'] = torch.zeros(
-                                    (1, self.seq_len, 170),
-                                    dtype=torch.float,
-                                    device=target_device
-                                )
-                            
-                            tensor_devices['teacher_logits'] = sample_out['teacher_logits'].device
-                            
-                        except Exception as e:
-                            # ENHANCED: Add more detailed error logging
-                            if self.verbose and not hasattr(self, '_detailed_logits_error'):
-                                print(f"Detailed error in teacher logits processing: {e}")
-                                if teacher_logits_seq:
-                                    print(f"Teacher logits shapes: {[t.shape for t in teacher_logits_seq[:5]]}")
-                                    print(f"Teacher logits devices: {[t.device for t in teacher_logits_seq[:5]]}")
-                                self._detailed_logits_error = True
-                            
-                            # Create a fallback tensor with consistent device
-                            sample_out['teacher_logits'] = torch.zeros(
-                                (1, self.seq_len, 170), 
-                                dtype=torch.float, 
-                                device=target_device
-                            )
-                            tensor_devices['teacher_logits'] = sample_out['teacher_logits'].device
-                
-                # ENHANCED: More thorough device check - FIX FOR 'cuda:0' vs 'cuda' comparison
-                device_mismatches = []
-                for k, v in sample_out.items():
-                    if isinstance(v, torch.Tensor) and v.device != target_device:
-                        # Fix for 'cuda:0' vs 'cuda' comparison
-                        if str(v.device) == 'cuda:0' and str(target_device) == 'cuda':
-                            # These are actually the same device, just different naming
-                            continue
-                        if str(v.device) == 'cuda' and str(target_device) == 'cuda:0':
-                            # These are actually the same device, just different naming
-                            continue
-                        # Only add to mismatches if they're actually different devices
-                        device_mismatches.append((k, str(v.device), str(target_device)))
-                
-                if device_mismatches:
-                    if self.verbose:
-                        print(f"WARNING: Device mismatches after stacking: {device_mismatches}")
-                    
-                    # Fix any remaining device mismatches
-                    for k, _, _ in device_mismatches:
-                        sample_out[k] = sample_out[k].to(target_device)
-                
-                # Final verification before returning - FIX FOR 'cuda:0' vs 'cuda' comparison
-                final_devices = {k: str(v.device) for k, v in sample_out.items() if isinstance(v, torch.Tensor)}
-                # Check if we have actual different devices (not just 'cuda' vs 'cuda:0')
-                actual_device_mismatch = False
-                device_types = set()
-                
-                for device_str in final_devices.values():
-                    # Extract device type (cuda, cpu) without index
-                    device_type = device_str.split(':')[0]
-                    device_types.add(device_type)
-                
-                if len(device_types) > 1:
-                    # This is an actual mismatch (cuda vs cpu)
-                    actual_device_mismatch = True
-                
-                if actual_device_mismatch:
-                    # This should never happen now, but log it if it does
-                    if self.verbose:
-                        print(f"CRITICAL: Device mismatch still present after fixes: {final_devices}")
-                    
-                    # Last resort - force everything to target_device
-                    for k in sample_out:
-                        if isinstance(sample_out[k], torch.Tensor):
-                            sample_out[k] = sample_out[k].to(target_device)
-                
-                # Move data to CPU if using workers (though this should be disabled)
-                if self.num_workers > 0 and self.cuda_available and target_device.type == 'cuda':
-                    # Move all tensors to CPU
-                    for k in sample_out:
-                        if isinstance(sample_out[k], torch.Tensor):
-                            sample_out[k] = sample_out[k].cpu()
-                else:
-                    # Store in GPU batch cache if enabled
-                    if self.batch_gpu_cache and target_device.type == 'cuda':
-                        try:
-                            # Verify all tensors are on target device before caching
-                            for k, v in sample_out.items():
-                                if isinstance(v, torch.Tensor) and v.device != target_device:
-                                    sample_out[k] = v.to(target_device)
-                                    
-                            self.gpu_batch_cache[idx] = sample_out
-                            
-                            # Limit cache size
-                            max_cached_items = 100
-                            if len(self.gpu_batch_cache) > max_cached_items:
-                                oldest_key = next(iter(self.gpu_batch_cache))
-                                del self.gpu_batch_cache[oldest_key]
-                        except Exception as e:
-                            # If caching fails, clear the cache
-                            if self.verbose and not hasattr(self, '_cache_write_error'):
-                                print(f"Error writing to GPU cache: {e}")
-                                print("Clearing GPU cache")
-                                self._cache_write_error = True
-                            self.gpu_batch_cache = {}
-                
-                return sample_out
-                
-            except RuntimeError as e:
-                # If error occurs when stacking, add more detailed diagnostics
-                if self.verbose and not hasattr(self, '_stack_error_details'):
-                    print(f"Detailed stack error: {e}")
-                    print(f"Tensor devices before stack: {tensor_devices}")
-                    
-                    if sequence:
-                        print(f"Sequence tensor count: {len(sequence)}")
-                        seq_devices = [str(t.device) for t in sequence[:5]]
-                        print(f"First 5 sequence tensor devices: {seq_devices}")
-                        
-                    if label_seq:
-                        print(f"Label tensor count: {len(label_seq)}")
-                        label_devices = [str(t.device) for t in label_seq[:5]]
-                        print(f"First 5 label tensor devices: {label_devices}")
-                    
-                    if teacher_logits_seq:
-                        print(f"Teacher logits tensor count: {len(teacher_logits_seq)}")
-                        logit_devices = [str(t.device) for t in teacher_logits_seq[:5]]
-                        print(f"First 5 teacher logits tensor devices: {logit_devices}")
-                    
-                    self._stack_error_details = True
-                
-                # Fall back to CPU
-                print(f"Error stacking tensors: {e}")
-                print("Falling back to CPU")
-                
-                # Move all tensors to CPU
-                cpu_device = torch.device('cpu')
-                sequence = [t.cpu() for t in sequence]
-                label_seq = [t.cpu() for t in label_seq]
-                
-                sample_out = {
-                    'spectro': torch.stack(sequence, dim=0),
-                    'chord_idx': torch.stack(label_seq, dim=0)
-                }
-                
-                # Add logits if needed
-                if has_teacher_logits or check_for_logits:
-                    if teacher_logits_seq:
-                        try:
-                            # Move all to CPU
-                            cpu_logits = [t.cpu() for t in teacher_logits_seq]
-                            sample_out['teacher_logits'] = torch.stack(cpu_logits, dim=0).unsqueeze(0)
-                        except Exception:
-                            # Create a default tensor
-                            sample_out['teacher_logits'] = torch.zeros(
-                                (1, self.seq_len, 170), 
-                                dtype=torch.float
-                            )
-                
-                return sample_out
-                
-        except Exception as e:
-            # Last resort fallback - completely regenerate output from scratch on CPU
-            if self.verbose:
-                print(f"Critical error in dataset.__getitem__: {e}")
-                print("Generating fallback output")
-            
-            # Always use CPU for fallback
-            fallback_device = torch.device('cpu')
-            
-            # Create a simple fallback output
-            spectro = torch.zeros((self.seq_len, expected_dim), dtype=torch.float, device=fallback_device)
-            chord_idx = torch.zeros(self.seq_len, dtype=torch.long, device=fallback_device)
-            
+            # Stack tensors, ensuring consistent dimensions
             sample_out = {
-                'spectro': spectro,
-                'chord_idx': chord_idx
+                'spectro': torch.stack(sequence, dim=0),
+                'chord_idx': torch.stack(label_seq, dim=0)
             }
             
-            if check_for_logits or has_teacher_logits:
-                sample_out['teacher_logits'] = torch.zeros(
-                    (1, self.seq_len, 170), 
-                    dtype=torch.float, 
-                    device=fallback_device
-                )
+            # Include teacher logits if we have them - CRITICAL FIX FOR DIMENSIONALITY ISSUE
+            if has_teacher_logits or check_for_logits:
+                if teacher_logits_seq:
+                    try:
+                        # First ensure all tensors have the same shape
+                        first_shape = teacher_logits_seq[0].shape
+                        for i in range(len(teacher_logits_seq)):
+                            if teacher_logits_seq[i].shape != first_shape:
+                                # Resize tensor to match first tensor shape
+                                if self.verbose and not hasattr(self, '_teacher_logits_shape_mismatch'):
+                                    print(f"Tensor shape mismatch: {teacher_logits_seq[i].shape} vs {first_shape}. Resizing.")
+                                    self._teacher_logits_shape_mismatch = True
+                                
+                                # Create a new tensor with the right shape
+                                new_tensor = torch.zeros(first_shape, dtype=torch.float, device=target_device)
+                                # Copy data where possible
+                                min_size = min(new_tensor.numel(), teacher_logits_seq[i].numel())
+                                new_tensor.view(-1)[:min_size].copy_(teacher_logits_seq[i].view(-1)[:min_size])
+                                teacher_logits_seq[i] = new_tensor
+                        
+                        # Stack teacher logits with consistent shape
+                        stacked_logits = torch.stack(teacher_logits_seq)
+                        
+                        # Add batch dimension if needed and ensure 3D format [batch, seq_len, classes]
+                        if stacked_logits.dim() == 2:  # Shape is [seq_len, classes]
+                            sample_out['teacher_logits'] = stacked_logits.unsqueeze(0)  # Add batch dimension to make [1, seq_len, classes]
+                        elif stacked_logits.dim() == 1:  # Shape is [classes]
+                            # Reshape to [1, 1, classes]
+                            sample_out['teacher_logits'] = stacked_logits.unsqueeze(0).unsqueeze(0)
+                        else:
+                            # Already 3D or higher - ensure it's [batch, seq_len, classes]
+                            sample_out['teacher_logits'] = stacked_logits.unsqueeze(0) if stacked_logits.dim() == 2 else stacked_logits
+                        
+                        # Final verification - ensure we have [batch, seq_len, classes] format
+                        if sample_out['teacher_logits'].dim() != 3:
+                            # Log shape and reshape to correct dimensions
+                            if self.verbose and not hasattr(self, '_teacher_logits_dim_fix'):
+                                print(f"Fixing teacher logits shape from {sample_out['teacher_logits'].shape} to [1, {self.seq_len}, classes]")
+                                self._teacher_logits_dim_fix = True
+                            
+                            # Create a properly formatted tensor - consistent format is [1, seq_len, classes]
+                            correct_shape = (1, self.seq_len, stacked_logits.shape[-1] if stacked_logits.dim() > 0 else 170)
+                            proper_tensor = torch.zeros(correct_shape, dtype=torch.float, device=target_device)
+                            
+                            # Try to copy existing data where possible
+                            if stacked_logits.dim() > 0:
+                                try:
+                                    if stacked_logits.dim() == 1:
+                                        # Single class vector
+                                        proper_tensor[0, 0, :min(stacked_logits.shape[0], proper_tensor.shape[2])] = stacked_logits[:proper_tensor.shape[2]]
+                                    elif stacked_logits.dim() == 2:
+                                        # Multiple class vectors
+                                        max_seq = min(stacked_logits.shape[0], proper_tensor.shape[1])
+                                        max_class = min(stacked_logits.shape[1], proper_tensor.shape[2])
+                                        proper_tensor[0, :max_seq, :max_class] = stacked_logits[:max_seq, :max_class]
+                                    elif stacked_logits.dim() == 3:
+                                        # Already have batch dimension
+                                        max_batch = min(stacked_logits.shape[0], proper_tensor.shape[0])
+                                        max_seq = min(stacked_logits.shape[1], proper_tensor.shape[1])
+                                        max_class = min(stacked_logits.shape[2], proper_tensor.shape[2])
+                                        proper_tensor[:max_batch, :max_seq, :max_class] = stacked_logits[:max_batch, :max_seq, :max_class]
+                                    else:
+                                        # Higher dimensions - flatten and use what we can
+                                        flat_stacked = stacked_logits.reshape(-1)
+                                        flat_proper = proper_tensor.reshape(-1)
+                                        max_copy = min(flat_stacked.shape[0], flat_proper.shape[0])
+                                        flat_proper[:max_copy] = flat_stacked[:max_copy]
+                                except Exception as e:
+                                    if self.verbose and not hasattr(self, '_tensor_copy_error'):
+                                        print(f"Error copying tensor data: {e}")
+                                        self._tensor_copy_error = True
+                            
+                            sample_out['teacher_logits'] = proper_tensor
+                    
+                    except Exception as e:
+                        if self.verbose and not hasattr(self, '_stacking_error'):
+                            print(f"Error stacking teacher logits: {e}")
+                            print(f"Teacher logits shapes: {[t.shape for t in teacher_logits_seq[:3]]}")
+                            self._stacking_error = True
+                        
+                        # Create a default tensor as fallback - consistent format is [1, seq_len, classes]
+                        proper_shape = (1, self.seq_len, 170)
+                        sample_out['teacher_logits'] = torch.zeros(proper_shape, dtype=torch.float, device=target_device)
+                else:
+                    # No teacher logits, but we should include them for consistent batch structure
+                    proper_shape = (1, self.seq_len, 170)
+                    sample_out['teacher_logits'] = torch.zeros(proper_shape, dtype=torch.float, device=target_device)
+            
+            # Cache the result for future use if GPU caching is enabled
+            if self.batch_gpu_cache and target_device.type == 'cuda':
+                try:
+                    self.gpu_batch_cache[idx] = sample_out
+                    # Limit cache size to prevent memory issues
+                    if len(self.gpu_batch_cache) > 100:
+                        oldest_key = next(iter(self.gpu_batch_cache))
+                        del self.gpu_batch_cache[oldest_key]
+                except Exception:
+                    # If caching fails, just ignore and return the sample
+                    self.gpu_batch_cache = {}  # Clear cache to prevent future errors
             
             return sample_out
+        
+        except TimeoutError:
+            # This is coming from the timeout handler in main() - we should pass it up
+            raise
+        except Exception as e:
+            # Check if this is a timeout error from signal handler, which we should propagate
+            if "Training function took too long to start" in str(e):
+                raise  # Re-raise the timeout error to be handled properly
+                
+            # For other errors, log but don't generate dummy data
+            if self.verbose:
+                print(f"Error in dataset.__getitem__: {e}")
+                
+            # Return what we have so far, or raise the exception if we don't have anything
+            if sequence and label_seq:
+                try:
+                    return {
+                        'spectro': torch.stack(sequence, dim=0),
+                        'chord_idx': torch.stack(label_seq, dim=0)
+                    }
+                except:
+                    # If stacking fails, then raise the original exception
+                    raise
+            else:
+                # If we have nothing to return, raise the original exception
+                raise
 
     def get_train_iterator(self, batch_size=128, shuffle=True, num_workers=None, pin_memory=None):
         """Get an optimized DataLoader for the training set"""

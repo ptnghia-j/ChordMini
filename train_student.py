@@ -293,12 +293,25 @@ class Tester:
             # Compute confusion matrix
             cm = confusion_matrix(filtered_targets, filtered_preds, labels=top_classes)
             
-            # Normalize the confusion matrix
-            cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+            # Normalize the confusion matrix - FIX: Handle division by zero and NaN values
+            row_sums = cm.sum(axis=1)
+            # Add small epsilon to avoid division by zero
+            row_sums = np.where(row_sums == 0, 1e-10, row_sums)
+            cm_normalized = cm.astype('float') / row_sums[:, np.newaxis]
             
-            # Create figure
+            # Replace NaN values with zeros for better visualization
+            cm_normalized = np.nan_to_num(cm_normalized, nan=0.0)
+            
+            # Create figure with robust min/max values
             plt.figure(figsize=(10, 8))
+            
+            # Use robust min/max values to avoid seaborn warnings
+            vmin = np.nanmin(cm_normalized[~np.isnan(cm_normalized)]) if np.any(~np.isnan(cm_normalized)) else 0
+            vmax = np.nanmax(cm_normalized[~np.isnan(cm_normalized)]) if np.any(~np.isnan(cm_normalized)) else 1
+            
+            # Create heatmap with robust parameters
             sns.heatmap(cm_normalized, annot=True, fmt='.2f', cmap='Blues',
+                        vmin=vmin, vmax=vmax,
                         xticklabels=[class_names[cls] for cls in top_classes],
                         yticklabels=[class_names[cls] for cls in top_classes])
             plt.xlabel('Predicted')
