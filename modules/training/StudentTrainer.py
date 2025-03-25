@@ -415,17 +415,17 @@ class StudentTrainer(BaseTrainer):
             
             kl_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (temperature ** 2)
             
-            # Standard cross entropy loss for hard targets
-            ce_loss = F.cross_entropy(student_logits, targets)
-            # focal loss
-            # f_loss = self.focal_loss(student_logits, targets, gamma=self.focal_gamma, alpha=self.focal_alpha)
-            
+            if self.use_focal_loss:
+                loss = self.focal_loss(student_logits, targets, gamma=self.focal_gamma, alpha=self.focal_alpha)
+            else:
+                loss = self.loss_fn(student_logits, targets)
+           
             # Combine losses with alpha weighting
-            combined_loss = alpha * kl_loss + (1 - alpha) * ce_loss
+            combined_loss = alpha * kl_loss + (1 - alpha) * loss
             
             # Add logging once for diagnostics
             if not hasattr(self, '_kd_loss_logged'):
-                self._log(f"KD loss breakdown - KL: {kl_loss.item():.4f}, CE: {ce_loss.item():.4f}, Combined: {combined_loss.item():.4f}")
+                self._log(f"KD loss breakdown - KL: {kl_loss.item():.4f}, CE: {loss.item():.4f}, Combined: {combined_loss.item():.4f}")
                 self._log(f"Using α={alpha}, temperature={temperature}")
                 self._kd_loss_logged = True
             

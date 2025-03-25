@@ -1355,7 +1355,7 @@ class SynthDataset(Dataset):
                 try:
                     self.gpu_batch_cache[idx] = sample_out
                     # Limit cache size to prevent memory issues
-                    if len(self.gpu_batch_cache) > 100:
+                    if len(self.gpu_batch_cache) > 256:
                         oldest_key = next(iter(self.gpu_batch_cache))
                         del self.gpu_batch_cache[oldest_key]
                 except Exception:
