@@ -204,46 +204,54 @@ class ChordNet(nn.Module):
 
         return logits, o if loss is None else (logits, loss)
 
-    def predict(self, x):
+    def predict(self, x, *args, **kwargs):
         """
-        Generate frame-by-frame predictions for input sequences.
+        Make a prediction with this model, supporting both regular and per-frame modes.
         
         Args:
-            x: Input tensor of shape [batch_size, seq_len, freq_dim]
-               or [batch_size, 1, seq_len, freq_dim]
+            x: Input tensor
+            *args: Additional positional arguments
+            **kwargs: Additional keyword arguments including:
+                - per_frame: Whether to return per-frame predictions (default: False)
         
         Returns:
-            Predicted chord indices for each frame in the sequence: [batch_size * seq_len]
+            Tensor of predictions
         """
         self.eval()
+        
+        # Extract the per_frame parameter if present, default to False
+        per_frame = kwargs.get('per_frame', False)
+        
         with torch.no_grad():
-            # Make sure input has the right shape
-            if x.dim() == 4:  # [batch, channels, seq_len, freq_dim]
-                x = x.squeeze(1)  # Remove channel dimension if present
-            
-            # Original forward pass
+            # Run forward pass
             logits = self.forward(x)
             
-            # Get the predictions for each frame
+            # Handle different output formats
             if isinstance(logits, tuple):
-                # Some models might return (logits, hidden_states)
-                logits = logits[0]
+                logits = logits[0]  # Take primary prediction logits
             
-            # Check if we have a 3D tensor [batch, seq, classes]
-            if logits.dim() == 3:
-                # Get predictions for each frame in the sequence
-                batch_size, seq_len, n_classes = logits.shape
-                
-                # Reshape to [batch_size * seq_len, n_classes] for frame-by-frame prediction
-                logits = logits.reshape(-1, n_classes)
-                
-                # Get the most likely chord for each frame
-                frame_predictions = torch.argmax(logits, dim=1)
-                
-                return frame_predictions
+            # Make predictions based on mode
+            if per_frame:
+                # Return predictions for each frame
+                return torch.argmax(logits, dim=-1)
             else:
-                # Fallback for models that already output flattened predictions
-                return torch.argmax(logits, dim=1)
+                # Take the most common prediction across the time dimension for batch prediction
+                if logits.dim() > 2:  # If we have a time dimension (dim>2)
+                    # Average across time dimension first
+                    logits_avg = torch.mean(logits, dim=1)
+                    return torch.argmax(logits_avg, dim=-1)
+                else:
+                    # No time dimension, just return argmax of logits
+                    return torch.argmax(logits, dim=-1)
+
+    # To maintain backward compatibility, you can also add these alias methods
+    def predict_per_frame(self, x):
+        """Alias for predict(x, per_frame=True)"""
+        return self.predict(x, per_frame=True)
+
+    def predict_frames(self, x):
+        """Alias for predict(x, per_frame=True)"""
+        return self.predict(x, per_frame=True)
 
 
 if __name__ == '__main__':

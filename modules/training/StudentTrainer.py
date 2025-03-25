@@ -677,10 +677,26 @@ class StudentTrainer(BaseTrainer):
             most_common_classes = [cls for cls, _ in target_counter.most_common(10)]
             
             # Create a mapping of indices to chord names if available
+            # FIXED: Pre-populate with all indices to ensure consistent display
             chord_names = {}
             if self.idx_to_chord:
+                # First, build a reverse mapping from index to chord name
+                # This ensures we can lookup any class index properly
+                for idx, chord in self.idx_to_chord.items():
+                    chord_names[idx] = chord
+                    
+                # Also make sure all our most common classes are mapped
                 for cls in most_common_classes:
-                    chord_names[cls] = self.idx_to_chord.get(cls, f"Unknown-{cls}")
+                    if cls not in chord_names:
+                        if cls in self.idx_to_chord:
+                            chord_names[cls] = self.idx_to_chord[cls]
+                        else:
+                            # If the class is not in idx_to_chord, use a consistent fallback
+                            chord_names[cls] = f"Unknown-{cls}"
+            else:
+                # If no mapping is available, create generic labels
+                for cls in most_common_classes:
+                    chord_names[cls] = f"Class-{cls}"
             
             # Log class distribution
             self._log("\nClass distribution in validation set:")
@@ -714,13 +730,14 @@ class StudentTrainer(BaseTrainer):
                     # Get the most commonly predicted class for this true class
                     most_predicted = pred_counter.most_common(1)[0][0] if pred_counter else true_cls
                     
-                    # Store results using safe lookups with default values
+                    # FIXED: Use the chord_names dictionary consistently - use proper lookups for both keys
                     true_chord_name = chord_names.get(true_cls, f"Class-{true_cls}")
+                    # Ensure most_predicted is also looked up in chord_names
                     pred_chord_name = chord_names.get(most_predicted, f"Class-{most_predicted}")
                     
                     confusion[true_chord_name] = {
                         'accuracy': accuracy,
-                        'most_predicted': pred_chord_name,
+                        'most_predicted': pred_chord_name,  # Now using the correct lookup
                         'correct': correct,
                         'total': total
                     }
@@ -744,24 +761,40 @@ class StudentTrainer(BaseTrainer):
             # Create and save a visual confusion matrix if visualization module is available
             if has_visualize:
                 try:
+                    # FIXED: Create better labels for the confusion matrix visualization
+                    # By ensuring we have chord names for all classes in the filtered data
+                    
                     # Create arrays of true and predicted labels for the most common classes
                     filtered_targets = []
                     filtered_preds = []
+                    class_indices = set()  # Track all unique class indices
                     
                     for i, (target, pred) in enumerate(zip(targets, predictions)):
                         if target in most_common_classes:
                             filtered_targets.append(target)
                             filtered_preds.append(pred)
+                            class_indices.add(target)
+                            class_indices.add(pred)
+                    
+                    # Ensure all class indices in the filtered data have chord names
+                    class_name_mapping = {}
+                    for idx in class_indices:
+                        if idx in chord_names:
+                            class_name_mapping[idx] = chord_names[idx]
+                        elif self.idx_to_chord and idx in self.idx_to_chord:
+                            class_name_mapping[idx] = self.idx_to_chord[idx]
+                        else:
+                            class_name_mapping[idx] = f"Class-{idx}"
                     
                     # Convert to numpy arrays
                     np_targets = np.array(filtered_targets)
                     np_preds = np.array(filtered_preds)
                     
-                    # Generate the confusion matrix visualization
+                    # Generate the confusion matrix visualization with the updated mapping
                     title = "Validation Confusion Matrix (Top Classes)"
                     fig = plot_confusion_matrix(
                         np_targets, np_preds,
-                        class_names=self.idx_to_chord,
+                        class_names=class_name_mapping,  # Use our enhanced mapping
                         normalize=True,
                         title=title,
                         max_classes=10
