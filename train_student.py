@@ -123,8 +123,8 @@ def main():
                         help='Root directory for data storage (overrides config value)')
     parser.add_argument('--use_warmup', action='store_true',
                        help='Use warm-up learning rate scheduling')
-    parser.add_argument('--warmup_epochs', type=int, default=5,
-                       help='Number of warm-up epochs')
+    parser.add_argument('--warmup_epochs', type=int, default=None,
+                       help='Number of warm-up epochs (default: from config)')
     parser.add_argument('--warmup_start_lr', type=float, default=None,
                        help='Initial learning rate for warm-up (default: 1/10 of base LR)')
     # Add new arguments for smooth LR scheduling
@@ -244,8 +244,9 @@ def main():
     if args.lr_schedule or config.training.get('lr_schedule'):
         logger.info(f"LR schedule: {args.lr_schedule or config.training.get('lr_schedule')}")
     if args.use_warmup or config.training.get('use_warmup', False):
-        # Fix: Use the warmup_epochs value from the command line or config, but prioritize command line
-        warmup_epochs = args.warmup_epochs if args.warmup_epochs != 5 else config.training.get('warmup_epochs', 5)
+        # Fix: Use the warmup_epochs value correctly. Since default is now None, 
+        # we can use a simple or-operator to fall back to config value
+        warmup_epochs = args.warmup_epochs or config.training.get('warmup_epochs', 5)
         logger.info(f"Using LR warm-up for {warmup_epochs} epochs")
         logger.info(f"Warm-up start LR: {args.warmup_start_lr or config.training.get('warmup_start_lr', config.training['learning_rate']/10)}")
     
@@ -411,9 +412,28 @@ def main():
         'device': device,  # Pass the device for GPU acceleration
         'pin_memory': False,  # IMPORTANT FIX: Disable pin_memory to avoid memory issues
         'prefetch_factor': 1,  # IMPORTANT FIX: Reduce prefetch factor
-        'batch_gpu_cache': False  # IMPORTANT FIX: Disable GPU caching to avoid memory issues
     }
     
+    # Add version-dependent GPU batch cache handling
+    if args.batch_gpu_cache:
+        # Check PyTorch version for compatibility
+        try:
+            pytorch_version = torch.__version__.split('.')
+            major, minor = int(pytorch_version[0]), int(pytorch_version[1])
+            
+            # Only enable batch GPU cache for PyTorch 1.8+ for better compatibility
+            if major > 1 or (major == 1 and minor >= 8):
+                logger.info(f"Enabling batch GPU cache (PyTorch {torch.__version__})")
+                dataset_args['batch_gpu_cache'] = True
+            else:
+                logger.info(f"Batch GPU cache disabled for PyTorch {torch.__version__} (requires 1.8+)")
+                dataset_args['batch_gpu_cache'] = False
+        except Exception as e:
+            logger.warning(f"Error parsing PyTorch version, disabling batch GPU cache: {e}")
+            dataset_args['batch_gpu_cache'] = False
+    else:
+        dataset_args['batch_gpu_cache'] = False
+
     # IMPORTANT FIX: Force worker count to 0 for safer operation
     dataset_args['num_workers'] = 0  # Disable workers to avoid shared memory issues
     logger.info("Using 0 workers to avoid CUDA shared memory issues")
@@ -540,24 +560,28 @@ def main():
     original_batch_size = config.training['batch_size']
     if torch.cuda.is_available():
         try:
-            # Get available memory and set a conservative batch size
+            # Get available memory and set a less conservative batch size
             free_mem = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024 * 1024)  # in GB
-            # Calculate safer batch size
-            if free_mem < 8:  # Less than 8GB
-                new_batch_size = min(original_batch_size, 16)
-            elif free_mem < 16:  # 8-16GB
+            # Calculate batch size with more generous limits
+            if free_mem < 6:  # Less than 6GB
                 new_batch_size = min(original_batch_size, 32)
-            else:  # More than 16GB
+            elif free_mem < 12:  # 6-12GB
                 new_batch_size = min(original_batch_size, 64)
+            else:  # More than 12GB
+                new_batch_size = min(original_batch_size, 128)
                 
             # Make sure batch size is a multiple of 8 for efficiency
             new_batch_size = (new_batch_size // 8) * 8
             if new_batch_size < 8:
                 new_batch_size = 8  # Minimum batch size of 8
                 
-            if new_batch_size < original_batch_size:
+            # Only reduce if significantly smaller than requested
+            if new_batch_size < original_batch_size * 0.75:  # Only reduce if more than 25% smaller
                 logger.info(f"Reducing batch size from {original_batch_size} to {new_batch_size} to avoid CUDA OOM errors")
                 config.training['batch_size'] = new_batch_size
+            else:
+                # Keep original batch size
+                logger.info(f"Using requested batch size of {original_batch_size}")
         except Exception as e:
             logger.warning(f"Error determining batch size: {e}")
     

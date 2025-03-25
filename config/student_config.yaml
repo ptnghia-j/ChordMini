@@ -29,7 +29,7 @@ training:
   # Knowledge distillation parameters (can be overridden by USE_KD_LOSS env var)
   use_kd_loss: true
   kd_alpha: 0.9
-  temperature: 20.0
+  temperature: 2.0
 
 # Model hyperparameters
 model:

@@ -28,146 +28,179 @@ class Tester:
         else:
             print(message)
     
-    def evaluate(self, save_plots=True):
+    def evaluate(self, save_plots=False, use_per_frame=True):
         """
-        Evaluate the model on the test set and generate performance metrics.
+        Evaluate the model on the test set.
         
         Args:
-            save_plots: Whether to save visualization plots
-        
+            save_plots: Whether to save evaluation plots
+            use_per_frame: Whether to use per-frame prediction
+            
         Returns:
             Dictionary of evaluation metrics
         """
+        if self.test_loader is None:
+            self._log("No test loader provided, skipping evaluation")
+            return {}
+            
         self.model.eval()
+        test_loss = 0.0
         all_preds = []
         all_targets = []
-
-        # Debug counters
-        pred_counter = Counter()
-        target_counter = Counter()
-
+        
+        total_correct = 0
+        total_samples = 0
+        
+        # Create a confusion matrix
+        if self.idx_to_chord:
+            n_classes = len(self.idx_to_chord)
+        else:
+            # Use a reasonable default if we don't know the exact number
+            n_classes = 25
+        
+        confusion_matrix = np.zeros((n_classes, n_classes), dtype=np.int32)
+        
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.test_loader):
-                # Extract inputs and targets
+                # Process both dictionary and tuple format
                 if isinstance(batch, dict):
-                    inputs = batch['spectro'].to(self.device)
-                    targets = batch['chord_idx'].to(self.device)
+                    inputs = batch['spectro']
+                    targets = batch['chord_idx']
                 else:
                     inputs, targets = batch
-                    inputs = inputs.to(self.device)
-                    targets = targets.to(self.device)
-
+                
+                # Move to device
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+                
                 # Apply normalization if provided
                 if self.normalization:
                     inputs = (inputs - self.normalization['mean']) / self.normalization['std']
-
-                # Debug first few batches
-                if batch_idx == 0:
-                    self._log(f"Input shape: {inputs.shape}, target shape: {targets.shape}")
-                    self._log(f"First few targets: {targets[:10].cpu().numpy()}")
-
-                # Get raw logits before prediction
-                outputs = self.model(inputs)
-                if isinstance(outputs, tuple):
-                    logits = outputs[0]
-                else:
-                    logits = outputs
-
-                # Check if logits have reasonable values
-                if batch_idx == 0:
-                    self._log(f"Logits shape: {logits.shape}")
-                    self._log(f"Logits mean: {logits.mean().item()}, std: {logits.std().item()}")
-                    self._log(f"First batch sample logits (max 5 values): {logits[0, :5].cpu().numpy()}")
-
-                # Use per-frame predictions if targets have a time dimension
-                use_per_frame = targets.dim() > 1 and targets.shape[1] > 1
                 
-                if hasattr(self.model, 'predict'):
-                    preds = self.model.predict(inputs, per_frame=use_per_frame)
-                else:
-                    # Fallback if no predict method
-                    if logits.dim() == 3:  # [batch, time, classes]
-                        preds = torch.argmax(logits, dim=2)
+                # Get predictions
+                try:
+                    # First try with per_frame parameter
+                    if hasattr(self.model, 'predict_per_frame') and use_per_frame:
+                        # Check if we should use the predict_per_frame method
+                        preds = self.model.predict_per_frame(inputs)
+                    elif hasattr(self.model, 'predict_frames') and use_per_frame:
+                        # Alternative method name for per-frame prediction
+                        preds = self.model.predict_frames(inputs)
                     else:
-                        preds = torch.argmax(logits, dim=1)
-
-                # Process predictions based on their dimensions
-                if targets.dim() > 1:
-                    if preds.dim() > 1:
-                        # Both are frame-level: flatten both
-                        preds_np = preds.cpu().numpy().flatten()
-                        targets_np = targets.cpu().numpy().flatten()
+                        # Fall back to standard predict method without per_frame parameter
+                        preds = self.model.predict(inputs)
+                except Exception as e:
+                    self._log(f"Error in model prediction: {e}")
+                    # Fall back to direct model call if predict method fails
+                    outputs = self.model(inputs)
+                    
+                    # Handle different model output formats
+                    if isinstance(outputs, tuple):
+                        logits = outputs[0]
                     else:
-                        # Targets are frame-level but preds are segment-level
-                        # Use most common target for each sequence
-                        seq_targets = []
-                        for i in range(targets.shape[0]):
-                            labels, counts = torch.unique(targets[i], return_counts=True)
-                            most_common_idx = torch.argmax(counts)
-                            seq_targets.append(labels[most_common_idx].item())
-                        targets_np = np.array(seq_targets)
-                        preds_np = preds.cpu().numpy()
+                        logits = outputs
+                    
+                    # Get predictions from logits
+                    preds = torch.argmax(logits, dim=-1)
+                
+                # Flatten tensors if needed for evaluation
+                if preds.dim() > 1 and targets.dim() > 1:
+                    # Both are sequences - flatten both
+                    preds_flat = preds.view(-1)
+                    targets_flat = targets.view(-1)
+                elif preds.dim() > 1 and targets.dim() == 1:
+                    # Predictions are sequences but targets are flat
+                    # Take the mean prediction across the sequence
+                    preds_flat = torch.mode(preds, dim=-1)[0]
                 else:
-                    # Standard case - both are segment-level
-                    preds_np = preds.cpu().numpy().flatten()
-                    targets_np = targets.cpu().numpy().flatten()
-
-                # Count distribution using the adjusted arrays
-                pred_counter.update(preds_np.tolist())
-                target_counter.update(targets_np.tolist())
-
-                all_preds.extend(preds_np)
-                all_targets.extend(targets_np)
-
-                # Debug first batch predictions vs targets
-                if batch_idx == 0:
-                    self._log(f"First batch - Predictions: {preds_np[:10]}")
-                    self._log(f"First batch - Targets: {targets_np[:10]}")
-
-        # Convert to numpy arrays for metrics calculation
-        all_preds = np.array(all_preds)
-        all_targets = np.array(all_targets)
-
-        # Print distribution statistics
-        self._log("\nTarget Distribution (top 10):")
-        for idx, count in target_counter.most_common(10):
-            chord_name = self.idx_to_chord.get(idx, "Unknown") if self.idx_to_chord else str(idx)
-            self._log(f"Target {idx} ({chord_name}): {count} occurrences ({count/len(all_targets)*100:.2f}%)")
-
-        self._log("\nPrediction Distribution (top 10):")
-        for idx, count in pred_counter.most_common(10):
-            chord_name = self.idx_to_chord.get(idx, "Unknown") if self.idx_to_chord else str(idx)
-            self._log(f"Prediction {idx} ({chord_name}): {count} occurrences ({count/len(all_preds)*100:.2f}%)")
-
-        # Calculate metrics
-        accuracy = accuracy_score(all_targets, all_preds)
-        precision = precision_score(all_targets, all_preds, average='weighted', zero_division=0)
-        recall = recall_score(all_targets, all_preds, average='weighted', zero_division=0)
-        f1 = f1_score(all_targets, all_preds, average='weighted', zero_division=0)
-
-        # Calculate per-class metrics for common classes
-        self._analyze_confusion_matrix(all_targets, all_preds, target_counter)
-
-        # Generate and save plots if requested
-        if save_plots:
-            self._generate_plots(all_targets, all_preds, target_counter, pred_counter)
-
-        # Print overall metrics
-        self._log(f"\nTest Metrics:")
-        self._log(f"Test Accuracy: {accuracy:.4f}")
-        self._log(f"Test Precision: {precision:.4f}")
-        self._log(f"Test Recall: {recall:.4f}")
-        self._log(f"Test F1 Score: {f1:.4f}")
+                    # Both are already flat
+                    preds_flat = preds
+                    targets_flat = targets
+                
+                # Move to CPU for sklearn metrics
+                preds_np = preds_flat.cpu().numpy()
+                targets_np = targets_flat.cpu().numpy()
+                
+                # Accumulate predictions for metrics
+                all_preds.append(preds_np)
+                all_targets.append(targets_np)
+                
+                # Calculate accuracy
+                correct = (preds_flat == targets_flat).sum().item()
+                samples = targets_flat.size(0)
+                
+                total_correct += correct
+                total_samples += samples
+                
+                # Update confusion matrix
+                for t, p in zip(targets_np, preds_np):
+                    # Ensure indices are within valid range
+                    t_idx = min(t, n_classes - 1)
+                    p_idx = min(p, n_classes - 1)
+                    confusion_matrix[t_idx, p_idx] += 1
+                    
+                # Log progress for long test sets
+                if batch_idx % 10 == 0:
+                    self._log(f"Evaluated {batch_idx} batches, current accuracy: {correct/max(1, samples):.4f}")
+                    
+        # Calculate overall metrics
+        accuracy = total_correct / max(1, total_samples)
         
-        # Return metrics dictionary
-        return {
+        # Combine all predictions and targets
+        all_preds = np.concatenate(all_preds)
+        all_targets = np.concatenate(all_targets)
+        
+        # Calculate metrics with sklearn
+        metrics = {
             'accuracy': accuracy,
-            'precision': precision,
-            'recall': recall,
-            'f1': f1,
-            'target_distribution': target_counter,
-            'prediction_distribution': pred_counter
+            'samples': total_samples
         }
+        
+        # Calculate additional metrics if there are enough samples
+        if len(all_targets) > 1:
+            # Compute and add more detailed metrics
+            try:
+                metrics['precision_macro'] = precision_score(all_targets, all_preds, average='macro')
+                metrics['recall_macro'] = recall_score(all_targets, all_preds, average='macro')
+                metrics['f1_macro'] = f1_score(all_targets, all_preds, average='macro')
+                
+                # Calculate metrics for most frequent classes (top 5)
+                class_counts = Counter(all_targets)
+                top_classes = [cls for cls, _ in class_counts.most_common(5)]
+                
+                if len(top_classes) > 0:
+                    # Create mask for top classes
+                    mask = np.isin(all_targets, top_classes)
+                    top_targets = all_targets[mask]
+                    top_preds = all_preds[mask]
+                    
+                    if len(top_targets) > 0:
+                        metrics['top_accuracy'] = accuracy_score(top_targets, top_preds)
+                        metrics['top_f1'] = f1_score(top_targets, top_preds, average='macro')
+                        
+                        # Log top class names if mapping is available
+                        if self.idx_to_chord:
+                            top_class_names = [self.idx_to_chord.get(cls, f"Unknown-{cls}") for cls in top_classes]
+                            self._log(f"Top classes: {top_class_names}")
+            except Exception as e:
+                self._log(f"Error calculating detailed metrics: {e}")
+        
+        # Save visualization if requested
+        if save_plots:
+            self._save_confusion_matrix(all_targets, all_preds)
+        
+        # Log results
+        self._log(f"Test Results:")
+        self._log(f"Accuracy: {metrics['accuracy']:.4f}")
+        if 'precision_macro' in metrics:
+            self._log(f"Precision (macro): {metrics['precision_macro']:.4f}")
+            self._log(f"Recall (macro): {metrics['recall_macro']:.4f}")
+            self._log(f"F1 Score (macro): {metrics['f1_macro']:.4f}")
+        if 'top_accuracy' in metrics:
+            self._log(f"Top Classes Accuracy: {metrics['top_accuracy']:.4f}")
+            self._log(f"Top Classes F1: {metrics['top_f1']:.4f}")
+        
+        return metrics
     
     def _analyze_confusion_matrix(self, targets, predictions, target_counter):
         """Analyze and log details from confusion matrix for common classes."""
