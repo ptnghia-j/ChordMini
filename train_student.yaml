@@ -142,6 +142,9 @@ spec:
               value: "true"  # Set to "true" to enable learning rate warm-up
             - name: WARMUP_EPOCHS
               value: "10"  # Number of epochs for warm-up
+            # Dropout setting
+            - name: DROPOUT
+              value: "0.3"  # Set dropout probability (0-1)
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
@@ -337,11 +340,20 @@ spec:
                 GPU_ARGS="${GPU_ARGS} --prefetch_factor ${PREFETCH_FACTOR}"
               fi
               
+              # Get dropout from environment
+              DROPOUT_ARG=""
+              if [ "${DROPOUT}" != "" ]; then
+                echo "Using dropout value: ${DROPOUT}"
+                DROPOUT_ARG="--dropout ${DROPOUT}"
+              else
+                echo "Using default dropout value from config"
+              fi
+              
               # Run the student training script with all options
               echo "Starting student training with GPU optimization and all options..."
               python train_student.py --config ./config/student_config.yaml --save_dir checkpoints/student \
                 ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS}\
-                ${GPU_ARGS} ${BATCH_OVERRIDE}
+                ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG}
               
               echo "=== Student model training complete ==="
               
