@@ -153,6 +153,10 @@ def main():
     parser.add_argument('--model_scale', type=float, default=None,
                        help='Scaling factor for model capacity (0.5=half, 1.0=base, 2.0=double)')
     
+    # Add dropout argument
+    parser.add_argument('--dropout', type=float, default=None,
+                       help='Dropout probability (0-1)')
+    
     # Add parameter to control dataset caching behavior
     parser.add_argument('--disable_cache', action='store_true',
                       help='Disable dataset caching to reduce memory usage')
@@ -527,6 +531,12 @@ def main():
     
     logger.info(f"Using model scale: {model_scale}")
     
+    # Get dropout value from args or config
+    dropout_rate = args.dropout
+    if dropout_rate is None:
+        dropout_rate = config.model.get('dropout', 0.3)  # Default to 0.3 if not specified
+    logger.info(f"Using dropout rate: {dropout_rate}")
+    
     # Create model instance
     model = ChordNet(
         n_freq=n_freq,
@@ -538,7 +548,7 @@ def main():
         t_head=config.model.get('base_config', {}).get('t_head', 6),
         d_layer=config.model.get('base_config', {}).get('d_layer', 3),
         d_head=config.model.get('base_config', {}).get('d_head', 6),
-        dropout=config.model.get('dropout', 0.5)
+        dropout=dropout_rate
     ).to(device)
     
     # CRITICAL FIX: Attach the chord mapping to the model
