@@ -189,6 +189,22 @@ def main():
     parser.add_argument('--small_dataset', type=float, default=None,
                       help='Use only a small percentage of dataset for quick testing (e.g., 0.01 for 1%%)')
     
+    # Add learning rate arguments
+    parser.add_argument('--learning_rate', type=float, default=None, 
+                        help='Base learning rate (overrides config value)')
+    parser.add_argument('--min_learning_rate', type=float, default=None,
+                        help='Minimum learning rate for schedulers (overrides config value)')
+                        
+    # Warm-up arguments (extending existing ones)
+    parser.add_argument('--use_warmup', action='store_true',
+                       help='Use warm-up learning rate scheduling')
+    parser.add_argument('--warmup_epochs', type=int, default=None,
+                       help='Number of warm-up epochs (default: from config)')
+    parser.add_argument('--warmup_start_lr', type=float, default=None,
+                       help='Initial learning rate for warm-up (default: 1/10 of base LR)')
+    parser.add_argument('--warmup_end_lr', type=float, default=None,
+                       help='Target learning rate at the end of warm-up (default: base LR)')
+    
     args = parser.parse_args()
 
     # Load configuration from YAML first before checking CUDA availability
@@ -211,6 +227,20 @@ def main():
 
     if args.storage_root is not None:
         config.paths['storage_root'] = args.storage_root
+    
+    # Handle learning rate overrides
+    if args.learning_rate is not None:
+        config.training['learning_rate'] = args.learning_rate
+        logger.info(f"Overriding base learning rate with command line value: {args.learning_rate}")
+    
+    if args.min_learning_rate is not None:
+        config.training['min_learning_rate'] = args.min_learning_rate
+        logger.info(f"Overriding minimum learning rate with command line value: {args.min_learning_rate}")
+    
+    # Handle warmup end learning rate
+    if args.warmup_end_lr is not None:
+        config.training['warmup_end_lr'] = args.warmup_end_lr
+        logger.info(f"Overriding warmup end learning rate with command line value: {args.warmup_end_lr}")
     
     # Log training configuration
     logger.info("\n=== Training Configuration ===")
@@ -242,17 +272,28 @@ def main():
     else:
         logger.info("Using standard cross-entropy loss")
     
-    # Log learning rate settings
+    # Log learning rate settings with expanded information
     logger.info("\n=== Learning Rate Configuration ===")
     logger.info(f"Initial LR: {config.training['learning_rate']}")
+    logger.info(f"Minimum LR: {config.training.get('min_learning_rate', 5e-6)}")
+    
     if args.lr_schedule or config.training.get('lr_schedule'):
-        logger.info(f"LR schedule: {args.lr_schedule or config.training.get('lr_schedule')}")
+        lr_schedule = args.lr_schedule or config.training.get('lr_schedule')
+        logger.info(f"LR schedule: {lr_schedule}")
+    
     if args.use_warmup or config.training.get('use_warmup', False):
         # Fix: Use the warmup_epochs value correctly. Since default is now None, 
         # we can use a simple or-operator to fall back to config value
         warmup_epochs = args.warmup_epochs or config.training.get('warmup_epochs', 5)
         logger.info(f"Using LR warm-up for {warmup_epochs} epochs")
-        logger.info(f"Warm-up start LR: {args.warmup_start_lr or config.training.get('warmup_start_lr', config.training['learning_rate']/10)}")
+        
+        # Get warmup start LR, with fallbacks
+        warmup_start_lr = args.warmup_start_lr or config.training.get('warmup_start_lr', config.training['learning_rate']/10)
+        logger.info(f"Warm-up start LR: {warmup_start_lr}")
+        
+        # Get warmup end LR, with fallbacks
+        warmup_end_lr = args.warmup_end_lr or config.training.get('warmup_end_lr', config.training['learning_rate'])
+        logger.info(f"Warm-up end LR: {warmup_end_lr}")
     
     # Log small dataset percentage setting if enabled
     small_dataset_percentage = args.small_dataset
@@ -559,7 +600,7 @@ def main():
     logger.info("Attached idx_to_chord mapping to model for correct MIR evaluation")
     logger.info(f"Model has {len(master_mapping)} chord labels including 'N' (no chord)")
 
-    # Create optimizer
+    # Create optimizer with potentially updated learning rate
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=config.training.get('learning_rate', 0.0001),
@@ -697,7 +738,7 @@ def main():
         logger.info("Final CUDA memory cleanup before training")
         torch.cuda.empty_cache()
     
-    # Create StudentTrainer with enhanced loss functions
+    # Create StudentTrainer with enhanced learning rate parameters
     trainer = StudentTrainer(
         model=model,
         optimizer=optimizer, 
@@ -710,10 +751,11 @@ def main():
         normalization=normalization,
         early_stopping_patience=config.training.get('early_stopping_patience', 5),
         lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
-        min_lr=config.training.get('min_lr', 5e-6),
+        min_lr=config.training.get('min_learning_rate', 5e-6),
         use_warmup=args.use_warmup or config.training.get('use_warmup', False),
         warmup_epochs=args.warmup_epochs or config.training.get('warmup_epochs', 5),
         warmup_start_lr=args.warmup_start_lr or config.training.get('warmup_start_lr', None),
+        warmup_end_lr=args.warmup_end_lr or config.training.get('warmup_end_lr', None), # Add warmup_end_lr parameter
         lr_schedule_type=args.lr_schedule or config.training.get('lr_schedule', None),
         use_focal_loss=args.use_focal_loss or config.training.get('use_focal_loss', False),
         focal_gamma=args.focal_gamma or config.training.get('focal_gamma', 2.0),
