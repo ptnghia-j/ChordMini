@@ -578,7 +578,7 @@ class StudentTrainer(BaseTrainer):
             return True
         return False
     
-    def validate_with_metrics(self, val_loader):
+    def validate_with_metrics(self, val_loader, current_epoch=None):
         self.model.eval()
         val_loss = 0.0
         val_correct = 0
@@ -642,19 +642,22 @@ class StudentTrainer(BaseTrainer):
         val_acc = val_correct / max(1, val_total)
         self._log(f"Epoch Validation Loss: {avg_loss:.4f}, Accuracy: {val_acc:.4f}")
         
-        # Calculate and log confusion matrix statistics
-        self._calculate_confusion_matrix(all_preds, all_targets)
+        # Pass the current epoch to the confusion matrix function
+        self._calculate_confusion_matrix(all_preds, all_targets, current_epoch)
         
         self.model.train()
         return avg_loss, val_acc
     
-    def _calculate_confusion_matrix(self, predictions, targets):
+    def _calculate_confusion_matrix(self, predictions, targets, current_epoch=None):
         """
-        Calculate, log, and save the confusion matrix for the most frequent classes.
+        Calculate, log, and save the confusion matrix.
+        Prints top 10 classes every epoch, but only saves full 170-class 
+        confusion matrix every 10 epochs.
         
         Args:
             predictions: List of predicted class indices
             targets: List of target class indices
+            current_epoch: Current training epoch number (for periodic full matrix saving)
         """
         if not predictions or not targets:
             self._log("Cannot calculate confusion matrix: no predictions or targets")
@@ -673,15 +676,13 @@ class StudentTrainer(BaseTrainer):
             target_counter = Counter(targets)
             total_samples = len(targets)
             
-            # Get the most common classes (up to 10)
+            # Get the most common classes (up to 10) for standard printing
             most_common_classes = [cls for cls, _ in target_counter.most_common(10)]
             
             # Create a mapping of indices to chord names if available
-            # FIXED: Pre-populate with all indices to ensure consistent display
             chord_names = {}
             if self.idx_to_chord:
                 # First, build a reverse mapping from index to chord name
-                # This ensures we can lookup any class index properly
                 for idx, chord in self.idx_to_chord.items():
                     chord_names[idx] = chord
                     
@@ -698,8 +699,8 @@ class StudentTrainer(BaseTrainer):
                 for cls in most_common_classes:
                     chord_names[cls] = f"Class-{cls}"
             
-            # Log class distribution
-            self._log("\nClass distribution in validation set:")
+            # Log class distribution for top 10 classes (print only)
+            self._log("\nClass distribution in validation set (Top 10):")
             for cls in most_common_classes:
                 try:
                     count = target_counter.get(cls, 0)
@@ -709,7 +710,7 @@ class StudentTrainer(BaseTrainer):
                 except Exception as e:
                     self._log(f"Error processing class {cls}: {e}")
             
-            # Calculate confusion matrix values
+            # Calculate confusion matrix values for top classes (printed to log)
             confusion = {}
             for true_cls in most_common_classes:
                 try:
@@ -730,22 +731,21 @@ class StudentTrainer(BaseTrainer):
                     # Get the most commonly predicted class for this true class
                     most_predicted = pred_counter.most_common(1)[0][0] if pred_counter else true_cls
                     
-                    # FIXED: Use the chord_names dictionary consistently - use proper lookups for both keys
+                    # Use the chord_names dictionary consistently
                     true_chord_name = chord_names.get(true_cls, f"Class-{true_cls}")
-                    # Ensure most_predicted is also looked up in chord_names
                     pred_chord_name = chord_names.get(most_predicted, f"Class-{most_predicted}")
                     
                     confusion[true_chord_name] = {
                         'accuracy': accuracy,
-                        'most_predicted': pred_chord_name,  # Now using the correct lookup
+                        'most_predicted': pred_chord_name,
                         'correct': correct,
                         'total': total
                     }
                 except Exception as e:
                     self._log(f"Error processing confusion data for class {true_cls}: {e}")
             
-            # Log confusion matrix information
-            self._log("\nConfusion Matrix Analysis (Top Classes):")
+            # Log confusion matrix information for top classes
+            self._log("\nConfusion Matrix Analysis (Top 10 Classes):")
             self._log(f"{'True Class':<20} | {'Accuracy':<10} | {'Most Predicted':<20} | {'Correct/Total'}")
             self._log(f"{'-'*20} | {'-'*10} | {'-'*20} | {'-'*15}")
             
@@ -758,60 +758,62 @@ class StudentTrainer(BaseTrainer):
             common_acc = common_correct / common_total if common_total > 0 else 0
             self._log(f"\nAccuracy on most common classes: {common_acc:.4f} ({common_correct}/{common_total})")
             
-            # Create and save a visual confusion matrix if visualization module is available
+            # Create and save ONLY the full confusion matrix every 10 epochs
             if has_visualize:
-                try:
-                    # FIXED: Create better labels for the confusion matrix visualization
-                    # By ensuring we have chord names for all classes in the filtered data
+                # Save the full confusion matrix only every 10 epochs or when epoch is not specified
+                save_full_matrix = current_epoch is None or current_epoch % 10 == 0
+                
+                if save_full_matrix:
+                    self._log(f"\nSaving full 170-class confusion matrix for epoch {current_epoch}")
                     
-                    # Create arrays of true and predicted labels for the most common classes
-                    filtered_targets = []
-                    filtered_preds = []
-                    class_indices = set()  # Track all unique class indices
-                    
-                    for i, (target, pred) in enumerate(zip(targets, predictions)):
-                        if target in most_common_classes:
-                            filtered_targets.append(target)
-                            filtered_preds.append(pred)
-                            class_indices.add(target)
-                            class_indices.add(pred)
-                    
-                    # Ensure all class indices in the filtered data have chord names
-                    class_name_mapping = {}
-                    for idx in class_indices:
-                        if idx in chord_names:
-                            class_name_mapping[idx] = chord_names[idx]
-                        elif self.idx_to_chord and idx in self.idx_to_chord:
-                            class_name_mapping[idx] = self.idx_to_chord[idx]
-                        else:
-                            class_name_mapping[idx] = f"Class-{idx}"
-                    
-                    # Convert to numpy arrays
-                    np_targets = np.array(filtered_targets)
-                    np_preds = np.array(filtered_preds)
-                    
-                    # Generate the confusion matrix visualization with the updated mapping
-                    title = "Validation Confusion Matrix (Top Classes)"
-                    fig = plot_confusion_matrix(
-                        np_targets, np_preds,
-                        class_names=class_name_mapping,  # Use our enhanced mapping
-                        normalize=True,
-                        title=title,
-                        max_classes=10
-                    )
-                    
-                    # Ensure the checkpoint directory exists
-                    os.makedirs(self.checkpoint_dir, exist_ok=True)
-                    
-                    # Save the figure to a file
-                    confusion_matrix_path = os.path.join(self.checkpoint_dir, "confusion_matrix.png")
-                    fig.savefig(confusion_matrix_path, dpi=300, bbox_inches='tight')
-                    self._log(f"Saved confusion matrix visualization to {confusion_matrix_path}")
-                    
-                    # Close the figure to free memory
-                    plt.close(fig)
-                except Exception as e:
-                    self._log(f"Error saving confusion matrix visualization: {e}")
+                    try:
+                        # For full confusion matrix (all classes), create a class mapping
+                        # that includes ALL possible chord indices from the model
+                        all_class_mapping = {}
+                        if self.idx_to_chord:
+                            for idx, chord in self.idx_to_chord.items():
+                                all_class_mapping[idx] = chord
+                        
+                        # Get a list of all unique classes
+                        all_classes = set(targets).union(set(predictions))
+                        
+                        # Ensure the classes are sorted for consistent visualization
+                        all_classes_list = sorted(list(all_classes))
+                        
+                        # Make sure all classes have labels
+                        for cls in all_classes:
+                            if cls not in all_class_mapping:
+                                all_class_mapping[cls] = f"Class-{cls}"
+                        
+                        # Generate the full confusion matrix visualization
+                        full_title = f"Full Confusion Matrix - Epoch {current_epoch}"
+                        np_targets_full = np.array(targets)
+                        np_preds_full = np.array(predictions)
+                        
+                        # Generate the full confusion matrix (without size limits)
+                        fig_full = plot_confusion_matrix(
+                            np_targets_full, np_preds_full,
+                            class_names=all_class_mapping,
+                            normalize=True,
+                            title=full_title,
+                            max_classes=None  # No limit on number of classes
+                        )
+                        
+                        # Save the full figure with epoch in filename
+                        os.makedirs(self.checkpoint_dir, exist_ok=True)
+                        full_cm_path = os.path.join(
+                            self.checkpoint_dir, 
+                            f"confusion_matrix_full_epoch_{current_epoch}.png"
+                        )
+                        fig_full.savefig(full_cm_path, dpi=300, bbox_inches='tight')
+                        self._log(f"Saved full confusion matrix to {full_cm_path}")
+                        plt.close(fig_full)
+                    except Exception as e:
+                        self._log(f"Error saving full confusion matrix visualization: {e}")
+                        import traceback
+                        self._log(traceback.format_exc())
+                else:
+                    self._log(f"Skipping confusion matrix visualization for epoch {current_epoch} (only saved every 10 epochs)")
             
         except Exception as e:
             self._log(f"Error calculating confusion matrix: {e}")
@@ -1296,7 +1298,8 @@ class StudentTrainer(BaseTrainer):
                 
                 # Run validation
                 if val_loader is not None:
-                    val_loss, val_acc = self.validate_with_metrics(val_loader)
+                    # Pass current epoch number to validation for confusion matrix
+                    val_loss, val_acc = self.validate_with_metrics(val_loader, current_epoch=epoch)
                     self.val_losses.append(val_loss)
                     
                     # Only apply standard LR adjustment if:
