@@ -6,7 +6,8 @@
 training:
   batch_size: 128
   max_epochs: 100
-  learning_rate: 1.0e-4
+  learning_rate: 1.0e-3  # Base learning rate
+  min_learning_rate: 5.0e-6  # Minimum learning rate for schedulers
   weight_decay: 1.0e-5
   betas: [0.9, 0.98]
   epsilon: 1.0e-9
@@ -14,12 +15,12 @@ training:
   seq_len: 108
   seq_stride: 36
   save_checkpoint_interval: 10
-  min_lr: 5.0e-6
   lr_decay_factor: 0.95
-  # Warm-up parameters (can be overridden by USE_WARMUP env var)
+  # Warm-up parameters with expanded options
   use_warmup: true
   warmup_epochs: 10
-  warmup_start_lr: 1.0e-5
+  warmup_start_lr: 1.0e-5  # Initial learning rate at the start of warm-up
+  warmup_end_lr: 1.0e-3    # Target learning rate at the end of warm-up (typically same as learning_rate)
   # LR schedule parameter (can be overridden by LR_SCHEDULE env var)
   lr_schedule: 'cosine'  # Can be 'cosine', 'linear_decay', 'one_cycle', or 'cosine_warm_restarts'
   # Focal loss parameters (can be overridden by USE_FOCAL_LOSS env var)
