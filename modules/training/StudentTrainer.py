@@ -8,12 +8,11 @@ import matplotlib.pyplot as plt  # Add missing matplotlib import
 from collections import Counter
 import re
 from sklearn.metrics import confusion_matrix
-# Import chord utilities
-from modules.utils.chords import get_chord_quality, CHORD_QUALITIES
-# Import visualization functions
+
+# Import visualization functions including chord quality mapping
 from modules.utils.visualize import (
     plot_confusion_matrix, plot_chord_quality_confusion_matrix,
-    plot_learning_curve, calculate_quality_confusion_matrix
+    plot_learning_curve, calculate_quality_confusion_matrix,
 )
 
 class StudentTrainer(BaseTrainer):
@@ -679,99 +678,6 @@ class StudentTrainer(BaseTrainer):
         self.model.train()
         return avg_loss, val_acc
     
-    def _map_chord_to_quality(self, chord_name):
-        """
-        Map a chord name to its quality group.
-        
-        Args:
-            chord_name (str): The chord name (e.g., "C:maj", "A:min", "G:7", "N")
-            
-        Returns:
-            str: The chord quality group name
-        """
-        # Handle special cases
-        if chord_name in ["N", "X", "None", "Unknown"]:
-            return "No Chord"
-            
-        # Standardize notation if it uses : separator
-        chord_name = chord_name.replace(":", "")
-            
-        # Define quality mappings with regex patterns
-        quality_mappings = [
-            # Major quality group
-            (r'^[A-G]$|maj$|^[A-G]maj$', 'Major'),
-            # Minor quality group
-            (r'min$|m$|^[A-G]m$', 'Minor'),
-            # Dominant 7th quality group
-            (r'7$|^[A-G]7$|dom7$', 'Dom7'),
-            # Major 7th quality group
-            (r'maj7$|^[A-G]maj7$', 'Maj7'),
-            # Minor 7th quality group
-            (r'min7$|m7$|^[A-G]m7$', 'Min7'),
-            # Diminished quality group
-            (r'dim$|°|^[A-G]dim$|^[A-G]o$', 'Dim'),
-            # Diminished 7th quality group
-            (r'dim7$|°7|^[A-G]dim7$|^[A-G]o7$', 'Dim7'),
-            # Half-diminished quality group
-            (r'hdim$|ø|m7b5$|^[A-G]ø$', 'Half-Dim'),
-            # Augmented quality group
-            (r'aug$|\+$|^[A-G]\+$|^[A-G]aug$', 'Aug'),
-            # Suspended quality group
-            (r'sus$|sus2$|sus4$', 'Sus'),
-            # Extended chords 9th, 11th, 13th
-            (r'9$|11$|13$', 'Extended')
-        ]
-            
-        # Check each pattern
-        for pattern, quality in quality_mappings:
-            if re.search(pattern, chord_name):
-                return quality
-                
-        # Default quality for any other chord
-        return "Other"
-        
-    def _group_predictions_by_quality(self, predictions, targets, idx_to_chord):
-        """
-        Group predictions and targets by chord quality.
-        
-        Args:
-            predictions: List of predicted class indices
-            targets: List of target class indices
-            idx_to_chord: Dictionary mapping indices to chord names
-            
-        Returns:
-            tuple: (pred_qualities, target_qualities, quality_names)
-        """
-        # Get unique quality groups
-        quality_groups = set()
-        
-        # Create mappings from class indices to quality groups
-        idx_to_quality = {}
-        
-        # Build mappings
-        for idx, chord in idx_to_chord.items():
-            quality = self._map_chord_to_quality(chord)
-            idx_to_quality[idx] = quality
-            quality_groups.add(quality)
-        
-        # Sort quality groups for consistent order
-        quality_names = sorted(list(quality_groups))
-        
-        # Map predictions and targets to quality groups
-        pred_qualities = []
-        target_qualities = []
-        
-        for pred, targ in zip(predictions, targets):
-            # Map index to quality (use default if not found)
-            pred_quality = idx_to_quality.get(pred, "Other")
-            target_quality = idx_to_quality.get(targ, "Other")
-            
-            # Convert to indices in the quality_names list
-            pred_qualities.append(quality_names.index(pred_quality))
-            target_qualities.append(quality_names.index(target_quality))
-        
-        return pred_qualities, target_qualities, quality_names
-
     def _calculate_confusion_matrix(self, predictions, targets, current_epoch=None):
         """
         Calculate, log, and save the confusion matrix.
