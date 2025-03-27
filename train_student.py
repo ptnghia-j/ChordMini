@@ -195,13 +195,12 @@ def main():
     parser.add_argument('--min_learning_rate', type=float, default=None,
                         help='Minimum learning rate for schedulers (overrides config value)')
                         
-    # Warm-up arguments (extending existing ones)
-    parser.add_argument('--use_warmup', action='store_true',
-                       help='Use warm-up learning rate scheduling')
-    parser.add_argument('--warmup_epochs', type=int, default=None,
-                       help='Number of warm-up epochs (default: from config)')
-    parser.add_argument('--warmup_start_lr', type=float, default=None,
-                       help='Initial learning rate for warm-up (default: 1/10 of base LR)')
+    # FIXED: Remove duplicate --use_warmup argument (it's already defined above)
+    # parser.add_argument('--use_warmup', action='store_true',
+    #                   help='Use warm-up learning rate scheduling')
+    # Remove duplicate --warmup_start_lr here
+    # parser.add_argument('--warmup_start_lr', type=float, default=None,
+    #                   help='Initial learning rate for warm-up (default: 1/10 of base LR)')
     parser.add_argument('--warmup_end_lr', type=float, default=None,
                        help='Target learning rate at the end of warm-up (default: base LR)')
     
@@ -237,7 +236,15 @@ def main():
         config.training['min_learning_rate'] = args.min_learning_rate
         logger.info(f"Overriding minimum learning rate with command line value: {args.min_learning_rate}")
     
-    # Handle warmup end learning rate
+    # Handle warmup overrides
+    if args.warmup_epochs is not None:
+        config.training['warmup_epochs'] = args.warmup_epochs
+        logger.info(f"Overriding warmup epochs with command line value: {args.warmup_epochs}")
+    
+    if args.warmup_start_lr is not None:
+        config.training['warmup_start_lr'] = args.warmup_start_lr
+        logger.info(f"Overriding warmup start learning rate with command line value: {args.warmup_start_lr}")
+
     if args.warmup_end_lr is not None:
         config.training['warmup_end_lr'] = args.warmup_end_lr
         logger.info(f"Overriding warmup end learning rate with command line value: {args.warmup_end_lr}")
@@ -480,8 +487,8 @@ def main():
         dataset_args['batch_gpu_cache'] = False
 
     # IMPORTANT FIX: Force worker count to 0 for safer operation
-    dataset_args['num_workers'] = 0  # Disable workers to avoid shared memory issues
-    logger.info("Using 0 workers to avoid CUDA shared memory issues")
+    dataset_args['num_workers'] = 2  # Disable workers to avoid shared memory issues
+    # logger.info("Using 0 workers to avoid CUDA shared memory issues")
     
     # Apply knowledge distillation settings
     if use_kd and args.logits_dir:
@@ -527,8 +534,8 @@ def main():
     train_loader = synth_dataset.get_train_iterator(
         batch_size=config.training['batch_size'], 
         shuffle=True,
-        num_workers=0,  # Force 0 to avoid shared memory issues
-        pin_memory=False  # Disable pin memory to avoid memory issues
+        num_workers=2,  # Force 0 to avoid shared memory issues
+        pin_memory=True  # Disable pin memory to avoid memory issues
     )
     
     val_loader = synth_dataset.get_eval_iterator(
@@ -650,21 +657,6 @@ def main():
         logger.info(f"CUDA memory stats (GB): allocated={allocated:.2f}, max_allocated={max_allocated:.2f}")
         logger.info(f"CUDA memory stats (GB): reserved={reserved:.2f}, max_reserved={max_reserved:.2f}")
     
-    # Create data loaders with optimized settings for GPU
-    # IMPORTANT FIX: Force zero workers to avoid multiprocessing issues
-    train_loader = synth_dataset.get_train_iterator(
-        batch_size=config.training['batch_size'], 
-        shuffle=True,
-        num_workers=0,  # Force 0 to avoid shared memory issues
-        pin_memory=False  # Disable pin memory to avoid memory issues
-    )
-    
-    val_loader = synth_dataset.get_eval_iterator(
-        batch_size=config.training['batch_size'], 
-        shuffle=False,
-        num_workers=0,  # Force 0 to avoid shared memory issues
-        pin_memory=False  # Disable pin memory
-    )
     
     # Calculate global mean and std for normalization (as done in teacher model)
     # IMPORTANT FIX: Use safer memory handling when calculating stats

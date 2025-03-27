@@ -1,214 +1,360 @@
-import matplotlib.pyplot as plt
 import numpy as np
-import torch
-import seaborn as sns
+import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix
-import itertools
+import seaborn as sns
 from collections import Counter
+import os
+import re
 
-def plot_confusion_matrix(y_true, y_pred, class_names=None, normalize=True, title=None, max_classes=20, figsize=(12,10)):
+# Define chord quality mappings - will be used if not using chords.py functions
+DEFAULT_CHORD_QUALITIES = [
+    "Major", "Minor", "Dom7", "Maj7", "Min7", "Dim", 
+    "Dim7", "Half-Dim", "Aug", "Sus", "No Chord", "Other"
+]
+
+def plot_confusion_matrix(y_true, y_pred, class_names=None, normalize=True, title=None, 
+                          figsize=(12, 10), cmap='Blues', max_classes=12, text_size=8):
     """
-    Generate a confusion matrix visualization.
+    Plot a confusion matrix with improved visualization for many classes.
     
     Args:
-        y_true: True labels (array-like)
-        y_pred: Predicted labels (array-like)
-        class_names: Dictionary mapping class indices to class names, or None for default names
-        normalize: Whether to normalize by row (true label frequency)
-        title: Title for plot
-        max_classes: Maximum number of classes to include (limit to most common)
-        figsize: Figure size as (width, height)
+        y_true: True labels
+        y_pred: Predicted labels
+        class_names: Dictionary mapping class indices to names, or list of class names
+        normalize: Whether to normalize the confusion matrix
+        title: Plot title
+        figsize: Figure size (width, height) in inches
+        cmap: Color map for heatmap
+        max_classes: Maximum number of classes to show (None for all)
+        text_size: Font size for text annotations
         
     Returns:
-        Figure object with the plot
+        matplotlib figure
     """
-
+    # Create mapping from class indices to names if provided
+    if class_names is None:
+        # Default to index strings if no mapping provided
+        unique_labels = sorted(set(np.concatenate([y_true, y_pred])))
+        class_names = {i: str(i) for i in unique_labels}
     
-    if len(y_true) == 0 or len(y_pred) == 0:
-        # Create an empty figure if there's no data
-        fig, ax = plt.subplots(figsize=figsize)
-        ax.text(0.5, 0.5, "No data to plot", horizontalalignment='center', 
-                verticalalignment='center', fontsize=14)
-        return fig
+    # Handle both dict and list formats for class_names
+    if isinstance(class_names, dict):
+        # Convert dict to list for confusion matrix labels
+        unique_labels = sorted(set(np.concatenate([y_true, y_pred])))
+        class_list = [class_names.get(i, str(i)) for i in unique_labels]
+        indices = unique_labels
+    else:
+        # Assume class_names is already a list
+        class_list = class_names
+        indices = list(range(len(class_names)))
     
-    # Count true labels and get the most common ones
-    counter = Counter(y_true)
-    most_common = [cls for cls, _ in counter.most_common(max_classes)]
-    
-    # Mask to include only the most common classes
-    mask_true = np.isin(y_true, most_common)
-    mask_pred = np.isin(y_pred, most_common)
-    
-    # Get indices for both true and predicted being in the top classes
-    indices = np.where(mask_true)[0]
-    
-    if len(indices) == 0:
-        # If no samples match the filter, create empty figure
-        fig, ax = plt.subplots(figsize=figsize)
-        ax.text(0.5, 0.5, "No common classes found", horizontalalignment='center', 
-                verticalalignment='center', fontsize=14)
-        return fig
-    
-    # Filter the labels
-    filtered_y_true = np.array(y_true)[indices]
-    filtered_y_pred = np.array(y_pred)[indices]
-    
-    # Compute confusion matrix
-    cm = confusion_matrix(filtered_y_true, filtered_y_pred, labels=most_common)
-    
-    # Normalize the confusion matrix if requested
-    if normalize:
-        # FIX: Handle division by zero when normalizing
-        row_sums = cm.sum(axis=1)
-        # Add small epsilon to avoid division by zero
-        row_sums = np.where(row_sums == 0, 1e-10, row_sums)  # Replace zeros with small value
-        cm = cm.astype('float') / row_sums[:, np.newaxis]
+    # If we have too many classes, select only the most common ones
+    if max_classes is not None and len(indices) > max_classes:
+        # Count occurrences of each class in true labels
+        class_counts = {}
+        for i, idx in enumerate(indices):
+            count = np.sum(y_true == idx)
+            class_counts[idx] = count
         
-        # Additional fix: Replace NaN values with zeros for better visualization
-        cm = np.nan_to_num(cm, nan=0.0)
+        # Select top max_classes by count
+        top_indices = sorted(class_counts.keys(), key=lambda x: class_counts[x], reverse=True)[:max_classes]
+        
+        # Filter labels and class list to only include top classes
+        mask_true = np.isin(y_true, top_indices)
+        mask_pred = np.isin(y_pred, top_indices)
+        
+        # Keep only samples where both true and pred are in top classes
+        mask = mask_true & mask_pred
+        filtered_y_true = y_true[mask]
+        filtered_y_pred = y_pred[mask]
+        
+        # Remap indices to be consecutive
+        index_map = {idx: i for i, idx in enumerate(top_indices)}
+        remapped_y_true = np.array([index_map[idx] for idx in filtered_y_true])
+        remapped_y_pred = np.array([index_map[idx] for idx in filtered_y_pred])
+        
+        # Filter class list
+        filtered_class_list = [class_list[indices.index(idx)] for idx in top_indices]
+        
+        # Use filtered data
+        cm_indices = top_indices
+        cm_classes = filtered_class_list
+        y_true_cm = remapped_y_true
+        y_pred_cm = remapped_y_pred
+    else:
+        # Use all classes
+        cm_indices = indices
+        cm_classes = class_list
+        y_true_cm = y_true
+        y_pred_cm = y_pred
     
-    # Create figure and axes
+    # Create the confusion matrix
+    cm = confusion_matrix(y_true_cm, y_pred_cm)
+    
+    # Normalize if requested
+    if normalize:
+        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        cm = np.nan_to_num(cm)  # Replace NaN with zero
+    
+    # Create the figure and axes
     fig, ax = plt.subplots(figsize=figsize)
     
-    # Generate class labels for plotting
-    if class_names is not None:
-        # Convert class indices to names for the most common classes
-        label_names = []
-        for cls in most_common:
-            # Handle cases where the class may not be in the mapping
-            if class_names is None:
-                label_names.append(f"Class-{cls}")
-            elif isinstance(class_names, dict):
-                label_names.append(class_names.get(cls, f"Class-{cls}"))
-            else:
-                try:
-                    # For list/array-like class_names
-                    label_names.append(class_names[cls])
-                except (IndexError, TypeError):
-                    label_names.append(f"Class-{cls}")
-    else:
-        # Default to class indices if no mapping provided
-        label_names = [f"Class-{cls}" for cls in most_common]
+    # Calculate suitable font size for axis ticks based on number of classes
+    n_classes = len(cm_classes)
+    font_size = max(5, min(10, 20 - 0.1 * n_classes))
     
-    # Plot confusion matrix with improved handling of NaN values
-    try:
-        # Use robust min/max values to avoid seaborn warnings
-        vmin = np.nanmin(cm[~np.isnan(cm)]) if np.any(~np.isnan(cm)) else 0
-        vmax = np.nanmax(cm[~np.isnan(cm)]) if np.any(~np.isnan(cm)) else 1
-        
-        # Create heatmap with robust parameters
-        sns.heatmap(cm, annot=True, fmt='.2f' if normalize else 'd', cmap='Blues',
-                    xticklabels=label_names, yticklabels=label_names, ax=ax,
-                    vmin=vmin, vmax=vmax)
-    except ValueError as e:
-        # Fallback to a simpler heatmap without vmin/vmax if there's an error
-        sns.heatmap(cm, annot=True, fmt='.2f' if normalize else 'd', cmap='Blues',
-                    xticklabels=label_names, yticklabels=label_names, ax=ax)
-        ax.text(0.5, 0.5, f"Warning: {str(e)}", transform=ax.transAxes, 
-                horizontalalignment='center', color='red', alpha=0.7)
-        
-    # Set title and labels
+    # Plot the confusion matrix with seaborn for better coloring
+    sns.heatmap(cm, annot=n_classes <= 20, fmt='.2f' if normalize else 'd',
+                cmap=cmap, square=True, linewidths=0.5, cbar_kws={"shrink": 0.8},
+                xticklabels=cm_classes, yticklabels=cm_classes, annot_kws={"size": text_size})
+    
+    # Improve the layout
+    plt.tight_layout()
+    ax.set_xlabel('Predicted', fontsize=font_size + 2)
+    ax.set_ylabel('True', fontsize=font_size + 2)
+    
     if title:
-        ax.set_title(title)
-    ax.set_ylabel('True label')
-    ax.set_xlabel('Predicted label')
-    
-    # Rotate x-axis labels for readability
-    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
-    
-    # Tight layout to ensure all labels are visible
-    fig.tight_layout()
+        ax.set_title(title, fontsize=font_size + 4)
+        
+    # Set tick font sizes
+    plt.xticks(rotation=45, ha='right', fontsize=font_size)
+    plt.yticks(rotation=0, fontsize=font_size)
     
     return fig
 
-def plot_class_distribution(class_counts, class_names=None, title='Class Distribution', 
-                           figsize=(12, 8), max_classes=20):
+def map_chord_to_quality(chord_name):
     """
-    Plot a bar chart of class distribution.
+    Map a chord name to its quality group.
     
     Args:
-        class_counts: Dictionary or Counter with class_idx:count pairs
-        class_names: Dictionary mapping class indices to names (optional)
-        title: Plot title
-        figsize: Figure size
-        max_classes: Maximum number of classes to display
-    
+        chord_name (str): The chord name (e.g., "C:maj", "A:min", "G:7", "N")
+        
     Returns:
-        matplotlib figure
+        str: The chord quality group name
     """
-    # Sort by frequency
-    sorted_items = sorted(class_counts.items(), key=lambda x: x[1], reverse=True)
-    
-    # Limit to max_classes
-    items_to_plot = sorted_items[:max_classes]
-    
-    # Extract class indices and counts
-    classes, counts = zip(*items_to_plot)
-    
-    # Map class indices to names if provided
-    if class_names:
-        labels = [class_names.get(cls, f"Class-{cls}") for cls in classes]
-    else:
-        labels = [f"Class-{cls}" for cls in classes]
-    
-    # Create figure
-    plt.figure(figsize=figsize)
-    
-    # Plot bars
-    bars = plt.bar(range(len(counts)), counts, align='center')
-    
-    # Add count numbers on top of bars
-    for i, bar in enumerate(bars):
-        height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2., height + 0.1,
-                f'{counts[i]}', ha='center', va='bottom', rotation=0)
-    
-    # Set labels and title
-    plt.xticks(range(len(counts)), labels, rotation=45, ha='right')
-    plt.title(title, fontsize=16)
-    plt.xlabel('Class', fontsize=14)
-    plt.ylabel('Count', fontsize=14)
-    
-    # Adjust layout
-    plt.tight_layout()
-    
-    return plt.gcf()
+    # Try to import chord functions from chords.py
+    try:
+        from modules.utils.chords import get_chord_quality
+        return get_chord_quality(chord_name)
+    except (ImportError, AttributeError):
+        # Fallback implementation if get_chord_quality isn't available
+        
+        # Handle special cases
+        if chord_name in ["N", "X", "None", "Unknown"]:
+            return "No Chord"
+            
+        # Standardize notation if it uses : separator
+        chord_name = chord_name.replace(":", "")
+            
+        # Define quality mappings with regex patterns
+        quality_mappings = [
+            # Major quality group
+            (r'^[A-G]$|maj$|^[A-G]maj$', 'Major'),
+            # Minor quality group
+            (r'min$|m$|^[A-G]m$', 'Minor'),
+            # Dominant 7th quality group
+            (r'7$|^[A-G]7$|dom7$', 'Dom7'),
+            # Major 7th quality group
+            (r'maj7$|^[A-G]maj7$', 'Maj7'),
+            # Minor 7th quality group
+            (r'min7$|m7$|^[A-G]m7$', 'Min7'),
+            # Diminished quality group
+            (r'dim$|°|^[A-G]dim$|^[A-G]o$', 'Dim'),
+            # Diminished 7th quality group
+            (r'dim7$|°7|^[A-G]dim7$|^[A-G]o7$', 'Dim7'),
+            # Half-diminished quality group
+            (r'hdim$|ø|m7b5$|^[A-G]ø$', 'Half-Dim'),
+            # Augmented quality group
+            (r'aug$|\+$|^[A-G]\+$|^[A-G]aug$', 'Aug'),
+            # Suspended quality group
+            (r'sus$|sus2$|sus4$', 'Sus'),
+            # Extended chords 9th, 11th, 13th
+            (r'9$|11$|13$', 'Extended')
+        ]
+            
+        # Check each pattern
+        for pattern, quality in quality_mappings:
+            if re.search(pattern, chord_name):
+                return quality
+                
+        # Default quality for any other chord
+        return "Other"
 
-def plot_learning_curve(epochs, train_metrics, val_metrics=None, metric_name='Loss',
-                        title='Learning Curve', figsize=(10, 6)):
+def get_chord_quality_groups():
     """
-    Plot training and validation metrics over epochs.
+    Get the list of chord quality groups from chords.py if available,
+    otherwise return a default list.
+    """
+    try:
+        from modules.utils.chords import CHORD_QUALITIES
+        return CHORD_QUALITIES
+    except (ImportError, AttributeError):
+        return DEFAULT_CHORD_QUALITIES
+
+def group_chords_by_quality(predictions, targets, idx_to_chord):
+    """
+    Group chord predictions and targets by quality.
     
     Args:
-        epochs: List of epoch numbers
-        train_metrics: List of training metric values
-        val_metrics: List of validation metric values (optional)
-        metric_name: Name of the metric being plotted
-        title: Plot title
-        figsize: Figure size
+        predictions: List of predicted chord indices
+        targets: List of target chord indices
+        idx_to_chord: Dictionary mapping indices to chord names
+        
+    Returns:
+        tuple: (pred_qualities, target_qualities, quality_names)
+    """
+    # Get the quality groups
+    quality_groups = get_chord_quality_groups()
     
+    # Map each chord to its quality
+    idx_to_quality = {}
+    for idx, chord in idx_to_chord.items():
+        quality = map_chord_to_quality(chord)
+        idx_to_quality[idx] = quality
+        if quality not in quality_groups:
+            quality_groups.append(quality)
+    
+    # Map predictions and targets to quality groups
+    pred_qualities = []
+    target_qualities = []
+    
+    for pred, target in zip(predictions, targets):
+        # Get qualities (default to "Other" if not found)
+        pred_quality = idx_to_quality.get(pred, "Other")
+        target_quality = idx_to_quality.get(target, "Other")
+        
+        # Convert to indices in quality_groups
+        pred_idx = quality_groups.index(pred_quality) if pred_quality in quality_groups else quality_groups.index("Other")
+        target_idx = quality_groups.index(target_quality) if target_quality in quality_groups else quality_groups.index("Other")
+        
+        pred_qualities.append(pred_idx)
+        target_qualities.append(target_idx)
+    
+    return np.array(pred_qualities), np.array(target_qualities), quality_groups
+
+def calculate_quality_confusion_matrix(predictions, targets, idx_to_chord):
+    """
+    Calculate confusion matrix for chord qualities.
+    
+    Args:
+        predictions: List of predicted chord indices
+        targets: List of target chord indices
+        idx_to_chord: Dictionary mapping indices to chord names
+        
+    Returns:
+        tuple: (quality_cm, quality_counts, quality_accuracy, quality_groups)
+    """
+    # Group by quality
+    pred_qualities, target_qualities, quality_groups = group_chords_by_quality(
+        predictions, targets, idx_to_chord
+    )
+    
+    # Calculate confusion matrix
+    quality_cm = confusion_matrix(
+        y_true=target_qualities, 
+        y_pred=pred_qualities,
+        labels=list(range(len(quality_groups)))
+    )
+    
+    # Count samples per quality group
+    quality_counts = Counter(target_qualities)
+    
+    # Calculate accuracy per quality group
+    quality_accuracy = {}
+    for i, quality in enumerate(quality_groups):
+        true_idx = np.where(target_qualities == i)[0]
+        if len(true_idx) > 0:
+            correct = np.sum(pred_qualities[true_idx] == i)
+            accuracy = correct / len(true_idx)
+            quality_accuracy[quality] = accuracy
+        else:
+            quality_accuracy[quality] = 0.0
+            
+    return quality_cm, quality_counts, quality_accuracy, quality_groups
+
+def plot_chord_quality_confusion_matrix(predictions, targets, idx_to_chord, 
+                                       title=None, figsize=(10, 8), text_size=10, 
+                                       save_path=None, dpi=300):
+    """
+    Create and save a chord quality confusion matrix.
+    
+    Args:
+        predictions: List of predicted chord indices
+        targets: List of target chord indices
+        idx_to_chord: Dictionary mapping indices to chord names
+        title: Plot title
+        figsize: Figure size (width, height) in inches
+        text_size: Font size for text annotations
+        save_path: Path to save the figure (if None, just returns the figure)
+        dpi: DPI for saved figure
+        
+    Returns:
+        tuple: (figure, quality_accuracy, quality_cm)
+    """
+    # Group by quality and calculate metrics
+    quality_cm, quality_counts, quality_accuracy, quality_groups = calculate_quality_confusion_matrix(
+        predictions, targets, idx_to_chord
+    )
+    
+    # Create confusion matrix plot
+    pred_qualities, target_qualities, _ = group_chords_by_quality(
+        predictions, targets, idx_to_chord
+    )
+    
+    fig = plot_confusion_matrix(
+        target_qualities,
+        pred_qualities,
+        class_names=quality_groups,
+        normalize=True,
+        title=title,
+        figsize=figsize,
+        text_size=text_size
+    )
+    
+    # Save the figure if requested
+    if save_path is not None:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+    
+    return fig, quality_accuracy, quality_cm, quality_groups, quality_counts
+
+def plot_learning_curve(train_loss, val_loss=None, title='Learning Curve', figsize=(10, 6), 
+                       save_path=None, dpi=300):
+    """
+    Plot training and validation learning curves.
+    
+    Args:
+        train_loss: List of training loss values
+        val_loss: List of validation loss values (optional)
+        title: Plot title
+        figsize: Figure size (width, height) in inches
+        save_path: Path to save the figure (if None, just returns the figure)
+        dpi: DPI for saved figure
+        
     Returns:
         matplotlib figure
     """
-    plt.figure(figsize=figsize)
+    fig, ax = plt.subplots(figsize=figsize)
     
-    # Plot training metrics
-    plt.plot(epochs, train_metrics, 'b-', label=f'Training {metric_name}')
+    # Plot training loss
+    epochs = range(1, len(train_loss) + 1)
+    ax.plot(epochs, train_loss, 'b-', label='Training Loss')
     
-    # Plot validation metrics if available
-    if val_metrics:
-        plt.plot(epochs, val_metrics, 'r-', label=f'Validation {metric_name}')
+    # Plot validation loss if provided
+    if val_loss:
+        ax.plot(epochs, val_loss, 'r-', label='Validation Loss')
     
-    # Add labels and legend
-    plt.title(title, fontsize=16)
-    plt.xlabel('Epochs', fontsize=14)
-    plt.ylabel(metric_name, fontsize=14)
-    plt.legend()
+    ax.set_title(title)
+    ax.set_xlabel('Epochs')
+    ax.set_ylabel('Loss')
+    ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.7)
     
-    # Add grid for readability
-    plt.grid(True, linestyle='--', alpha=0.7)
+    # Save the figure if requested
+    if save_path is not None:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
     
-    # Tight layout
-    plt.tight_layout()
-    
-    return plt.gcf()
+    return fig

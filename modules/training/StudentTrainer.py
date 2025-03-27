@@ -6,6 +6,15 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, OneCycleLR, Co
 import torch.nn.functional as F
 import matplotlib.pyplot as plt  # Add missing matplotlib import
 from collections import Counter
+import re
+from sklearn.metrics import confusion_matrix
+# Import chord utilities
+from modules.utils.chords import get_chord_quality, CHORD_QUALITIES
+# Import visualization functions
+from modules.utils.visualize import (
+    plot_confusion_matrix, plot_chord_quality_confusion_matrix,
+    plot_learning_curve, calculate_quality_confusion_matrix
+)
 
 class StudentTrainer(BaseTrainer):
     """
@@ -402,10 +411,21 @@ class StudentTrainer(BaseTrainer):
             # Use class attributes for temperature and alpha
             temperature = self.temperature
             alpha = self.kd_alpha
+
+
+            # student_logits = student_logits - student_logits.mean(dim=-1, keepdim=True)
+            # teacher_logits = teacher_logits - teacher_logits.mean(dim=-1, keepdim=True)
+            # student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+            # teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+
+            # Apply zero-mean normalization to the logits before softmax
+            # This is important for stable knowledge distillation as suggested by research
+            student_logits_normalized = student_logits - student_logits.mean(dim=1, keepdim=True)
+            teacher_logits_normalized = teacher_logits - teacher_logits.mean(dim=1, keepdim=True)
             
             # KL divergence loss with temperature scaling for soft targets
-            student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
-            teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
+            student_log_probs = F.log_softmax(student_logits_normalized / temperature, dim=1)
+            teacher_probs = F.softmax(teacher_logits_normalized / temperature, dim=1)
             
             # Check for NaN values that could break the loss calculation
             if torch.isnan(student_log_probs).any() or torch.isnan(teacher_probs).any():
@@ -426,8 +446,19 @@ class StudentTrainer(BaseTrainer):
             # Add logging once for diagnostics
             if not hasattr(self, '_kd_loss_logged'):
                 self._log(f"KD loss breakdown - KL: {kl_loss.item():.4f}, CE: {loss.item():.4f}, Combined: {combined_loss.item():.4f}")
-                self._log(f"Using α={alpha}, temperature={temperature}")
+                self._log(f"Using α={alpha}, temperature={temperature} with zero-mean logit normalization")
                 self._kd_loss_logged = True
+            
+            # NEW: Print teacher distribution details for confidence analysis
+            if teacher_probs.size(0) > 0:
+                sample_teacher = teacher_probs[0]
+                top_values, top_indices = torch.topk(sample_teacher, 10)
+                self._log("Teacher distribution for first sample in batch:")
+                for rank, (val, idx) in enumerate(zip(top_values, top_indices), start=1):
+                    chord_name = self.idx_to_chord.get(idx.item(), f"Class-{idx.item()}") if self.idx_to_chord else f"Class-{idx.item()}"
+                    self._log(f"  Rank {rank}: {chord_name} with probability {val.item():.4f}")
+                avg_confidence = teacher_probs.max(dim=1)[0].mean().item()
+                self._log(f"Average teacher max probability in batch: {avg_confidence:.4f}")
             
             return combined_loss
         except Exception as e:
@@ -648,11 +679,104 @@ class StudentTrainer(BaseTrainer):
         self.model.train()
         return avg_loss, val_acc
     
+    def _map_chord_to_quality(self, chord_name):
+        """
+        Map a chord name to its quality group.
+        
+        Args:
+            chord_name (str): The chord name (e.g., "C:maj", "A:min", "G:7", "N")
+            
+        Returns:
+            str: The chord quality group name
+        """
+        # Handle special cases
+        if chord_name in ["N", "X", "None", "Unknown"]:
+            return "No Chord"
+            
+        # Standardize notation if it uses : separator
+        chord_name = chord_name.replace(":", "")
+            
+        # Define quality mappings with regex patterns
+        quality_mappings = [
+            # Major quality group
+            (r'^[A-G]$|maj$|^[A-G]maj$', 'Major'),
+            # Minor quality group
+            (r'min$|m$|^[A-G]m$', 'Minor'),
+            # Dominant 7th quality group
+            (r'7$|^[A-G]7$|dom7$', 'Dom7'),
+            # Major 7th quality group
+            (r'maj7$|^[A-G]maj7$', 'Maj7'),
+            # Minor 7th quality group
+            (r'min7$|m7$|^[A-G]m7$', 'Min7'),
+            # Diminished quality group
+            (r'dim$|°|^[A-G]dim$|^[A-G]o$', 'Dim'),
+            # Diminished 7th quality group
+            (r'dim7$|°7|^[A-G]dim7$|^[A-G]o7$', 'Dim7'),
+            # Half-diminished quality group
+            (r'hdim$|ø|m7b5$|^[A-G]ø$', 'Half-Dim'),
+            # Augmented quality group
+            (r'aug$|\+$|^[A-G]\+$|^[A-G]aug$', 'Aug'),
+            # Suspended quality group
+            (r'sus$|sus2$|sus4$', 'Sus'),
+            # Extended chords 9th, 11th, 13th
+            (r'9$|11$|13$', 'Extended')
+        ]
+            
+        # Check each pattern
+        for pattern, quality in quality_mappings:
+            if re.search(pattern, chord_name):
+                return quality
+                
+        # Default quality for any other chord
+        return "Other"
+        
+    def _group_predictions_by_quality(self, predictions, targets, idx_to_chord):
+        """
+        Group predictions and targets by chord quality.
+        
+        Args:
+            predictions: List of predicted class indices
+            targets: List of target class indices
+            idx_to_chord: Dictionary mapping indices to chord names
+            
+        Returns:
+            tuple: (pred_qualities, target_qualities, quality_names)
+        """
+        # Get unique quality groups
+        quality_groups = set()
+        
+        # Create mappings from class indices to quality groups
+        idx_to_quality = {}
+        
+        # Build mappings
+        for idx, chord in idx_to_chord.items():
+            quality = self._map_chord_to_quality(chord)
+            idx_to_quality[idx] = quality
+            quality_groups.add(quality)
+        
+        # Sort quality groups for consistent order
+        quality_names = sorted(list(quality_groups))
+        
+        # Map predictions and targets to quality groups
+        pred_qualities = []
+        target_qualities = []
+        
+        for pred, targ in zip(predictions, targets):
+            # Map index to quality (use default if not found)
+            pred_quality = idx_to_quality.get(pred, "Other")
+            target_quality = idx_to_quality.get(targ, "Other")
+            
+            # Convert to indices in the quality_names list
+            pred_qualities.append(quality_names.index(pred_quality))
+            target_qualities.append(quality_names.index(target_quality))
+        
+        return pred_qualities, target_qualities, quality_names
+
     def _calculate_confusion_matrix(self, predictions, targets, current_epoch=None):
         """
         Calculate, log, and save the confusion matrix.
-        Prints top 10 classes every epoch, but only saves full 170-class 
-        confusion matrix every 10 epochs.
+        Prints chord quality groups for clearer visualization and also saves the
+        full class confusion matrix every 10 epochs.
         
         Args:
             predictions: List of predicted class indices
@@ -664,14 +788,6 @@ class StudentTrainer(BaseTrainer):
             return
             
         try:
-            # Try to import visualization module
-            try:
-                from modules.utils.visualize import plot_confusion_matrix
-                has_visualize = True
-            except ImportError:
-                self._log("Warning: modules.utils.visualize not available; using basic confusion matrix")
-                has_visualize = False
-            
             # Count occurrences of each class in targets
             target_counter = Counter(targets)
             total_samples = len(targets)
@@ -758,62 +874,106 @@ class StudentTrainer(BaseTrainer):
             common_acc = common_correct / common_total if common_total > 0 else 0
             self._log(f"\nAccuracy on most common classes: {common_acc:.4f} ({common_correct}/{common_total})")
             
-            # Create and save ONLY the full confusion matrix every 10 epochs
-            if has_visualize:
-                # Save the full confusion matrix only every 10 epochs or when epoch is not specified
-                save_full_matrix = current_epoch is None or current_epoch % 10 == 0
-                
-                if save_full_matrix:
-                    self._log(f"\nSaving full 170-class confusion matrix for epoch {current_epoch}")
+            # NEW: Create and visualize chord quality group confusion matrix using chords.py
+            if self.idx_to_chord:
+                self._log("\n=== Creating chord quality group confusion matrix ===")
+                try:
+                    # Use the visualization module to calculate quality statistics
+                    quality_cm, quality_counts, quality_accuracy, quality_groups = calculate_quality_confusion_matrix(
+                        predictions, targets, self.idx_to_chord
+                    )
                     
+                    # Log quality distribution
+                    self._log("\nChord quality distribution:")
+                    for i, quality in enumerate(quality_groups):
+                        count = quality_counts.get(i, 0)
+                        percentage = 100 * count / len(targets) if targets else 0
+                        self._log(f"  {quality}: {count} samples ({percentage:.2f}%)")
+                    
+                    # Log accuracies by quality
+                    self._log("\nAccuracy by chord quality:")
+                    for quality, acc in sorted(quality_accuracy.items(), key=lambda x: x[1], reverse=True):
+                        self._log(f"  {quality}: {acc:.4f}")
+                    
+                    # Create and save chord quality confusion matrix
+                    title = f"Chord Quality Confusion Matrix - Epoch {current_epoch}"
+                    quality_cm_path = os.path.join(
+                        self.checkpoint_dir, 
+                        f"confusion_matrix_quality_epoch_{current_epoch}.png"
+                    )
+                    
+                    # Plot using the visualization function
                     try:
-                        # For full confusion matrix (all classes), create a class mapping
-                        # that includes ALL possible chord indices from the model
-                        all_class_mapping = {}
-                        if self.idx_to_chord:
-                            for idx, chord in self.idx_to_chord.items():
-                                all_class_mapping[idx] = chord
-                        
-                        # Get a list of all unique classes
-                        all_classes = set(targets).union(set(predictions))
-                        
-                        # Ensure the classes are sorted for consistent visualization
-                        all_classes_list = sorted(list(all_classes))
-                        
-                        # Make sure all classes have labels
-                        for cls in all_classes:
-                            if cls not in all_class_mapping:
-                                all_class_mapping[cls] = f"Class-{cls}"
-                        
-                        # Generate the full confusion matrix visualization
-                        full_title = f"Full Confusion Matrix - Epoch {current_epoch}"
-                        np_targets_full = np.array(targets)
-                        np_preds_full = np.array(predictions)
-                        
-                        # Generate the full confusion matrix (without size limits)
-                        fig_full = plot_confusion_matrix(
-                            np_targets_full, np_preds_full,
-                            class_names=all_class_mapping,
-                            normalize=True,
-                            title=full_title,
-                            max_classes=None  # No limit on number of classes
+                        _, _, _, _, _ = plot_chord_quality_confusion_matrix(
+                            predictions, targets, self.idx_to_chord,
+                            title=title, save_path=quality_cm_path
                         )
-                        
-                        # Save the full figure with epoch in filename
-                        os.makedirs(self.checkpoint_dir, exist_ok=True)
-                        full_cm_path = os.path.join(
-                            self.checkpoint_dir, 
-                            f"confusion_matrix_full_epoch_{current_epoch}.png"
-                        )
-                        fig_full.savefig(full_cm_path, dpi=300, bbox_inches='tight')
-                        self._log(f"Saved full confusion matrix to {full_cm_path}")
-                        plt.close(fig_full)
+                        self._log(f"Saved chord quality confusion matrix to {quality_cm_path}")
                     except Exception as e:
-                        self._log(f"Error saving full confusion matrix visualization: {e}")
-                        import traceback
-                        self._log(traceback.format_exc())
-                else:
-                    self._log(f"Skipping confusion matrix visualization for epoch {current_epoch} (only saved every 10 epochs)")
+                        self._log(f"Error plotting chord quality confusion matrix: {e}")
+                        # Print normalized confusion matrix as text fallback
+                        self._log("\nChord Quality Confusion Matrix (normalized):")
+                        normalized_cm = quality_cm.astype('float') / quality_cm.sum(axis=1)[:, np.newaxis]
+                        normalized_cm = np.nan_to_num(normalized_cm)  # Replace NaN with zero
+                        for i, row in enumerate(normalized_cm):
+                            self._log(f"{quality_groups[i]:<10}: " + " ".join([f"{x:.2f}" for x in row]))
+                        
+                except Exception as e:
+                    self._log(f"Error creating quality-based confusion matrix: {e}")
+                    import traceback
+                    self._log(traceback.format_exc())
+            
+            # Create and save the full confusion matrix every 10 epochs (less frequently)
+            if current_epoch is None or current_epoch % 10 == 0:
+                self._log(f"\nSaving full class confusion matrix for epoch {current_epoch}")
+                
+                try:
+                    # Create a mapping that includes ALL possible chord indices
+                    all_class_mapping = {}
+                    if self.idx_to_chord:
+                        for idx, chord in self.idx_to_chord.items():
+                            all_class_mapping[idx] = chord
+                    
+                    # Get a list of all unique classes
+                    all_classes = set(targets).union(set(predictions))
+                    
+                    # Ensure the classes are sorted for consistent visualization
+                    all_classes_list = sorted(list(all_classes))
+                    
+                    # Make sure all classes have labels
+                    for cls in all_classes:
+                        if cls not in all_class_mapping:
+                            all_class_mapping[cls] = f"Class-{cls}"
+                    
+                    # Generate the full confusion matrix using the visualization function
+                    full_title = f"Full Confusion Matrix - Epoch {current_epoch}"
+                    np_targets_full = np.array(targets)
+                    np_preds_full = np.array(predictions)
+                    
+                    # Set save path
+                    full_cm_path = os.path.join(
+                        self.checkpoint_dir, 
+                        f"confusion_matrix_full_epoch_{current_epoch}.png"
+                    )
+                    
+                    # Generate full confusion matrix plot and save it
+                    fig_full = plot_confusion_matrix(
+                        np_targets_full, np_preds_full,
+                        class_names=all_class_mapping,
+                        normalize=True,
+                        title=full_title,
+                        max_classes=None  # No limit on number of classes
+                    )
+                    
+                    os.makedirs(self.checkpoint_dir, exist_ok=True)
+                    fig_full.savefig(full_cm_path, dpi=300, bbox_inches='tight')
+                    self._log(f"Saved full confusion matrix to {full_cm_path}")
+                    plt.close(fig_full)
+                    
+                except Exception as e:
+                    self._log(f"Error saving full confusion matrix visualization: {e}")
+                    import traceback
+                    self._log(traceback.format_exc())
             
         except Exception as e:
             self._log(f"Error calculating confusion matrix: {e}")
@@ -1398,3 +1558,27 @@ class StudentTrainer(BaseTrainer):
                 print(message)
         else:
             print(message)
+
+    def _plot_loss_history(self):
+        """Plot and save the loss history."""
+        try:
+            # Check if we have loss data
+            if not hasattr(self, 'train_losses') or len(self.train_losses) == 0:
+                self._log("No loss history to plot")
+                return
+                
+            # Set up save path
+            save_path = os.path.join(self.checkpoint_dir, "loss_history.png")
+            
+            # Use the visualization function to plot loss history
+            val_losses = self.val_losses if hasattr(self, 'val_losses') and len(self.val_losses) > 0 else None
+            fig = plot_learning_curve(
+                self.train_losses, val_losses, 
+                title="Training and Validation Loss", 
+                save_path=save_path
+            )
+            
+            self._log(f"Loss history plot saved to {save_path}")
+            plt.close(fig)
+        except Exception as e:
+            self._log(f"Error plotting loss history: {e}")
