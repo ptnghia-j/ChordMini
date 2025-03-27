@@ -122,6 +122,94 @@ def plot_confusion_matrix(y_true, y_pred, class_names=None, normalize=True, titl
     
     return fig
 
+def plot_class_distribution(y_true, class_names=None, figsize=(12, 8), title='Class Distribution', 
+                            max_classes=20, save_path=None, dpi=300, vertical=True):
+    """
+    Plot the distribution of classes in a dataset.
+    
+    Args:
+        y_true: Array of true class indices or labels
+        class_names: Dictionary mapping class indices to names, or list of class names
+        figsize: Figure size (width, height) in inches
+        title: Plot title
+        max_classes: Maximum number of classes to show (None for all)
+        save_path: Path to save the figure (if None, just returns the figure)
+        dpi: DPI for saved figure
+        vertical: If True, use vertical bars; otherwise, horizontal
+        
+    Returns:
+        matplotlib figure
+    """
+    # Count frequency of each class
+    class_counts = Counter(y_true)
+    
+    # Create mapping from class indices to names if provided
+    if class_names is None:
+        # Default to index strings if no mapping provided
+        class_mapping = {idx: str(idx) for idx in class_counts.keys()}
+    elif isinstance(class_names, dict):
+        # Use provided dictionary
+        class_mapping = class_names
+    else:
+        # Assume class_names is a list and map indices to it
+        class_mapping = {i: name for i, name in enumerate(class_names) if i in class_counts}
+    
+    # Sort by frequency (most common first) and limit to max_classes
+    sorted_classes = sorted(class_counts.keys(), key=lambda x: class_counts[x], reverse=True)
+    if max_classes is not None and len(sorted_classes) > max_classes:
+        sorted_classes = sorted_classes[:max_classes]
+    
+    # Get class names and counts for plotting
+    class_labels = [class_mapping.get(cls, str(cls)) for cls in sorted_classes]
+    class_values = [class_counts[cls] for cls in sorted_classes]
+    
+    # Calculate percentages
+    total_samples = sum(class_counts.values())
+    percentages = [100.0 * count / total_samples for count in class_values]
+    
+    # Create figure and plot
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Plot horizontal or vertical bars
+    if vertical:
+        bars = ax.bar(class_labels, class_values, color='steelblue')
+        # Add count labels on top of bars
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height + 0.5,
+                    f'{int(height)}',
+                    ha='center', va='bottom', rotation=0)
+        # Set labels
+        ax.set_xlabel('Class')
+        ax.set_ylabel('Count')
+        # Rotate x-axis labels for better readability
+        plt.xticks(rotation=45, ha='right')
+    else:
+        # Horizontal bars with class names on y-axis
+        bars = ax.barh(class_labels, class_values, color='steelblue')
+        # Add count and percentage labels inside bars
+        for i, (bar, percentage) in enumerate(zip(bars, percentages)):
+            width = bar.get_width()
+            if width > 0:
+                ax.text(width * 0.5, bar.get_y() + bar.get_height()/2,
+                        f'{int(width)} ({percentage:.1f}%)', 
+                        ha='center', va='center', color='white')
+        # Set labels
+        ax.set_ylabel('Class')
+        ax.set_xlabel('Count')
+    
+    # Set title and adjust layout
+    ax.set_title(title)
+    plt.tight_layout()
+    
+    # Save figure if path provided
+    if save_path:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+    
+    return fig
+
 def map_chord_to_quality(chord_name):
     """
     Map a chord name to its quality group.
