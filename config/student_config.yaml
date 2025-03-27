@@ -11,7 +11,7 @@ training:
   weight_decay: 1.0e-5
   betas: [0.9, 0.98]
   epsilon: 1.0e-9
-  early_stopping_patience: 15
+  early_stopping_patience: 20
   seq_len: 108
   seq_stride: 36
   save_checkpoint_interval: 10

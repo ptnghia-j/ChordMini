@@ -134,7 +134,7 @@ spec:
             - name: LEARNING_RATE
               value: "0.001"  # Base learning rate
             - name: MIN_LEARNING_RATE
-              value: "0.000001"  # Minimum learning rate for schedulers
+              value: "0.00005"  # Minimum learning rate for schedulers
             # Knowledge distillation settings
             - name: USE_KD_LOSS
               value: "true"  # Set to "true" to enable KD loss
@@ -146,16 +146,16 @@ spec:
             - name: USE_FOCAL_LOSS
               value: "true"  # Set to "true" to enable focal loss
             - name: FOCAL_GAMMA
-              value: "1.5"   # Focusing parameter for focal loss
+              value: "2.0"   # Focusing parameter for focal loss
             - name: FOCAL_ALPHA
               value: "0.25"  # Class weight parameter for focal loss
             # Warmup settings
             - name: USE_WARMUP
               value: "true"  # Set to "true" to enable learning rate warm-up
             - name: WARMUP_START_LR
-              value: "0.0005"  # Starting learning rate for warm-up
+              value: "0.0001"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.001"  # Final learning rate after warm-up
+              value: "0.05"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
               value: "20"  # Number of epochs for warm-up
             # Dropout setting

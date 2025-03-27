@@ -73,9 +73,9 @@ class SynthDataset(Dataset):
         self.cuda_available = torch.cuda.is_available()
         
         # Force num_workers to 0 for GPU compatibility
-        self.num_workers = 0
-        if num_workers is not None and num_workers > 0 and verbose:
-            print(f"Forcing num_workers to 0 (was {num_workers}) for single-worker GPU optimization")
+        self.num_workers = 2
+        # if num_workers is not None and num_workers > 0 and verbose:
+        #     print(f"Forcing num_workers to 0 (was {num_workers}) for single-worker GPU optimization")
         
         # Initialize basic parameters
         self.spec_dir = Path(spec_dir)
@@ -95,7 +95,7 @@ class SynthDataset(Dataset):
         self.require_teacher_logits = require_teacher_logits
         
         # Disable pin_memory since we're using a single worker
-        self.pin_memory = False
+        self.pin_memory = True
         if pin_memory and verbose:
             print("Disabling pin_memory since we're using a single worker")
             
@@ -1385,11 +1385,11 @@ class SynthDataset(Dataset):
 
     def get_train_iterator(self, batch_size=128, shuffle=True, num_workers=None, pin_memory=None):
         """Get an optimized DataLoader for the training set"""
-        # Always use a single worker (0) for GPU compatibility
-        num_workers_val = 0
+        # # Always use a single worker (0) for GPU compatibility
+        # num_workers_val = 0
         
-        # Always disable pin_memory for single worker
-        pin_memory_val = False
+        # # Always disable pin_memory for single worker
+        # pin_memory_val = False
         
         if not self.train_indices:
             warnings.warn("No training segments available")
@@ -1397,16 +1397,20 @@ class SynthDataset(Dataset):
                 SynthSegmentSubset(self, []),
                 batch_size=batch_size,
                 shuffle=shuffle,
-                pin_memory=pin_memory_val,
-                num_workers=num_workers_val
+                # pin_memory=pin_memory_val,
+                # num_workers=num_workers_val
+                pin_memory=pin_memory,
+                num_workers=num_workers
             )
         
         return DataLoader(
             SynthSegmentSubset(self, self.train_indices),
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=num_workers_val,
-            pin_memory=pin_memory_val
+            # num_workers=num_workers_val,
+            # pin_memory=pin_memory_val
+            pin_memory=pin_memory,
+            num_workers=num_workers
         )
     
     def get_eval_iterator(self, batch_size=128, shuffle=False, num_workers=None, pin_memory=None):
@@ -1415,7 +1419,7 @@ class SynthDataset(Dataset):
         num_workers_val = 0
         
         # Always disable pin_memory for single worker
-        pin_memory_val = False
+        pin_memory_val = True
         
         if not self.eval_indices:
             warnings.warn("No evaluation segments available")
@@ -1441,7 +1445,7 @@ class SynthDataset(Dataset):
         num_workers_val = 0
         
         # Always disable pin_memory for single worker
-        pin_memory_val = False
+        pin_memory_val = True
         
         if not self.test_indices:
             warnings.warn("No test segments available")
