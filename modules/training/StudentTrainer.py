@@ -448,8 +448,8 @@ class StudentTrainer(BaseTrainer):
                 self._log(f"Using α={alpha}, temperature={temperature} with zero-mean logit normalization")
                 self._kd_loss_logged = True
             
-            # NEW: Print teacher distribution details for confidence analysis
-            if teacher_probs.size(0) > 0:
+            # NEW: Print teacher distribution details only once during training
+            if not hasattr(self, '_teacher_distribution_logged') and teacher_probs.size(0) > 0:
                 sample_teacher = teacher_probs[0]
                 top_values, top_indices = torch.topk(sample_teacher, 10)
                 self._log("Teacher distribution for first sample in batch:")
@@ -458,6 +458,8 @@ class StudentTrainer(BaseTrainer):
                     self._log(f"  Rank {rank}: {chord_name} with probability {val.item():.4f}")
                 avg_confidence = teacher_probs.max(dim=1)[0].mean().item()
                 self._log(f"Average teacher max probability in batch: {avg_confidence:.4f}")
+                # Set flag to prevent future prints
+                self._teacher_distribution_logged = True
             
             return combined_loss
         except Exception as e:
