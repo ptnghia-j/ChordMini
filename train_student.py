@@ -461,7 +461,7 @@ def main():
         'stride': config.training.get('seq_stride', 5),  # Add fallback default
         'frame_duration': frame_duration,
         'verbose': True,
-        'device': device,  # Pass the device for GPU acceleration
+        'device': torch.device('cpu'),  # Force loading on CPU to avoid pin_memory errors
         'pin_memory': False,  # IMPORTANT FIX: Disable pin_memory to avoid memory issues
         'prefetch_factor': 1,  # IMPORTANT FIX: Reduce prefetch factor
     }
@@ -530,19 +530,18 @@ def main():
         logger.warning("WARNING: Validation dataset is empty. Will skip validation steps.")
     
     # Create data loaders with optimized settings for GPU - MOVE THIS BEFORE CHECKING THE LOADER
-    # IMPORTANT FIX: Force zero workers to avoid multiprocessing issues
     train_loader = synth_dataset.get_train_iterator(
         batch_size=config.training['batch_size'], 
         shuffle=True,
-        num_workers=2,  # Force 0 to avoid shared memory issues
-        pin_memory=True  # Disable pin memory to avoid memory issues
+        num_workers=0,  # Change to 0 to avoid shared memory errors
+        pin_memory=False  # Disable pin_memory to avoid pinning GPU tensors
     )
     
     val_loader = synth_dataset.get_eval_iterator(
         batch_size=config.training['batch_size'], 
         shuffle=False,
         num_workers=0,  # Force 0 to avoid shared memory issues
-        pin_memory=False  # Disable pin memory
+        pin_memory=False  # Disable pin_memory
     )
     
     # Check train loader
@@ -953,4 +952,10 @@ def main():
     logger.info("Student training and evaluation complete!")
 
 if __name__ == '__main__':
+    import multiprocessing
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # Start method already set
+        pass
     main()

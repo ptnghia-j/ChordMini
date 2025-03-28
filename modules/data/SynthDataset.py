@@ -1068,6 +1068,10 @@ class SynthDataset(Dataset):
         if not self.segment_indices:
             raise IndexError("Dataset is empty - no segments available")
         
+        # Initialize self.gpu_batch_cache if it's None to avoid TypeError
+        if self.batch_gpu_cache and self.gpu_batch_cache is None:
+            self.gpu_batch_cache = {}
+            
         # Try to use GPU batch cache with error handling
         if self.batch_gpu_cache and idx in self.gpu_batch_cache:
             try:
@@ -1312,6 +1316,9 @@ class SynthDataset(Dataset):
                                     if stacked_logits.dim() == 1:
                                         # Single class vector
                                         proper_tensor[0, 0, :min(stacked_logits.shape[0], proper_tensor.shape[2])] = stacked_logits[:proper_tensor.shape[2]]
+                                    elif stacked_logits.shape[0] == 1:
+                                        # Single-frame logits stored as [1, num_classes]
+                                        proper_tensor[0, 0, :min(stacked_logits.shape[1], proper_tensor.shape[2])] = stacked_logits[0, :proper_tensor.shape[2]]
                                     elif stacked_logits.dim() == 2:
                                         # Multiple class vectors
                                         max_seq = min(stacked_logits.shape[0], proper_tensor.shape[1])

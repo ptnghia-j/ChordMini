@@ -139,9 +139,9 @@ spec:
             - name: USE_KD_LOSS
               value: "true"  # Set to "true" to enable KD loss
             - name: KD_ALPHA
-              value: "0.9"  # Weight for KD loss (0-1)
+              value: "0.6"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
-              value: "2.0"  # Temperature for softening distributions
+              value: "3.0"  # Temperature for softening distributions
             # Focal loss settings
             - name: USE_FOCAL_LOSS
               value: "true"  # Set to "true" to enable focal loss
@@ -155,7 +155,7 @@ spec:
             - name: WARMUP_START_LR
               value: "0.0001"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.05"  # Final learning rate after warm-up
+              value: "0.005"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
               value: "20"  # Number of epochs for warm-up
             # Dropout setting
