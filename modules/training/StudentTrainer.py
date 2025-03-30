@@ -546,8 +546,8 @@ class StudentTrainer(BaseTrainer):
         
         # Add more detailed logging for the first few warmup epochs to verify correct ramp-up
         # Log only for first 3 epochs, every 100th epoch, or the final warmup epoch
-        if epoch <= 3 or epoch == self.warmup_epochs or epoch % 100 == 0:
-            self._log(f"Warm-up epoch {epoch}/{self.warmup_epochs}: progress={warmup_progress:.4f}, LR = {new_lr:.6f}")
+        # if epoch <= 3 or epoch == self.warmup_epochs or epoch % 100 == 0:
+        #     self._log(f"Warm-up epoch {epoch}/{self.warmup_epochs}: progress={warmup_progress:.4f}, LR = {new_lr:.6f}")
         
         return self._set_lr(new_lr)
         

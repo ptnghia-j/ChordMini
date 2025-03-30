@@ -163,6 +163,7 @@ spec:
             - name: storage
               mountPath: /mnt/storage
       containers:
+        # !!! It is recommended to test the model on small portion of the dataset first
         - name: student-trainer
           image: pytorch/pytorch:1.9.0-cuda11.1-cudnn8-runtime
           workingDir: /mnt/storage/ChordMini
@@ -176,7 +177,7 @@ spec:
               value: "1.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
             # Learning rate scheduling options - overrides student_config.yaml settings
             - name: LR_SCHEDULE
-              value: "validation"  # Changed from empty string to 'validation'
+              value: "cosine"  # Changed from empty string to 'validation'
             # Additional learning rate parameters - new additions
             - name: LEARNING_RATE
               value: "0.001"  # Base learning rate
@@ -186,7 +187,7 @@ spec:
             - name: USE_KD_LOSS
               value: "true"  # Set to "true" to enable KD loss
             - name: KD_ALPHA
-              value: "0.3"  # Weight for KD loss (0-1)
+              value: "0.1"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
               value: "2.0"  # Temperature for softening distributions
             # Focal loss settings
@@ -204,10 +205,10 @@ spec:
             - name: WARMUP_END_LR
               value: "0.001"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "10"  # Number of epochs for warm-up
+              value: "5"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
-              value: "0.3"  # Set dropout probability (0-1)
+              value: "0.2"  # Set dropout probability (0-1)
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
@@ -223,10 +224,17 @@ spec:
               value: "6"     # Prefetch 6 batches for better throughput
             # Add dataset type environment variable
             - name: DATASET_TYPE
-              value: "maestro"  # Use "maestro" for Maestro dataset or "fma" for FMA dataset
+              value: "fma"  # Use "maestro" for Maestro dataset or "fma" for FMA dataset
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
               value: "auto"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
+            - name: SUB_DIR
+              value: "fma_logits"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
+            # Dataset initialization controls: set  LAZY_INT=false and set percentage in SMALL_DATASET to use, otherwise default to full dataset
+            - name: LAZY_INIT
+              value: "false"  # Controls dataset lazy initialization (true/false)
+            - name: SMALL_DATASET
+              value: "0.01"   # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
           command:
             - sh
             - -c
@@ -319,6 +327,15 @@ spec:
               elif [ "${USE_WARMUP}" = "true" ]; then
                 echo "Using warm-up learning rate schedule for ${WARMUP_EPOCHS} epochs"
                 LR_SCHEDULE_ARG="--use_warmup --warmup_epochs ${WARMUP_EPOCHS}"
+                # Add the other warmup parameters to ensure they're passed to the script
+                if [ "${WARMUP_START_LR}" != "" ]; then
+                  LR_SCHEDULE_ARG="${LR_SCHEDULE_ARG} --warmup_start_lr ${WARMUP_START_LR}"
+                  echo "Using warmup start learning rate: ${WARMUP_START_LR}"
+                fi
+                if [ "${WARMUP_END_LR}" != "" ]; then
+                  LR_SCHEDULE_ARG="${LR_SCHEDULE_ARG} --warmup_end_lr ${WARMUP_END_LR}"
+                  echo "Using warmup end learning rate: ${WARMUP_END_LR}" 
+                fi
               else
                 echo "Using default validation-based learning rate adjustment"
               fi
@@ -403,18 +420,10 @@ spec:
                   # Define paths based on directory structure
                   if [ -d "${DATA_ROOT}/logits/synth/spectrograms" ] && [ -d "${DATA_ROOT}/logits/synth/labels" ] && [ -d "${DATA_ROOT}/logits/synth/logits" ]; then
                     # Standard structure with separate directories
-                    # Check if logits directory has more data and use it if it does
-                    MAIN_SPEC_COUNT=$(find "${DATA_ROOT}/synth/spectrograms" -type f -name "*.npy" 2>/dev/null | wc -l)
-                    LOGITS_SPEC_COUNT=$(find "${DATA_ROOT}/logits/synth/spectrograms" -type f -name "*.npy" 2>/dev/null | wc -l)
-                    
-                    if [ ${MAIN_SPEC_COUNT:-0} -lt ${LOGITS_SPEC_COUNT:-0} ]; then
-                      echo "Using spectrograms and labels from logits directory (more files available)"
-                      KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms --label_dir ${DATA_ROOT}/logits/synth/labels --logits_dir ${DATA_ROOT}/logits/synth/logits"
-                    else
-                      echo "Using spectrograms and labels from main directory with logits from logits directory"
-                      KD_ARGS="--logits_dir ${DATA_ROOT}/logits/synth/logits"
-                    fi
-                    echo "Using standard KD directory structure"
+                    # MODIFIED: Always use the logits directory for KD if it has the proper structure
+                    echo "Found complete KD directory structure with spectrograms, labels, and logits"
+                    KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms --label_dir ${DATA_ROOT}/logits/synth/labels --logits_dir ${DATA_ROOT}/logits/synth/logits"
+                    echo "Using spectrograms, labels, and logits from the logits directory"
                   elif [ -d "${DATA_ROOT}/logits/synth" ]; then
                     # All files might be in the root directory
                     KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth --label_dir ${DATA_ROOT}/logits/synth --logits_dir ${DATA_ROOT}/logits/synth"
@@ -451,6 +460,22 @@ spec:
                 GPU_ARGS="${GPU_ARGS} --prefetch_factor ${PREFETCH_FACTOR}"
               fi
               
+              # Dataset initialization control arguments
+              DATASET_INIT_ARGS=""
+              if [ "${LAZY_INIT}" = "true" ]; then
+                echo "Using lazy initialization for dataset"
+                DATASET_INIT_ARGS="--lazy_init"
+              else
+                echo "Disabling lazy initialization for dataset (will pre-load all metadata)"
+              fi
+              
+              if [ "${SMALL_DATASET}" != "" ] && [ "${SMALL_DATASET}" != "null" ]; then
+                echo "Using only ${SMALL_DATASET} fraction of dataset (${SMALL_DATASET}%)"
+                DATASET_INIT_ARGS="${DATASET_INIT_ARGS} --small_dataset ${SMALL_DATASET}"
+              else
+                echo "Using full dataset"
+              fi
+              
               # Get dropout from environment
               DROPOUT_ARG=""
               if [ "${DROPOUT}" != "" ]; then
@@ -460,11 +485,49 @@ spec:
                 echo "Using default dropout value from config"
               fi
               
-              # Run the student training script with all options
+              # ! NOTE: Define checkpoint
+              CHECKPOINTS_DIR="/mnt/storage/checkpoints/student"
+              
+              # ! NOTE: save checkpoint directory defined in env
+              if [ "${SUB_DIR}" != "" ]; then
+                # Create directory with subdirectory if SUB_DIR is specified
+                mkdir -p "${CHECKPOINTS_DIR}/${SUB_DIR}"
+                echo "Using checkpoint directory: ${CHECKPOINTS_DIR}/${SUB_DIR}"
+              else
+                # Create just the base directory
+                mkdir -p "${CHECKPOINTS_DIR}"
+                echo "Using checkpoint directory: ${CHECKPOINTS_DIR}"
+              fi
+              
+              # Handle checkpoint loading option
+              CHECKPOINT_ARG=""
+              if [ "${LOAD_CHECKPOINT}" = "auto" ]; then
+                if [ -f "${CHECKPOINTS_DIR}/student_model_best.pth" ]; then
+                  echo "Found existing checkpoint at ${CHECKPOINTS_DIR}/student_model_best.pth"
+                  echo "Will attempt to load and continue training from best checkpoint"
+                  CHECKPOINT_ARG="--load_checkpoint ${CHECKPOINTS_DIR}/student_model_best.pth"
+                else
+                  echo "No existing checkpoint found at ${CHECKPOINTS_DIR}/student_model_best.pth"
+                  echo "Starting training from scratch"
+                fi
+              elif [ "${LOAD_CHECKPOINT}" = "never" ]; then
+                echo "Starting fresh training (ignoring any existing checkpoints)"
+              elif [ "${LOAD_CHECKPOINT}" = "required" ]; then
+                if [ -f "${CHECKPOINTS_DIR}/student_model_best.pth" ]; then
+                  echo "Found required checkpoint at ${CHECKPOINTS_DIR}/student_model_best.pth"
+                  CHECKPOINT_ARG="--load_checkpoint ${CHECKPOINTS_DIR}/student_model_best.pth"
+                else
+                  echo "ERROR: Required checkpoint not found at ${CHECKPOINTS_DIR}/student_model_best.pth"
+                  echo "Cannot proceed with training"
+                  exit 1
+                fi
+              fi
+              
+              # Run the student training script with all options (without --best_model_dir flag)
               echo "Starting student training with GPU optimization and all options..."
-              python train_student.py $DATASET_ARG --config ./config/student_config.yaml --save_dir ${CHECKPOINT_DIR} \
-                ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS}\
-                ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} ${CHECKPOINT_ARG}
+              python train_student.py $DATASET_ARG --config ./config/student_config.yaml --save_dir ${CHECKPOINTS_DIR}${SUB_DIR} \
+                ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} \
+                ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS}
               
               echo "=== Student model training complete ==="
               
