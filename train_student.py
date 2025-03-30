@@ -128,7 +128,7 @@ def main():
     parser.add_argument('--warmup_start_lr', type=float, default=None,
                        help='Initial learning rate for warm-up (default: 1/10 of base LR)')
     # Add new arguments for smooth LR scheduling
-    parser.add_argument('--lr_schedule', type=str, choices=['cosine', 'linear_decay', 'one_cycle', 'cosine_warm_restarts'], default=None,
+    parser.add_argument('--lr_schedule', type=str, choices=['cosine', 'linear_decay', 'one_cycle', 'cosine_warm_restarts', 'validation', 'none'], default=None,
                        help='Learning rate schedule type (default: validation-based)')
     
     # Add focal loss arguments
@@ -204,10 +204,19 @@ def main():
     parser.add_argument('--warmup_end_lr', type=float, default=None,
                        help='Target learning rate at the end of warm-up (default: base LR)')
     
+    # Add new argument for dataset type
+    parser.add_argument('--dataset_type', type=str, choices=['fma', 'maestro'], default='fma',
+                      help='Dataset format type: fma (numeric IDs) or maestro (arbitrary filenames)')
+    
     args = parser.parse_args()
 
     # Load configuration from YAML first before checking CUDA availability
     config = HParams.load(args.config)
+    
+    # Override config with dataset_type if specified
+    if not hasattr(config, 'data'):
+        config.data = {}
+    config.data['dataset_type'] = args.dataset_type
     
     # Then check device availability
     if config.misc['use_cuda'] and is_cuda_available():
@@ -510,8 +519,11 @@ def main():
     # Update dataset initialization to ensure small_dataset_percentage is passed correctly
     dataset_args['small_dataset_percentage'] = small_dataset_percentage
     
+    # Add dataset_type parameter to SynthDataset initialization
+    dataset_args['dataset_type'] = config.data.get('dataset_type', 'fma')
+    
     # Create the dataset with parameters
-    logger.info("Creating SynthDataset...")
+    logger.info(f"Creating SynthDataset with dataset_type='{dataset_args['dataset_type']}'...")
     synth_dataset = SynthDataset(**dataset_args)
     
     # After loading data, print dataset sizes to confirm data is available
@@ -729,6 +741,13 @@ def main():
         logger.info("Final CUDA memory cleanup before training")
         torch.cuda.empty_cache()
     
+    # Handle special LR schedule cases
+    lr_schedule_type = None
+    if args.lr_schedule in ['validation', 'none']:
+        lr_schedule_type = None  # Force None for validation-based LR
+    else:
+        lr_schedule_type = args.lr_schedule or config.training.get('lr_schedule', None)
+
     # Create StudentTrainer with enhanced learning rate parameters
     trainer = StudentTrainer(
         model=model,
@@ -747,7 +766,7 @@ def main():
         warmup_epochs=args.warmup_epochs or config.training.get('warmup_epochs', 5),
         warmup_start_lr=args.warmup_start_lr or config.training.get('warmup_start_lr', None),
         warmup_end_lr=args.warmup_end_lr or config.training.get('warmup_end_lr', None), # Add warmup_end_lr parameter
-        lr_schedule_type=args.lr_schedule or config.training.get('lr_schedule', None),
+        lr_schedule_type=lr_schedule_type,
         use_focal_loss=args.use_focal_loss or config.training.get('use_focal_loss', False),
         focal_gamma=args.focal_gamma or config.training.get('focal_gamma', 2.0),
         focal_alpha=args.focal_alpha or config.training.get('focal_alpha', None),

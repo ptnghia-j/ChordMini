@@ -56,3 +56,20 @@ def logging_verbosity(verbose_level):
         logger.setLevel(logging.INFO)
     elif verbose_level >= 2:
         logger.setLevel(logging.DEBUG)
+
+def is_debug():
+    """
+    Check if debug logging is enabled.
+    This is a safer way to check logging level than directly accessing internal values.
+    
+    Returns:
+        bool: True if debug logging is enabled, False otherwise
+    """
+    import logging
+    try:
+        # Try to get the logger instance and check its level
+        root_logger = logging.getLogger()
+        return root_logger.level <= logging.DEBUG
+    except:
+        # If anything fails, default to False
+        return False

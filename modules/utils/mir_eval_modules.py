@@ -32,6 +32,11 @@ def audio_file_to_features(audio_file, config):
         # print("DEBUG: Exception details:", e)
         # print("DEBUG: Available audioread backends:", audioread.available_backends())
         raise RuntimeError(f"Failed to load audio file '{audio_file}': {e}")
+    
+    # Get FFT size from config or use default
+    n_fft = config.feature.get('n_fft', 512)
+    hop_length = config.feature.get('hop_length', 512)
+    
     currunt_sec_hz = 0
     feature = None  # initialize feature
     while len(original_wav) > currunt_sec_hz + config.mp3['song_hz'] * config.mp3['inst_len']:
@@ -47,15 +52,29 @@ def audio_file_to_features(audio_file, config):
         else:
             feature = np.concatenate((feature, tmp), axis=1)
         currunt_sec_hz = end_idx
-    tmp = librosa.cqt(original_wav[currunt_sec_hz:],
+    
+    # Process the final segment with proper padding if needed
+    final_segment = original_wav[currunt_sec_hz:]
+    
+    # Check if segment is too short for the FFT window
+    if len(final_segment) < n_fft:
+        # Print warning and pad the segment
+        print(f"Warning: Final segment of {audio_file} is too short ({len(final_segment)} samples). Padding to {n_fft} samples.")
+        padding_needed = n_fft - len(final_segment)
+        final_segment = np.pad(final_segment, (0, padding_needed), mode="constant", constant_values=0)
+    
+    # Process the properly sized segment
+    tmp = librosa.cqt(final_segment,
                       sr=sr,
                       n_bins=config.feature['n_bins'],
                       bins_per_octave=config.feature['bins_per_octave'],
                       hop_length=config.feature['hop_length'])
+    
     if feature is None:
         feature = tmp
     else:
         feature = np.concatenate((feature, tmp), axis=1)
+    
     feature = np.log(np.abs(feature) + 1e-6)
     song_length_second = len(original_wav) / config.mp3['song_hz']
     feature_per_second = config.feature['hop_length'] / config.mp3['song_hz']
@@ -212,6 +231,33 @@ def lab_file_error_modify(ref_labels):
             if ref_labels[i].find('min') != -1:
                 ref_labels[i] = ref_labels[i][:ref_labels[i].find('min')] + ':' + ref_labels[i][ref_labels[i].find('min'):]
     return ref_labels
+
+def compute_individual_chord_accuracy(reference_labels, prediction_labels):
+    """
+    Compute accuracy for individual chord qualities.
+    Extract chord quality as the substring after ':'; if none exists, assume 'maj'.
+    Returns a dictionary mapping quality (e.g. maj, min, min7, etc.) to accuracy.
+    """
+    from collections import defaultdict
+    def get_quality(chord):
+        if ':' in chord:
+            return chord.split(':')[1]
+        else:
+            return "maj"  # default quality if no ':' is present
+    stats = defaultdict(lambda: {'correct': 0, 'total': 0})
+    for ref, pred in zip(reference_labels, prediction_labels):
+        q_ref = get_quality(ref)
+        q_pred = get_quality(pred)
+        stats[q_ref]['total'] += 1
+        if q_ref == q_pred:
+            stats[q_ref]['correct'] += 1
+    acc = {}
+    for quality, vals in stats.items():
+        if vals['total'] > 0:
+            acc[quality] = vals['correct'] / vals['total']
+        else:
+            acc[quality] = 0.0
+    return acc
 
 def root_majmin_score_calculation(valid_dataset, config, mean, std, device, model, model_type, verbose=False):
     """
@@ -547,6 +593,8 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
     }
     
     song_length_list = []
+    collected_refs = []     # <-- New: collect reference chord labels
+    collected_preds = []    # <-- New: collect predicted chord labels
     errors = 0
     
     # Process each song group
@@ -605,6 +653,11 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                 
                 # Extract the reference chord label
                 chord_label = sample['chord_label']
+                
+                # Add extra checking for chord_label structure
+                if isinstance(chord_label, list) and len(chord_label) > 0 and isinstance(chord_label[0], list):
+                    print(f"Warning: Detected nested chord_label in sample {i}. First element shape: {len(chord_label[0])} chords")
+                
                 reference_labels.append(chord_label)
             
             # Combine all frames into a single tensor
@@ -642,6 +695,10 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                 # Convert indices to chord names
                 pred_chords = [idx_to_chord.get(pred, "N") for pred in predictions]
                 
+                # Collect raw chord label lists for individual chord accuracy
+                collected_refs.extend(reference_labels)
+                collected_preds.extend(pred_chords)
+                
                 # Debug first few predicted chords to verify format
                 if i == 0:
                     print(f"First 5 predicted chords: {pred_chords[:5]}")
@@ -678,6 +735,51 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
             print(f"Error evaluating sample group {song_id}: {str(e)}")
             if errors <= 10:  # Only print detailed error for first 10 errors
                 traceback.print_exc()
+    
+    # Extra: Debug print to ensure labels were collected
+    if not collected_refs:
+        print("Warning: No reference chord labels were collected for individual accuracy.")
+        print(f"First few predictions (if any): {collected_preds[:5]}")
+    if not collected_preds:
+        print("Warning: No predicted chord labels were collected for individual accuracy.")
+        print(f"First few references (if any): {collected_refs[:5]}")
+    
+    # Print collected counts regardless
+    print(f"Collected {len(collected_refs)} reference labels and {len(collected_preds)} predictions for chord quality analysis")
+    
+    # Extra: Print individual chord accuracy computed over all processed songs
+    # Make more robust by ensuring both lists have values and equal length
+    if collected_refs and collected_preds:
+        # Ensure lists are the same length
+        min_len = min(len(collected_refs), len(collected_preds))
+        if min_len > 0:
+            # Check if chord labels have the expected format (with ":")
+            has_colon_ref = any(':' in str(chord) for chord in collected_refs[:100] if chord)
+            has_colon_pred = any(':' in str(chord) for chord in collected_preds[:100] if chord)
+            
+            if not has_colon_ref:
+                print("Warning: Reference chord labels don't contain ':' format needed for quality analysis")
+                print(f"Sample references: {collected_refs[:5]}")
+            if not has_colon_pred:
+                print("Warning: Predicted chord labels don't contain ':' format needed for quality analysis")
+                print(f"Sample predictions: {collected_preds[:5]}")
+            
+            # Trim to equal length
+            ref_sample = collected_refs[:min_len]
+            pred_sample = collected_preds[:min_len]
+            
+            # Now compute accuracy 
+            ind_acc = compute_individual_chord_accuracy(ref_sample, pred_sample)
+            if ind_acc:
+                print("\nIndividual Chord Quality Accuracy:")
+                print("---------------------------------")
+                for chord_quality, accuracy_val in sorted(ind_acc.items(), key=lambda x: x[1], reverse=True):
+                    print(f"  {chord_quality}: {accuracy_val*100:.2f}%")
+            else:
+                print("\nNo individual chord accuracy data computed despite having labels.")
+                print("This may indicate a problem with the chord format.")
+    else:
+        print("Warning: Insufficient data for chord quality analysis. Need both reference and prediction labels.")
     
     # Calculate weighted average scores - FIX: Ensure consistent lengths and non-negative values
     average_score_dict = {}
@@ -749,8 +851,57 @@ def calculate_chord_scores(timestamps, durations, reference_labels, prediction_l
     # Ensure all inputs have the same length
     min_len = min(len(intervals), len(reference_labels), len(prediction_labels))
     intervals = intervals[:min_len]
-    reference_labels = reference_labels[:min_len]
-    prediction_labels = prediction_labels[:min_len]
+    
+    # IMPORTANT: Handle potentially nested reference_labels - add this check without changing
+    # the core behavior for non-nested lists
+    fixed_reference_labels = []
+    fixed_prediction_labels = []
+    
+    # Check for nested reference labels (e.g., [['N', 'E:min', ...]] instead of ['N', 'E:min', ...])
+    if (len(reference_labels) > 0 and isinstance(reference_labels[0], list) and 
+            len(reference_labels[0]) > 0 and isinstance(reference_labels[0][0], str)):
+        print(f"Detected doubly-nested reference labels with {len(reference_labels[0])} items")
+        fixed_reference_labels = [str(chord) for chord in reference_labels[0][:min_len]]
+    else:
+        # Keep original behavior for non-nested lists
+        for ref in reference_labels[:min_len]:
+            if isinstance(ref, (list, tuple, np.ndarray)):
+                # Handle case where individual elements are also lists
+                if len(ref) > 0:
+                    fixed_reference_labels.append(str(ref[0]))  # Take first element if it's a list
+                else:
+                    fixed_reference_labels.append("N")  # Default for empty list
+            else:
+                fixed_reference_labels.append(str(ref))  # Keep as is if not a list
+    
+    # Do the same for prediction labels for consistency
+    for pred in prediction_labels[:min_len]:
+        if isinstance(pred, (list, tuple, np.ndarray)):
+            if len(pred) > 0:
+                fixed_prediction_labels.append(str(pred[0]))
+            else:
+                fixed_prediction_labels.append("N")
+        else:
+            fixed_prediction_labels.append(str(pred))
+    
+    # Make sure both lists are the same length
+    final_length = min(len(fixed_reference_labels), len(fixed_prediction_labels))
+    fixed_reference_labels = fixed_reference_labels[:final_length]
+    fixed_prediction_labels = fixed_prediction_labels[:final_length]
+    
+    # Update durations to match the final length
+    if len(durations) > final_length:
+        durations = durations[:final_length]
+    
+    # Debug output only if we actually needed to fix something
+    if len(reference_labels) != len(fixed_reference_labels) or isinstance(reference_labels[0], list):
+        print(f"Fixed reference chord list from {len(reference_labels)} to {len(fixed_reference_labels)} items")
+        if len(fixed_reference_labels) > 0:
+            print(f"First 5 reference chords (fixed): {fixed_reference_labels[:5]}")
+    
+    # Continue with existing logic, but use our fixed lists
+    reference_labels = fixed_reference_labels
+    prediction_labels = fixed_prediction_labels
     
     # Initialize default scores
     root_score = 0.0

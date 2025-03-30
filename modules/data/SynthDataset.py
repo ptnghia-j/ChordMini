@@ -29,13 +29,16 @@ class SynthDataset(Dataset):
     """
     Dataset for loading preprocessed spectrograms and chord labels.
     Optimized implementation for GPU acceleration with single worker.
+    Supports two dataset formats:
+    - 'fma': Uses numeric 6-digit IDs with format ddd/dddbbb_spec.npy 
+    - 'maestro': Uses arbitrary filenames with format maestro-v3.0.0/file-name_spec.npy
     """
     def __init__(self, spec_dir, label_dir, chord_mapping=None, seq_len=10, stride=None, 
                  frame_duration=0.1, num_workers=0, cache_file=None, verbose=True,
                  use_cache=True, metadata_only=True, cache_fraction=0.1, logits_dir=None,
                  lazy_init=False, require_teacher_logits=False, device=None,
                  pin_memory=False, prefetch_factor=2, batch_gpu_cache=False,
-                 small_dataset_percentage=None):
+                 small_dataset_percentage=None, dataset_type='fma'):
         """
         Initialize the dataset with optimized settings for GPU acceleration.
         
@@ -46,7 +49,7 @@ class SynthDataset(Dataset):
             seq_len: Sequence length for segmentation
             stride: Stride for segmentation (default: same as seq_len)
             frame_duration: Duration of each frame in seconds
-            num_workers: Number of workers for data loading (forced to 0 for GPU compatibility)
+            num_workers: Number of workers for data loading
             cache_file: Path to cache file
             verbose: Whether to print verbose output
             use_cache: Whether to use caching
@@ -60,6 +63,9 @@ class SynthDataset(Dataset):
             prefetch_factor: Number of batches to prefetch (for DataLoader)
             batch_gpu_cache: Whether to cache batches on GPU for repeated access patterns
             small_dataset_percentage: Optional percentage of the dataset to use (0-1.0)
+            dataset_type: Type of dataset format ('fma' or 'maestro')
+                - 'fma': Uses numeric 6-digit IDs with directory structure ddd/dddbbb_spec.npy
+                - 'maestro': Uses arbitrary filenames with structure maestro-v3.0.0/file-name_spec.npy
         """
         # First, log initialization time start to track potential timeout issues
         import time
@@ -93,6 +99,11 @@ class SynthDataset(Dataset):
         self.cache_fraction = cache_fraction  # Fraction of samples to cache (default: 10%)
         self.lazy_init = lazy_init
         self.require_teacher_logits = require_teacher_logits
+        self.dataset_type = dataset_type  # Dataset format type ('fma' or 'maestro')
+        
+        if self.dataset_type not in ['fma', 'maestro']:
+            warnings.warn(f"Unknown dataset_type '{dataset_type}', defaulting to 'fma'")
+            self.dataset_type = 'fma'
         
         # Disable pin_memory since we're using a single worker
         self.pin_memory = True
@@ -109,8 +120,25 @@ class SynthDataset(Dataset):
         else:
             self.chord_to_idx = {}
             
-        # Calculate and store the numeric ID regex pattern (6 digits)
-        self.numeric_id_pattern = re.compile(r'(\d{6})')
+        # Set up regex patterns based on dataset type
+        if self.dataset_type == 'maestro':
+            # For Maestro dataset, match any filename pattern ending with _spec, _logits, or .lab
+            self.file_pattern = re.compile(r'(.+?)(?:_spec|_logits)?\.(?:npy|lab)$')
+            if self.verbose:
+                print(f"Using Maestro dataset format with pattern matching")
+                print(f"Expected file paths:")
+                print(f"  - Spectrograms: {spec_dir}/maestro-v3.0.0/file-name_spec.npy")
+                print(f"  - Labels: {label_dir}/maestro-v3.0.0/file-name.lab")
+                print(f"  - Logits: {logits_dir}/maestro-v3.0.0/file-name_logits.npy (if available)")
+        else:
+            # Default for FMA dataset - the existing 6-digit numeric ID pattern
+            self.numeric_id_pattern = re.compile(r'(\d{6})')
+            if self.verbose:
+                print(f"Using FMA dataset format with 6-digit numeric ID pattern")
+                print(f"Expected file paths:")
+                print(f"  - Spectrograms: {spec_dir}/ddd/dddbbb_spec.npy")
+                print(f"  - Labels: {label_dir}/ddd/dddbbb.lab")
+                print(f"  - Logits: {logits_dir}/ddd/dddbbb_logits.npy (if available)")
         
         # Auto-detect device if not provided - use device module with safer initialization
         if device is None:
@@ -148,9 +176,9 @@ class SynthDataset(Dataset):
             
         # Generate a safer cache file name using hashing if none provided
         if cache_file is None:
-            cache_key = f"{spec_dir}_{label_dir}_{seq_len}_{stride}_{frame_duration}"
+            cache_key = f"{spec_dir}_{label_dir}_{seq_len}_{stride}_{frame_duration}_{dataset_type}"
             cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
-            self.cache_file = f"dataset_cache_{cache_hash}.pkl"
+            self.cache_file = f"dataset_cache_{dataset_type}_{cache_hash}.pkl"
             if verbose:
                 print(f"Using cache file: {self.cache_file}")
         else:
@@ -170,51 +198,75 @@ class SynthDataset(Dataset):
             self.samples = []
             self.segment_indices = []
             
-            # First, find all valid spectrogram files with numeric ID pattern
-            if self.verbose:
-                print("Scanning for files with 6-digit numeric IDs...")
-            
             # Create a mapping of label files for quick lookup
             label_files_dict = {}
             for label_path in Path(label_dir).glob("**/*.lab"):
-                # Extract the 6-digit ID from the filename
-                numeric_match = self.numeric_id_pattern.search(str(label_path.stem))
-                if numeric_match:
-                    numeric_id = numeric_match.group(1)
-                    label_files_dict[numeric_id] = label_path
+                if self.dataset_type == 'maestro':
+                    # For Maestro dataset, extract the file name without extension
+                    file_match = self.file_pattern.search(str(label_path.name))
+                    if file_match:
+                        file_id = file_match.group(1)  # Base filename without extension
+                        parent_dir = label_path.parent.name  # Get parent directory name
+                        combined_id = f"{parent_dir}/{file_id}"  # Combined ID with directory
+                        label_files_dict[combined_id] = label_path
+                else:
+                    # For FMA dataset, extract the 6-digit ID from the filename
+                    numeric_match = self.numeric_id_pattern.search(str(label_path.stem))
+                    if numeric_match:
+                        numeric_id = numeric_match.group(1)
+                        label_files_dict[numeric_id] = label_path
             
             if self.verbose:
-                print(f"Found {len(label_files_dict)} label files with valid numeric IDs")
+                print(f"Found {len(label_files_dict)} label files with valid IDs")
             
-            # Store file paths for lazy loading, focusing on files with numeric IDs
+            # Store file paths for lazy loading, focusing on files with matching IDs
             self.spec_files = []
             for spec_path in Path(spec_dir).glob("**/*.npy"):
-                # Extract the 6-digit ID from the filename
-                numeric_match = self.numeric_id_pattern.search(str(spec_path.stem))
-                if numeric_match:
-                    numeric_id = numeric_match.group(1)
-                    # Only include files that have matching label files
-                    if numeric_id in label_files_dict:
-                        self.spec_files.append((spec_path, numeric_id))
+                if self.dataset_type == 'maestro':
+                    # For Maestro dataset
+                    file_match = self.file_pattern.search(str(spec_path.name))
+                    if file_match:
+                        file_id = file_match.group(1)  # Extract base filename
+                        if file_id.endswith('_spec'):
+                            file_id = file_id[:-5]  # Remove '_spec' suffix if present
+                        parent_dir = spec_path.parent.name  # Get parent directory name
+                        combined_id = f"{parent_dir}/{file_id}"  # Combined ID with directory
+                        
+                        # Only include files that have matching label files
+                        if combined_id in label_files_dict:
+                            self.spec_files.append((spec_path, combined_id))
+                else:
+                    # For FMA dataset - extract the 6-digit ID from the filename
+                    numeric_match = self.numeric_id_pattern.search(str(spec_path.stem))
+                    if numeric_match:
+                        numeric_id = numeric_match.group(1)
+                        # Only include files that have matching label files
+                        if numeric_id in label_files_dict:
+                            self.spec_files.append((spec_path, numeric_id))
             
             if self.verbose:
-                print(f"Found {len(self.spec_files)} spectrogram files with valid numeric IDs (lazy mode)")
+                print(f"Found {len(self.spec_files)} spectrogram files with valid IDs (lazy mode)")
             
             # Track which song IDs we've processed to avoid duplicates
             processed_song_ids = set()
             # Build minimal metadata for each file without loading content
             song_samples = {}  # Group indices by song_id
             
-            for spec_file, numeric_id in self.spec_files:
-                # Skip if we've already processed this numeric ID
-                if numeric_id in processed_song_ids:
+            for spec_file, song_id in self.spec_files:
+                # Skip if we've already processed this ID
+                if song_id in processed_song_ids:
                     continue
                 
-                # Get the 3-digit directory prefix
-                dir_prefix = numeric_id[:3]
+                # Get directory information based on dataset type
+                if self.dataset_type == 'maestro':
+                    # For Maestro, the directory prefix is the parent directory name (e.g., 'maestro-v3.0.0')
+                    dir_prefix = spec_file.parent.name
+                else:
+                    # For FMA, get the 3-digit directory prefix from the numeric ID
+                    dir_prefix = song_id[:3] if len(song_id) >= 3 else song_id
                 
-                # Construct the exact paths to the label file
-                label_file = label_files_dict.get(numeric_id)
+                # Construct the paths to the label file based on dataset type
+                label_file = label_files_dict.get(song_id)
                 if not label_file or not label_file.exists():
                     continue  # Skip if no matching label file
                 
@@ -246,26 +298,38 @@ class SynthDataset(Dataset):
                         sample_data = {
                             'spec_path': str(spec_file),
                             'chord_label': chord_label,
-                            'song_id': numeric_id,
+                            'song_id': song_id,
                             'frame_idx': t,
                             'dir_prefix': dir_prefix  # Store the directory prefix for faster lookup
                         }
                         
                         # Add logits path if logits directory is provided
                         if self.logits_dir is not None:
-                            logits_path = self.logits_dir / dir_prefix / f"{numeric_id}_logits.npy"
+                            # Construct logits path based on dataset type
+                            if self.dataset_type == 'maestro':
+                                # For Maestro, construct path with parent dir intact
+                                if '/' in song_id:  # Combined format: "dir/filename"
+                                    parent_dir, base_name = song_id.split('/', 1)
+                                    logits_path = self.logits_dir / parent_dir / f"{base_name}_logits.npy"
+                                else:
+                                    # Fallback if no directory separator
+                                    logits_path = self.logits_dir / f"{song_id}_logits.npy"
+                            else:
+                                # For FMA, use the existing 3-digit directory structure
+                                logits_path = self.logits_dir / dir_prefix / f"{song_id}_logits.npy"
+                                
                             if os.path.exists(logits_path):
                                 sample_data['logit_path'] = str(logits_path)
                         
                         self.samples.append(sample_data)
                         
                         # Track this sample in the song group for segmenting
-                        if numeric_id not in song_samples:
-                            song_samples[numeric_id] = []
-                        song_samples[numeric_id].append(sample_idx)
+                        if song_id not in song_samples:
+                            song_samples[song_id] = []
+                        song_samples[song_id].append(sample_idx)
                     
                     # Mark this song ID as processed
-                    processed_song_ids.add(numeric_id)
+                    processed_song_ids.add(song_id)
                         
                 except Exception as e:
                     if verbose:
@@ -431,58 +495,82 @@ class SynthDataset(Dataset):
         if self.verbose:
             print("Finding spectrogram files (this may take a moment)...")
         
-        # First, create a mapping of label files by numeric ID
+        # First, create a mapping of label files for quick lookup
         label_files_dict = {}
         for label_path in self.label_dir.glob("**/*.lab"):
-            # Extract the 6-digit ID from the filename
-            numeric_match = self.numeric_id_pattern.search(str(label_path.stem))
-            if numeric_match:
-                numeric_id = numeric_match.group(1)
-                label_files_dict[numeric_id] = label_path
+            if self.dataset_type == 'maestro':
+                # For Maestro dataset, extract the file name without extension
+                file_match = self.file_pattern.search(str(label_path.name))
+                if file_match:
+                    file_id = file_match.group(1)  # Base filename
+                    parent_dir = label_path.parent.name  # Get parent directory name
+                    combined_id = f"{parent_dir}/{file_id}"  # Combined ID with directory
+                    label_files_dict[combined_id] = label_path
+            else:
+                # For FMA dataset, extract the 6-digit ID from the filename
+                numeric_match = self.numeric_id_pattern.search(str(label_path.stem))
+                if numeric_match:
+                    numeric_id = numeric_match.group(1)
+                    label_files_dict[numeric_id] = label_path
         
         if self.verbose:
-            print(f"Found {len(label_files_dict)} label files with valid numeric IDs")
+            print(f"Found {len(label_files_dict)} label files with valid IDs")
         
-        # Find all spectrogram files with numeric IDs
+        # Find all spectrogram files based on dataset type
         valid_spec_files = []
         
-        # Look for the specific format first: {dir_prefix}/{numeric_id}_spec.npy
-        for prefix_dir in self.spec_dir.glob("**/"):
-            if prefix_dir.is_dir() and len(prefix_dir.name) == 3 and prefix_dir.name.isdigit():
-                dir_prefix = prefix_dir.name
-                # Look for files with pattern {numeric_id}_spec.npy where numeric_id starts with dir_prefix
-                for spec_path in prefix_dir.glob(f"{dir_prefix}???_spec.npy"):
-                    # Extract the 6-digit ID from the filename
-                    filename = spec_path.stem
-                    if filename.endswith("_spec"):
-                        filename = filename[:-5]  # Remove '_spec' suffix
+        if self.dataset_type == 'maestro':
+            # For Maestro dataset, search in all subdirectories
+            for spec_path in self.spec_dir.glob("**/*.npy"):
+                file_match = self.file_pattern.search(str(spec_path.name))
+                if file_match:
+                    file_id = file_match.group(1)  # Extract base filename
+                    if file_id.endswith('_spec'):
+                        file_id = file_id[:-5]  # Remove '_spec' suffix
+                    parent_dir = spec_path.parent.name  # Get parent directory name
+                    combined_id = f"{parent_dir}/{file_id}"  # Combined ID with directory
                     
-                    numeric_match = self.numeric_id_pattern.search(filename)
+                    # Only include files that have matching label files
+                    if combined_id in label_files_dict:
+                        valid_spec_files.append((spec_path, combined_id))
+        else:
+            # For FMA dataset - look for the specific format first: {dir_prefix}/{numeric_id}_spec.npy
+            for prefix_dir in self.spec_dir.glob("**/"):
+                if prefix_dir.is_dir() and len(prefix_dir.name) == 3 and prefix_dir.name.isdigit():
+                    dir_prefix = prefix_dir.name
+                    # Look for files with pattern {numeric_id}_spec.npy where numeric_id starts with dir_prefix
+                    for spec_path in prefix_dir.glob(f"{dir_prefix}???_spec.npy"):
+                        # Extract the 6-digit ID from the filename
+                        filename = spec_path.stem
+                        if filename.endswith("_spec"):
+                            filename = filename[:-5]  # Remove '_spec' suffix
+                        
+                        numeric_match = self.numeric_id_pattern.search(filename)
+                        if numeric_match:
+                            numeric_id = numeric_match.group(1)
+                            # Only include files that have matching label files
+                            if numeric_id in label_files_dict:
+                                valid_spec_files.append((spec_path, numeric_id))
+            
+            # If we didn't find any files with the specific pattern, fall back to the general search
+            if not valid_spec_files and self.verbose:
+                print("No spectrogram files found with pattern {dir_prefix}/{numeric_id}_spec.npy, trying general search...")
+                
+                for spec_path in self.spec_dir.glob("**/*.npy"):
+                    # Extract the 6-digit ID from the filename
+                    numeric_match = self.numeric_id_pattern.search(str(spec_path.stem))
                     if numeric_match:
                         numeric_id = numeric_match.group(1)
                         # Only include files that have matching label files
                         if numeric_id in label_files_dict:
                             valid_spec_files.append((spec_path, numeric_id))
         
-        # If we didn't find any files with the specific pattern, fall back to the general search
-        if not valid_spec_files and self.verbose:
-            print("No spectrogram files found with pattern {dir_prefix}/{numeric_id}_spec.npy, trying general search...")
-            
-            for spec_path in self.spec_dir.glob("**/*.npy"):
-                # Extract the 6-digit ID from the filename
-                numeric_match = self.numeric_id_pattern.search(str(spec_path.stem))
-                if numeric_match:
-                    numeric_id = numeric_match.group(1)
-                    # Only include files that have matching label files
-                    if numeric_id in label_files_dict:
-                        valid_spec_files.append((spec_path, numeric_id))
-        
         if not valid_spec_files:
-            warnings.warn("No spectrogram files found with valid numeric IDs. Check your data paths.")
+            warnings.warn(f"No valid spectrogram files found for dataset type '{self.dataset_type}'. Check your data paths.")
             return
             
         if self.verbose:
-            print(f"Found {len(valid_spec_files)} spectrogram files with valid numeric IDs")
+            print(f"Found {len(valid_spec_files)} valid spectrogram files")
             # Print sample paths to help diagnose directory structure
             if valid_spec_files:
                 print("Sample spectrogram paths:")
@@ -670,18 +758,31 @@ class SynthDataset(Dataset):
         else:
             warnings.warn("No samples loaded. Check your data paths and structure.")
     
-    def _process_file(self, spec_file, numeric_id, label_files_dict, return_skip_reason=False):
-        """Process a single spectrogram file with 6-digit ID pattern"""
+    def _process_file(self, spec_file, file_id, label_files_dict, return_skip_reason=False):
+        """Process a single spectrogram file based on dataset type"""
         samples = []
         skip_reason = None
         
         try:
-            # We already have the numeric ID extracted from the calling function
-            # Get the 3-digit directory prefix
-            dir_prefix = numeric_id[:3]
+            # Handle directory prefix based on dataset type
+            if self.dataset_type == 'maestro':
+                # For Maestro, the directory prefix is the parent directory name
+                dir_prefix = spec_file.parent.name
+                if self.verbose and not hasattr(self, '_maestro_path_logged'):
+                    print(f"Maestro dataset format: using parent directory '{dir_prefix}' for organization")
+                    print(f"Example spec file path: {spec_file}")
+                    print(f"Example ID (combined dir/file): {file_id}")
+                    self._maestro_path_logged = True
+            else:
+                # For FMA, extract the 3-digit prefix from the numeric ID
+                dir_prefix = file_id[:3] if len(file_id) >= 3 else file_id
+                if self.verbose and not hasattr(self, '_fma_path_logged'):
+                    print(f"FMA dataset format: using 3-digit prefix '{dir_prefix}' from ID {file_id}")
+                    print(f"Example spec file path: {spec_file}")
+                    self._fma_path_logged = True
             
             # Get the matching label file directly from the dictionary
-            label_file = label_files_dict.get(numeric_id)
+            label_file = label_files_dict.get(file_id)
             if not label_file or not os.path.exists(str(label_file)):
                 if hasattr(self, 'skipped_reasons'):
                     self.skipped_reasons['missing_label'] += 1
@@ -693,21 +794,23 @@ class SynthDataset(Dataset):
             # Find matching logit file if logits_dir is provided
             logit_file = None
             if self.logits_dir is not None:
-                # Construct the expected logits path using the fixed pattern
-                logit_file = self.logits_dir / dir_prefix / f"{numeric_id}_logits.npy"
-                
-                # Check if the logits file exists
-                if not os.path.exists(logit_file):
-                    if self.verbose and not hasattr(self, '_missing_logits_warning'):
-                        print(f"WARNING: No matching logits file found at {logit_file}")
-                        self._missing_logits_warning = True
-                    
-                    if hasattr(self, 'skipped_reasons'):
-                        self.skipped_reasons['missing_logits'] += 1
-                    skip_reason = 'missing_logits'
-                    if return_skip_reason:
-                        return [], skip_reason
-                    return []
+                # Construct the expected logits path based on dataset type
+                if self.dataset_type == 'maestro':
+                    # For Maestro, use directory structure from file_id
+                    if '/' in file_id:
+                        parent_dir, base_name = file_id.split('/', 1)
+                        logit_file = self.logits_dir / parent_dir / f"{base_name}_logits.npy"
+                        if self.verbose and not hasattr(self, '_maestro_logit_path_logged'):
+                            print(f"Maestro logit path example: {logit_file}")
+                            self._maestro_logit_path_logged = True
+                    else:
+                        logit_file = self.logits_dir / f"{file_id}_logits.npy"
+                else:
+                    # For FMA, use the 3-digit directory structure
+                    logit_file = self.logits_dir / dir_prefix / f"{file_id}_logits.npy"
+                    if self.verbose and not hasattr(self, '_fma_logit_path_logged'):
+                        print(f"FMA logit path example: {logit_file}")
+                        self._fma_logit_path_logged = True
             
             # At this point, we have all required components (spec, label, and logits if enabled)
             
@@ -732,17 +835,22 @@ class SynthDataset(Dataset):
                         elif chord_label not in self.chord_mapping:
                             warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
                             chord_label = "N"
-                            
-                        # Store the correct path format including _spec suffix
-                        expected_spec_path = str(self.spec_dir / dir_prefix / f"{numeric_id}_spec.npy")
+                        
+                        # Store the path format based on dataset type
+                        if self.dataset_type == 'maestro':
+                            # For Maestro, keep the full path as is
+                            expected_spec_path = str(spec_file)
+                        else:
+                            # For FMA, ensure the path follows the expected format
+                            expected_spec_path = str(self.spec_dir / dir_prefix / f"{file_id}_spec.npy")
                         
                         samples.append({
                             'spec_path': str(spec_file),  # Keep original path for loading
-                            'expected_spec_path': expected_spec_path,  # Store the expected format path
+                            'expected_spec_path': expected_spec_path,
                             'chord_label': chord_label,
-                            'song_id': numeric_id,
+                            'song_id': file_id,
                             'frame_idx': t,
-                            'dir_prefix': dir_prefix  # Store the directory prefix for faster lookup
+                            'dir_prefix': dir_prefix
                         })
                         
                         # Record logit path if available
@@ -815,7 +923,7 @@ class SynthDataset(Dataset):
                         sample_dict = {
                             'spectro': spec[t],
                             'chord_label': chord_label,
-                            'song_id': numeric_id,
+                            'song_id': file_id,  # Changed from numeric_id to file_id
                             'dir_prefix': dir_prefix,
                             'frame_idx': t
                         }
@@ -857,7 +965,7 @@ class SynthDataset(Dataset):
                 return [], skip_reason
             return []
             
-        # Return processed samples (or empty list if we skipped this file)
+        # Return processed samples
         if return_skip_reason:
             return samples, skip_reason
         return samples
@@ -1180,12 +1288,12 @@ class SynthDataset(Dataset):
                                 else:
                                     # Create zeros tensor for out-of-bounds frame
                                     teacher_logits = np.zeros(teacher_logits.shape[-1] if len(teacher_logits.shape) > 1 else 170)
-                            elif teacher_logits.shape[0] == 1:
-                                # Single-frame logits stored as [1, num_classes]
-                                teacher_logits = teacher_logits[0]
-                            else:
-                                # Multi-frame logits without frame index - take first frame
-                                teacher_logits = teacher_logits[0]
+                        elif teacher_logits.shape[0] == 1:
+                            # Single-frame logits stored as [1, num_classes]
+                            teacher_logits = teacher_logits[0]
+                        else:
+                            # Multi-frame logits without frame index - take first frame
+                            teacher_logits = teacher_logits[0]
                         
                         # Ensure teacher_logits is 1D
                         if len(teacher_logits.shape) > 1:
@@ -1471,6 +1579,94 @@ class SynthDataset(Dataset):
             num_workers=num_workers_val,
             pin_memory=pin_memory_val
         )
+    # Fix the test_multi_format_support function implementation
+def test_multi_format_support():
+    """Test the SynthDataset's multi-format support with sample data"""
+    import tempfile
+    import shutil
+    
+    print("\n=== Testing multi-format support ===")
+    try:
+        # Create temporary directories for testing
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Create test directories
+            base_dir = Path(temp_dir)
+            
+            # Test FMA format
+            fma_spec_dir = base_dir / "fma_specs"
+            fma_label_dir = base_dir / "fma_labels"
+            fma_logits_dir = base_dir / "fma_logits"
+            
+            # Create directory structure for FMA
+            (fma_spec_dir / "123").mkdir(parents=True)
+            (fma_label_dir / "123").mkdir(parents=True)
+            (fma_logits_dir / "123").mkdir(parents=True)
+            
+            # Create sample files for FMA
+            np.save(fma_spec_dir / "123" / "123456_spec.npy", np.zeros((10, 144)))
+            with open(fma_label_dir / "123" / "123456.lab", "w") as f:
+                f.write("0.0 1.0 C\n1.0 2.0 G")
+            # Also create a logits file for FMA format
+            np.save(fma_logits_dir / "123" / "123456_logits.npy", np.zeros((10, 25)))
+            
+            # Test Maestro format
+            maestro_spec_dir = base_dir / "maestro_specs"
+            maestro_label_dir = base_dir / "maestro_labels"
+            maestro_logits_dir = base_dir / "maestro_logits"
+            
+            # Create directory structure for Maestro
+            (maestro_spec_dir / "maestro-v3.0.0").mkdir(parents=True)
+            (maestro_label_dir / "maestro-v3.0.0").mkdir(parents=True)
+            (maestro_logits_dir / "maestro-v3.0.0").mkdir(parents=True)
+            
+            # Create sample files for Maestro
+            np.save(maestro_spec_dir / "maestro-v3.0.0" / "piece1_spec.npy", np.zeros((10, 144)))
+            with open(maestro_label_dir / "maestro-v3.0.0" / "piece1.lab", "w") as f:
+                f.write("0.0 1.0 C\n1.0 2.0 G")
+            # Also create a logits file for Maestro format
+            np.save(maestro_logits_dir / "maestro-v3.0.0" / "piece1_logits.npy", np.zeros((10, 25)))
+            
+            # Test both formats
+            print("Testing FMA format...")
+            fma_dataset = SynthDataset(
+                spec_dir=fma_spec_dir, 
+                label_dir=fma_label_dir,
+                logits_dir=fma_logits_dir,
+                dataset_type='fma',
+                verbose=True,
+                seq_len=5,  # Add required parameters
+                stride=2,
+                lazy_init=False,  # Force full initialization
+                metadata_only=True  # Use metadata for faster testing
+            )
+            
+            print("\nTesting Maestro format...")
+            maestro_dataset = SynthDataset(
+                spec_dir=maestro_spec_dir, 
+                label_dir=maestro_label_dir,
+                logits_dir=maestro_logits_dir,
+                dataset_type='maestro',
+                verbose=True,
+                seq_len=5,  # Add required parameters
+                stride=2,
+                lazy_init=False,  # Force full initialization
+                metadata_only=True  # Use metadata for faster testing
+            )
+            
+            # Print dataset stats to verify
+            print("\nFMA Dataset Stats:")
+            print(f"  Total frames: {len(fma_dataset.samples)}")
+            print(f"  Total segments: {len(fma_dataset)}")
+            
+            print("\nMaestro Dataset Stats:")
+            print(f"  Total frames: {len(maestro_dataset.samples)}")
+            print(f"  Total segments: {len(maestro_dataset)}")
+            
+            print("\nMulti-format support test complete!")
+    except Exception as e:
+        print(f"Error during multi-format test: {e}")
+        import traceback
+        traceback.print_exc()
 
 class SynthSegmentSubset(Dataset):
     """Subset of the SynthDataset based on specified indices"""
@@ -1540,3 +1736,8 @@ if __name__ == "__main__":
     print(f"  Target chord indices: {sample_batch['chord_idx'].shape}")
     
     print("\nTest complete!")
+
+    # Update and uncomment the multi-format support test
+    test_multi_format_support()
+
+
