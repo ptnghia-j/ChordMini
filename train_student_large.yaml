@@ -224,6 +224,9 @@ spec:
             # Add dataset type environment variable
             - name: DATASET_TYPE
               value: "maestro"  # Use "maestro" for Maestro dataset or "fma" for FMA dataset
+            # Add checkpoint loading control option
+            - name: LOAD_CHECKPOINT
+              value: "auto"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
           command:
             - sh
             - -c
@@ -459,9 +462,9 @@ spec:
               
               # Run the student training script with all options
               echo "Starting student training with GPU optimization and all options..."
-              python train_student.py $DATASET_ARG --config ./config/student_config.yaml --save_dir checkpoints/student \
+              python train_student.py $DATASET_ARG --config ./config/student_config.yaml --save_dir ${CHECKPOINT_DIR} \
                 ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS}\
-                ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS}
+                ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} ${CHECKPOINT_ARG}
               
               echo "=== Student model training complete ==="
               
@@ -482,4 +485,4 @@ spec:
       volumes:
         - name: storage
           persistentVolumeClaim:
-            claimName: temporary-storage
+            claimName: temporary-storage-1

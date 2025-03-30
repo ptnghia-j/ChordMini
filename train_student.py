@@ -208,6 +208,10 @@ def main():
     parser.add_argument('--dataset_type', type=str, choices=['fma', 'maestro'], default='fma',
                       help='Dataset format type: fma (numeric IDs) or maestro (arbitrary filenames)')
     
+    # Add new argument for checkpoint loading
+    parser.add_argument('--load_checkpoint', type=str, default=None,
+                      help='Path to checkpoint file to resume training from')
+    
     args = parser.parse_args()
 
     # Load configuration from YAML first before checking CUDA availability
@@ -778,34 +782,62 @@ def main():
     # Set chord mapping in trainer for checkpoint saving
     trainer.set_chord_mapping(chord_mapping)
     
-    # After model initialization, log the model structure
-    logger.info("\n=== Model Summary ===")
-    try:
-        # Log basic model information
-        parameter_count = sum(p.numel() for p in model.parameters())
-        trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logger.info(f"Total parameters: {parameter_count:,}")
-        logger.info(f"Trainable parameters: {trainable_count:,}")
-        
-        # Log structure of first batch to confirm dimensions
-        sample_batch = next(iter(train_loader))
-        logger.info(f"Input spectro shape: {sample_batch['spectro'].shape}")
-        logger.info(f"Target chord_idx shape: {sample_batch['chord_idx'].shape}")
-        
-        # Verify we have teacher logits if KD is enabled
-        if use_kd and 'teacher_logits' not in sample_batch:
-            logger.error("ERROR: Knowledge distillation is enabled but no teacher_logits found in batch.")
-            logger.error("Check your dataset configuration or disable KD with --use_kd_loss=false")
-            return
-            
-    except Exception as e:
-        logger.error(f"ERROR: Failed during model check: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return
+    # After model initialization and optimizer setup, check for and load checkpoint if specified
+    start_epoch = 1
+    if args.load_checkpoint:
+        if os.path.exists(args.load_checkpoint):
+            try:
+                logger.info(f"\n=== Loading checkpoint from {args.load_checkpoint} ===")
+                checkpoint = torch.load(args.load_checkpoint, map_location=device)
+                
+                # Load model weights
+                model.load_state_dict(checkpoint['model_state_dict'])
+                logger.info("Model state loaded successfully")
+                
+                # Load optimizer state if available
+                if 'optimizer_state_dict' in checkpoint:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    logger.info("Optimizer state loaded successfully")
+                
+                # Get starting epoch
+                if 'epoch' in checkpoint:
+                    # Start from the next epoch
+                    start_epoch = checkpoint['epoch'] + 1
+                    logger.info(f"Resuming from epoch {start_epoch} (after checkpoint epoch {checkpoint['epoch']})")
+                
+                # Log checkpoint accuracy if available
+                if 'accuracy' in checkpoint:
+                    logger.info(f"Checkpoint validation accuracy: {checkpoint['accuracy']:.4f}")
+                
+                # If using scheduler and checkpoint has scheduler state
+                if 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] and trainer.smooth_scheduler:
+                    try:
+                        trainer.smooth_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                        logger.info("Scheduler state loaded successfully")
+                    except Exception as e:
+                        logger.warning(f"Could not load scheduler state: {e}")
+                
+                logger.info(f"Successfully loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+                
+                # Set best validation accuracy if available
+                if hasattr(trainer, 'best_val_acc') and 'accuracy' in checkpoint:
+                    trainer.best_val_acc = checkpoint['accuracy']
+                    logger.info(f"Set best validation accuracy to {trainer.best_val_acc:.4f}")
+                
+            except Exception as e:
+                logger.error(f"Error loading checkpoint: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                logger.warning("Starting training from scratch due to checkpoint loading error")
+                start_epoch = 1
+        else:
+            logger.warning(f"Checkpoint file not found: {args.load_checkpoint}")
+            logger.warning("Starting training from scratch")
+    else:
+        logger.info("No checkpoint specified, starting training from scratch")
     
-    # Run training with error reporting
-    logger.info("\n=== Starting training ===")
+    # Run training with error reporting and starting from the specified epoch
+    logger.info(f"\n=== Starting training from epoch {start_epoch}/{config.training.get('num_epochs', 100)} ===")
     try:
         # Wrap the training call with timeout handling to detect hangs
         import signal
@@ -828,7 +860,7 @@ def main():
         logger.info("Timeout detection disabled for production use")
         
         # Start training
-        trainer.train(train_loader, val_loader)
+        trainer.train(train_loader, val_loader, start_epoch=start_epoch)
         
         # No need to cancel the alarm since it's not set
         # signal.alarm(0)

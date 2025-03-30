@@ -1038,7 +1038,14 @@ class StudentTrainer(BaseTrainer):
         return inputs, targets
 
     def train(self, train_loader, val_loader=None, start_epoch=1):
-        """Train the model with optimized GPU usage"""
+        """
+        Train the model with optimized GPU usage.
+        
+        Args:
+            train_loader: DataLoader for training data
+            val_loader: DataLoader for validation data
+            start_epoch: Epoch to start training from (for resuming from checkpoint)
+        """
         try:
             self.model.train()
             
