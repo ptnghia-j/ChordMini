@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-mini
+  name: chord-mini-large
   namespace: csuf-titans
   labels:
     app: chord-student-training
@@ -70,45 +70,92 @@ spec:
               PROJ_ROOT="/mnt/storage/ChordMini"
               echo "Project root: $PROJ_ROOT"
               
-              # Create the data directories if they don't exist
+              # Create the data directories if they don't exist for both dataset types
+              # FMA dataset directories
               mkdir -p "/mnt/storage/data/synth/spectrograms"
               mkdir -p "/mnt/storage/data/synth/labels"
+              mkdir -p "/mnt/storage/data/synth/logits"
+              
+              # Maestro dataset directories
+              mkdir -p "/mnt/storage/data/maestro_synth/spectrograms"
+              mkdir -p "/mnt/storage/data/maestro_synth/labels"
+              mkdir -p "/mnt/storage/data/maestro_synth/logits"
               
               # Create symlinks from project directory to actual data location if needed
               mkdir -p "$PROJ_ROOT/data/synth"
+              mkdir -p "$PROJ_ROOT/data/maestro_synth"
               
-              # Check if symlinks already exist
+              # Create symlinks for FMA dataset
               if [ -L "$PROJ_ROOT/data/synth/spectrograms" ]; then
-                echo "Symlink for spectrograms already exists"
+                echo "Symlink for FMA spectrograms already exists"
               else
                 ln -sf "/mnt/storage/data/synth/spectrograms" "$PROJ_ROOT/data/synth/spectrograms"
-                echo "Created symlink for spectrograms"
+                echo "Created symlink for FMA spectrograms"
               fi
               
               if [ -L "$PROJ_ROOT/data/synth/labels" ]; then
-                echo "Symlink for labels already exists"
+                echo "Symlink for FMA labels already exists"
               else
                 ln -sf "/mnt/storage/data/synth/labels" "$PROJ_ROOT/data/synth/labels"
-                echo "Created symlink for labels"
+                echo "Created symlink for FMA labels"
               fi
               
-              # Check for spectrogram files in the main and alternate locations
-              echo "---- Checking for spectrogram files ----"
-              find "/mnt/storage/data/synth" -name "*.npy" | head -10
-              find "$PROJ_ROOT/data/synth" -name "*.npy" | head -10
+              if [ -L "$PROJ_ROOT/data/synth/logits" ]; then
+                echo "Symlink for FMA logits already exists"
+              else
+                ln -sf "/mnt/storage/data/synth/logits" "$PROJ_ROOT/data/synth/logits"
+                echo "Created symlink for FMA logits"
+              fi
               
-              # Check for label files in the main and alternate locations
-              echo "---- Checking for label files ----"
-              find "/mnt/storage/data/synth" -name "*.lab" | head -10 
-              find "$PROJ_ROOT/data/synth" -name "*.lab" | head -10
+              # Create symlinks for Maestro dataset
+              if [ -L "$PROJ_ROOT/data/maestro_synth/spectrograms" ]; then
+                echo "Symlink for Maestro spectrograms already exists"
+              else
+                ln -sf "/mnt/storage/data/maestro_synth/spectrograms" "$PROJ_ROOT/data/maestro_synth/spectrograms"
+                echo "Created symlink for Maestro spectrograms"
+              fi
               
-              # Verify there are some relevant files (but allow training to proceed regardless)
+              if [ -L "$PROJ_ROOT/data/maestro_synth/labels" ]; then
+                echo "Symlink for Maestro labels already exists"
+              else
+                ln -sf "/mnt/storage/data/maestro_synth/labels" "$PROJ_ROOT/data/maestro_synth/labels"
+                echo "Created symlink for Maestro labels"
+              fi
+              
+              if [ -L "$PROJ_ROOT/data/maestro_synth/logits" ]; then
+                echo "Symlink for Maestro logits already exists"
+              else
+                ln -sf "/mnt/storage/data/maestro_synth/logits" "$PROJ_ROOT/data/maestro_synth/logits"
+                echo "Created symlink for Maestro logits"
+              fi
+              
+              # Check for spectrogram files in both datasets
+              echo "---- Checking for FMA spectrogram files ----"
+              find "/mnt/storage/data/synth" -name "*.npy" | head -5
+              
+              echo "---- Checking for Maestro spectrogram files ----"
+              find "/mnt/storage/data/maestro_synth" -name "*.npy" | head -5
+              
+              # Check for label files in both datasets
+              echo "---- Checking for FMA label files ----"
+              find "/mnt/storage/data/synth" -name "*.lab" | head -5
+              
+              echo "---- Checking for Maestro label files ----"
+              find "/mnt/storage/data/maestro_synth" -name "*.lab" | head -5
+              
+              # Verify there are some relevant files for at least one dataset
               echo "Checking if there are data files to process..."
-              SPEC_COUNT=$(find "/mnt/storage/data/synth" -type f -name "*.npy" | wc -l)
-              LABEL_COUNT=$(find "/mnt/storage/data/synth" -type f -name "*.lab" | wc -l)
-              echo "Found $SPEC_COUNT spectrogram files and $LABEL_COUNT label files"
-              if [ "$SPEC_COUNT" -eq 0 ] || [ "$LABEL_COUNT" -eq 0 ]; then
-                echo "WARNING: No data files found. Training may fail."
+              FMA_SPEC_COUNT=$(find "/mnt/storage/data/synth" -type f -name "*.npy" | wc -l)
+              FMA_LABEL_COUNT=$(find "/mnt/storage/data/synth" -type f -name "*.lab" | wc -l)
+              
+              MAESTRO_SPEC_COUNT=$(find "/mnt/storage/data/maestro_synth" -type f -name "*.npy" | wc -l)
+              MAESTRO_LABEL_COUNT=$(find "/mnt/storage/data/maestro_synth" -type f -name "*.lab" | wc -l)
+              
+              echo "Found $FMA_SPEC_COUNT FMA spectrogram files and $FMA_LABEL_COUNT FMA label files"
+              echo "Found $MAESTRO_SPEC_COUNT Maestro spectrogram files and $MAESTRO_LABEL_COUNT Maestro label files"
+              
+              if [ "$FMA_SPEC_COUNT" -eq 0 ] && [ "$MAESTRO_SPEC_COUNT" -eq 0 ] || [ "$FMA_LABEL_COUNT" -eq 0 ] && [ "$MAESTRO_LABEL_COUNT" -eq 0 ]; then
+                echo "WARNING: No data files found in either dataset. Training may fail."
               else
                 echo "Data files found. Proceeding with training."
               fi
@@ -174,6 +221,9 @@ spec:
               value: "true"  # Enable GPU batch caching
             - name: PREFETCH_FACTOR
               value: "6"     # Prefetch 6 batches for better throughput
+            # Add dataset type environment variable
+            - name: DATASET_TYPE
+              value: "maestro"  # Use "maestro" for Maestro dataset or "fma" for FMA dataset
           command:
             - sh
             - -c
@@ -219,6 +269,23 @@ spec:
               SPEC_COUNT=$(find ./data/synth/spectrograms -type f -name "*.npy" | wc -l)
               LABEL_COUNT=$(find ./data/synth/labels -type f -name "*.lab" | wc -l)
               echo "Found $SPEC_COUNT spectrogram files and $LABEL_COUNT label files"
+              
+              # Before starting training, verify data exists for selected dataset
+              if [ "${DATASET_TYPE}" = "maestro" ]; then
+                SPEC_COUNT=$(find ./data/maestro_synth/spectrograms -type f -name "*.npy" | wc -l)
+                LABEL_COUNT=$(find ./data/maestro_synth/labels -type f -name "*.lab" | wc -l)
+                echo "Using Maestro dataset: Found $SPEC_COUNT spectrogram files and $LABEL_COUNT label files"
+                
+                # Add dataset type to training command
+                DATASET_ARG="--dataset_type maestro"
+              else
+                SPEC_COUNT=$(find ./data/synth/spectrograms -type f -name "*.npy" | wc -l)
+                LABEL_COUNT=$(find ./data/synth/labels -type f -name "*.lab" | wc -l)
+                echo "Using FMA dataset: Found $SPEC_COUNT spectrogram files and $LABEL_COUNT label files"
+                
+                # Add dataset type to training command
+                DATASET_ARG="--dataset_type fma"
+              fi
               
               # Before starting training, verify data exists
               if [ "$SPEC_COUNT" -eq 0 ] || [ "$LABEL_COUNT" -eq 0 ]; then
@@ -392,7 +459,7 @@ spec:
               
               # Run the student training script with all options
               echo "Starting student training with GPU optimization and all options..."
-              python train_student.py --config ./config/student_config.yaml --save_dir checkpoints/student \
+              python train_student.py $DATASET_ARG --config ./config/student_config.yaml --save_dir checkpoints/student \
                 ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS}\
                 ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS}
               
