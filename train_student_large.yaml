@@ -230,6 +230,12 @@ spec:
               value: "auto"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
             - name: SUB_DIR
               value: "fma_logits"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
+            # Add reset epoch control option
+            - name: RESET_EPOCH
+              value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
+            # Add reset scheduler control option
+            - name: RESET_SCHEDULER
+              value: "true"  # Whether to reset LR scheduler when resetting epochs (true/false)
             # Dataset initialization controls: set  LAZY_INT=false and set percentage in SMALL_DATASET to use, otherwise default to full dataset
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
@@ -504,8 +510,19 @@ spec:
               if [ "${LOAD_CHECKPOINT}" = "auto" ]; then
                 if [ -f "${CHECKPOINTS_DIR}/student_model_best.pth" ]; then
                   echo "Found existing checkpoint at ${CHECKPOINTS_DIR}/student_model_best.pth"
-                  echo "Will attempt to load and continue training from best checkpoint"
-                  CHECKPOINT_ARG="--load_checkpoint ${CHECKPOINTS_DIR}/student_model_best.pth"
+                  if [ "${RESET_EPOCH}" = "true" ]; then
+                    RESET_ARG="--reset_epoch"
+                    if [ "${RESET_SCHEDULER}" = "true" ]; then
+                      echo "Will load weights but start training from epoch 1 with fresh learning rate schedule"
+                      RESET_ARG="${RESET_ARG} --reset_scheduler"
+                    else
+                      echo "Will load weights but start training from epoch 1 (keeping scheduler state)"
+                    fi
+                    CHECKPOINT_ARG="--load_checkpoint ${CHECKPOINTS_DIR}/student_model_best.pth ${RESET_ARG}"
+                  else
+                    echo "Will load weights and continue training from saved epoch"
+                    CHECKPOINT_ARG="--load_checkpoint ${CHECKPOINTS_DIR}/student_model_best.pth"
+                  fi
                 else
                   echo "No existing checkpoint found at ${CHECKPOINTS_DIR}/student_model_best.pth"
                   echo "Starting training from scratch"
@@ -514,12 +531,22 @@ spec:
                 echo "Starting fresh training (ignoring any existing checkpoints)"
               elif [ "${LOAD_CHECKPOINT}" = "required" ]; then
                 if [ -f "${CHECKPOINTS_DIR}/student_model_best.pth" ]; then
-                  echo "Found required checkpoint at ${CHECKPOINTS_DIR}/student_model_best.pth"
-                  CHECKPOINT_ARG="--load_checkpoint ${CHECKPOINTS_DIR}/student_model_best.pth"
-                else
-                  echo "ERROR: Required checkpoint not found at ${CHECKPOINTS_DIR}/student_model_best.pth"
-                  echo "Cannot proceed with training"
-                  exit 1
+                  if [ "${RESET_EPOCH}" = "true" ]; then
+                    RESET_ARG="--reset_epoch"
+                    if [ "${RESET_SCHEDULER}" = "true" ]; then
+                      echo "Found required checkpoint at ${CHECKPOINTS_DIR}/student_model_best.pth"
+                      echo "Will load weights but start training from epoch 1 with fresh learning rate schedule"
+                      RESET_ARG="${RESET_ARG} --reset_scheduler"
+                    else
+                      echo "Found required checkpoint at ${CHECKPOINTS_DIR}/student_model_best.pth"
+                      echo "Will load weights but start training from epoch 1 (keeping scheduler state)"
+                    fi
+                    CHECKPOINT_ARG="--load_checkpoint ${CHECKPOINTS_DIR}/student_model_best.pth ${RESET_ARG}"
+                  else
+                    echo "ERROR: Required checkpoint not found at ${CHECKPOINTS_DIR}/student_model_best.pth"
+                    echo "Cannot proceed with training"
+                    exit 1
+                  fi
                 fi
               fi
               

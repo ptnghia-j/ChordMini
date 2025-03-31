@@ -211,6 +211,12 @@ def main():
     # Add new argument for checkpoint loading
     parser.add_argument('--load_checkpoint', type=str, default=None,
                       help='Path to checkpoint file to resume training from')
+    # Add argument to reset epoch counter when loading checkpoint
+    parser.add_argument('--reset_epoch', action='store_true',
+                      help='Start from epoch 1 even when loading from checkpoint')
+    # Add argument to reset scheduler when resetting epoch
+    parser.add_argument('--reset_scheduler', action='store_true',
+                      help='Reset learning rate scheduler when --reset_epoch is used')
     
     args = parser.parse_args()
 
@@ -799,11 +805,31 @@ def main():
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                     logger.info("Optimizer state loaded successfully")
                 
-                # Get starting epoch
-                if 'epoch' in checkpoint:
+                # Get starting epoch - implement the reset_epoch flag here
+                if not args.reset_epoch and 'epoch' in checkpoint:
                     # Start from the next epoch
                     start_epoch = checkpoint['epoch'] + 1
                     logger.info(f"Resuming from epoch {start_epoch} (after checkpoint epoch {checkpoint['epoch']})")
+                else:
+                    # Always start from epoch 1 if reset_epoch flag is set
+                    start_epoch = 1
+                    logger.info(f"Reset epoch flag set - Starting from epoch 1 (ignoring checkpoint epoch {checkpoint.get('epoch', 'unknown')})")
+                    
+                    # If reset_scheduler flag is also set, don't load scheduler state
+                    if args.reset_scheduler:
+                        logger.info("Reset scheduler flag set - Starting with fresh learning rate schedule")
+                        # If warmup is enabled, set LR to warmup start value
+                        if args.use_warmup or config.training.get('use_warmup', False):
+                            warmup_start_lr = args.warmup_start_lr or config.training.get('warmup_start_lr', config.training['learning_rate']/10)
+                            logger.info(f"Setting initial learning rate to warmup start value: {warmup_start_lr}")
+                            for param_group in optimizer.param_groups:
+                                param_group['lr'] = warmup_start_lr
+                        else:
+                            # Otherwise, set LR to base learning rate
+                            base_lr = config.training['learning_rate']
+                            logger.info(f"Setting initial learning rate to base value: {base_lr}")
+                            for param_group in optimizer.param_groups:
+                                param_group['lr'] = base_lr
                 
                 # Log checkpoint accuracy if available
                 if 'accuracy' in checkpoint:
@@ -811,11 +837,15 @@ def main():
                 
                 # If using scheduler and checkpoint has scheduler state
                 if 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] and trainer.smooth_scheduler:
-                    try:
-                        trainer.smooth_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                        logger.info("Scheduler state loaded successfully")
-                    except Exception as e:
-                        logger.warning(f"Could not load scheduler state: {e}")
+                    # Only load scheduler state if we're not resetting it
+                    if not (args.reset_epoch and args.reset_scheduler):
+                        try:
+                            trainer.smooth_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                            logger.info("Scheduler state loaded successfully")
+                        except Exception as e:
+                            logger.warning(f"Could not load scheduler state: {e}")
+                    else:
+                        logger.info("Skipping scheduler state loading due to reset_scheduler flag")
                 
                 logger.info(f"Successfully loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
                 
