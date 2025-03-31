@@ -1264,7 +1264,7 @@ class StudentTrainer(BaseTrainer):
                                     # Use scaler for mixed precision
                                     scaler.scale(loss).backward()
                                     scaler.unscale_(self.optimizer)  # Unscale before clipping
-                                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm, error_if_nonfinite=False)
                                     scaler.step(self.optimizer)
                                     scaler.update()
                                     
@@ -1311,7 +1311,7 @@ class StudentTrainer(BaseTrainer):
                             # Skip invalid losses (avoid NaN propagation)
                             if loss is not None and not torch.isnan(loss) and torch.isfinite(loss):
                                 loss.backward()
-                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm, error_if_nonfinite=False)
                                 self.optimizer.step()
                                 
                                 preds = logits.argmax(dim=1)

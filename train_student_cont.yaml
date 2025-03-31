@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-mini-large
+  name: chord-mini-cont
   namespace: csuf-titans
   labels:
     app: chord-student-training
@@ -35,6 +35,13 @@ spec:
         - name: clone-repo
           image: alpine:3.16
           imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "1"
+              memory: "128Mi"
+            limits:
+              cpu: "1.2"
+              memory: "1Gi"
           command:
             - sh
             - -c
@@ -59,6 +66,13 @@ spec:
         - name: data-check
           image: alpine:3.16
           imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "1"
+              memory: "128Mi"
+            limits:
+              cpu: "1.2"
+              memory: "1Gi"
           command:
             - sh
             - -c
@@ -182,10 +196,10 @@ spec:
             - name: LEARNING_RATE
               value: "0.001"  # Base learning rate
             - name: MIN_LEARNING_RATE
-              value: "0.00005"  # Minimum learning rate for schedulers
+              value: "0.00001"  # Minimum learning rate for schedulers
             # Knowledge distillation settings
             - name: USE_KD_LOSS
-              value: "true"  # Set to "true" to enable KD loss
+              value: "false"  # Set to "true" to enable KD loss
             - name: KD_ALPHA
               value: "0.1"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
@@ -203,33 +217,33 @@ spec:
             - name: WARMUP_START_LR
               value: "0.0001"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.0002"  # Final learning rate after warm-up
+              value: "0.001"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "2"  # Number of epochs for warm-up
+              value: "5"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
-              value: "0.2"  # Set dropout probability (0-1)
+              value: "0.4"  # Set dropout probability (0-1)
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
             # GPU memory utilization optimization
             - name: GPU_MEMORY_FRACTION
-              value: "0.95"  # Use 95% of available GPU memory
+              value: "0.99"  # Use 99% of available GPU memory
             - name: CUDA_VISIBLE_DEVICES
               value: "0"
             # Dataset GPU optimization flags
             - name: BATCH_GPU_CACHE
               value: "true"  # Enable GPU batch caching
             - name: PREFETCH_FACTOR
-              value: "10"     # Prefetch 6 batches for better throughput
+              value: "10"     # Prefetch >=6 batches for better throughput
             # Add dataset type environment variable
             - name: DATASET_TYPE
-              value: "fma"  # Use "maestro" for Maestro dataset or "fma" for FMA dataset
+              value: "maestro"  # Use "maestro" for Maestro dataset or "fma" for FMA dataset
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
               value: "auto"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
             - name: SUB_DIR
-              value: "fma_logits"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
+              value: "maestro"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
@@ -238,9 +252,9 @@ spec:
               value: "true"  # Whether to reset LR scheduler when resetting epochs (true/false)
             # Dataset initialization controls: set  LAZY_INT=false and set percentage in SMALL_DATASET to use, otherwise default to full dataset
             - name: LAZY_INIT
-              value: "true"  # Controls dataset lazy initialization (true/false)
+              value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: "null"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: "0.05"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
           command:
             - sh
             - -c
@@ -289,19 +303,33 @@ spec:
               
               # Before starting training, verify data exists for selected dataset
               if [ "${DATASET_TYPE}" = "maestro" ]; then
+                echo "Setting up directories for Maestro dataset..."
                 SPEC_COUNT=$(find ./data/maestro_synth/spectrograms -type f -name "*.npy" | wc -l)
                 LABEL_COUNT=$(find ./data/maestro_synth/labels -type f -name "*.lab" | wc -l)
                 echo "Using Maestro dataset: Found $SPEC_COUNT spectrogram files and $LABEL_COUNT label files"
                 
                 # Add dataset type to training command
                 DATASET_ARG="--dataset_type maestro"
+                
+                # Use Maestro paths explicitly for spectrograms and labels
+                SPEC_DIR_ARG="--spec_dir ${DATA_ROOT}/maestro_synth/spectrograms"
+                LABEL_DIR_ARG="--label_dir ${DATA_ROOT}/maestro_synth/labels"
+                
+                echo "Using Maestro data directories: ${DATA_ROOT}/maestro_synth/spectrograms and ${DATA_ROOT}/maestro_synth/labels"
               else
+                echo "Setting up directories for FMA dataset..."
                 SPEC_COUNT=$(find ./data/synth/spectrograms -type f -name "*.npy" | wc -l)
                 LABEL_COUNT=$(find ./data/synth/labels -type f -name "*.lab" | wc -l)
                 echo "Using FMA dataset: Found $SPEC_COUNT spectrogram files and $LABEL_COUNT label files"
                 
                 # Add dataset type to training command
                 DATASET_ARG="--dataset_type fma"
+                
+                # Use FMA paths explicitly
+                SPEC_DIR_ARG="--spec_dir ${DATA_ROOT}/synth/spectrograms" 
+                LABEL_DIR_ARG="--label_dir ${DATA_ROOT}/synth/labels"
+                
+                echo "Using FMA data directories: ${DATA_ROOT}/synth/spectrograms and ${DATA_ROOT}/synth/labels"
               fi
               
               # Before starting training, verify data exists
@@ -419,33 +447,50 @@ spec:
               if [ "${USE_KD_LOSS}" = "true" ]; then
                 echo "Knowledge distillation enabled - using teacher logits"
                 
+                # Set KD data root based on dataset type
+                if [ "${DATASET_TYPE}" = "maestro" ]; then
+                  KD_DATA_ROOT="${DATA_ROOT}/logits/maestro_synth"
+                  echo "Using Maestro dataset - KD data root: ${KD_DATA_ROOT}"
+                else
+                  KD_DATA_ROOT="${DATA_ROOT}/logits/synth"
+                  echo "Using FMA dataset - KD data root: ${KD_DATA_ROOT}"
+                fi
+                
                 # Check if KD_DATA_ROOT exists
-                if [ -d "${DATA_ROOT}/logits/synth" ]; then
-                  echo "Using KD data from: ${DATA_ROOT}/logits/synth"
+                if [ -d "${KD_DATA_ROOT}" ]; then
+                  echo "Using KD data from: ${KD_DATA_ROOT}"
                   
                   # Define paths based on directory structure
-                  if [ -d "${DATA_ROOT}/logits/synth/spectrograms" ] && [ -d "${DATA_ROOT}/logits/synth/labels" ] && [ -d "${DATA_ROOT}/logits/synth/logits" ]; then
+                  if [ -d "${KD_DATA_ROOT}/spectrograms" ] && [ -d "${KD_DATA_ROOT}/labels" ] && [ -d "${KD_DATA_ROOT}/logits" ]; then
                     # Standard structure with separate directories
-                    # MODIFIED: Always use the logits directory for KD if it has the proper structure
                     echo "Found complete KD directory structure with spectrograms, labels, and logits"
-                    KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms --label_dir ${DATA_ROOT}/logits/synth/labels --logits_dir ${DATA_ROOT}/logits/synth/logits"
+                    KD_ARGS="--spec_dir ${KD_DATA_ROOT}/spectrograms --label_dir ${KD_DATA_ROOT}/labels --logits_dir ${KD_DATA_ROOT}/logits"
                     echo "Using spectrograms, labels, and logits from the logits directory"
-                  elif [ -d "${DATA_ROOT}/logits/synth" ]; then
+                  elif [ -d "${KD_DATA_ROOT}" ]; then
                     # All files might be in the root directory
-                    KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth --label_dir ${DATA_ROOT}/logits/synth --logits_dir ${DATA_ROOT}/logits/synth"
+                    KD_ARGS="--spec_dir ${KD_DATA_ROOT} --label_dir ${KD_DATA_ROOT} --logits_dir ${KD_DATA_ROOT}"
                     echo "Using flat KD directory structure"
                   else
-                    echo "WARNING: KD_DATA_ROOT does not exist: ${DATA_ROOT}/logits/synth"
+                    echo "WARNING: KD_DATA_ROOT does not exist: ${KD_DATA_ROOT}"
                     echo "Attempting to use default paths"
-                    KD_ARGS="--logits_dir /mnt/storage/data/logits/synth/logits"
+                    
+                    # Create fallback path based on dataset type
+                    if [ "${DATASET_TYPE}" = "maestro" ]; then
+                      FALLBACK_PATH="/mnt/storage/data/logits/maestro_synth/logits"
+                    else
+                      FALLBACK_PATH="/mnt/storage/data/logits/synth/logits"
+                    fi
+                    
+                    KD_ARGS="--logits_dir ${FALLBACK_PATH}"
                     
                     # Create parent directories to avoid errors later
-                    mkdir -p "/mnt/storage/data/logits/synth/logits"
+                    mkdir -p "${FALLBACK_PATH}"
                   fi
                   
                   # Log the actual paths being used
                   echo "KD arguments: ${KD_ARGS}"
                 else
+                  echo "WARNING: KD data root directory not found: ${KD_DATA_ROOT}"
                   KD_ARGS=""
                 fi
               else
@@ -554,7 +599,8 @@ spec:
               echo "Starting student training with GPU optimization and all options..."
               python train_student.py $DATASET_ARG --config ./config/student_config.yaml --save_dir ${CHECKPOINTS_DIR}/${SUB_DIR} \
                 ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} \
-                ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS}
+                ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS} \
+                ${SPEC_DIR_ARG} ${LABEL_DIR_ARG}
               
               echo "=== Student model training complete ==="
               

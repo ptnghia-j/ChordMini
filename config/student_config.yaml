@@ -42,7 +42,7 @@ model:
     t_head: 6         # Base temporal attention heads
     d_layer: 3        # Base decoder layers
     d_head: 6         # Base decoder heads
-  n_group: 4          # Keep this the same to maintain frequency dimension compatibility
+  n_group: 12         # Changed from 4 to 12 to ensure compatibility with n_bins=144 (must divide evenly)
   dropout: 0.3        # Dropout rate
   use_chord_aware_loss: false
 
