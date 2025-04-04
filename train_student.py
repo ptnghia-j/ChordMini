@@ -275,10 +275,8 @@ def main():
     
     # Log knowledge distillation settings
     use_kd = args.use_kd_loss or config.training.get('use_kd_loss', False)
+    use_kd = str(use_kd).lower() == 'true'
     
-    # Fix: Properly handle string-to-boolean conversion for environment variables
-    if isinstance(use_kd, str):
-        use_kd = use_kd.lower() == "true"
     
     kd_alpha = args.kd_alpha or config.training.get('kd_alpha', 0.5)
     temperature = args.temperature or config.training.get('temperature', 1.0)
