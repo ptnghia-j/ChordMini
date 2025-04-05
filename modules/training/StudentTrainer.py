@@ -1,18 +1,21 @@
+import re
 import os
 import torch
 import numpy as np
-from modules.training.Trainer import BaseTrainer
-from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, OneCycleLR, CosineAnnealingWarmRestarts
+
 import torch.nn.functional as F
 import matplotlib.pyplot as plt  # Add missing matplotlib import
+
+from modules.utils.logger import info, warning, error, debug, logging_verbosity, is_debug
+from modules.training.Trainer import BaseTrainer
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, OneCycleLR, CosineAnnealingWarmRestarts
 from collections import Counter
-import re
-from sklearn.metrics import confusion_matrix
 
 # Import visualization functions including chord quality mapping
 from modules.utils.visualize import (
     plot_confusion_matrix, plot_chord_quality_confusion_matrix,
     plot_learning_curve, calculate_quality_confusion_matrix,
+    calculate_confusion_matrix
 )
 
 class StudentTrainer(BaseTrainer):
@@ -44,16 +47,16 @@ class StudentTrainer(BaseTrainer):
         self.kd_alpha = kd_alpha
         self.temperature = temperature
         if self.use_kd_loss:
-            self._log(f"Using KD loss with α={kd_alpha} and temperature={temperature}")
-            self._log("Teacher logits expected to be provided in each batch")
+            info(f"Using KD loss with α={kd_alpha} and temperature={temperature}")
+            info("Teacher logits expected to be provided in each batch")
         
         if self.use_focal_loss:
-            self._log(f"Using Focal Loss (gamma={focal_gamma}) to handle class imbalance")
+            info(f"Using Focal Loss (gamma={focal_gamma}) to handle class imbalance")
             if self.focal_alpha is not None:
-                self._log(f"Using alpha={focal_alpha} for additional class weighting")
+                info(f"Using alpha={focal_alpha} for additional class weighting")
             # When using focal loss, don't use standard class weights
             class_weights = None
-            self._log("Class weights disabled as focal loss is being used")
+            info("Class weights disabled as focal loss is being used")
         
         # Now that logger is initialized, we can pad class weights
         self.weight_tensor = None
@@ -65,7 +68,7 @@ class StudentTrainer(BaseTrainer):
                 class_weights = self._adjust_weights_for_no_chord(class_weights, idx_to_chord)
             
             expected_classes = model.fc.out_features
-            self._log(f"Padding class weights from {len(class_weights)} to {expected_classes}")
+            info(f"Padding class weights from {len(class_weights)} to {expected_classes}")
             padded_weights = self._pad_class_weights(class_weights, expected_classes)
             
             # Now set the loss function with padded weights
@@ -101,12 +104,12 @@ class StudentTrainer(BaseTrainer):
         
         # Verify warmup values are sensible - fix incomplete warmup swap logic
         if self.use_warmup and self.warmup_start_lr >= self.warmup_end_lr:
-            self._log(f"WARNING: warmup_start_lr ({self.warmup_start_lr}) >= warmup_end_lr ({self.warmup_end_lr})")
-            self._log("This would cause LR to decrease during warmup instead of increasing. Swapping values.")
+            info(f"WARNING: warmup_start_lr ({self.warmup_start_lr}) >= warmup_end_lr ({self.warmup_end_lr})")
+            info("This would cause LR to decrease during warmup instead of increasing. Swapping values.")
             temp = self.warmup_start_lr
             self.warmup_start_lr = self.warmup_end_lr
             self.warmup_end_lr = temp
-            self._log(f"After swap: warmup_start_lr ({self.warmup_start_lr}) → warmup_end_lr ({self.warmup_end_lr})")
+            info(f"After swap: warmup_start_lr ({self.warmup_start_lr}) → warmup_end_lr ({self.warmup_end_lr})")
         
         # LR schedule type for smooth scheduling
         self.lr_schedule_type = lr_schedule_type
@@ -117,20 +120,20 @@ class StudentTrainer(BaseTrainer):
         # Set up smooth scheduler if requested
         if self.lr_schedule_type:
             self._create_smooth_scheduler()
-            self._log(f"Using smooth '{self.lr_schedule_type}' learning rate schedule")
+            info(f"Using smooth '{self.lr_schedule_type}' learning rate schedule")
         else:
-            self._log("Using validation-based learning rate adjustment")
+            info("Using validation-based learning rate adjustment")
         
         # Set up warmup independent of scheduler choice
         if self.use_warmup:
-            self._log(f"Using warm-up LR schedule for first {self.warmup_epochs} epochs")
-            self._log(f"Warm-up LR: {self.warmup_start_lr:.6f} → {self.warmup_end_lr:.6f}")
+            info(f"Using warm-up LR schedule for first {self.warmup_epochs} epochs")
+            info(f"Warm-up LR: {self.warmup_start_lr:.6f} → {self.warmup_end_lr:.6f}")
             # Set initial learning rate to warm-up start LR
             self._set_lr(self.warmup_start_lr)
             
             # If using both warmup and a scheduler, log this combined approach
             if self.lr_schedule_type:
-                self._log(f"Will apply {self.lr_schedule_type} scheduler after warmup completes")
+                info(f"Will apply {self.lr_schedule_type} scheduler after warmup completes")
         
         # Best model tracking
         self.best_model_path = os.path.join(self.checkpoint_dir, "student_model_best.pth")
@@ -148,7 +151,7 @@ class StudentTrainer(BaseTrainer):
         if self.use_warmup and self.warmup_epochs > 0:
             # For warmup + scheduler combo, we create scheduler for post-warmup epochs only
             self.post_warmup_epochs = max(1, self.num_epochs - self.warmup_epochs)
-            self._log(f"Creating scheduler for {self.post_warmup_epochs} post-warmup epochs")
+            info(f"Creating scheduler for {self.post_warmup_epochs} post-warmup epochs")
         else:
             # No warmup, scheduler will be used for all epochs
             self.post_warmup_epochs = self.num_epochs
@@ -162,7 +165,7 @@ class StudentTrainer(BaseTrainer):
                 T_max=self.post_warmup_epochs,
                 eta_min=self.min_lr
             )
-            self._log(f"Cosine annealing from {start_lr:.6f} to {self.min_lr:.6f} after warmup")
+            info(f"Cosine annealing from {start_lr:.6f} to {self.min_lr:.6f} after warmup")
         elif self.lr_schedule_type == 'cosine_warm_restarts':
             # Cosine annealing with warm restarts
             # First restart after 5 epochs, then double the period
@@ -172,7 +175,7 @@ class StudentTrainer(BaseTrainer):
                 T_mult=2,  # Double the period after each restart
                 eta_min=self.min_lr
             )
-            self._log(f"Cosine annealing with warm restarts: min_lr={self.min_lr:.6f} after warmup")
+            info(f"Cosine annealing with warm restarts: min_lr={self.min_lr:.6f} after warmup")
             
         elif self.lr_schedule_type == 'one_cycle':
             # One-cycle learning rate schedule
@@ -186,16 +189,16 @@ class StudentTrainer(BaseTrainer):
                 final_div_factor=10000,  # Final LR = max_lr/10000
                 anneal_strategy='cos'
             )
-            self._log(f"One-cycle LR: {self.initial_lr:.6f} → {self.initial_lr*10:.6f} → {self.initial_lr*10/10000:.8f} after warmup")
+            info(f"One-cycle LR: {self.initial_lr:.6f} → {self.initial_lr*10:.6f} → {self.initial_lr*10/10000:.8f} after warmup")
             
         elif self.lr_schedule_type == 'linear_decay':
             # Linear decay from initial LR to min_lr
             lambda_fn = lambda epoch: 1 - (1 - self.min_lr / self.initial_lr) * (epoch / self.post_warmup_epochs)
             self.smooth_scheduler = LambdaLR(self.optimizer, lr_lambda=lambda_fn)
-            self._log(f"Linear decay from {self.initial_lr:.6f} to {self.min_lr:.6f} after warmup")
+            info(f"Linear decay from {self.initial_lr:.6f} to {self.min_lr:.6f} after warmup")
             
         else:
-            self._log(f"Unknown scheduler type: {self.lr_schedule_type}. Using warmup-only with validation-based adjustment")
+            info(f"Unknown scheduler type: {self.lr_schedule_type}. Using warmup-only with validation-based adjustment")
             self.lr_schedule_type = None
     
     def _update_smooth_scheduler(self, epoch, batch_idx, num_batches):
@@ -215,7 +218,7 @@ class StudentTrainer(BaseTrainer):
                 fractional_epoch = (epoch - 1) + (batch_idx / num_batches)
                 self.smooth_scheduler.step(fractional_epoch)
                 self._scheduler_step_count += 1
-                self._log(f"Fractional scheduler step at epoch {epoch}, batch {batch_idx}/{num_batches}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
+                info(f"Fractional scheduler step at epoch {epoch}, batch {batch_idx}/{num_batches}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
 
     def _update_learning_rate(self, epoch, batch_idx=None, num_batches=None):
         """
@@ -243,7 +246,7 @@ class StudentTrainer(BaseTrainer):
                     fractional_epoch = epoch - self.warmup_epochs - 1 + (batch_idx / num_batches)
                     self.smooth_scheduler.step(fractional_epoch)
                     self._scheduler_step_count += 1
-                    self._log(f"Fractional scheduler step at epoch {epoch}, batch {batch_idx}/{num_batches}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
+                    info(f"Fractional scheduler step at epoch {epoch}, batch {batch_idx}/{num_batches}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
                 else:
                     # Just use regular epoch-based steps (CosineAnnealingLR, LambdaLR)
                     # Only step if we haven't already stepped for this epoch
@@ -252,21 +255,21 @@ class StudentTrainer(BaseTrainer):
                         self.smooth_scheduler.step()
                         self._last_stepped_epoch = epoch - self.warmup_epochs - 1
                         self._scheduler_step_count += 1
-                        self._log(f"Full scheduler step at adjusted epoch {epoch - self.warmup_epochs - 1}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
+                        info(f"Full scheduler step at adjusted epoch {epoch - self.warmup_epochs - 1}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
             else:
                 # No warmup - use standard scheduler stepping
                 if batch_idx is not None and num_batches is not None and isinstance(self.smooth_scheduler, (OneCycleLR, CosineAnnealingWarmRestarts)):
                     fractional_epoch = (epoch - 1) + (batch_idx / num_batches)
                     self.smooth_scheduler.step(fractional_epoch)
                     self._scheduler_step_count += 1
-                    self._log(f"Fractional scheduler step (no warmup) at epoch {epoch}, batch {batch_idx}/{num_batches}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
+                    info(f"Fractional scheduler step (no warmup) at epoch {epoch}, batch {batch_idx}/{num_batches}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
                 else:
                     # Just use regular epoch-based steps without epoch parameter
                     if not hasattr(self, '_last_stepped_epoch') or self._last_stepped_epoch != (epoch - 1):
                         self.smooth_scheduler.step()
                         self._last_stepped_epoch = epoch - 1
                         self._scheduler_step_count += 1
-                        self._log(f"Full scheduler step (no warmup) at epoch {epoch-1}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
+                        info(f"Full scheduler step (no warmup) at epoch {epoch-1}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
                         
             return self.optimizer.param_groups[0]['lr']
         else:
@@ -287,9 +290,9 @@ class StudentTrainer(BaseTrainer):
                 break
         
         if n_chord_idx is not None and n_chord_idx < len(weights):
-            self._log(f"Found 'N' (no chord) at index {n_chord_idx}")
-            self._log(f"Weight for 'N' class: {weights[n_chord_idx]:.4f}")
-            self._log("No weight adjustment applied - using original class weights")
+            info(f"Found 'N' (no chord) at index {n_chord_idx}")
+            info(f"Weight for 'N' class: {weights[n_chord_idx]:.4f}")
+            info("No weight adjustment applied - using original class weights")
         
         # Return weights unmodified
         return weights
@@ -349,7 +352,7 @@ class StudentTrainer(BaseTrainer):
         # Verify dimensions match before proceeding
         if student_logits.shape != teacher_logits.shape:
             # Comment out dimension mismatch logging to reduce confusion
-            # self._log(f"Dimension mismatch in distillation_loss: student {student_logits.shape}, teacher {teacher_logits.shape}")
+            # info(f"Dimension mismatch in distillation_loss: student {student_logits.shape}, teacher {teacher_logits.shape}")
             
             try:
                 # Try to adapt dimensions - comment out detailed logging for diagnosis
@@ -358,7 +361,7 @@ class StudentTrainer(BaseTrainer):
                 # Handle 4D teacher tensor (batch, seq, time, classes) → needs special handling
                 if len(t_shape) == 4 and t_shape[1] == 1:
                     # This is the key fix: squeeze dimension 1 and then reshape
-                    # self._log(f"Reshaping 4D teacher tensor with shape {t_shape}")
+                    # info(f"Reshaping 4D teacher tensor with shape {t_shape}")
                     # First squeeze the singleton dimension
                     teacher_logits = teacher_logits.squeeze(1)  # Now (batch, time, classes)
                     
@@ -368,10 +371,10 @@ class StudentTrainer(BaseTrainer):
                         expected_batch_size = t_shape[0] * t_shape[2]  # batch * time
                         if expected_batch_size == s_shape[0]:
                             # Perfect! Just reshape teacher to match student
-                            # self._log(f"Flattening teacher tensor from {teacher_logits.shape} to match student {s_shape}")
+                            # info(f"Flattening teacher tensor from {teacher_logits.shape} to match student {s_shape}")
                             teacher_logits = teacher_logits.reshape(-1, t_shape[3])  # (batch*time, classes)
                         else:
-                            # self._log(f"Batch size mismatch after flattening: expected {expected_batch_size}, got {s_shape[0]}")
+                            # info(f"Batch size mismatch after flattening: expected {expected_batch_size}, got {s_shape[0]}")
                             # If student batch is larger, need to subsample
                             if s_shape[0] > expected_batch_size:
                                 pass  # Incomplete code - will be implemented later
@@ -381,29 +384,29 @@ class StudentTrainer(BaseTrainer):
                 # If that didn't work, try more basic approaches
                 if student_logits.shape != teacher_logits.shape:
                     if len(s_shape) != len(t_shape):
-                        # self._log(f"Dimension count mismatch: student has {len(s_shape)}, teacher has {len(t_shape)}")
+                        # info(f"Dimension count mismatch: student has {len(s_shape)}, teacher has {len(t_shape)}")
                         pass
                     
                     # Check for batch size mismatch in 2D case
                     if len(s_shape) == 2 and len(t_shape) == 2 and s_shape[1] == t_shape[1]:
                         if s_shape[0] > t_shape[0]:
-                            # self._log(f"Batch size mismatch: student={s_shape[0]}, teacher={t_shape[0]}")
-                            # self._log(f"Subsampling student batch from {s_shape[0]} to {t_shape[0]}")
+                            # info(f"Batch size mismatch: student={s_shape[0]}, teacher={t_shape[0]}")
+                            # info(f"Subsampling student batch from {s_shape[0]} to {t_shape[0]}")
                             student_logits = student_logits[:t_shape[0]]
                             targets = targets[:t_shape[0]] if targets.size(0) > t_shape[0] else targets
                         else:
-                            # self._log(f"Batch size mismatch: student={s_shape[0]}, teacher={t_shape[0]}")
-                            # self._log(f"Truncating teacher batch from {t_shape[0]} to {s_shape[0]}")
+                            # info(f"Batch size mismatch: student={s_shape[0]}, teacher={t_shape[0]}")
+                            # info(f"Truncating teacher batch from {t_shape[0]} to {s_shape[0]}")
                             teacher_logits = teacher_logits[:s_shape[0]]
                 
                 # Final check once more before continuing
                 if student_logits.shape != teacher_logits.shape:
                     raise ValueError(f"Failed to match dimensions after attempted fixes: student {student_logits.shape}, teacher {teacher_logits.shape}")
                 
-                # self._log(f"Successfully adapted dimensions for KD loss to {student_logits.shape}")
+                # info(f"Successfully adapted dimensions for KD loss to {student_logits.shape}")
             except Exception as e:
-                self._log(f"Error adapting dimensions: {str(e)}")
-                self._log("Falling back to standard cross entropy loss")
+                info(f"Error adapting dimensions: {str(e)}")
+                info("Falling back to standard cross entropy loss")
                 return F.cross_entropy(student_logits, targets)
         
         try:
@@ -428,7 +431,7 @@ class StudentTrainer(BaseTrainer):
             
             # Check for NaN values that could break the loss calculation
             if torch.isnan(student_log_probs).any() or torch.isnan(teacher_probs).any():
-                self._log("WARNING: NaN values detected in KD loss inputs")
+                info("WARNING: NaN values detected in KD loss inputs")
                 student_log_probs = torch.nan_to_num(student_log_probs)
                 teacher_probs = torch.nan_to_num(teacher_probs)
             
@@ -444,27 +447,27 @@ class StudentTrainer(BaseTrainer):
             
             # Add logging once for diagnostics
             if not hasattr(self, '_kd_loss_logged'):
-                self._log(f"KD loss breakdown - KL: {kl_loss.item():.4f}, CE: {loss.item():.4f}, Combined: {combined_loss.item():.4f}")
-                self._log(f"Using α={alpha}, temperature={temperature} with zero-mean logit normalization")
+                info(f"KD loss breakdown - KL: {kl_loss.item():.4f}, CE: {loss.item():.4f}, Combined: {combined_loss.item():.4f}")
+                info(f"Using α={alpha}, temperature={temperature} with zero-mean logit normalization")
                 self._kd_loss_logged = True
             
             # NEW: Print teacher distribution details only once during training
             if not hasattr(self, '_teacher_distribution_logged') and teacher_probs.size(0) > 0:
                 sample_teacher = teacher_probs[0]
                 top_values, top_indices = torch.topk(sample_teacher, 10)
-                self._log("Teacher distribution for first sample in batch:")
+                info("Teacher distribution for first sample in batch:")
                 for rank, (val, idx) in enumerate(zip(top_values, top_indices), start=1):
                     chord_name = self.idx_to_chord.get(idx.item(), f"Class-{idx.item()}") if self.idx_to_chord else f"Class-{idx.item()}"
-                    self._log(f"  Rank {rank}: {chord_name} with probability {val.item():.4f}")
+                    info(f"  Rank {rank}: {chord_name} with probability {val.item():.4f}")
                 avg_confidence = teacher_probs.max(dim=1)[0].mean().item()
-                self._log(f"Average teacher max probability in batch: {avg_confidence:.4f}")
+                info(f"Average teacher max probability in batch: {avg_confidence:.4f}")
                 # Set flag to prevent future prints
                 self._teacher_distribution_logged = True
             
             return combined_loss
         except Exception as e:
-            self._log(f"Error in distillation loss calculation: {str(e)}")
-            self._log("Falling back to standard cross entropy loss")
+            info(f"Error in distillation loss calculation: {str(e)}")
+            info("Falling back to standard cross entropy loss")
             return F.cross_entropy(student_logits, targets)
 
     def label_smoothed_loss(self, logits, targets, smoothing=0.1):
@@ -489,8 +492,8 @@ class StudentTrainer(BaseTrainer):
             loss = torch.mean(torch.sum(-true_dist * log_probs, dim=-1))
             return loss
         except Exception as e:
-            self._log(f"Error in label smoothed loss calculation: {str(e)}")
-            self._log("Falling back to standard cross entropy loss")
+            info(f"Error in label smoothed loss calculation: {str(e)}")
+            info("Falling back to standard cross entropy loss")
             return F.cross_entropy(logits, targets)
 
     def _pad_class_weights(self, weights, expected_length):
@@ -507,7 +510,7 @@ class StudentTrainer(BaseTrainer):
             else:
                 padding_value = 1.0
                 
-            self._log(f"Using padding value: {padding_value:.4f}")
+            info(f"Using padding value: {padding_value:.4f}")
             
             import numpy as np
             padded_weights = np.zeros(expected_length, dtype=np.float32)
@@ -517,7 +520,7 @@ class StudentTrainer(BaseTrainer):
         
         # If weights array is too long, truncate it
         if len(weights) > expected_length:
-            self._log(f"Warning: Truncating class weights from {len(weights)} to {expected_length}")
+            info(f"Warning: Truncating class weights from {len(weights)} to {expected_length}")
             return weights[:expected_length]
         
         return weights
@@ -547,7 +550,7 @@ class StudentTrainer(BaseTrainer):
         # Add more detailed logging for the first few warmup epochs to verify correct ramp-up
         # Log only for first 3 epochs, every 100th epoch, or the final warmup epoch
         # if epoch <= 3 or epoch == self.warmup_epochs or epoch % 100 == 0:
-        #     self._log(f"Warm-up epoch {epoch}/{self.warmup_epochs}: progress={warmup_progress:.4f}, LR = {new_lr:.6f}")
+        #     info(f"Warm-up epoch {epoch}/{self.warmup_epochs}: progress={warmup_progress:.4f}, LR = {new_lr:.6f}")
         
         return self._set_lr(new_lr)
         
@@ -556,7 +559,7 @@ class StudentTrainer(BaseTrainer):
         if self.before_val_acc > val_acc:
             old_lr = self.optimizer.param_groups[0]['lr']
             new_lr = self._reduce_lr(self.optimizer, self.lr_decay_factor, self.min_lr)
-            self._log(f"Decreasing learning rate from {old_lr:.6f} to {new_lr:.6f}")
+            info(f"Decreasing learning rate from {old_lr:.6f} to {new_lr:.6f}")
         
         # Update previous validation accuracy
         self.before_val_acc = val_acc
@@ -592,10 +595,10 @@ class StudentTrainer(BaseTrainer):
                     'std': self.normalization['std'] if self.normalization else None
                 }, self.best_model_path)
                 
-                self._log(f"Saved best model with validation accuracy: {val_acc:.4f}")
+                info(f"Saved best model with validation accuracy: {val_acc:.4f}")
                 return True
             except Exception as e:
-                self._log(f"Error saving model: {str(e)}")
+                info(f"Error saving model: {str(e)}")
                 return False
         else:
             self.early_stop_counter += 1
@@ -604,7 +607,7 @@ class StudentTrainer(BaseTrainer):
     def _check_early_stopping(self):
         """Check if early stopping criteria is met."""
         if self.early_stop_counter >= self.early_stopping_patience:
-            self._log(f"Early stopping triggered after {self.early_stop_counter} epochs without improvement")
+            info(f"Early stopping triggered after {self.early_stop_counter} epochs without improvement")
             return True
         return False
     
@@ -661,230 +664,22 @@ class StudentTrainer(BaseTrainer):
                     all_preds.extend(preds.cpu().numpy())
                     all_targets.extend(targets.cpu().numpy())
                 except Exception as e:
-                    self._log(f"Error during validation: {str(e)}")
+                    info(f"Error during validation: {str(e)}")
                     continue  # Skip this batch if there's an error
         
         if val_total == 0:
-            self._log("WARNING: No validation samples were correctly processed!")
+            info("WARNING: No validation samples were correctly processed!")
             return float('inf'), 0.0  # Return worst possible values
             
         avg_loss = val_loss / max(1, len(val_loader))
         val_acc = val_correct / max(1, val_total)
-        self._log(f"Epoch Validation Loss: {avg_loss:.4f}, Accuracy: {val_acc:.4f}")
+        info(f"Epoch Validation Loss: {avg_loss:.4f}, Accuracy: {val_acc:.4f}")
         
         # Pass the current epoch to the confusion matrix function
-        self._calculate_confusion_matrix(all_preds, all_targets, current_epoch)
+        calculate_confusion_matrix(all_preds, all_targets, self.checkpoint_dir, current_epoch)
         
         self.model.train()
         return avg_loss, val_acc
-    
-    def _calculate_confusion_matrix(self, predictions, targets, current_epoch=None):
-        """
-        Calculate, log, and save the confusion matrix.
-        Prints chord quality groups for clearer visualization and also saves the
-        full class confusion matrix every 10 epochs.
-        
-        Args:
-            predictions: List of predicted class indices
-            targets: List of target class indices
-            current_epoch: Current training epoch number (for periodic full matrix saving)
-        """
-        if not predictions or not targets:
-            self._log("Cannot calculate confusion matrix: no predictions or targets")
-            return
-            
-        try:
-            # Count occurrences of each class in targets
-            target_counter = Counter(targets)
-            total_samples = len(targets)
-            
-            # Get the most common classes (up to 10) for standard printing
-            most_common_classes = [cls for cls, _ in target_counter.most_common(10)]
-            
-            # Create a mapping of indices to chord names if available
-            chord_names = {}
-            if self.idx_to_chord:
-                # First, build a reverse mapping from index to chord name
-                for idx, chord in self.idx_to_chord.items():
-                    chord_names[idx] = chord
-                    
-                # Also make sure all our most common classes are mapped
-                for cls in most_common_classes:
-                    if cls not in chord_names:
-                        if cls in self.idx_to_chord:
-                            chord_names[cls] = self.idx_to_chord[cls]
-                        else:
-                            # If the class is not in idx_to_chord, use a consistent fallback
-                            chord_names[cls] = f"Unknown-{cls}"
-            else:
-                # If no mapping is available, create generic labels
-                for cls in most_common_classes:
-                    chord_names[cls] = f"Class-{cls}"
-            
-            # Log class distribution for top 10 classes (print only)
-            self._log("\nClass distribution in validation set (Top 10):")
-            for cls in most_common_classes:
-                try:
-                    count = target_counter.get(cls, 0)
-                    percentage = 100 * count / total_samples if total_samples > 0 else 0
-                    chord_name = chord_names.get(cls, f"Class-{cls}")
-                    self._log(f"  {chord_name}: {count} samples ({percentage:.2f}%)")
-                except Exception as e:
-                    self._log(f"Error processing class {cls}: {e}")
-            
-            # Calculate confusion matrix values for top classes (printed to log)
-            confusion = {}
-            for true_cls in most_common_classes:
-                try:
-                    # Get indices where true class equals this class
-                    true_indices = [i for i, t in enumerate(targets) if t == true_cls]
-                    if not true_indices:
-                        continue
-                        
-                    # Get predictions for these indices
-                    cls_preds = [predictions[i] for i in true_indices]
-                    pred_counter = Counter(cls_preds)
-                    
-                    # Calculate accuracy for this class
-                    correct = pred_counter.get(true_cls, 0)
-                    total = len(true_indices)
-                    accuracy = correct / total if total > 0 else 0
-                    
-                    # Get the most commonly predicted class for this true class
-                    most_predicted = pred_counter.most_common(1)[0][0] if pred_counter else true_cls
-                    
-                    # Use the chord_names dictionary consistently
-                    true_chord_name = chord_names.get(true_cls, f"Class-{true_cls}")
-                    pred_chord_name = chord_names.get(most_predicted, f"Class-{most_predicted}")
-                    
-                    confusion[true_chord_name] = {
-                        'accuracy': accuracy,
-                        'most_predicted': pred_chord_name,
-                        'correct': correct,
-                        'total': total
-                    }
-                except Exception as e:
-                    self._log(f"Error processing confusion data for class {true_cls}: {e}")
-            
-            # Log confusion matrix information for top classes
-            self._log("\nConfusion Matrix Analysis (Top 10 Classes):")
-            self._log(f"{'True Class':<20} | {'Accuracy':<10} | {'Most Predicted':<20} | {'Correct/Total'}")
-            self._log(f"{'-'*20} | {'-'*10} | {'-'*20} | {'-'*15}")
-            
-            for true_class, stats in confusion.items():
-                self._log(f"{true_class:<20} | {stats['accuracy']:.4f}     | {stats['most_predicted']:<20} | {stats['correct']}/{stats['total']}")
-                
-            # Calculate overall metrics for these common classes
-            common_correct = sum(confusion[cls]['correct'] for cls in confusion)
-            common_total = sum(confusion[cls]['total'] for cls in confusion)
-            common_acc = common_correct / common_total if common_total > 0 else 0
-            self._log(f"\nAccuracy on most common classes: {common_acc:.4f} ({common_correct}/{common_total})")
-            
-            # NEW: Create and visualize chord quality group confusion matrix using chords.py
-            if self.idx_to_chord:
-                self._log("\n=== Creating chord quality group confusion matrix ===")
-                try:
-                    # Use the visualization module to calculate quality statistics
-                    quality_cm, quality_counts, quality_accuracy, quality_groups = calculate_quality_confusion_matrix(
-                        predictions, targets, self.idx_to_chord
-                    )
-                    
-                    # Log quality distribution
-                    self._log("\nChord quality distribution:")
-                    for i, quality in enumerate(quality_groups):
-                        count = quality_counts.get(i, 0)
-                        percentage = 100 * count / len(targets) if targets else 0
-                        self._log(f"  {quality}: {count} samples ({percentage:.2f}%)")
-                    
-                    # Log accuracies by quality
-                    self._log("\nAccuracy by chord quality:")
-                    for quality, acc in sorted(quality_accuracy.items(), key=lambda x: x[1], reverse=True):
-                        self._log(f"  {quality}: {acc:.4f}")
-                    
-                    # Create and save chord quality confusion matrix
-                    title = f"Chord Quality Confusion Matrix - Epoch {current_epoch}"
-                    quality_cm_path = os.path.join(
-                        self.checkpoint_dir, 
-                        f"confusion_matrix_quality_epoch_{current_epoch}.png"
-                    )
-                    
-                    # Plot using the visualization function
-                    try:
-                        _, _, _, _, _ = plot_chord_quality_confusion_matrix(
-                            predictions, targets, self.idx_to_chord,
-                            title=title, save_path=quality_cm_path
-                        )
-                        self._log(f"Saved chord quality confusion matrix to {quality_cm_path}")
-                    except Exception as e:
-                        self._log(f"Error plotting chord quality confusion matrix: {e}")
-                        # Print normalized confusion matrix as text fallback
-                        self._log("\nChord Quality Confusion Matrix (normalized):")
-                        normalized_cm = quality_cm.astype('float') / quality_cm.sum(axis=1)[:, np.newaxis]
-                        normalized_cm = np.nan_to_num(normalized_cm)  # Replace NaN with zero
-                        for i, row in enumerate(normalized_cm):
-                            self._log(f"{quality_groups[i]:<10}: " + " ".join([f"{x:.2f}" for x in row]))
-                        
-                except Exception as e:
-                    self._log(f"Error creating quality-based confusion matrix: {e}")
-                    import traceback
-                    self._log(traceback.format_exc())
-            
-            # Create and save the full confusion matrix every 10 epochs (less frequently)
-            if current_epoch is None or current_epoch % 10 == 0:
-                self._log(f"\nSaving full class confusion matrix for epoch {current_epoch}")
-                
-                try:
-                    # Create a mapping that includes ALL possible chord indices
-                    all_class_mapping = {}
-                    if self.idx_to_chord:
-                        for idx, chord in self.idx_to_chord.items():
-                            all_class_mapping[idx] = chord
-                    
-                    # Get a list of all unique classes
-                    all_classes = set(targets).union(set(predictions))
-                    
-                    # Ensure the classes are sorted for consistent visualization
-                    all_classes_list = sorted(list(all_classes))
-                    
-                    # Make sure all classes have labels
-                    for cls in all_classes:
-                        if cls not in all_class_mapping:
-                            all_class_mapping[cls] = f"Class-{cls}"
-                    
-                    # Generate the full confusion matrix using the visualization function
-                    full_title = f"Full Confusion Matrix - Epoch {current_epoch}"
-                    np_targets_full = np.array(targets)
-                    np_preds_full = np.array(predictions)
-                    
-                    # Set save path
-                    full_cm_path = os.path.join(
-                        self.checkpoint_dir, 
-                        f"confusion_matrix_full_epoch_{current_epoch}.png"
-                    )
-                    
-                    # Generate full confusion matrix plot and save it
-                    fig_full = plot_confusion_matrix(
-                        np_targets_full, np_preds_full,
-                        class_names=all_class_mapping,
-                        normalize=True,
-                        title=full_title,
-                        max_classes=None  # No limit on number of classes
-                    )
-                    
-                    os.makedirs(self.checkpoint_dir, exist_ok=True)
-                    fig_full.savefig(full_cm_path, dpi=300, bbox_inches='tight')
-                    self._log(f"Saved full confusion matrix to {full_cm_path}")
-                    plt.close(fig_full)
-                    
-                except Exception as e:
-                    self._log(f"Error saving full confusion matrix visualization: {e}")
-                    import traceback
-                    self._log(traceback.format_exc())
-            
-        except Exception as e:
-            self._log(f"Error calculating confusion matrix: {e}")
-            import traceback
-            self._log(traceback.format_exc())
 
     def compute_loss(self, logits, targets, teacher_logits=None):
         """Compute loss with optimized GPU operations"""
@@ -907,17 +702,17 @@ class StudentTrainer(BaseTrainer):
             
             # Check for and handle dimension mismatch between logits and targets
             if logits.ndim == 3 and targets.ndim == 1:
-                self._log(f"WARNING: Dimension mismatch - logits: {logits.shape}, targets: {targets.shape}")
-                self._log("Averaging logits over time dimension")
+                info(f"WARNING: Dimension mismatch - logits: {logits.shape}, targets: {targets.shape}")
+                info("Averaging logits over time dimension")
                 logits = logits.mean(dim=1)  # Average over time dimension
             elif logits.ndim == 3 and targets.ndim == 2:
                 if logits.size(1) != targets.size(1):
-                    self._log(f"WARNING: Time dimension mismatch - logits: {logits.shape}, targets: {targets.shape}")
+                    info(f"WARNING: Time dimension mismatch - logits: {logits.shape}, targets: {targets.shape}")
                     if logits.size(1) > targets.size(1):
-                        self._log(f"Truncating logits time dimension from {logits.size(1)} to {targets.size(1)}")
+                        info(f"Truncating logits time dimension from {logits.size(1)} to {targets.size(1)}")
                         logits = logits[:, :targets.size(1), :]
                     else:
-                        self._log(f"Truncating targets time dimension from {targets.size(1)} to {logits.size(1)}")
+                        info(f"Truncating targets time dimension from {targets.size(1)} to {logits.size(1)}")
                         targets = targets[:, :logits.size(1)]
                 
                 # Reshape for loss calculation
@@ -926,7 +721,7 @@ class StudentTrainer(BaseTrainer):
                 
             # Report reshape results
             if orig_logits_shape != logits.shape or orig_targets_shape != targets.shape:
-                self._log(f"Reshaped tensors for loss calculation - logits: {orig_logits_shape} -> {logits.shape}, "
+                info(f"Reshaped tensors for loss calculation - logits: {orig_logits_shape} -> {logits.shape}, "
                          f"targets: {orig_targets_shape} -> {targets.shape}")
             
             # Use focal loss if enabled
@@ -941,19 +736,19 @@ class StudentTrainer(BaseTrainer):
                 try:
                     loss = self.loss_fn(logits, targets)
                 except RuntimeError as e:
-                    self._log(f"Error in loss calculation: {e}")
-                    self._log(f"Logits shape: {logits.shape}, targets shape: {targets.shape}")
-                    self._log(f"Target values: min={targets.min().item()}, max={targets.max().item()}")
+                    info(f"Error in loss calculation: {e}")
+                    info(f"Logits shape: {logits.shape}, targets shape: {targets.shape}")
+                    info(f"Target values: min={targets.min().item()}, max={targets.max().item()}")
                     
                     # Try to recover by ensuring targets are in valid range
                     num_classes = logits.size(-1)
                     if targets.max().item() >= num_classes:
-                        self._log(f"WARNING: Target values exceed output dimension {num_classes}, clamping")
+                        info(f"WARNING: Target values exceed output dimension {num_classes}, clamping")
                         targets = torch.clamp(targets, 0, num_classes-1)
                         loss = self.loss_fn(logits, targets)
                     else:
                         # Use a simpler loss function if we can't recover
-                        self._log("Using unweighted cross entropy as fallback")
+                        info("Using unweighted cross entropy as fallback")
                         loss = F.cross_entropy(logits, targets)
             
             # If KD loss is enabled and teacher_logits are given, compute KD loss and combine.
@@ -967,7 +762,7 @@ class StudentTrainer(BaseTrainer):
                         # If student logits are 2D (batch, classes), then average teacher logits over time
                         if logits.dim() == 2:
                             teacher_logits = teacher_logits.mean(dim=1)  # Average over time dimension
-                            self._log(f"Averaged 3D teacher logits over time to match 2D student logits", level='debug')
+                            debug(f"Averaged 3D teacher logits over time to match 2D student logits")
                     # Handle 1D or 2D teacher logits
                     elif teacher_logits.dim() <= 2:
                         # If student logits are 3D but teacher is 2D, unsqueeze teacher
@@ -977,7 +772,7 @@ class StudentTrainer(BaseTrainer):
                                 teacher_logits = teacher_logits.unsqueeze(1)
                                 # Expand to match student time dimension
                                 teacher_logits = teacher_logits.expand(-1, logits.shape[1], -1)
-                                self._log(f"Expanded 2D teacher logits to match 3D student logits", level='debug')
+                                debug(f"Expanded 2D teacher logits to match 3D student logits")
                     
                     # Final dimension check
                     if teacher_logits.shape[-1] != logits.shape[-1]:
@@ -1001,21 +796,21 @@ class StudentTrainer(BaseTrainer):
                     kd_loss = self.distillation_loss(logits, teacher_logits, targets)
                     return kd_loss
                 except Exception as e:
-                    self._log(f"ERROR in KD loss processing - falling back to standard loss: {str(e)}")
+                    info(f"ERROR in KD loss processing - falling back to standard loss: {str(e)}")
                     # Continue with standard loss
             
             # Ensure loss is non-negative (critical fix)
             loss = torch.clamp(loss, min=0.0)
             
             if torch.isnan(loss):
-                self._log(f"NaN loss detected - logits: min={logits.min().item():.4f}, max={logits.max().item():.4f}, "
+                info(f"NaN loss detected - logits: min={logits.min().item():.4f}, max={logits.max().item():.4f}, "
                          f"targets: min={targets.min().item()}, max={targets.max().item()}")
                 # Return a default loss value instead of NaN
                 return torch.tensor(1.0, device=loss.device, requires_grad=True)
             
             return loss
         except Exception as e:
-            self._log(f"Unexpected error in compute_loss: {str(e)}")
+            info(f"Unexpected error in compute_loss: {str(e)}")
             # Last resort fallback - provide a dummy loss to avoid training failure
             return torch.tensor(1.0, device=self.device, requires_grad=True)
 
@@ -1067,17 +862,17 @@ class StudentTrainer(BaseTrainer):
                     # If we're still in warmup, scheduler only needs post-warmup steps
                     remaining_epochs = self.num_epochs - self.warmup_epochs
                     total_steps = num_batches * remaining_epochs
-                    self._log(f"OneCycleLR configured for {total_steps} steps after {self.warmup_epochs} warmup epochs")
+                    info(f"OneCycleLR configured for {total_steps} steps after {self.warmup_epochs} warmup epochs")
                 elif self.use_warmup and start_epoch > self.warmup_epochs:
                     # Already past warmup, calculate remaining post-warmup epochs
                     remaining_epochs = self.num_epochs - (start_epoch - 1)
                     total_steps = num_batches * remaining_epochs
-                    self._log(f"Resuming OneCycleLR for {total_steps} steps (past warmup)")
+                    info(f"Resuming OneCycleLR for {total_steps} steps (past warmup)")
                 else:
                     # No warmup, scheduler handles all epochs
                     remaining_epochs = self.num_epochs - (start_epoch - 1)
                     total_steps = num_batches * remaining_epochs
-                    self._log(f"OneCycleLR configured for {total_steps} steps")
+                    info(f"OneCycleLR configured for {total_steps} steps")
                     
                 # Recreate scheduler with correct total_steps
                 self.smooth_scheduler = OneCycleLR(
@@ -1095,41 +890,41 @@ class StudentTrainer(BaseTrainer):
             
             # Log KD status at the beginning of training
             if self.use_kd_loss:
-                self._log(f"Knowledge Distillation enabled: α={self.kd_alpha}, temperature={self.temperature}")
+                info(f"Knowledge Distillation enabled: α={self.kd_alpha}, temperature={self.temperature}")
                 
                 # Check first batch for teacher logits - early verification
                 try:
-                    self._log("Verifying teacher logits availability in first batch...")
+                    info("Verifying teacher logits availability in first batch...")
                     first_batch = next(iter(train_loader))
                     if 'teacher_logits' not in first_batch:
-                        self._log("WARNING: KD is enabled but teacher_logits are missing from the first batch!")
-                        self._log("This will cause training to fall back to standard CE loss and may lead to poor results.")
-                        self._log("Please ensure your dataset properly includes teacher logits for all samples.")
+                        info("WARNING: KD is enabled but teacher_logits are missing from the first batch!")
+                        info("This will cause training to fall back to standard CE loss and may lead to poor results.")
+                        info("Please ensure your dataset properly includes teacher logits for all samples.")
                     else:
                         teacher_shape = first_batch['teacher_logits'].shape
-                        self._log(f"Teacher logits verified with shape: {teacher_shape}")
+                        info(f"Teacher logits verified with shape: {teacher_shape}")
                         # Check if we have non-zero values in teacher logits
                         if first_batch['teacher_logits'].abs().sum().item() == 0:
-                            self._log("WARNING: Teacher logits contain all zeros! Check your logits loading process.")
+                            info("WARNING: Teacher logits contain all zeros! Check your logits loading process.")
                 except Exception as e:
-                    self._log(f"Error checking first batch for teacher logits: {e}")
+                    info(f"Error checking first batch for teacher logits: {e}")
             else:
-                self._log("Knowledge Distillation disabled, using standard loss")
+                info("Knowledge Distillation disabled, using standard loss")
             
             # Handle initial learning rate explicitly (before first epoch)
             if self.use_warmup and start_epoch == 1:
                 # Explicitly set to warmup_start_lr to ensure we're starting from the right point
                 curr_lr = self.optimizer.param_groups[0]['lr']
                 if abs(curr_lr - self.warmup_start_lr) > 1e-7:  # Allow small floating point differences
-                    self._log(f"Setting initial learning rate from {curr_lr:.6f} to warm-up start value: {self.warmup_start_lr:.6f}")
+                    info(f"Setting initial learning rate from {curr_lr:.6f} to warm-up start value: {self.warmup_start_lr:.6f}")
                     self._set_lr(self.warmup_start_lr)
                 else:
-                    self._log(f"Initial learning rate already set to warm-up start value: {curr_lr:.6f}")
+                    info(f"Initial learning rate already set to warm-up start value: {curr_lr:.6f}")
             elif self.use_warmup and start_epoch > 1 and start_epoch <= self.warmup_epochs:
                 # Resuming in the middle of warmup - calculate appropriate warmup LR
                 old_lr = self.optimizer.param_groups[0]['lr']
                 new_lr = self._warmup_learning_rate(start_epoch)
-                self._log(f"Resuming in warmup phase at epoch {start_epoch} with LR adjusted from {old_lr:.6f} to {new_lr:.6f}")
+                info(f"Resuming in warmup phase at epoch {start_epoch} with LR adjusted from {old_lr:.6f} to {new_lr:.6f}")
             elif self.use_warmup and start_epoch > self.warmup_epochs and self.lr_schedule_type:
                 # Resuming after warmup, need to advance scheduler to the right point
                 effective_epoch = start_epoch - self.warmup_epochs - 1
@@ -1142,11 +937,11 @@ class StudentTrainer(BaseTrainer):
                     for _ in range(effective_epoch):
                         self.smooth_scheduler.step()
                         
-                self._log(f"Resuming after warmup at epoch {start_epoch} (scheduler epoch {effective_epoch}) with LR: {self.optimizer.param_groups[0]['lr']:.6f}")
+                info(f"Resuming after warmup at epoch {start_epoch} (scheduler epoch {effective_epoch}) with LR: {self.optimizer.param_groups[0]['lr']:.6f}")
                 
             # Debug values for warmup
             if self.use_warmup:
-                self._log(f"Warmup configuration: {self.warmup_epochs} epochs from {self.warmup_start_lr:.6f} to {self.warmup_end_lr:.6f}")
+                info(f"Warmup configuration: {self.warmup_epochs} epochs from {self.warmup_start_lr:.6f} to {self.warmup_end_lr:.6f}")
                 
             for epoch in range(start_epoch, self.num_epochs + 1):
                 # Determine LR source for this epoch for logging
@@ -1159,7 +954,7 @@ class StudentTrainer(BaseTrainer):
                 
                 # Apply learning rate update - this now properly handles combined warmup+scheduler
                 current_lr = self._update_learning_rate(epoch)
-                self._log(f"Epoch {epoch}: LR = {current_lr:.6f} (from {lr_source})")
+                info(f"Epoch {epoch}: LR = {current_lr:.6f} (from {lr_source})")
                 
                 self.timer.reset(); self.timer.start()
                 epoch_loss = 0.0
@@ -1179,7 +974,7 @@ class StudentTrainer(BaseTrainer):
                     scaler = torch.cuda.amp.GradScaler()
                     using_amp = True
                     if epoch == start_epoch:
-                        self._log("Using mixed precision training with automatic mixed precision")
+                        info("Using mixed precision training with automatic mixed precision")
                 else:
                     using_amp = False
                 
@@ -1203,13 +998,13 @@ class StudentTrainer(BaseTrainer):
                     # Enhanced KD logging and error checking
                     if self.use_kd_loss and teacher_logits is None:
                         if batch_idx == 0 or batch_idx % 100 == 0:
-                            self._log(f"WARNING: KD enabled but no teacher logits found in batch {batch_idx}")
+                            info(f"WARNING: KD enabled but no teacher logits found in batch {batch_idx}")
                             
                             # If this keeps happening, report it clearly
                             if batch_idx >= 100 and kd_batches == 0:
-                                self._log("CRITICAL ERROR: Knowledge Distillation is enabled but NO teacher logits found in any batches so far!")
-                                self._log("This indicates a problem with your dataset or logits loading. Training will continue with standard loss.")
-                                self._log("You should stop training and fix the logits loading issue.")
+                                info("CRITICAL ERROR: Knowledge Distillation is enabled but NO teacher logits found in any batches so far!")
+                                info("This indicates a problem with your dataset or logits loading. Training will continue with standard loss.")
+                                info("You should stop training and fix the logits loading issue.")
                     
                     if self.normalization:
                         # Create the normalization tensors using clone().detach() if they don't exist
@@ -1249,7 +1044,7 @@ class StudentTrainer(BaseTrainer):
                                         if teacher_logits.shape[0:2] == orig_logits_shape[0:2]:
                                             teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
                                         else:
-                                            self._log(f"Shape mismatch between student ({orig_logits_shape}) and teacher ({teacher_logits.shape}) logits")
+                                            info(f"Shape mismatch between student ({orig_logits_shape}) and teacher ({teacher_logits.shape}) logits")
                                             # Try time dimension averaging as fallback 
                                             if teacher_logits.shape[0] == orig_logits_shape[0]:
                                                 teacher_logits = teacher_logits.mean(dim=1)
@@ -1275,7 +1070,7 @@ class StudentTrainer(BaseTrainer):
                                         train_total += targets.size(0)
                                         epoch_loss += loss.item()
                                 else:
-                                    self._log(f"WARNING: Skipping batch {batch_idx} due to invalid loss: {loss}")
+                                    info(f"WARNING: Skipping batch {batch_idx} due to invalid loss: {loss}")
                         else:
                             # Standard full-precision training
                             outputs = self.model(inputs)
@@ -1298,7 +1093,7 @@ class StudentTrainer(BaseTrainer):
                                     if teacher_logits.shape[0:2] == orig_logits_shape[0:2]:
                                         teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
                                     else:
-                                        self._log(f"Shape mismatch between student ({orig_logits_shape}) and teacher ({teacher_logits.shape}) logits")
+                                        info(f"Shape mismatch between student ({orig_logits_shape}) and teacher ({teacher_logits.shape}) logits")
                                         # Try time dimension averaging as fallback 
                                         if teacher_logits.shape[0] == orig_logits_shape[0]:
                                             teacher_logits = teacher_logits.mean(dim=1)
@@ -1325,37 +1120,37 @@ class StudentTrainer(BaseTrainer):
                                     current_lr = self.optimizer.param_groups[0]['lr']
                                     batch_acc = batch_correct / targets.size(0) if targets.size(0) > 0 else 0
                                     kd_status = " (with KD)" if teacher_logits is not None else ""
-                                    self._log(f"Epoch {epoch}/{self.num_epochs} | Batch {batch_idx}/{len(train_loader)} | Loss: {loss.item():.4f} | Batch Acc: {batch_acc:.4f}{kd_status} | LR: {current_lr:.7f}")
+                                    info(f"Epoch {epoch}/{self.num_epochs} | Batch {batch_idx}/{len(train_loader)} | Loss: {loss.item():.4f} | Batch Acc: {batch_acc:.4f}{kd_status} | LR: {current_lr:.7f}")
                             else:
-                                self._log(f"WARNING: Skipping batch {batch_idx} due to invalid loss: {loss}")
+                                info(f"WARNING: Skipping batch {batch_idx} due to invalid loss: {loss}")
                             
                     except Exception as e:
-                        self._log(f"Error in training batch {batch_idx}: {str(e)}")
+                        info(f"Error in training batch {batch_idx}: {str(e)}")
                         import traceback
-                        self._log(traceback.format_exc())
+                        info(traceback.format_exc())
                         continue  # Skip this batch if there's an error
                 
                 # After each epoch, clear CUDA cache to prevent memory fragmentation
-                if torch.cuda.is_available():
+                if (epoch + 1) % 5 == 0 and torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
                 # Log KD usage statistics 
                 if self.use_kd_loss:
                     kd_percent = (kd_batches / total_batches) * 100 if total_batches > 0 else 0
-                    self._log(f"KD usage: {kd_batches}/{total_batches} batches ({kd_percent:.1f}%)")
+                    info(f"KD usage: {kd_batches}/{total_batches} batches ({kd_percent:.1f}%)")
                     
                     # Warn if KD usage is low, as this indicates a potential problem 
                     if kd_percent < 50 and total_batches > 10:
-                        self._log(f"WARNING: KD is enabled but only {kd_percent:.1f}% of batches had teacher logits!")
-                        self._log("This means most batches are falling back to standard CE loss, which may impact results.")
+                        info(f"WARNING: KD is enabled but only {kd_percent:.1f}% of batches had teacher logits!")
+                        info("This means most batches are falling back to standard CE loss, which may impact results.")
                         if kd_percent == 0:
-                            self._log("CRITICAL: No batches had teacher logits despite KD being enabled!")
+                            info("CRITICAL: No batches had teacher logits despite KD being enabled!")
                 
                 # Log training metrics for this epoch
                 avg_train_loss = epoch_loss / max(1, len(train_loader))
                 train_acc = train_correct / max(1, train_total)
                 self.timer.stop()
-                self._log(f"Epoch {epoch}/{self.num_epochs} | Train Loss: {avg_train_loss:.4f} | Train Accuracy: {train_acc:.4f} | Time: {self.timer.elapsed_time():.2f} sec")
+                info(f"Epoch {epoch}/{self.num_epochs} | Train Loss: {avg_train_loss:.4f} | Train Accuracy: {train_acc:.4f} | Time: {self.timer.elapsed_time():.2f} sec")
                 self.train_losses.append(avg_train_loss)
                 
                 if self.animator:
@@ -1367,7 +1162,7 @@ class StudentTrainer(BaseTrainer):
                         # Use step() without epoch parameter to avoid deprecation warning
                         self.smooth_scheduler.step()
                         current_lr = self.optimizer.param_groups[0]['lr']
-                        self._log(f"Scheduler stepped to LR: {current_lr:.7f}")
+                        info(f"Scheduler stepped to LR: {current_lr:.7f}")
                 
                 # Run validation
                 if val_loader is not None:
@@ -1380,7 +1175,7 @@ class StudentTrainer(BaseTrainer):
                     # 2. We're not in the warm-up phase
                     if not self.lr_schedule_type and not (self.use_warmup and epoch <= self.warmup_epochs):
                         self._adjust_learning_rate(val_acc)
-                        self._log(f"Epoch {epoch}: LR = {self.optimizer.param_groups[0]['lr']:.6f} (from {lr_source})")
+                        info(f"Epoch {epoch}: LR = {self.optimizer.param_groups[0]['lr']:.6f} (from {lr_source})")
                     
                     # Always track the best model and check for early stopping
                     self._save_best_model(val_acc, val_loss, epoch)
@@ -1403,18 +1198,18 @@ class StudentTrainer(BaseTrainer):
                             'mean': self.normalization['mean'] if self.normalization else None,
                             'std': self.normalization['std'] if self.normalization else None
                         }, checkpoint_path)
-                        self._log(f"Saved checkpoint at epoch {epoch}")
+                        info(f"Saved checkpoint at epoch {epoch}")
                     except Exception as e:
-                        self._log(f"Error saving checkpoint: {str(e)}")
+                        info(f"Error saving checkpoint: {str(e)}")
 
-            self._log(f"Training complete! Scheduler steps: {self._scheduler_step_count}")
+            info(f"Training complete! Scheduler steps: {self._scheduler_step_count}")
             self._print_loss_history()
             self._plot_loss_history()
             
         except Exception as e:
-            self._log(f"Unexpected error during training: {str(e)}")
+            info(f"Unexpected error during training: {str(e)}")
             import traceback
-            self._log(traceback.format_exc())
+            info(traceback.format_exc())
             # Try to save an emergency checkpoint
             try:
                 emergency_path = os.path.join(self.checkpoint_dir, "emergency_checkpoint.pth")
@@ -1423,9 +1218,9 @@ class StudentTrainer(BaseTrainer):
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'error': str(e)
                 }, emergency_path)
-                self._log(f"Saved emergency checkpoint to {emergency_path}")
+                info(f"Saved emergency checkpoint to {emergency_path}")
             except:
-                self._log("Failed to save emergency checkpoint")
+                info("Failed to save emergency checkpoint")
 
     def load_best_model(self):
         """Load the best model saved during training."""
@@ -1433,51 +1228,22 @@ class StudentTrainer(BaseTrainer):
             try:
                 checkpoint = torch.load(self.best_model_path)
                 self.model.load_state_dict(checkpoint['model_state_dict'])
-                self._log(f"Loaded best model from epoch {checkpoint['epoch']} with validation accuracy {checkpoint['accuracy']:.4f}")
+                info(f"Loaded best model from epoch {checkpoint['epoch']} with validation accuracy {checkpoint['accuracy']:.4f}")
                 return True
             except Exception as e:
-                self._log(f"Error loading best model: {str(e)}")
+                info(f"Error loading best model: {str(e)}")
                 return False
         else:
-            self._log("No best model found to load.")
+            info("No best model found to load.")
             return False
 
-    def _log(self, message, level=None):
-        """
-        Log a message with optional level support.
-        
-        Args:
-            message: The message to log
-            level: Optional logging level (debug, info, warning, error)
-        """
-        # If level is provided but not supported by the logger, just use the message
-        if self.logger:
-            try:
-                if level == 'debug':
-                    self.logger.debug(message)
-                elif level == 'warning' or level == 'warn':
-                    self.logger.warning(message)
-                elif level == 'error' or level == 'err':
-                    self.logger.error(message)
-                else:
-                    # Default to info level
-                    self.logger.info(message)
-            except AttributeError:
-                # If the logger doesn't support the level method, fall back to info
-                self.logger.info(message)
-            except Exception as e:
-                # Last resort: print directly if logger fails
-                print(f"Logger error: {e}")
-                print(message)
-        else:
-            print(message)
 
     def _plot_loss_history(self):
         """Plot and save the loss history."""
         try:
             # Check if we have loss data
             if not hasattr(self, 'train_losses') or len(self.train_losses) == 0:
-                self._log("No loss history to plot")
+                info("No loss history to plot")
                 return
                 
             # Set up save path
@@ -1491,7 +1257,7 @@ class StudentTrainer(BaseTrainer):
                 save_path=save_path
             )
             
-            self._log(f"Loss history plot saved to {save_path}")
+            info(f"Loss history plot saved to {save_path}")
             plt.close(fig)
         except Exception as e:
-            self._log(f"Error plotting loss history: {e}")
+            info(f"Error plotting loss history: {e}")

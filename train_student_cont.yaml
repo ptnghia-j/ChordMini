@@ -238,7 +238,7 @@ spec:
               value: "true"  # Whether to reset LR scheduler when resetting epochs (true/false)
             # Dataset initialization controls
             - name: LAZY_INIT
-              value: "true"  # Controls dataset lazy initialization (true/false)
+              value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
               value: "null"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE

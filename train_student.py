@@ -449,9 +449,6 @@ def main():
     logger.info(f"\nUsing chord mapping from chords.py with {len(chord_mapping)} unique chords")
     logger.info(f"Sample chord mapping: {dict(list(chord_mapping.items())[:5])}")
     
-    # Compute frame_duration from configuration
-    frame_duration = config.feature.get('hop_duration', 0.1)
-    
     # Resolve checkpoints directory path
     checkpoints_dir_config = config.paths.get('checkpoints_dir', 'checkpoints')
     checkpoints_dir = resolve_path(checkpoints_dir_config, storage_root, project_root)
@@ -466,18 +463,21 @@ def main():
         'chord_mapping': chord_mapping,
         'seq_len': config.training.get('seq_len', 10),
         'stride': config.training.get('seq_stride', 5),
-        'frame_duration': frame_duration,
+        'frame_duration': config.feature.get('hop_duration', 0.1),
         'verbose': True,
         'device': device,
-        'prefetch_factor': args.prefetch_factor,
+        'prefetch_factor': float(args.prefetch_factor),
         'num_workers': 6,
-        'use_cache': not args.disable_cache,
-        'metadata_only': args.metadata_cache,
-        'cache_fraction': args.cache_fraction,
-        'lazy_init': args.lazy_init,
-        'batch_gpu_cache': args.batch_gpu_cache
+        # debug area
+        'use_cache': not config.data.get('disable_cache', False),
+        'metadata_only': config.data.get('metadata_cache', False),
+        'cache_fraction': config.data.get('cache_fraction', 0.1),
+        'lazy_init': config.data.get('lazy_init', False),
+        'batch_gpu_cache': str(args.batch_gpu_cache).lower() == "true",
     })
     
+    # print out dataset args
+    logger.info(f"Dataset arguments: {dataset_args}")
     # Apply knowledge distillation settings
     if use_kd and args.logits_dir:
         logits_dir = resolve_path(args.logits_dir, storage_root, project_root)

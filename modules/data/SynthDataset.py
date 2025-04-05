@@ -835,7 +835,7 @@ class SynthDataset(Dataset):
                         parent_dir, base_name = file_id.split('/', 1)
                         logit_file = self.logits_dir / parent_dir / f"{base_name}_logits.npy"
                         if self.verbose and not hasattr(self, '_maestro_logit_path_logged'):
-                            print(f"Maestro logit path example: {logit_file}")
+                            # print(f"Maestro logit path example: {logit_file}")
                             self._maestro_logit_path_logged = True
                     else:
                         logit_file = self.logits_dir / f"{file_id}_logits.npy"
@@ -843,7 +843,7 @@ class SynthDataset(Dataset):
                     # For FMA, use the 3-digit directory structure
                     logit_file = self.logits_dir / dir_prefix / f"{file_id}_logits.npy"
                     if self.verbose and not hasattr(self, '_fma_logit_path_logged'):
-                        print(f"FMA logit path example: {logit_file}")
+                        # print(f"FMA logit path example: {logit_file}")
                         self._fma_logit_path_logged = True
             
             # At this point, we have all required components (spec, label, and logits if enabled)
@@ -1017,25 +1017,25 @@ class SynthDataset(Dataset):
                     return None
                 raise  # Re-raise other errors
             
-            # Sanity check shape and values
-            if isinstance(teacher_logits, np.ndarray):
-                if self.verbose and not hasattr(self, '_logit_shape_reported'):
-                    print(f"Teacher logits shape: {teacher_logits.shape}, min: {teacher_logits.min()}, max: {teacher_logits.max()}")
-                    self._logit_shape_reported = True
+            # # Sanity check shape and values
+            # if isinstance(teacher_logits, np.ndarray):
+            #     if self.verbose and not hasattr(self, '_logit_shape_reported'):
+            #         print(f"Teacher logits shape: {teacher_logits.shape}, min: {teacher_logits.min()}, max: {teacher_logits.max()}")
+            #         self._logit_shape_reported = True
                 
-                # Handle NaN or inf values
-                if np.isnan(teacher_logits).any() or np.isinf(teacher_logits).any():
-                    teacher_logits = np.nan_to_num(teacher_logits, nan=0.0, posinf=100.0, neginf=-100.0)
-                    if self.verbose and not hasattr(self, '_logit_nan_reported'):
-                        print(f"WARNING: NaN or inf values found in teacher logits and replaced")
-                        self._logit_nan_reported = True
+            #     # Handle NaN or inf values
+            #     if np.isnan(teacher_logits).any() or np.isinf(teacher_logits).any():
+            #         teacher_logits = np.nan_to_num(teacher_logits, nan=0.0, posinf=100.0, neginf=-100.0)
+            #         if self.verbose and not hasattr(self, '_logit_nan_reported'):
+            #             print(f"WARNING: NaN or inf values found in teacher logits and replaced")
+            #             self._logit_nan_reported = True
                 
-                return teacher_logits
-            else:
-                if self.verbose and not hasattr(self, '_logit_type_warning'):
-                    print(f"WARNING: Loaded teacher logits has unexpected type: {type(teacher_logits)}")
-                    self._logit_type_warning = True
-                return None
+            #     return teacher_logits
+            # else:
+            #     if self.verbose and not hasattr(self, '_logit_type_warning'):
+            #         print(f"WARNING: Loaded teacher logits has unexpected type: {type(teacher_logits)}")
+            #         self._logit_type_warning = True
+            #     return None
                 
         except Exception as e:
             warnings.warn(f"Error loading logits file {logit_file}: {str(e)}")
