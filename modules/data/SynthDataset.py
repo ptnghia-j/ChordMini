@@ -617,7 +617,7 @@ class SynthDataset(Dataset):
         }
         
         # Calculate number of processes to use (leave one core free)
-        num_cpus = 6
+        num_cpus = self.num_workers
         
         # Adjust num_cpus for very small datasets to prevent overhead
         if len(valid_spec_files) < num_cpus * 4:  # If files are fewer than 4× the CPUs

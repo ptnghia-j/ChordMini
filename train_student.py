@@ -657,7 +657,6 @@ def main():
         use_kd_loss=use_kd,
         kd_alpha=kd_alpha,
         temperature=temperature,
-        num_workers=dataset_args['num_workers'],
     )
     
     # Set chord mapping in trainer
