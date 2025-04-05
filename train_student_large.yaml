@@ -203,9 +203,9 @@ spec:
             - name: WARMUP_START_LR
               value: "0.0001"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.0002"  # Final learning rate after warm-up
+              value: "0.001"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "2"  # Number of epochs for warm-up
+              value: "6"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
               value: "0.2"  # Set dropout probability (0-1)
@@ -221,26 +221,28 @@ spec:
             - name: BATCH_GPU_CACHE
               value: "true"  # Enable GPU batch caching
             - name: PREFETCH_FACTOR
-              value: "10"     # Prefetch 6 batches for better throughput
+              value: "6"     # Prefetch 6 batches for better throughput
             # Add dataset type environment variable
             - name: DATASET_TYPE
               value: "fma"  # Use "maestro" for Maestro dataset or "fma" for FMA dataset
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
-              value: "auto"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
+              value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
             - name: SUB_DIR
-              value: "fma_logits"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
+              value: "fma-02"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
             # Add reset scheduler control option
             - name: RESET_SCHEDULER
               value: "true"  # Whether to reset LR scheduler when resetting epochs (true/false)
-            # Dataset initialization controls: set  LAZY_INT=false and set percentage in SMALL_DATASET to use, otherwise default to full dataset
+            # Dataset initialization controls
             - name: LAZY_INIT
               value: "true"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
               value: "null"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+            - name: METADATA_CACHE
+              value: "true"  # Use metadata-only caching to reduce memory usage
           command:
             - sh
             - -c
@@ -330,22 +332,28 @@ spec:
               if [ "${LR_SCHEDULE}" != "" ] && [ "${LR_SCHEDULE}" != "null" ]; then
                 echo "Using ${LR_SCHEDULE} learning rate schedule"
                 LR_SCHEDULE_ARG="--lr_schedule ${LR_SCHEDULE}"
-              elif [ "${USE_WARMUP}" = "true" ]; then
-                echo "Using warm-up learning rate schedule for ${WARMUP_EPOCHS} epochs"
-                LR_SCHEDULE_ARG="--use_warmup --warmup_epochs ${WARMUP_EPOCHS}"
-                # Add the other warmup parameters to ensure they're passed to the script
-                if [ "${WARMUP_START_LR}" != "" ]; then
-                  LR_SCHEDULE_ARG="${LR_SCHEDULE_ARG} --warmup_start_lr ${WARMUP_START_LR}"
-                  echo "Using warmup start learning rate: ${WARMUP_START_LR}"
-                fi
-                if [ "${WARMUP_END_LR}" != "" ]; then
-                  LR_SCHEDULE_ARG="${LR_SCHEDULE_ARG} --warmup_end_lr ${WARMUP_END_LR}"
-                  echo "Using warmup end learning rate: ${WARMUP_END_LR}" 
-                fi
               else
                 echo "Using default validation-based learning rate adjustment"
               fi
-
+              
+              # Create separate warmup argument variable that's always set when warmup is enabled
+              WARMUP_ARG=""
+              if [ "${USE_WARMUP}" = "true" ]; then
+                echo "Using warm-up learning rate schedule for ${WARMUP_EPOCHS} epochs"
+                WARMUP_ARG="--use_warmup --warmup_epochs ${WARMUP_EPOCHS}"
+                
+                # Add the other warmup parameters to ensure they're passed to the script
+                if [ "${WARMUP_START_LR}" != "" ]; then
+                  WARMUP_ARG="${WARMUP_ARG} --warmup_start_lr ${WARMUP_START_LR}"
+                  echo "Using warmup start learning rate: ${WARMUP_START_LR}"
+                fi
+                
+                if [ "${WARMUP_END_LR}" != "" ]; then
+                  WARMUP_ARG="${WARMUP_ARG} --warmup_end_lr ${WARMUP_END_LR}"
+                  echo "Using warmup end learning rate: ${WARMUP_END_LR}" 
+                fi
+              fi
+              
               # Get learning rate arguments
               LR_ARGS=""
               if [ "${LEARNING_RATE}" != "" ]; then
@@ -553,7 +561,7 @@ spec:
               # Run the student training script with all options (without --best_model_dir flag)
               echo "Starting student training with GPU optimization and all options..."
               python train_student.py $DATASET_ARG --config ./config/student_config.yaml --save_dir ${CHECKPOINTS_DIR}/${SUB_DIR} \
-                ${LR_SCHEDULE_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} \
+                ${LR_SCHEDULE_ARG} ${WARMUP_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} \
                 ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS}
               
               echo "=== Student model training complete ==="
@@ -562,12 +570,12 @@ spec:
               python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
             requests:
-              cpu: "3"             
-              memory: "18Gi"    
+              cpu: "6"             
+              memory: "48Gi"    
               nvidia.com/gpu: "1"
             limits:
-              cpu: "6"             
-              memory: "32Gi" 
+              cpu: "10"             
+              memory: "96Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage

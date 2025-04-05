@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 import torch
 import numpy as np
@@ -7,7 +8,7 @@ import glob
 from pathlib import Path
 import matplotlib.pyplot as plt
 import time
-import multiprocessing
+from multiprocessing import Pool
 from functools import partial
 import pickle
 import warnings
@@ -15,6 +16,12 @@ from tqdm import tqdm
 import hashlib
 import re
 from modules.utils.device import get_device, to_device, clear_gpu_cache
+
+# Define a wrapper function for multiprocessing
+def process_file_wrapper(args):
+    """Wrapper function for multiprocessing file processing"""
+    dataset_instance, spec_file, file_id, label_files_dict, return_skip_reason = args
+    return dataset_instance._process_file(spec_file, file_id, label_files_dict, return_skip_reason)
 
 # We can simplify the multiprocessing setup since we're using a single worker
 # This code is still useful for the __main__ case to ensure proper testing behavior
@@ -79,7 +86,7 @@ class SynthDataset(Dataset):
         self.cuda_available = torch.cuda.is_available()
         
         # Force num_workers to 0 for GPU compatibility
-        self.num_workers = 2
+        self.num_workers = num_workers
         # if num_workers is not None and num_workers > 0 and verbose:
         #     print(f"Forcing num_workers to 0 (was {num_workers}) for single-worker GPU optimization")
         
@@ -124,21 +131,21 @@ class SynthDataset(Dataset):
         if self.dataset_type == 'maestro':
             # For Maestro dataset, match any filename pattern ending with _spec, _logits, or .lab
             self.file_pattern = re.compile(r'(.+?)(?:_spec|_logits)?\.(?:npy|lab)$')
-            if self.verbose:
-                print(f"Using Maestro dataset format with pattern matching")
-                print(f"Expected file paths:")
-                print(f"  - Spectrograms: {spec_dir}/maestro-v3.0.0/file-name_spec.npy")
-                print(f"  - Labels: {label_dir}/maestro-v3.0.0/file-name.lab")
-                print(f"  - Logits: {logits_dir}/maestro-v3.0.0/file-name_logits.npy (if available)")
+            # if self.verbose:
+            #     print(f"Using Maestro dataset format with pattern matching")
+            #     print(f"Expected file paths:")
+            #     print(f"  - Spectrograms: {spec_dir}/maestro-v3.0.0/file-name_spec.npy")
+            #     print(f"  - Labels: {label_dir}/maestro-v3.0.0/file-name.lab")
+            #     print(f"  - Logits: {logits_dir}/maestro-v3.0.0/file-name_logits.npy (if available)")
         else:
             # Default for FMA dataset - the existing 6-digit numeric ID pattern
             self.numeric_id_pattern = re.compile(r'(\d{6})')
-            if self.verbose:
-                print(f"Using FMA dataset format with 6-digit numeric ID pattern")
-                print(f"Expected file paths:")
-                print(f"  - Spectrograms: {spec_dir}/ddd/dddbbb_spec.npy")
-                print(f"  - Labels: {label_dir}/ddd/dddbbb.lab")
-                print(f"  - Logits: {logits_dir}/ddd/dddbbb_logits.npy (if available)")
+            # if self.verbose:
+            #     print(f"Using FMA dataset format with 6-digit numeric ID pattern")
+            #     print(f"Expected file paths:")
+            #     print(f"  - Spectrograms: {spec_dir}/ddd/dddbbb_spec.npy")
+            #     print(f"  - Labels: {label_dir}/ddd/dddbbb.lab")
+            #     print(f"  - Logits: {logits_dir}/ddd/dddbbb_logits.npy (if available)")
         
         # Auto-detect device if not provided - use device module with safer initialization
         if device is None:
@@ -599,7 +606,6 @@ class SynthDataset(Dataset):
                     if len(valid_spec_files) > 1:
                         print(f"Last file: {valid_spec_files[-1][0]}")
         
-        # Sequential processing 
         self.samples = []
         self.total_processed = 0
         self.total_skipped = 0
@@ -610,13 +616,41 @@ class SynthDataset(Dataset):
             'format_error': 0
         }
         
-        for spec_file, numeric_id in tqdm(valid_spec_files, desc="Loading data", disable=not self.verbose):
+        # Calculate number of processes to use (leave one core free)
+        num_cpus = 6
+        
+        # Adjust num_cpus for very small datasets to prevent overhead
+        if len(valid_spec_files) < num_cpus * 4:  # If files are fewer than 4× the CPUs
+            num_cpus = max(1, len(valid_spec_files) // 2)
+            if self.verbose:
+                print(f"Small dataset detected, reducing worker count to {num_cpus}")
+
+        # Create arguments list with self instance for each file
+        args_list = [(self, spec_file, file_id, label_files_dict, True) 
+                    for spec_file, file_id in valid_spec_files]
+        
+        if self.verbose:
+            print(f"Processing {len(args_list)} files with {num_cpus} parallel workers")
+            
+        # Use multiprocessing with context manager for clean exit
+        with Pool(processes=num_cpus) as pool:
+            # Map the processing function to the arguments using imap for progress tracking
+            process_results = list(tqdm(
+                pool.imap(process_file_wrapper, args_list),
+                total=len(args_list),
+                desc=f"Loading data (parallel {'lazy' if self.lazy_init else 'full'})",
+                disable=not self.verbose
+            ))
+        
+        # Process results from parallel execution
+        for samples, skip_reason in process_results:
             self.total_processed += 1
-            processed = self._process_file(spec_file, numeric_id, label_files_dict)
-            if processed:
-                self.samples.extend(processed)
+            if samples:
+                self.samples.extend(samples)
             else:
                 self.total_skipped += 1
+                if skip_reason in self.skipped_reasons:
+                    self.skipped_reasons[skip_reason] += 1
         
         # Log statistics about skipped files
         if hasattr(self, 'total_processed') and self.total_processed > 0:
@@ -769,16 +803,16 @@ class SynthDataset(Dataset):
                 # For Maestro, the directory prefix is the parent directory name
                 dir_prefix = spec_file.parent.name
                 if self.verbose and not hasattr(self, '_maestro_path_logged'):
-                    print(f"Maestro dataset format: using parent directory '{dir_prefix}' for organization")
-                    print(f"Example spec file path: {spec_file}")
-                    print(f"Example ID (combined dir/file): {file_id}")
+                    # print(f"Maestro dataset format: using parent directory '{dir_prefix}' for organization")
+                    # print(f"Example spec file path: {spec_file}")
+                    # print(f"Example ID (combined dir/file): {file_id}")
                     self._maestro_path_logged = True
             else:
                 # For FMA, extract the 3-digit prefix from the numeric ID
                 dir_prefix = file_id[:3] if len(file_id) >= 3 else file_id
                 if self.verbose and not hasattr(self, '_fma_path_logged'):
-                    print(f"FMA dataset format: using 3-digit prefix '{dir_prefix}' from ID {file_id}")
-                    print(f"Example spec file path: {spec_file}")
+                    # print(f"FMA dataset format: using 3-digit prefix '{dir_prefix}' from ID {file_id}")
+                    # print(f"Example spec file path: {spec_file}")
                     self._fma_path_logged = True
             
             # Get the matching label file directly from the dictionary
@@ -1470,7 +1504,7 @@ class SynthDataset(Dataset):
                 try:
                     self.gpu_batch_cache[idx] = sample_out
                     # Limit cache size to prevent memory issues
-                    if len(self.gpu_batch_cache) > 256:
+                    if len(self.gpu_batch_cache) > 768:
                         oldest_key = next(iter(self.gpu_batch_cache))
                         del self.gpu_batch_cache[oldest_key]
                 except Exception:
@@ -1500,11 +1534,6 @@ class SynthDataset(Dataset):
 
     def get_train_iterator(self, batch_size=128, shuffle=True, num_workers=None, pin_memory=None):
         """Get an optimized DataLoader for the training set"""
-        # # Always use a single worker (0) for GPU compatibility
-        # num_workers_val = 0
-        
-        # # Always disable pin_memory for single worker
-        # pin_memory_val = False
         
         if not self.train_indices:
             warnings.warn("No training segments available")
@@ -1512,8 +1541,6 @@ class SynthDataset(Dataset):
                 SynthSegmentSubset(self, []),
                 batch_size=batch_size,
                 shuffle=shuffle,
-                # pin_memory=pin_memory_val,
-                # num_workers=num_workers_val
                 pin_memory=pin_memory,
                 num_workers=num_workers
             )
@@ -1522,19 +1549,12 @@ class SynthDataset(Dataset):
             SynthSegmentSubset(self, self.train_indices),
             batch_size=batch_size,
             shuffle=shuffle,
-            # num_workers=num_workers_val,
-            # pin_memory=pin_memory_val
             pin_memory=pin_memory,
             num_workers=num_workers
         )
     
     def get_eval_iterator(self, batch_size=128, shuffle=False, num_workers=None, pin_memory=None):
         """Get an optimized DataLoader for the evaluation set"""
-        # Always use a single worker (0) for GPU compatibility
-        num_workers_val = 0
-        
-        # Always disable pin_memory for single worker
-        pin_memory_val = True
         
         if not self.eval_indices:
             warnings.warn("No evaluation segments available")
@@ -1542,25 +1562,21 @@ class SynthDataset(Dataset):
                 SynthSegmentSubset(self, []),
                 batch_size=batch_size,
                 shuffle=shuffle,
-                pin_memory=pin_memory_val,
-                num_workers=num_workers_val
+                pin_memory=pin_memory,
+                num_workers=num_workers
             )
             
         return DataLoader(
             SynthSegmentSubset(self, self.eval_indices),
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=num_workers_val,
-            pin_memory=pin_memory_val
+            num_workers=num_workers,
+            pin_memory=pin_memory
         )
     
     def get_test_iterator(self, batch_size=128, shuffle=False, num_workers=None, pin_memory=None):
         """Get an optimized DataLoader for the test set"""
-        # Always use a single worker (0) for GPU compatibility
-        num_workers_val = 0
-        
-        # Always disable pin_memory for single worker
-        pin_memory_val = True
+
         
         if not self.test_indices:
             warnings.warn("No test segments available")
@@ -1568,106 +1584,17 @@ class SynthDataset(Dataset):
                 SynthSegmentSubset(self, []),
                 batch_size=batch_size,
                 shuffle=shuffle,
-                pin_memory=pin_memory_val,
-                num_workers=num_workers_val
+                pin_memory=pin_memory,
+                num_workers=num_workers
             )
             
         return DataLoader(
             SynthSegmentSubset(self, self.test_indices),
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=num_workers_val,
-            pin_memory=pin_memory_val
+            num_workers=num_workers,
+            pin_memory=pin_memory
         )
-    # Fix the test_multi_format_support function implementation
-def test_multi_format_support():
-    """Test the SynthDataset's multi-format support with sample data"""
-    import tempfile
-    import shutil
-    
-    print("\n=== Testing multi-format support ===")
-    try:
-        # Create temporary directories for testing
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Create test directories
-            base_dir = Path(temp_dir)
-            
-            # Test FMA format
-            fma_spec_dir = base_dir / "fma_specs"
-            fma_label_dir = base_dir / "fma_labels"
-            fma_logits_dir = base_dir / "fma_logits"
-            
-            # Create directory structure for FMA
-            (fma_spec_dir / "123").mkdir(parents=True)
-            (fma_label_dir / "123").mkdir(parents=True)
-            (fma_logits_dir / "123").mkdir(parents=True)
-            
-            # Create sample files for FMA
-            np.save(fma_spec_dir / "123" / "123456_spec.npy", np.zeros((10, 144)))
-            with open(fma_label_dir / "123" / "123456.lab", "w") as f:
-                f.write("0.0 1.0 C\n1.0 2.0 G")
-            # Also create a logits file for FMA format
-            np.save(fma_logits_dir / "123" / "123456_logits.npy", np.zeros((10, 25)))
-            
-            # Test Maestro format
-            maestro_spec_dir = base_dir / "maestro_specs"
-            maestro_label_dir = base_dir / "maestro_labels"
-            maestro_logits_dir = base_dir / "maestro_logits"
-            
-            # Create directory structure for Maestro
-            (maestro_spec_dir / "maestro-v3.0.0").mkdir(parents=True)
-            (maestro_label_dir / "maestro-v3.0.0").mkdir(parents=True)
-            (maestro_logits_dir / "maestro-v3.0.0").mkdir(parents=True)
-            
-            # Create sample files for Maestro
-            np.save(maestro_spec_dir / "maestro-v3.0.0" / "piece1_spec.npy", np.zeros((10, 144)))
-            with open(maestro_label_dir / "maestro-v3.0.0" / "piece1.lab", "w") as f:
-                f.write("0.0 1.0 C\n1.0 2.0 G")
-            # Also create a logits file for Maestro format
-            np.save(maestro_logits_dir / "maestro-v3.0.0" / "piece1_logits.npy", np.zeros((10, 25)))
-            
-            # Test both formats
-            print("Testing FMA format...")
-            fma_dataset = SynthDataset(
-                spec_dir=fma_spec_dir, 
-                label_dir=fma_label_dir,
-                logits_dir=fma_logits_dir,
-                dataset_type='fma',
-                verbose=True,
-                seq_len=5,  # Add required parameters
-                stride=2,
-                lazy_init=False,  # Force full initialization
-                metadata_only=True  # Use metadata for faster testing
-            )
-            
-            print("\nTesting Maestro format...")
-            maestro_dataset = SynthDataset(
-                spec_dir=maestro_spec_dir, 
-                label_dir=maestro_label_dir,
-                logits_dir=maestro_logits_dir,
-                dataset_type='maestro',
-                verbose=True,
-                seq_len=5,  # Add required parameters
-                stride=2,
-                lazy_init=False,  # Force full initialization
-                metadata_only=True  # Use metadata for faster testing
-            )
-            
-            # Print dataset stats to verify
-            print("\nFMA Dataset Stats:")
-            print(f"  Total frames: {len(fma_dataset.samples)}")
-            print(f"  Total segments: {len(fma_dataset)}")
-            
-            print("\nMaestro Dataset Stats:")
-            print(f"  Total frames: {len(maestro_dataset.samples)}")
-            print(f"  Total segments: {len(maestro_dataset)}")
-            
-            print("\nMulti-format support test complete!")
-    except Exception as e:
-        print(f"Error during multi-format test: {e}")
-        import traceback
-        traceback.print_exc()
-
 class SynthSegmentSubset(Dataset):
     """Subset of the SynthDataset based on specified indices"""
     def __init__(self, dataset, indices):
@@ -1681,63 +1608,3 @@ class SynthSegmentSubset(Dataset):
         if idx >= len(self.indices):
             raise IndexError(f"Index {idx} out of range for dataset with {len(self.indices)} indices")
         return self.dataset[self.indices[idx]]
-
-
-if __name__ == "__main__":
-    # Path to test data
-    import sys
-    from pathlib import Path
-    
-    # Get the project root directory
-    if len(sys.argv) > 1:
-        project_root = sys.argv[1]
-    else:
-        project_root = str(Path(__file__).resolve().parents[2])  # Go up 2 levels from this file
-    
-    spec_dir = os.path.join(project_root, "data", "synth", "spectrograms")
-    label_dir = os.path.join(project_root, "data", "synth", "labels")
-    
-    print(f"Testing SynthDataset with data from:")
-    print(f"  Spectrograms: {spec_dir}")
-    print(f"  Labels: {label_dir}")
-    
-    # Build a chord mapping
-    temp_dataset = SynthDataset(spec_dir, label_dir, chord_mapping=None, seq_len=1, stride=1)
-    unique_chords = set(sample['chord_label'] for sample in temp_dataset.samples)
-    chord_mapping = {chord: idx for idx, chord in enumerate(sorted(unique_chords))}
-    
-    # Make sure 'N' is included for no-chord label
-    if "N" not in chord_mapping:
-        chord_mapping["N"] = len(chord_mapping)
-    
-    print(f"\nGenerated chord mapping with {len(chord_mapping)} unique chords")
-    print(f"First 5 mappings: {dict(list(chord_mapping.items())[:5])}")
-    
-    # Create dataset with reasonable sequence length
-    dataset = SynthDataset(spec_dir, label_dir, chord_mapping=chord_mapping, seq_len=10, stride=5)
-    
-    # Print dataset stats
-    print(f"\nDataset Statistics:")
-    print(f"  Total frames: {len(dataset.samples)}")
-    print(f"  Total segments: {len(dataset)}")
-    print(f"  Train segments: {len(dataset.train_indices)}")
-    print(f"  Eval segments: {len(dataset.eval_indices)}")
-    print(f"  Test segments: {len(dataset.test_indices)}")
-    
-    # Test loaders
-    train_loader = dataset.get_train_iterator(batch_size=16, shuffle=True)
-    val_loader = dataset.get_eval_iterator(batch_size=16)
-    test_loader = dataset.get_test_iterator(batch_size=16)
-    
-    # Display sample batch
-    sample_batch = next(iter(train_loader))
-    print(f"\nSample batch:")
-    print(f"  Spectrogram shape: {sample_batch['spectro'].shape}")
-    print(f"  Target chord indices: {sample_batch['chord_idx'].shape}")
-    
-    print("\nTest complete!")
-
-    # Update and uncomment the multi-format support test
-    test_multi_format_support()
-
-
