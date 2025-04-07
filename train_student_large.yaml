@@ -205,10 +205,10 @@ spec:
             - name: WARMUP_END_LR
               value: "0.001"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "6"  # Number of epochs for warm-up
+              value: "10"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
-              value: "0.2"  # Set dropout probability (0-1)
+              value: "0.3"  # Set dropout probability (0-1)
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
@@ -229,7 +229,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
             - name: SUB_DIR
-              value: "fma-02"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
+              value: "fma-logits"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
@@ -238,11 +238,11 @@ spec:
               value: "true"  # Whether to reset LR scheduler when resetting epochs (true/false)
             # Dataset initialization controls
             - name: LAZY_INIT
-              value: "true"  # Controls dataset lazy initialization (true/false)
+              value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
               value: "null"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
-              value: "true"  # Use metadata-only caching to reduce memory usage
+              value: "false"  # Use metadata-only caching to reduce memory usage
           command:
             - sh
             - -c
@@ -570,12 +570,12 @@ spec:
               python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
             requests:
-              cpu: "6"             
+              cpu: "5"             
               memory: "48Gi"    
               nvidia.com/gpu: "1"
             limits:
               cpu: "10"             
-              memory: "96Gi" 
+              memory: "108Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage

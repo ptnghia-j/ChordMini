@@ -147,7 +147,8 @@ def main():
     # Always use large vocabulary
     config.feature['large_voca'] = True  # Set to True always
     n_classes = 170  # Large vocabulary size
-    model_file = args.model_file or './checkpoints/student_model_best.pth'
+    #model_file = args.model_file or './checkpoints/student_model_best.pth'
+    model_file = args.model_file or './checkpoints/student_model_final.pth'
     idx_to_chord = idx2voca_chord()
     logger.info("Using large vocabulary chord set (170 chords)")
 

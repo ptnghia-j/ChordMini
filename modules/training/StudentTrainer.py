@@ -2,6 +2,7 @@ import re
 import os
 import torch
 import numpy as np
+import warnings  # Add import for warnings module
 
 import torch.nn.functional as F
 import matplotlib.pyplot as plt  # Add missing matplotlib import
@@ -17,6 +18,83 @@ from modules.utils.visualize import (
     plot_learning_curve, calculate_quality_confusion_matrix,
     calculate_confusion_matrix
 )
+
+def safe_clip_grad_norm_(parameters, max_norm, error_if_nonfinite=False, verbose=True):
+    """
+    Safely clip gradient norm while providing helpful diagnostics for non-finite values.
+    
+    Args:
+        parameters: Model parameters to clip gradients for
+        max_norm: Maximum allowed gradient norm
+        error_if_nonfinite: Whether to raise error on non-finite gradients
+        verbose: Whether to print detailed diagnostics when non-finite values are found
+    
+    Returns:
+        total_norm: The total gradient norm before clipping
+    """
+    # Filter parameters that have gradients
+    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    
+    # Check if there are any parameters with gradients
+    if len(parameters) == 0:
+        return torch.tensor(0.0)
+    
+    # Add gradient clamping to stabilize training
+    for p in parameters:
+        if p.grad is not None:
+            # Apply different clamping based on parameter shape
+            if p.numel() <= 12:  # For small vectors like biases
+                p.grad.data.clamp_(-1.0, 1.0)  # More conservative for small parameters
+            else:
+                p.grad.data.clamp_(-2.0, 2.0)  # Allow slightly larger gradients for weights
+    
+    # Check for non-finite gradients before clipping
+    has_nonfinite = False
+    problem_params = []
+    
+    for i, p in enumerate(parameters):
+        if not torch.isfinite(p.grad).all():
+            has_nonfinite = True
+            problem_params.append((i, p))
+    
+    # Handle non-finite gradients with better diagnostics
+    if has_nonfinite:
+        if verbose:
+            info(f"Non-finite gradients detected in {len(problem_params)} parameters")
+            
+            # Print stats about the first few problematic parameters
+            for i, (idx, param) in enumerate(problem_params[:3]):  # Limit to first 3
+                grad = param.grad
+                nan_count = torch.isnan(grad).sum().item()
+                inf_count = torch.isinf(grad).sum().item()
+                total_elements = grad.numel()
+                
+                info(
+                    f"Parameter {idx}: shape={list(param.shape)}, "
+                    f"NaNs: {nan_count}/{total_elements} ({nan_count/total_elements:.2%}), "
+                    f"Infs: {inf_count}/{total_elements} ({inf_count/total_elements:.2%})"
+                )
+            
+            if len(problem_params) > 3:
+                info(f"... and {len(problem_params) - 3} more parameters with issues")
+        
+        # Zero out problematic gradients to allow training to continue
+        for _, p in problem_params:
+            p.grad = torch.where(torch.isfinite(p.grad), p.grad, torch.zeros_like(p.grad))
+        
+        info(
+            "Non-finite gradients detected and zeroed out. "
+            "This may indicate numerical instability in your model."
+        )
+    
+    # Now apply gradient clipping with the fixed gradients
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        total_norm = torch.nn.utils.clip_grad_norm_(
+            parameters, max_norm, error_if_nonfinite=error_if_nonfinite
+        )
+    
+    return total_norm
 
 class StudentTrainer(BaseTrainer):
     """
@@ -355,55 +433,65 @@ class StudentTrainer(BaseTrainer):
             # info(f"Dimension mismatch in distillation_loss: student {student_logits.shape}, teacher {teacher_logits.shape}")
             
             try:
-                # Try to adapt dimensions - comment out detailed logging for diagnosis
+                # Cache key for shape transformation
                 s_shape, t_shape = student_logits.shape, teacher_logits.shape
+                shape_key = (tuple(t_shape), tuple(s_shape))
                 
-                # Handle 4D teacher tensor (batch, seq, time, classes) → needs special handling
-                if len(t_shape) == 4 and t_shape[1] == 1:
-                    # This is the key fix: squeeze dimension 1 and then reshape
-                    # info(f"Reshaping 4D teacher tensor with shape {t_shape}")
-                    # First squeeze the singleton dimension
-                    teacher_logits = teacher_logits.squeeze(1)  # Now (batch, time, classes)
+                # See if we've handled this shape combination before
+                if not hasattr(self, '_shape_transform_cache'):
+                    self._shape_transform_cache = {}
+                
+                # Use cached transformation if available
+                if shape_key in self._shape_transform_cache:
+                    teacher_logits = self._shape_transform_cache[shape_key](teacher_logits)
+                else:
+                    # Handle 4D teacher tensor (batch, seq, time, classes) → needs special handling
+                    if len(t_shape) == 4 and t_shape[1] == 1:
+                        # Define an efficient transformation for this shape pattern
+                        def transform_fn(tensor):
+                            # Use view instead of reshape when possible to avoid copying memory
+                            # contiguous() ensures memory layout is suitable for view
+                            tensor = tensor.squeeze(1).contiguous()  # Now (batch, time, classes)
+                            
+                            # If the student logits are already flattened (batch*time, classes)
+                            if len(s_shape) == 2:
+                                expected_batch_size = t_shape[0] * t_shape[2]  # batch * time
+                                if expected_batch_size == s_shape[0]:
+                                    return tensor.view(-1, t_shape[3])  # (batch*time, classes)
+                                elif s_shape[0] > expected_batch_size:
+                                    return tensor.view(-1, t_shape[3])
+                                else:
+                                    # More efficient slicing approach
+                                    return tensor[:s_shape[0]//t_shape[2]].view(-1, t_shape[3])
+                            return tensor
                     
-                    # If the student logits are already flattened (batch*time, classes)
-                    if len(s_shape) == 2:
-                        # Calculate if the batch sizes would match after flattening
-                        expected_batch_size = t_shape[0] * t_shape[2]  # batch * time
-                        if expected_batch_size == s_shape[0]:
-                            # Perfect! Just reshape teacher to match student
-                            # info(f"Flattening teacher tensor from {teacher_logits.shape} to match student {s_shape}")
-                            teacher_logits = teacher_logits.reshape(-1, t_shape[3])  # (batch*time, classes)
-                        else:
-                            # info(f"Batch size mismatch after flattening: expected {expected_batch_size}, got {s_shape[0]}")
-                            # If student batch is larger, need to subsample
-                            if s_shape[0] > expected_batch_size:
-                                pass  # Incomplete code - will be implemented later
-                            else:
-                                pass  # Incomplete code - will be implemented later
-                
-                # If that didn't work, try more basic approaches
-                if student_logits.shape != teacher_logits.shape:
-                    if len(s_shape) != len(t_shape):
-                        # info(f"Dimension count mismatch: student has {len(s_shape)}, teacher has {len(t_shape)}")
-                        pass
+                        # Apply transformation
+                        teacher_logits = transform_fn(teacher_logits)
+                        # Cache for future reuse
+                        self._shape_transform_cache[shape_key] = transform_fn
                     
-                    # Check for batch size mismatch in 2D case
-                    if len(s_shape) == 2 and len(t_shape) == 2 and s_shape[1] == t_shape[1]:
-                        if s_shape[0] > t_shape[0]:
-                            # info(f"Batch size mismatch: student={s_shape[0]}, teacher={t_shape[0]}")
-                            # info(f"Subsampling student batch from {s_shape[0]} to {t_shape[0]}")
-                            student_logits = student_logits[:t_shape[0]]
-                            targets = targets[:t_shape[0]] if targets.size(0) > t_shape[0] else targets
-                        else:
-                            # info(f"Batch size mismatch: student={s_shape[0]}, teacher={t_shape[0]}")
-                            # info(f"Truncating teacher batch from {t_shape[0]} to {s_shape[0]}")
-                            teacher_logits = teacher_logits[:s_shape[0]]
+                    # Simple and direct dimension handling for 2D/3D mismatch
+                    elif len(s_shape) != len(t_shape):
+                        if len(s_shape) == 2 and len(t_shape) == 3:
+                            # Create a reusable transformation function
+                            def transform_fn(tensor):
+                                return tensor.mean(dim=1)
+                            
+                            teacher_logits = transform_fn(teacher_logits)
+                            self._shape_transform_cache[shape_key] = transform_fn
+                        
+                        elif len(s_shape) == 3 and len(t_shape) == 2:
+                            # Create a reusable transformation function
+                            def transform_fn(tensor):
+                                return tensor.unsqueeze(1).expand(-1, s_shape[1], -1)
+                            
+                            teacher_logits = transform_fn(teacher_logits)
+                            self._shape_transform_cache[shape_key] = transform_fn
                 
-                # Final check once more before continuing
+                # Final check for shape match
                 if student_logits.shape != teacher_logits.shape:
-                    raise ValueError(f"Failed to match dimensions after attempted fixes: student {student_logits.shape}, teacher {teacher_logits.shape}")
-                
-                # info(f"Successfully adapted dimensions for KD loss to {student_logits.shape}")
+                    raise ValueError(f"Failed to match dimensions: student {student_logits.shape}, teacher {teacher_logits.shape}")
+                    
             except Exception as e:
                 info(f"Error adapting dimensions: {str(e)}")
                 info("Falling back to standard cross entropy loss")
@@ -676,7 +764,7 @@ class StudentTrainer(BaseTrainer):
         info(f"Epoch Validation Loss: {avg_loss:.4f}, Accuracy: {val_acc:.4f}")
         
         # Pass the current epoch to the confusion matrix function
-        calculate_confusion_matrix(all_preds, all_targets, self.checkpoint_dir, current_epoch)
+        calculate_confusion_matrix(all_preds, all_targets, self.idx_to_chord, self.checkpoint_dir, current_epoch)
         
         self.model.train()
         return avg_loss, val_acc
@@ -1059,7 +1147,7 @@ class StudentTrainer(BaseTrainer):
                                     # Use scaler for mixed precision
                                     scaler.scale(loss).backward()
                                     scaler.unscale_(self.optimizer)  # Unscale before clipping
-                                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm, error_if_nonfinite=False)
+                                    safe_clip_grad_norm_(self.model.parameters(), self.max_grad_norm, error_if_nonfinite=False)
                                     scaler.step(self.optimizer)
                                     scaler.update()
                                     
@@ -1106,7 +1194,7 @@ class StudentTrainer(BaseTrainer):
                             # Skip invalid losses (avoid NaN propagation)
                             if loss is not None and not torch.isnan(loss) and torch.isfinite(loss):
                                 loss.backward()
-                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm, error_if_nonfinite=False)
+                                safe_clip_grad_norm_(self.model.parameters(), self.max_grad_norm, error_if_nonfinite=False)
                                 self.optimizer.step()
                                 
                                 preds = logits.argmax(dim=1)
@@ -1130,9 +1218,9 @@ class StudentTrainer(BaseTrainer):
                         info(traceback.format_exc())
                         continue  # Skip this batch if there's an error
                 
-                # After each epoch, clear CUDA cache to prevent memory fragmentation
-                if (epoch + 1) % 5 == 0 and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # # After each epoch, clear CUDA cache to prevent memory fragmentation
+                # if (epoch + 1) % 5 == 0 and torch.cuda.is_available():
+                #     torch.cuda.empty_cache()
                 
                 # Log KD usage statistics 
                 if self.use_kd_loss:

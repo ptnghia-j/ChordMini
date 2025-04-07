@@ -177,7 +177,7 @@ spec:
               value: "1.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
             # Learning rate scheduling options - overrides student_config.yaml settings
             - name: LR_SCHEDULE
-              value: "cosine"  # Changed from empty string to 'validation'
+              value: "validation"  # Changed from empty string to 'validation'
             # Additional learning rate parameters - new additions
             - name: LEARNING_RATE
               value: "0.001"  # Base learning rate
@@ -185,7 +185,7 @@ spec:
               value: "0.00005"  # Minimum learning rate for schedulers
             # Knowledge distillation settings
             - name: USE_KD_LOSS
-              value: "true"  # Set to "true" to enable KD loss
+              value: "false"  # Set to "true" to enable KD loss
             - name: KD_ALPHA
               value: "0.1"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
@@ -242,7 +242,7 @@ spec:
             - name: SMALL_DATASET
               value: "null"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
-              value: "true"  # Use metadata-only caching to reduce memory usage
+              value: "false"  # Use metadata-only caching to reduce memory usage
           command:
             - sh
             - -c
@@ -414,7 +414,6 @@ spec:
                 CACHE_ARGS="--metadata_cache"
               else
                 echo "Dataset caching disabled to reduce memory usage"
-                CACHE_ARGS="--disable_cache"
               fi
               
               # Add cache fraction argument
@@ -558,9 +557,21 @@ spec:
                 fi
               fi
               
+              # Define dataset paths based on selected dataset type
+              if [ "${DATASET_TYPE}" = "maestro" ]; then
+                SPEC_DIR_PATH="${DATA_ROOT}/maestro_synth/spectrograms"
+                LABEL_DIR_PATH="${DATA_ROOT}/maestro_synth/labels"
+                echo "Using Maestro dataset paths: ${SPEC_DIR_PATH} and ${LABEL_DIR_PATH}"
+              else
+                SPEC_DIR_PATH="${DATA_ROOT}/synth/spectrograms"
+                LABEL_DIR_PATH="${DATA_ROOT}/synth/labels"
+                echo "Using FMA dataset paths: ${SPEC_DIR_PATH} and ${LABEL_DIR_PATH}"
+              fi
+              
               # Run the student training script with all options (without --best_model_dir flag)
               echo "Starting student training with GPU optimization and all options..."
-              python train_student.py $DATASET_ARG --config ./config/student_config.yaml --save_dir ${CHECKPOINTS_DIR}/${SUB_DIR} \
+              python train_student.py $DATASET_ARG --spec_dir ${SPEC_DIR_PATH} \
+                --label_dir ${LABEL_DIR_PATH} --config ./config/student_config.yaml --save_dir ${CHECKPOINTS_DIR}/${SUB_DIR} \
                 ${LR_SCHEDULE_ARG} ${WARMUP_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} \
                 ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS}
               
@@ -571,11 +582,11 @@ spec:
           resources:
             requests:
               cpu: "4"             
-              memory: "18Gi"    
+              memory: "16Gi"    
               nvidia.com/gpu: "1"
             limits:
               cpu: "8"             
-              memory: "36Gi" 
+              memory: "32Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage

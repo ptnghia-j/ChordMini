@@ -334,7 +334,7 @@ def main():
     logger.info(f"Model scale: {model_scale}")
     
     # Log knowledge distillation settings
-    use_kd = args.use_kd_loss or config.training.get('use_kd_loss', False)
+    use_kd = args.use_kd_loss if args.use_kd_loss else config.training.get('use_kd_loss', False)
     use_kd = str(use_kd).lower() == "true"
     
     kd_alpha = args.kd_alpha or config.training.get('kd_alpha', 0.5)
@@ -371,11 +371,16 @@ def main():
     
     if args.use_warmup or config.training.get('use_warmup', False):
         # FIX: Use correct warmup_epochs from config without hardcoded defaults
-        warmup_epochs = config.training.get('warmup_epochs')
-        if warmup_epochs is not None:
-            logger.info(f"Using LR warm-up for {warmup_epochs} epochs")
-        else:
-            logger.info(f"Using LR warm-up (epochs not specified in config)")
+        try:
+            warmup_epochs = int(args.warmup_epochs) if args.warmup_epochs else config.training.get('warmup_epochs', None)
+            if warmup_epochs is not None:
+                logger.info(f"Using LR warm-up for {warmup_epochs} epochs")
+            else:
+                logger.info(f"Using LR warm-up (epochs not specified in config)")
+        except ValueError:
+            warmup_epochs = 10
+            logger.error("Invalid warmup_epochs value, using default from config")
+
             
         # Log warmup parameters
         logger.info(f"Warm-up start LR: {config.training.get('warmup_start_lr')}")
@@ -384,12 +389,18 @@ def main():
     # Initialize dataset_args dictionary
     dataset_args = {}
     
-    # Set small dataset percentage
-    dataset_args['small_dataset_percentage'] = args.small_dataset or config.data.get('small_dataset_percentage')
-    if dataset_args['small_dataset_percentage'] is not None:
-        logger.info(f"\n=== Using Small Dataset ===")
-        logger.info(f"Dataset will be limited to {dataset_args['small_dataset_percentage'] * 100:.1f}% of the full size")
-        logger.info(f"This is a testing/development feature and should not be used for final training")
+    dataset_args['small_dataset_percentage'] = args.small_dataset
+    if dataset_args['small_dataset_percentage'] is None or (isinstance(dataset_args['small_dataset_percentage'], str) and dataset_args['small_dataset_percentage'].lower() in ["null", "none", ""]):
+        dataset_args['small_dataset_percentage'] = None
+        logger.info("Using full dataset (small_dataset_percentage is None)")
+    else:
+        try:
+            dataset_args['small_dataset_percentage'] = float(dataset_args['small_dataset_percentage'])
+            logger.info(f"Using {dataset_args['small_dataset_percentage']*100:.1f}% of dataset")
+        except ValueError:
+            logger.error(f"Invalid small_dataset_percentage: {dataset_args['small_dataset_percentage']}")
+            dataset_args['small_dataset_percentage'] = None
+            logger.info("Falling back to using full dataset")
     
     # Set dataset type
     dataset_args['dataset_type'] = config.data.get('dataset_type', 'fma')
@@ -466,13 +477,13 @@ def main():
         'frame_duration': config.feature.get('hop_duration', 0.1),
         'verbose': True,
         'device': device,
-        'prefetch_factor': float(args.prefetch_factor),
+        'prefetch_factor': float(args.prefetch_factor) if args.prefetch_factor else 1,
         'num_workers': 6,
         # debug area
         'use_cache': not config.data.get('disable_cache', False),
-        'metadata_only': config.data.get('metadata_cache', False),
+        'metadata_only': str(args.metadata_cache).lower() == "true",
         'cache_fraction': config.data.get('cache_fraction', 0.1),
-        'lazy_init': config.data.get('lazy_init', False),
+        'lazy_init': str(args.lazy_init).lower() == "true",
         'batch_gpu_cache': str(args.batch_gpu_cache).lower() == "true",
     })
     

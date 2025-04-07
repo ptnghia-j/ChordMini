@@ -592,7 +592,7 @@ def main():
     parser.add_argument('--audio_dir', type=str, required=True, help='Directory containing audio files')
     parser.add_argument('--label_dir', type=str, required=True, help='Directory containing label files')
     parser.add_argument('--config', type=str, default='./config/student_config.yaml', help='Path to configuration file')
-    parser.add_argument('--model', type=str, default='./checkpoints/student_model_best.pth', help='Path to model file')
+    parser.add_argument('--model', type=str, default='./checkpoints/student_model_final.pth', help='Path to model file')
     parser.add_argument('--output', type=str, default='evaluation_results.json', help='Path to save results')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
     args = parser.parse_args()

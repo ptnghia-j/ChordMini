@@ -1504,7 +1504,10 @@ class SynthDataset(Dataset):
                 try:
                     self.gpu_batch_cache[idx] = sample_out
                     # Limit cache size to prevent memory issues
-                    if len(self.gpu_batch_cache) > 768:
+                    # ! Note: Effectively if stride step is small, cache works well for all overlapping segments
+                    # ! up to 2 * batch size, unless gpu has more memory than dataset total size
+                    # ! we can never cache the whole dataset and missing as window slides
+                    if len(self.gpu_batch_cache) > 256:
                         oldest_key = next(iter(self.gpu_batch_cache))
                         del self.gpu_batch_cache[oldest_key]
                 except Exception:
