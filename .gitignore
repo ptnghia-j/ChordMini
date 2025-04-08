@@ -237,5 +237,20 @@ __pycache__/
 .DS_Store
 
 # Dataset caches
-dataset_cache_*.pklcheckpoints/*.pth
+dataset_cache_*.pkl
 cache/
+
+# Ignore all numpy cache files
+cache/
+cache/*.npy
+*.npy.cache
+**/*.npy.cache
+**/cache/*.npy
+
+# Ensure all data caches are ignored
+dataset_cache_*.pkl
+dataset_cache.pkl
+
+# Fix the typo in the previous line that combined two patterns
+dataset_cache_*.pkl
+checkpoints/*.pth
