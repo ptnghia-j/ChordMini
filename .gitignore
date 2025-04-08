@@ -238,3 +238,4 @@ __pycache__/
 
 # Dataset caches
 dataset_cache_*.pklcheckpoints/*.pth
+cache/

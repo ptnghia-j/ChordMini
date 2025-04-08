@@ -106,6 +106,48 @@ def process_audio_with_padding(audio_file, config):
         logger.error(f"Error processing audio file: {e}")
         raise
 
+def load_hmm_model(hmm_path, base_model, device):
+    """
+    Load HMM model for chord sequence smoothing
+    
+    Args:
+        hmm_path: Path to the HMM model checkpoint
+        base_model: The loaded base chord recognition model
+        device: Device to load the model on
+    
+    Returns:
+        Loaded HMM model or None if loading fails
+    """
+    try:
+        from modules.models.HMM.ChordHMM import ChordHMM
+        
+        logger.info(f"Loading HMM model from {hmm_path}")
+        
+        # Load checkpoint
+        checkpoint = torch.load(hmm_path, map_location=device)
+        
+        # Get configuration
+        config = checkpoint.get('config', {})
+        num_states = config.get('num_states', 170)
+        
+        # Create HMM model
+        hmm_model = ChordHMM(
+            pretrained_model=base_model,  # Use the already loaded base model
+            num_states=num_states,
+            device=device
+        ).to(device)
+        
+        # Load HMM state dict
+        hmm_model.load_state_dict(checkpoint['model_state_dict'])
+        
+        logger.info(f"HMM model loaded successfully with {num_states} states")
+        return hmm_model
+    except Exception as e:
+        logger.error(f"Error loading HMM model: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Run chord recognition on audio files")
@@ -121,9 +163,10 @@ def main():
                        help='Apply smoothing to predictions to reduce noise')
     parser.add_argument('--min_segment_duration', type=float, default=0.0,
                        help='Minimum duration in seconds for a chord segment (to reduce fragmentation)')
-    # Add model scale parameter
     parser.add_argument('--model_scale', type=float, default=1.0,
                        help='Scaling factor for model capacity (0.5=half, 1.0=base, 2.0=double)')
+    parser.add_argument('--hmm', type=str, default=None,
+                       help='Path to HMM model for chord sequence smoothing')
     args = parser.parse_args()
 
     # Set up logging
@@ -147,7 +190,6 @@ def main():
     # Always use large vocabulary
     config.feature['large_voca'] = True  # Set to True always
     n_classes = 170  # Large vocabulary size
-    #model_file = args.model_file or './checkpoints/student_model_best.pth'
     model_file = args.model_file or './checkpoints/student_model_final.pth'
     idx_to_chord = idx2voca_chord()
     logger.info("Using large vocabulary chord set (170 chords)")
@@ -233,6 +275,15 @@ def main():
         mean, std = 0.0, 1.0  # Default values
         logger.warning("Using default normalization parameters")
 
+    # Load HMM model if specified
+    hmm_model = None
+    if args.hmm and os.path.isfile(args.hmm):
+        hmm_model = load_hmm_model(args.hmm, model, device)
+        if hmm_model:
+            logger.info("HMM model will be used for prediction smoothing")
+    elif args.hmm:
+        logger.warning(f"HMM model file not found: {args.hmm}")
+    
     # Create output directory if it doesn't exist
     os.makedirs(args.save_dir, exist_ok=True)
     
@@ -278,8 +329,8 @@ def main():
                 # Ensure feature tensor is on CPU
                 feature_tensor = torch.tensor(feature, dtype=torch.float32)
                 
-                # Get frame-level predictions in batches to avoid OOM errors
-                all_predictions = []
+                # Get raw frame-level predictions in batches to avoid OOM errors
+                raw_predictions = []
                 batch_size = 32  # Process in smaller batches
                 
                 for t in range(0, num_instance, batch_size):
@@ -315,18 +366,37 @@ def main():
                     # Flatten and collect predictions
                     if prediction.dim() > 1:
                         for p in prediction:
-                            all_predictions.append(p.cpu().numpy())
+                            raw_predictions.append(p.cpu().numpy())
                     else:
-                        all_predictions.append(prediction.cpu().numpy())
+                        raw_predictions.append(prediction.cpu().numpy())
+                
+                # Concatenate all raw predictions
+                raw_predictions = np.concatenate(raw_predictions)
+                
+                # Apply HMM smoothing if model is available
+                if hmm_model is not None:
+                    logger.info("Applying HMM sequence modeling to predictions...")
+                    hmm_model.eval()
+                    
+                    # Move everything to CPU for consistent processing
+                    hmm_model = hmm_model.cpu()
+                    
+                    # Run Viterbi decoding on the full sequence for best results
+                    feature_tensor = feature_tensor.cpu()
+                    with torch.no_grad():
+                        all_predictions = hmm_model.decode(feature_tensor).cpu().numpy()
+                    
+                    logger.info(f"HMM smoothed predictions generated: {all_predictions.shape}")
+                else:
+                    # Use raw predictions or apply simple smoothing
+                    all_predictions = raw_predictions
             
-            # Concatenate all predictions
-            all_predictions = np.concatenate(all_predictions)
-            
-            # Apply smoothing if requested
-            if args.smooth_predictions:
-                # Apply median filtering with window size 3
-                from scipy.signal import medfilt
-                all_predictions = medfilt(all_predictions, kernel_size=3)
+                    # Apply smoothing if requested
+                    if args.smooth_predictions:
+                        # Apply median filtering with window size 3
+                        from scipy.signal import medfilt
+                        all_predictions = medfilt(all_predictions, kernel_size=3)
+                        logger.info("Applied median filtering to predictions")
             
             # Find chord boundaries
             prev_chord = all_predictions[0]
@@ -354,8 +424,12 @@ def main():
                 final_time = min(song_length_second, feature.shape[0] * feature_per_second)
                 lines.append(f"{start_time:.6f} {final_time:.6f} {idx_to_chord[prev_chord]}\n")
             
-            # Save output to .lab file
-            output_filename = os.path.splitext(os.path.basename(audio_path))[0] + '.lab'
+            # Save output to .lab file with HMM suffix if applicable
+            output_filename = os.path.splitext(os.path.basename(audio_path))[0]
+            if hmm_model is not None:
+                output_filename += '_hmm'  # Add suffix to indicate HMM processing
+            output_filename += '.lab'
+            
             output_path = os.path.join(args.save_dir, output_filename)
             
             with open(output_path, 'w') as f:

@@ -655,3 +655,61 @@ def plot_learning_curve(train_loss, val_loss=None, title='Learning Curve', figsi
         fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
     
     return fig
+
+def visualize_transitions(hmm_model, idx_to_chord, top_k=10, save_path='transitions.png',
+                          figsize=(12, 6), cmap='viridis', title=None, dpi=300):
+    """
+    Visualize chord transition probabilities from an HMM model.
+    
+    Args:
+        hmm_model: HMM model with transitions attribute (PyTorch tensor)
+        idx_to_chord: Dictionary mapping indices to chord names
+        top_k: Number of top transitions to display
+        save_path: Path to save the visualization
+        figsize: Figure size (width, height) in inches
+        cmap: Color map for the bars
+        title: Custom title (if None, a default title is used)
+        dpi: DPI for saved figure
+        
+    Returns:
+        matplotlib figure
+    """
+    # Get transition probabilities
+    transitions = hmm_model.transitions.detach().cpu().numpy()
+    
+    # Convert from log space
+    transitions = np.exp(transitions)
+    
+    # Find top k transitions
+    top_pairs = []
+    for i in range(transitions.shape[0]):
+        for j in range(transitions.shape[1]):
+            top_pairs.append((i, j, transitions[i, j]))
+    
+    top_pairs.sort(key=lambda x: x[2], reverse=True)
+    top_pairs = top_pairs[:top_k]
+    
+    # Create labels
+    labels = []
+    values = []
+    for i, j, v in top_pairs:
+        # Handle cases where indices aren't in the chord mapping
+        chord_i = idx_to_chord.get(i, f"Chord-{i}")
+        chord_j = idx_to_chord.get(j, f"Chord-{j}")
+        labels.append(f"{chord_i}→{chord_j}")
+        values.append(v)
+    
+    # Plot
+    fig, ax = plt.subplots(figsize=figsize)
+    sns.barplot(x=labels, y=values, ax=ax, palette=cmap)
+    plt.xticks(rotation=45, ha='right')
+    plt.title(title or f"Top {top_k} Chord Transitions")
+    plt.tight_layout()
+    
+    # Save the figure if requested
+    if save_path:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+    
+    return fig

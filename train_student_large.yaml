@@ -70,86 +70,86 @@ spec:
               PROJ_ROOT="/mnt/storage/ChordMini"
               echo "Project root: $PROJ_ROOT"
               
-              # Create the data directories if they don't exist for both dataset types
-              # FMA dataset directories
-              mkdir -p "/mnt/storage/data/synth/spectrograms"
-              mkdir -p "/mnt/storage/data/synth/labels"
-              mkdir -p "/mnt/storage/data/synth/logits"
+              # Create consolidated data directories if they don't exist
+              # FMA dataset directories (using logits structure for all)
+              mkdir -p "/mnt/storage/data/logits/synth/spectrograms"
+              mkdir -p "/mnt/storage/data/logits/synth/labels"
+              mkdir -p "/mnt/storage/data/logits/synth/logits"
               
-              # Maestro dataset directories
-              mkdir -p "/mnt/storage/data/maestro_synth/spectrograms"
-              mkdir -p "/mnt/storage/data/maestro_synth/labels"
-              mkdir -p "/mnt/storage/data/maestro_synth/logits"
+              # Maestro dataset directories (using logits structure for all)
+              mkdir -p "/mnt/storage/data/logits/maestro_synth/spectrograms"
+              mkdir -p "/mnt/storage/data/logits/maestro_synth/labels"
+              mkdir -p "/mnt/storage/data/logits/maestro_synth/logits"
               
-              # Create symlinks from project directory to actual data location if needed
+              # Create symlinks from project directory to actual data location
               mkdir -p "$PROJ_ROOT/data/synth"
               mkdir -p "$PROJ_ROOT/data/maestro_synth"
               
-              # Create symlinks for FMA dataset
+              # Create unified symlinks for FMA dataset
               if [ -L "$PROJ_ROOT/data/synth/spectrograms" ]; then
                 echo "Symlink for FMA spectrograms already exists"
               else
-                ln -sf "/mnt/storage/data/synth/spectrograms" "$PROJ_ROOT/data/synth/spectrograms"
+                ln -sf "/mnt/storage/data/logits/synth/spectrograms" "$PROJ_ROOT/data/synth/spectrograms"
                 echo "Created symlink for FMA spectrograms"
               fi
               
               if [ -L "$PROJ_ROOT/data/synth/labels" ]; then
                 echo "Symlink for FMA labels already exists"
               else
-                ln -sf "/mnt/storage/data/synth/labels" "$PROJ_ROOT/data/synth/labels"
+                ln -sf "/mnt/storage/data/logits/synth/labels" "$PROJ_ROOT/data/synth/labels"
                 echo "Created symlink for FMA labels"
               fi
               
               if [ -L "$PROJ_ROOT/data/synth/logits" ]; then
                 echo "Symlink for FMA logits already exists"
               else
-                ln -sf "/mnt/storage/data/synth/logits" "$PROJ_ROOT/data/synth/logits"
+                ln -sf "/mnt/storage/data/logits/synth/logits" "$PROJ_ROOT/data/synth/logits"
                 echo "Created symlink for FMA logits"
               fi
               
-              # Create symlinks for Maestro dataset
+              # Create unified symlinks for Maestro dataset
               if [ -L "$PROJ_ROOT/data/maestro_synth/spectrograms" ]; then
                 echo "Symlink for Maestro spectrograms already exists"
               else
-                ln -sf "/mnt/storage/data/maestro_synth/spectrograms" "$PROJ_ROOT/data/maestro_synth/spectrograms"
+                ln -sf "/mnt/storage/data/logits/maestro_synth/spectrograms" "$PROJ_ROOT/data/maestro_synth/spectrograms"
                 echo "Created symlink for Maestro spectrograms"
               fi
               
               if [ -L "$PROJ_ROOT/data/maestro_synth/labels" ]; then
                 echo "Symlink for Maestro labels already exists"
               else
-                ln -sf "/mnt/storage/data/maestro_synth/labels" "$PROJ_ROOT/data/maestro_synth/labels"
+                ln -sf "/mnt/storage/data/logits/maestro_synth/labels" "$PROJ_ROOT/data/maestro_synth/labels"
                 echo "Created symlink for Maestro labels"
               fi
               
               if [ -L "$PROJ_ROOT/data/maestro_synth/logits" ]; then
                 echo "Symlink for Maestro logits already exists"
               else
-                ln -sf "/mnt/storage/data/maestro_synth/logits" "$PROJ_ROOT/data/maestro_synth/logits"
+                ln -sf "/mnt/storage/data/logits/maestro_synth/logits" "$PROJ_ROOT/data/maestro_synth/logits"
                 echo "Created symlink for Maestro logits"
               fi
               
               # Check for spectrogram files in both datasets
               echo "---- Checking for FMA spectrogram files ----"
-              find "/mnt/storage/data/synth" -name "*.npy" | head -5
+              find "/mnt/storage/data/logits/synth/spectrograms" -name "*.npy" | head -5
               
               echo "---- Checking for Maestro spectrogram files ----"
-              find "/mnt/storage/data/maestro_synth" -name "*.npy" | head -5
+              find "/mnt/storage/data/logits/maestro_synth/spectrograms" -name "*.npy" | head -5
               
               # Check for label files in both datasets
               echo "---- Checking for FMA label files ----"
-              find "/mnt/storage/data/synth" -name "*.lab" | head -5
+              find "/mnt/storage/data/logits/synth/labels" -name "*.lab" | head -5
               
               echo "---- Checking for Maestro label files ----"
-              find "/mnt/storage/data/maestro_synth" -name "*.lab" | head -5
+              find "/mnt/storage/data/logits/maestro_synth/labels" -name "*.lab" | head -5
               
               # Verify there are some relevant files for at least one dataset
               echo "Checking if there are data files to process..."
-              FMA_SPEC_COUNT=$(find "/mnt/storage/data/synth" -type f -name "*.npy" | wc -l)
-              FMA_LABEL_COUNT=$(find "/mnt/storage/data/synth" -type f -name "*.lab" | wc -l)
+              FMA_SPEC_COUNT=$(find "/mnt/storage/data/logits/synth/spectrograms" -type f -name "*.npy" | wc -l)
+              FMA_LABEL_COUNT=$(find "/mnt/storage/data/logits/synth/labels" -type f -name "*.lab" | wc -l)
               
-              MAESTRO_SPEC_COUNT=$(find "/mnt/storage/data/maestro_synth" -type f -name "*.npy" | wc -l)
-              MAESTRO_LABEL_COUNT=$(find "/mnt/storage/data/maestro_synth" -type f -name "*.lab" | wc -l)
+              MAESTRO_SPEC_COUNT=$(find "/mnt/storage/data/logits/maestro_synth/spectrograms" -type f -name "*.npy" | wc -l)
+              MAESTRO_LABEL_COUNT=$(find "/mnt/storage/data/logits/maestro_synth/labels" -type f -name "*.lab" | wc -l)
               
               echo "Found $FMA_SPEC_COUNT FMA spectrogram files and $FMA_LABEL_COUNT FMA label files"
               echo "Found $MAESTRO_SPEC_COUNT Maestro spectrogram files and $MAESTRO_LABEL_COUNT Maestro label files"
@@ -163,7 +163,6 @@ spec:
             - name: storage
               mountPath: /mnt/storage
       containers:
-        # !!! It is recommended to test the model on small portion of the dataset first
         - name: student-trainer
           image: pytorch/pytorch:1.9.0-cuda11.1-cudnn8-runtime
           workingDir: /mnt/storage/ChordMini
@@ -187,7 +186,7 @@ spec:
             - name: USE_KD_LOSS
               value: "true"  # Set to "true" to enable KD loss
             - name: KD_ALPHA
-              value: "0.1"  # Weight for KD loss (0-1)
+              value: "0.2"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
               value: "2.0"  # Temperature for softening distributions
             # Focal loss settings
@@ -196,19 +195,19 @@ spec:
             - name: FOCAL_GAMMA
               value: "2.0"   # Focusing parameter for focal loss
             - name: FOCAL_ALPHA
-              value: "0.25"  # Class weight parameter for focal loss
+              value: "0.3"  # Class weight parameter for focal loss
             # Warmup settings
             - name: USE_WARMUP
               value: "true"  # Set to "true" to enable learning rate warm-up
             - name: WARMUP_START_LR
-              value: "0.0001"  # Starting learning rate for warm-up
+              value: "0.0005"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
               value: "0.001"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
               value: "10"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
-              value: "0.3"  # Set dropout probability (0-1)
+              value: "0.2"  # Set dropout probability (0-1)
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
@@ -222,9 +221,9 @@ spec:
               value: "true"  # Enable GPU batch caching
             - name: PREFETCH_FACTOR
               value: "6"     # Prefetch 6 batches for better throughput
-            # Add dataset type environment variable
+            # Add dataset type environment variable with combined option
             - name: DATASET_TYPE
-              value: "fma"  # Use "maestro" for Maestro dataset or "fma" for FMA dataset
+              value: "fma"  # Options: "fma", "maestro", or "combined"
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
@@ -275,13 +274,13 @@ spec:
               if [ ! -L "./data/synth/spectrograms" ]; then
                 echo "Recreating symlink for spectrograms"
                 mkdir -p ./data/synth
-                ln -sf "/mnt/storage/data/synth/spectrograms" "./data/synth/spectrograms"
+                ln -sf "/mnt/storage/data/logits/synth/spectrograms" "./data/synth/spectrograms"
               fi
               
               if [ ! -L "./data/synth/labels" ]; then
                 echo "Recreating symlink for labels"
                 mkdir -p ./data/synth
-                ln -sf "/mnt/storage/data/synth/labels" "./data/synth/labels"
+                ln -sf "/mnt/storage/data/logits/synth/labels" "./data/synth/labels"
               fi
               
               # Verify that spectrograms and labels exist in the expected location
@@ -291,40 +290,36 @@ spec:
               
               # Before starting training, verify data exists for selected dataset
               if [ "${DATASET_TYPE}" = "maestro" ]; then
-                SPEC_COUNT=$(find ./data/maestro_synth/spectrograms -type f -name "*.npy" | wc -l)
-                LABEL_COUNT=$(find ./data/maestro_synth/labels -type f -name "*.lab" | wc -l)
+                SPEC_COUNT=$(find ./data/logits/maestro_synth/spectrograms -type f -name "*.npy" | wc -l)
+                LABEL_COUNT=$(find ./data/logits/maestro_synth/labels -type f -name "*.lab" | wc -l)
                 echo "Using Maestro dataset: Found $SPEC_COUNT spectrogram files and $LABEL_COUNT label files"
                 
                 # Add dataset type to training command
                 DATASET_ARG="--dataset_type maestro"
+              elif [ "${DATASET_TYPE}" = "combined" ]; then
+                FMA_SPEC_COUNT=$(find ./data/logits/synth/spectrograms -type f -name "*.npy" | wc -l)
+                FMA_LABEL_COUNT=$(find ./data/logits/synth/labels -type f -name "*.lab" | wc -l)
+                MAESTRO_SPEC_COUNT=$(find ./data/logits/maestro_synth/spectrograms -type f -name "*.npy" | wc -l)
+                MAESTRO_LABEL_COUNT=$(find ./data/logits/maestro_synth/labels -type f -name "*.lab" | wc -l)
+                
+                echo "Using Combined datasets:"
+                echo "- FMA: Found $FMA_SPEC_COUNT spectrogram files and $FMA_LABEL_COUNT label files"
+                echo "- Maestro: Found $MAESTRO_SPEC_COUNT spectrogram files and $MAESTRO_LABEL_COUNT label files"
+                
+                # Add dataset type and Maestro paths to training command
+                DATASET_ARG="--dataset_type combined --maestro_spec_dir ${DATA_ROOT}/logits/maestro_synth/spectrograms --maestro_label_dir ${DATA_ROOT}/logits/maestro_synth/labels"
+                
+                # Add Maestro logits path if KD is enabled
+                if [ "${USE_KD_LOSS}" = "true" ]; then
+                  DATASET_ARG="$DATASET_ARG --maestro_logits_dir ${DATA_ROOT}/logits/maestro_synth/logits"
+                fi
               else
-                SPEC_COUNT=$(find ./data/synth/spectrograms -type f -name "*.npy" | wc -l)
-                LABEL_COUNT=$(find ./data/synth/labels -type f -name "*.lab" | wc -l)
+                SPEC_COUNT=$(find ./data/logits/synth/spectrograms -type f -name "*.npy" | wc -l)
+                LABEL_COUNT=$(find ./data/logits/synth/labels -type f -name "*.lab" | wc -l)
                 echo "Using FMA dataset: Found $SPEC_COUNT spectrogram files and $LABEL_COUNT label files"
                 
                 # Add dataset type to training command
                 DATASET_ARG="--dataset_type fma"
-              fi
-              
-              # Before starting training, verify data exists
-              if [ "$SPEC_COUNT" -eq 0 ] || [ "$LABEL_COUNT" -eq 0 ]; then
-                echo "WARNING: No data found in the expected paths"
-                echo "Looking for data in alternate locations..."
-                
-                ALT_SPEC_COUNT=$(find /mnt/storage -type f -name "*.npy" | wc -l)
-                ALT_LABEL_COUNT=$(find /mnt/storage -type f -name "*.lab" | wc -l)
-                echo "Found $ALT_SPEC_COUNT .npy files and $ALT_LABEL_COUNT .lab files in alternate locations"
-                
-                # Show where the files were found
-                if [ "$ALT_SPEC_COUNT" -gt 0 ]; then
-                  echo "Sample spectrogram locations:"
-                  find /mnt/storage -type f -name "*.npy" | head -5
-                fi
-                
-                if [ "$ALT_LABEL_COUNT" -gt 0 ]; then
-                  echo "Sample label locations:"
-                  find /mnt/storage -type f -name "*.lab" | head -5
-                fi
               fi
               
               # Get LR schedule option from environment
@@ -394,7 +389,7 @@ spec:
               KD_LOSS_ARG=""
               if [ "${USE_KD_LOSS}" = "true" ]; then
                 echo "Using knowledge distillation with alpha=${KD_ALPHA} and temperature=${TEMPERATURE}"
-                KD_LOSS_ARG="--use_kd_loss --kd_alpha ${KD_ALPHA} --temperature ${TEMPERATURE} --logits_dir ${DATA_ROOT}/logits/synth"
+                KD_LOSS_ARG="--use_kd_loss --kd_alpha ${KD_ALPHA} --temperature ${TEMPERATURE} --logits_dir ${DATA_ROOT}/logits/synth/logits"
                 echo "Note: Teacher logits must be included in the batch data"
               fi
               
@@ -427,34 +422,19 @@ spec:
               if [ "${USE_KD_LOSS}" = "true" ]; then
                 echo "Knowledge distillation enabled - using teacher logits"
                 
-                # Check if KD_DATA_ROOT exists
-                if [ -d "${DATA_ROOT}/logits/synth" ]; then
-                  echo "Using KD data from: ${DATA_ROOT}/logits/synth"
-                  
-                  # Define paths based on directory structure
-                  if [ -d "${DATA_ROOT}/logits/synth/spectrograms" ] && [ -d "${DATA_ROOT}/logits/synth/labels" ] && [ -d "${DATA_ROOT}/logits/synth/logits" ]; then
-                    # Standard structure with separate directories
-                    # MODIFIED: Always use the logits directory for KD if it has the proper structure
-                    echo "Found complete KD directory structure with spectrograms, labels, and logits"
-                    KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms --label_dir ${DATA_ROOT}/logits/synth/labels --logits_dir ${DATA_ROOT}/logits/synth/logits"
-                    echo "Using spectrograms, labels, and logits from the logits directory"
-                  elif [ -d "${DATA_ROOT}/logits/synth" ]; then
-                    # All files might be in the root directory
-                    KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth --label_dir ${DATA_ROOT}/logits/synth --logits_dir ${DATA_ROOT}/logits/synth"
-                    echo "Using flat KD directory structure"
-                  else
-                    echo "WARNING: KD_DATA_ROOT does not exist: ${DATA_ROOT}/logits/synth"
-                    echo "Attempting to use default paths"
-                    KD_ARGS="--logits_dir /mnt/storage/data/logits/synth/logits"
-                    
-                    # Create parent directories to avoid errors later
-                    mkdir -p "/mnt/storage/data/logits/synth/logits"
-                  fi
-                  
-                  # Log the actual paths being used
-                  echo "KD arguments: ${KD_ARGS}"
+                # Define the logits paths based on dataset type
+                if [ "${DATASET_TYPE}" = "maestro" ]; then
+                  # For Maestro dataset
+                  KD_ARGS="--logits_dir ${DATA_ROOT}/logits/maestro_synth/logits"
+                  echo "Using Maestro logits from: ${DATA_ROOT}/logits/maestro_synth/logits"
+                elif [ "${DATASET_TYPE}" = "combined" ]; then
+                  # For combined dataset
+                  KD_ARGS="--logits_dir ${DATA_ROOT}/logits/synth/logits --maestro_logits_dir ${DATA_ROOT}/logits/maestro_synth/logits"
+                  echo "Using combined logits from FMA and Maestro directories"
                 else
-                  KD_ARGS=""
+                  # Default for FMA dataset
+                  KD_ARGS="--logits_dir ${DATA_ROOT}/logits/synth/logits"
+                  echo "Using FMA logits from: ${DATA_ROOT}/logits/synth/logits"
                 fi
               else
                 KD_ARGS=""
@@ -520,7 +500,7 @@ spec:
                   echo "Found existing checkpoint at ${CHECKPOINTS_DIR}/student_model_best.pth"
                   if [ "${RESET_EPOCH}" = "true" ]; then
                     RESET_ARG="--reset_epoch"
-                    if [ "${RESET_SCHEDULER}" = "true" ]; then
+                    if [ "${RESET_SCHEDULER}" = "true" ];then
                       echo "Will load weights but start training from epoch 1 with fresh learning rate schedule"
                       RESET_ARG="${RESET_ARG} --reset_scheduler"
                     else
@@ -558,9 +538,22 @@ spec:
                 fi
               fi
               
-              # Run the student training script with all options (without --best_model_dir flag)
+              # Simplify data directory paths passed to the python script based on dataset type
+              if [ "${DATASET_TYPE}" = "maestro" ]; then
+                SPEC_DIR_ARG="--spec_dir ${DATA_ROOT}/logits/maestro_synth/spectrograms"
+                LABEL_DIR_ARG="--label_dir ${DATA_ROOT}/logits/maestro_synth/labels"
+              elif [ "${DATASET_TYPE}" = "combined" ]; then
+                SPEC_DIR_ARG="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms --maestro_spec_dir ${DATA_ROOT}/logits/maestro_synth/spectrograms"
+                LABEL_DIR_ARG="--label_dir ${DATA_ROOT}/logits/synth/labels --maestro_label_dir ${DATA_ROOT}/logits/maestro_synth/labels"
+              else
+                # Default FMA dataset
+                SPEC_DIR_ARG="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms"
+                LABEL_DIR_ARG="--label_dir ${DATA_ROOT}/logits/synth/labels"
+              fi
+              
+              # Run the student training script with all options and simplified paths
               echo "Starting student training with GPU optimization and all options..."
-              python train_student.py $DATASET_ARG --config ./config/student_config.yaml --save_dir ${CHECKPOINTS_DIR}/${SUB_DIR} \
+              python train_student.py $DATASET_ARG $SPEC_DIR_ARG $LABEL_DIR_ARG --config ./config/student_config.yaml --save_dir ${CHECKPOINTS_DIR}/${SUB_DIR} \
                 ${LR_SCHEDULE_ARG} ${WARMUP_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} \
                 ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS}
               

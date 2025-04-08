@@ -104,6 +104,33 @@ def load_model(model_file, config, device):
         logger.error(traceback.format_exc())
         return None, 0.0, 1.0, {}
 
+# NEW FUNCTION: Create and load HMM model
+def create_hmm_model(checkpoint, base_model, device):
+    """Create and initialize HMM model from checkpoint"""
+    try:
+        from modules.models.HMM.ChordHMM import ChordHMM
+        
+        # Get configuration
+        config = checkpoint.get('config', {})
+        num_states = config.get('num_states', 170)
+        
+        # Create HMM model
+        hmm_model = ChordHMM(
+            pretrained_model=base_model,  # Use the already loaded base model
+            num_states=num_states,
+            device=device
+        ).to(device)
+        
+        # Load HMM state dict
+        hmm_model.load_state_dict(checkpoint['model_state_dict'])
+        
+        logger.info(f"HMM model initialized with {num_states} states")
+        return hmm_model
+    except Exception as e:
+        logger.error(f"Error initializing HMM model: {e}")
+        logger.error(traceback.format_exc())
+        return None
+
 def flatten_nested_list(nested_list):
     """
     Recursively flatten a potentially nested list into a 1D list.
@@ -125,7 +152,7 @@ def flatten_nested_list(nested_list):
             
     return flattened
 
-def process_audio_file(audio_path, label_path, model, config, mean, std, device, idx_to_chord):
+def process_audio_file(audio_path, label_path, model, config, mean, std, device, idx_to_chord, hmm_model=None):
     """Process a single audio-label pair and create a sample for MIR evaluation."""
     try:
         # Extract features
@@ -140,7 +167,7 @@ def process_audio_file(audio_path, label_path, model, config, mean, std, device,
             feature = np.pad(feature, ((0, num_pad), (0, 0)), mode="constant", constant_values=0)
         num_instance = feature.shape[0] // n_timestep
         
-        # Generate predictions
+        # Generate predictions using base model
         all_predictions = []
         with torch.no_grad():
             model.eval()
@@ -174,7 +201,26 @@ def process_audio_file(audio_path, label_path, model, config, mean, std, device,
                 else:
                     all_predictions.append(prediction.numpy())
         
-        all_predictions = np.concatenate(all_predictions)
+        # Concatenate raw base model predictions
+        raw_predictions = np.concatenate(all_predictions)
+        
+        # Apply HMM smoothing if HMM model is available
+        if hmm_model is not None:
+            logger.debug(f"Applying HMM smoothing to predictions for {os.path.basename(audio_path)}")
+            with torch.no_grad():
+                hmm_model.eval()
+                # Convert predictions to tensor for HMM processing
+                feature_tensor = torch.tensor(feature, dtype=torch.float32).to(device)
+                
+                # Get HMM smoothed predictions using Viterbi decoding
+                smoothed_preds = hmm_model.decode(feature_tensor).cpu().numpy()
+                
+                # Use HMM predictions instead of raw predictions
+                all_predictions = smoothed_preds
+                logger.debug(f"HMM smoothing applied: raw shape={raw_predictions.shape}, smoothed shape={all_predictions.shape}")
+        else:
+            # Keep the raw predictions if no HMM model
+            all_predictions = raw_predictions
         
         # Parse ground truth annotations
         annotations = []
@@ -200,18 +246,17 @@ def process_audio_file(audio_path, label_path, model, config, mean, std, device,
         pred_frames = [idx_to_chord[int(idx)] for idx in all_predictions[:num_frames]]
         
         # Create sample dict with required fields
-        # CRITICAL FIX: Ensure all elements are strings and flatten any nested lists
         sample = {
             'song_id': os.path.splitext(os.path.basename(audio_path))[0],
             'spectro': feature,
             'model_pred': all_predictions,
             'gt_annotations': annotations,
-            # Explicitly flatten and convert to string any potential nested lists
             'chord_label': [str(chord) for chord in flatten_nested_list(gt_frames.tolist())],
             'pred_label': [str(chord) for chord in flatten_nested_list(pred_frames)],
             'feature_per_second': feature_per_second,
             'feature_length': num_frames,
-            'model_type': 'ChordNet'
+            'model_type': 'ChordNet',
+            'used_hmm': hmm_model is not None
         }
         
         return sample
@@ -245,28 +290,22 @@ def custom_calculate_chord_scores(timestamps, durations, reference_labels, predi
     min_len = min(len(intervals), len(reference_labels), len(prediction_labels))
     intervals = intervals[:min_len]
     
-    # CRITICAL FIX: Better handling of reference_labels - extract full chord sequence
     flat_ref_labels = []
     
-    # Check if reference_labels is a doubly nested list - often happens when it's [['N', 'N', ...]]
     if (len(reference_labels) > 0 and isinstance(reference_labels[0], list) and 
             len(reference_labels[0]) > 0 and isinstance(reference_labels[0][0], str)):
-        # This is the case where reference_labels is [['N', 'N', 'E:min', ...]]
-        # Extract the full inner list to preserve all chord labels
         logger.debug(f"Detected doubly-nested reference labels with {len(reference_labels[0])} items")
         flat_ref_labels = [str(chord) for chord in reference_labels[0][:min_len]]
     else:
-        # Handle other cases - single level nesting or no nesting
         for ref in reference_labels[:min_len]:
             if isinstance(ref, (list, tuple, np.ndarray)):
                 if len(ref) > 0:
-                    flat_ref_labels.append(str(ref[0]))  # Take first element if it's a list
+                    flat_ref_labels.append(str(ref[0]))
                 else:
-                    flat_ref_labels.append("N")  # Default for empty list
+                    flat_ref_labels.append("N")
             else:
-                flat_ref_labels.append(str(ref))  # Keep as is if not a list
+                flat_ref_labels.append(str(ref))
     
-    # Handle prediction labels with same careful approach
     flat_pred_labels = []
     for pred in prediction_labels[:min_len]:
         if isinstance(pred, (list, tuple, np.ndarray)):
@@ -277,54 +316,42 @@ def custom_calculate_chord_scores(timestamps, durations, reference_labels, predi
         else:
             flat_pred_labels.append(str(pred))
     
-    # Make sure both lists are the same length
     final_length = min(len(flat_ref_labels), len(flat_pred_labels))
     flat_ref_labels = flat_ref_labels[:final_length]
     flat_pred_labels = flat_pred_labels[:final_length]
     
-    # Update durations to match the final length
     if len(durations) > final_length:
         durations = durations[:final_length]
     
-    # Debug output (reduced verbosity for batch processing)
     logger.debug(f"Reference chords: {len(flat_ref_labels)}, prediction chords: {len(flat_pred_labels)}")
     
-    # Initialize scores
     root_score = thirds_score = triads_score = sevenths_score = tetrads_score = majmin_score = mirex_score = 0.0
     
     try:
-        # Root metric
         root_comparisons = mir_eval.chord.root(flat_ref_labels, flat_pred_labels)
         root_score = mir_eval.chord.weighted_accuracy(root_comparisons, durations)
         
-        # Thirds metric
         thirds_comparisons = mir_eval.chord.thirds(flat_ref_labels, flat_pred_labels)
         thirds_score = mir_eval.chord.weighted_accuracy(thirds_comparisons, durations)
         
-        # Triads metric
         triads_comparisons = mir_eval.chord.triads(flat_ref_labels, flat_pred_labels)
         triads_score = mir_eval.chord.weighted_accuracy(triads_comparisons, durations)
         
-        # Sevenths metric
         sevenths_comparisons = mir_eval.chord.sevenths(flat_ref_labels, flat_pred_labels)
         sevenths_score = mir_eval.chord.weighted_accuracy(sevenths_comparisons, durations)
         
-        # Tetrads metric
         tetrads_comparisons = mir_eval.chord.tetrads(flat_ref_labels, flat_pred_labels)
         tetrads_score = mir_eval.chord.weighted_accuracy(tetrads_comparisons, durations)
         
-        # Majmin metric
         majmin_comparisons = mir_eval.chord.majmin(flat_ref_labels, flat_pred_labels)
         majmin_score = mir_eval.chord.weighted_accuracy(majmin_comparisons, durations)
         
-        # Mirex metric
         mirex_comparisons = mir_eval.chord.mirex(flat_ref_labels, flat_pred_labels)
         mirex_score = mir_eval.chord.weighted_accuracy(mirex_comparisons, durations)
     except Exception as e:
         logger.error(f"Error in mir_eval scoring: {e}")
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     
-    # Ensure all scores are non-negative
     root_score = max(0.0, min(1.0, root_score))
     thirds_score = max(0.0, min(1.0, thirds_score))
     triads_score = max(0.0, min(1.0, triads_score))
@@ -340,40 +367,30 @@ def extract_chord_quality(chord):
     Extract chord quality from a chord label, handling different formats.
     Supports both colon format (C:maj) and direct format (Cmaj).
     """
-    # First try the colon format
     if ':' in chord:
         return chord.split(':')[1]
     
-    # Handle special cases
     if chord in ["N", "X"]:
         return chord
     
-    # Try to extract quality from direct format (e.g., Cmaj, Emin)
     import re
-    # Root note pattern (A-G with optional # or b)
     root_pattern = r'^[A-G][#b]?'
     
-    # Match and remove the root if present
     match = re.match(root_pattern, chord)
     if match:
-        # Extract everything after the root
         quality = chord[match.end():]
         if quality:
             return quality
             
-    # Default to maj if we can't determine
     return "maj"
 
 def compute_chord_quality_accuracy(reference_labels, prediction_labels):
     """
     Compute accuracy for individual chord qualities.
     Returns a dictionary mapping quality (e.g. maj, min, min7, etc.) to accuracy.
-    
-    Now handles different chord formats and provides detailed counts.
     """
     from collections import defaultdict
     
-    # Counter for debugging
     total_processed = 0
     malformed_chords = 0
     
@@ -382,7 +399,6 @@ def compute_chord_quality_accuracy(reference_labels, prediction_labels):
     for ref, pred in zip(reference_labels, prediction_labels):
         total_processed += 1
         
-        # Skip problematic chords
         if not ref or not pred:
             malformed_chords += 1
             continue
@@ -398,21 +414,15 @@ def compute_chord_quality_accuracy(reference_labels, prediction_labels):
             malformed_chords += 1
             continue
     
-    # Use logger instead of direct print statements
     logger.debug(f"Processed {total_processed} chord pairs, {malformed_chords} were malformed or caused errors")
     logger.debug(f"Found {len(stats)} unique chord qualities in the reference labels")
     
-    # Top qualities by frequency
     top_qualities = sorted(stats.items(), key=lambda x: x[1]['total'], reverse=True)
     
-    # Filter to only show qualities that appear at least 10 times or have >0% accuracy
     meaningful_qualities = [q for q, v in top_qualities if v['total'] >= 10 or (v['total'] > 0 and v['correct'] > 0)]
     logger.debug(f"Found {len(meaningful_qualities)} meaningful chord qualities (appear ≥10 times or have >0% accuracy)")
     
-    # Show top qualities by frequency in debug mode only
-    # Replace the logger.get_level() check with a simple try-except to avoid errors
     try:
-        # Check if we should show detailed debug output - try using logging level
         is_debug = logger.is_debug() if hasattr(logger, 'is_debug') else False
         if is_debug:
             count = 0
@@ -423,7 +433,6 @@ def compute_chord_quality_accuracy(reference_labels, prediction_labels):
                     if count >= 10:
                         break
     except Exception:
-        # If checking the debug level fails, just continue without showing detailed stats
         pass
     
     acc = {}
@@ -455,7 +464,6 @@ def evaluate_dataset(dataset, config, model, device, mean, std):
     """
     logger.info(f"Evaluating {len(dataset)} audio samples")
     
-    # Evaluation metrics
     score_list_dict = {
         'root': [],
         'thirds': [],
@@ -467,39 +475,30 @@ def evaluate_dataset(dataset, config, model, device, mean, std):
     }
     song_length_list = []
     
-    # Collect all reference and prediction labels for quality analysis
     all_reference_labels = []
     all_prediction_labels = []
     
-    # Process each sample with a progress bar
     for sample in tqdm(dataset, desc="Evaluating songs"):
         try:
-            # Extract timestamps
             frame_duration = config.feature.get('hop_duration', 0.1)
             feature_length = sample.get('feature_length', len(sample.get('chord_label', [])))
             timestamps = np.arange(feature_length) * frame_duration
             
-            # Extract chord labels and predictions
             reference_labels = sample.get('chord_label', [])
             prediction_labels = sample.get('pred_label', [])
             
-            # Ensure we have valid data
             if len(reference_labels) == 0 or len(prediction_labels) == 0:
                 logger.warning(f"Skipping sample {sample.get('song_id', 'unknown')}: missing labels")
                 continue
             
-            # Collect labels for quality analysis - make sure they're strings
             all_reference_labels.extend([str(label) for label in reference_labels])
             all_prediction_labels.extend([str(label) for label in prediction_labels])
             
-            # Calculate durations
             durations = np.diff(np.append(timestamps, [timestamps[-1] + frame_duration]))
             
-            # Calculate scores with our custom function
             root_score, thirds_score, triads_score, sevenths_score, tetrads_score, majmin_score, mirex_score = \
                 custom_calculate_chord_scores(timestamps, durations, reference_labels, prediction_labels)
             
-            # Store scores
             score_list_dict['root'].append(root_score)
             score_list_dict['thirds'].append(thirds_score)
             score_list_dict['triads'].append(triads_score)
@@ -508,18 +507,15 @@ def evaluate_dataset(dataset, config, model, device, mean, std):
             score_list_dict['majmin'].append(majmin_score)
             score_list_dict['mirex'].append(mirex_score)
             
-            # Store song length
             song_length = feature_length * frame_duration
             song_length_list.append(song_length)
             
-            # Print individual sample scores
             logger.info(f"Song {sample.get('song_id', 'unknown')}: length={song_length:.1f}s, root={root_score:.4f}, mirex={mirex_score:.4f}")
             
         except Exception as e:
             logger.error(f"Error evaluating sample {sample.get('song_id', 'unknown')}: {str(e)}")
             logger.debug(traceback.format_exc())
     
-    # Calculate weighted average scores
     average_score_dict = {}
     
     if song_length_list:
@@ -531,7 +527,6 @@ def evaluate_dataset(dataset, config, model, device, mean, std):
         for metric in score_list_dict:
             average_score_dict[metric] = 0.0
     
-    # Calculate chord quality accuracy if we have enough data
     quality_accuracy = {}
     quality_stats = {}
     
@@ -539,14 +534,12 @@ def evaluate_dataset(dataset, config, model, device, mean, std):
         logger.info("\n=== Chord Quality Analysis ===")
         logger.info(f"Collected {len(all_reference_labels)} reference and {len(all_prediction_labels)} prediction labels")
         
-        # Make sure lists are equal length
         min_len = min(len(all_reference_labels), len(all_prediction_labels))
         if min_len > 0:
             logger.info(f"Using {min_len} chord pairs for quality analysis")
             ref_labels = all_reference_labels[:min_len]
             pred_labels = all_prediction_labels[:min_len]
             
-            # Check if we have proper chord format with colons
             has_colon_ref = any(':' in str(label) for label in ref_labels[:100] if label)
             has_colon_pred = any(':' in str(label) for label in pred_labels[:100] if label)
             
@@ -555,7 +548,6 @@ def evaluate_dataset(dataset, config, model, device, mean, std):
             logger.debug(f"Sample reference labels: {[str(l) for l in ref_labels[:5]]}")
             logger.debug(f"Sample prediction labels: {[str(l) for l in pred_labels[:5]]}")
             
-            # Always attempt quality extraction with our improved extractor
             quality_accuracy, quality_stats = compute_chord_quality_accuracy(ref_labels, pred_labels)
     
     return score_list_dict, song_length_list, average_score_dict, quality_accuracy, quality_stats
@@ -579,7 +571,6 @@ def find_matching_audio_label_pairs(audio_dir, label_dir):
                 base_name = os.path.splitext(file)[0]
                 label_files[base_name] = os.path.join(root, file)
     
-    # Match audio files to label files
     matched_pairs = []
     for base_name, audio_path in audio_files.items():
         if base_name in label_files:
@@ -595,12 +586,11 @@ def main():
     parser.add_argument('--model', type=str, default='./checkpoints/student_model_final.pth', help='Path to model file')
     parser.add_argument('--output', type=str, default='evaluation_results.json', help='Path to save results')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
+    parser.add_argument('--hmm', type=str, default=None, help='Path to HMM model for sequence smoothing')
     args = parser.parse_args()
     
-    # Set up logging
     logger.logging_verbosity(2 if args.verbose else 1)
     
-    # Check if directories exist
     if not os.path.exists(args.audio_dir):
         logger.error(f"Audio directory not found: {args.audio_dir}")
         return
@@ -614,20 +604,37 @@ def main():
         logger.error(f"Model file not found: {args.model}")
         return
     
-    # Load configuration
     config = HParams.load(args.config)
     
-    # Set up device 
-    device = torch.device('cpu')  # CPU is more reliable for evaluation
+    device = torch.device('cpu')
     logger.info(f"Using device: {device}")
     
-    # Load model
+    hmm_model = None
+    hmm_checkpoint = None
+    
+    if args.hmm and os.path.exists(args.hmm):
+        try:
+            logger.info(f"Loading HMM checkpoint from {args.hmm}")
+            hmm_checkpoint = torch.load(args.hmm, map_location=device)
+            logger.info("HMM checkpoint loaded successfully, will initialize after base model")
+        except Exception as e:
+            logger.error(f"Error loading HMM checkpoint: {e}")
+            hmm_checkpoint = None
+    elif args.hmm:
+        logger.warning(f"HMM model file not found: {args.hmm}")
+    
     model, mean, std, idx_to_chord = load_model(args.model, config, device)
     if model is None:
         logger.error("Model loading failed. Cannot continue.")
         return
     
-    # Find matching audio and label files
+    if hmm_checkpoint is not None:
+        hmm_model = create_hmm_model(hmm_checkpoint, model, device)
+        if hmm_model is not None:
+            logger.info("HMM model initialized successfully and will be used for smoothing")
+        else:
+            logger.warning("HMM model initialization failed, will continue without HMM smoothing")
+    
     logger.info(f"Finding matching audio and label files...")
     matched_pairs = find_matching_audio_label_pairs(args.audio_dir, args.label_dir)
     logger.info(f"Found {len(matched_pairs)} matching audio-label pairs")
@@ -636,11 +643,11 @@ def main():
         logger.error("No matching audio-label pairs found. Cannot continue.")
         return
     
-    # Process all matched pairs
     dataset = []
     for audio_path, label_path in tqdm(matched_pairs, desc="Processing audio files"):
         sample = process_audio_file(
-            audio_path, label_path, model, config, mean, std, device, idx_to_chord
+            audio_path, label_path, model, config, mean, std, device, idx_to_chord,
+            hmm_model=hmm_model
         )
         if sample is not None:
             dataset.append(sample)
@@ -651,8 +658,7 @@ def main():
         logger.error("No samples were processed successfully. Cannot continue.")
         return
     
-    # Run evaluation
-    logger.info("\nRunning custom MIR evaluation...")
+    logger.info(f"\nRunning evaluation with{'out' if hmm_model is None else ''} HMM smoothing...")
     try:
         score_list_dict, song_length_list, average_score_dict, quality_accuracy, quality_stats = evaluate_dataset(
             dataset=dataset,
@@ -663,32 +669,28 @@ def main():
             std=std
         )
         
-        # Print overall results
         logger.info("\nOverall MIR evaluation results:")
         for metric, score in average_score_dict.items():
             logger.info(f"{metric} score: {score:.4f}")
         
-        # Print chord quality accuracy with higher visibility - ONLY SHOW MEANINGFUL QUALITIES
         if quality_accuracy:
             logger.info("\nIndividual Chord Quality Accuracy:")
             logger.info("---------------------------------")
             
-            # Only show qualities with at least 10 examples or >0% accuracy
             meaningful_qualities = [(q, acc) for q, acc in quality_accuracy.items() 
                                   if quality_stats.get(q, {}).get('total', 0) >= 10 or acc > 0]
             
-            # Sort by accuracy (high to low)
             for chord_quality, accuracy in sorted(meaningful_qualities, key=lambda x: x[1], reverse=True):
                 total = quality_stats.get(chord_quality, {}).get('total', 0)
                 correct = quality_stats.get(chord_quality, {}).get('correct', 0)
-                # Only show if it appears enough times
                 if total >= 10:
                     logger.info(f"{chord_quality}: {accuracy*100:.2f}% ({correct}/{total})")
         else:
             logger.warning("\nNo chord quality accuracy data available!")
         
-        # Save results to JSON - include stats for detailed analysis later
         results = {
+            'used_hmm': hmm_model is not None,
+            'hmm_path': args.hmm if hmm_model is not None else None,
             'average_scores': average_score_dict,
             'quality_accuracy': quality_accuracy,
             'quality_stats': {k: {'total': v['total'], 'correct': v['correct']} 

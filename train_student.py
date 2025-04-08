@@ -264,9 +264,9 @@ def main():
     parser.add_argument('--warmup_end_lr', type=float, default=None,
                        help='Target learning rate at the end of warm-up (default: base LR)')
     
-    # Dataset type
-    parser.add_argument('--dataset_type', type=str, choices=['fma', 'maestro'], default='fma',
-                      help='Dataset format type: fma (numeric IDs) or maestro (arbitrary filenames)')
+    # Modify dataset_type choices to include 'combined'
+    parser.add_argument('--dataset_type', type=str, choices=['fma', 'maestro', 'combined'], default='fma',
+                      help='Dataset format type: fma (numeric IDs), maestro (arbitrary filenames), or combined (both)')
     
     # Checkpoint loading
     parser.add_argument('--load_checkpoint', type=str, default=None,
@@ -359,32 +359,24 @@ def main():
             logger.info(f"Alpha: {args.focal_alpha or config.training.get('focal_alpha')}")
     else:
         logger.info("Using standard cross-entropy loss")
-    
-    # Log learning rate settings with expanded information
-    logger.info("\n=== Learning Rate Configuration ===")
-    logger.info(f"Initial LR: {config.training['learning_rate']}")
-    logger.info(f"Minimum LR: {config.training.get('min_learning_rate', 5e-6)}")
-    
-    if args.lr_schedule or config.training.get('lr_schedule'):
-        lr_schedule = args.lr_schedule or config.training.get('lr_schedule')
-        logger.info(f"LR schedule: {lr_schedule}")
-    
-    if args.use_warmup or config.training.get('use_warmup', False):
-        # FIX: Use correct warmup_epochs from config without hardcoded defaults
-        try:
-            warmup_epochs = int(args.warmup_epochs) if args.warmup_epochs else config.training.get('warmup_epochs', None)
-            if warmup_epochs is not None:
-                logger.info(f"Using LR warm-up for {warmup_epochs} epochs")
-            else:
-                logger.info(f"Using LR warm-up (epochs not specified in config)")
-        except ValueError:
-            warmup_epochs = 10
-            logger.error("Invalid warmup_epochs value, using default from config")
 
-            
-        # Log warmup parameters
-        logger.info(f"Warm-up start LR: {config.training.get('warmup_start_lr')}")
-        logger.info(f"Warm-up end LR: {config.training.get('warmup_end_lr')}")
+    # Clear summary of loss function configuration
+    if use_kd and (args.use_focal_loss or config.training.get('use_focal_loss', False)):
+        logger.info("\n=== Final Loss Configuration ===")
+        logger.info(f"Using Focal Loss (gamma={args.focal_gamma or config.training.get('focal_gamma', 2.0)}, alpha={args.focal_alpha or config.training.get('focal_alpha')}) combined with KD Loss")
+        logger.info(f"KD formula: final_loss = {kd_alpha} * KL_div_loss + {1-kd_alpha} * focal_loss")
+        logger.info(f"Note: When teacher logits are not available for a batch, only focal loss will be used")
+    elif use_kd:
+        logger.info("\n=== Final Loss Configuration ===")
+        logger.info(f"Using standard Cross Entropy combined with KD Loss")
+        logger.info(f"KD formula: final_loss = {kd_alpha} * KL_div_loss + {1-kd_alpha} * cross_entropy")
+        logger.info(f"Note: When teacher logits are not available for a batch, only cross entropy will be used")
+    elif args.use_focal_loss or config.training.get('use_focal_loss', False):
+        logger.info("\n=== Final Loss Configuration ===")
+        logger.info(f"Using only Focal Loss with gamma={args.focal_gamma or config.training.get('focal_gamma', 2.0)}, alpha={args.focal_alpha or config.training.get('focal_alpha')}")
+    else:
+        logger.info("\n=== Final Loss Configuration ===")
+        logger.info("Using only standard Cross Entropy Loss")
     
     # Initialize dataset_args dictionary
     dataset_args = {}
@@ -425,9 +417,9 @@ def main():
     logger.info(f"Storage root: {storage_root}")
     
     # Resolve primary paths from config, with CLI override
-    spec_dir_config = resolve_path(args.spec_dir or config.paths.get('spec_dir', 'data/synth/spectrograms'), 
+    spec_dir_config = resolve_path(args.spec_dir or config.paths.get('spec_dir', 'data/logits/synth/spectrograms'), 
                                   storage_root, project_root)
-    label_dir_config = resolve_path(args.label_dir or config.paths.get('label_dir', 'data/synth/labels'), 
+    label_dir_config = resolve_path(args.label_dir or config.paths.get('label_dir', 'data/logits/synth/labels'), 
                                    storage_root, project_root)
     
     # Resolve alternative paths if available
@@ -436,13 +428,60 @@ def main():
     
     logger.info(f"Looking for data files:")
     
-    # Find directories with data files
-    synth_spec_dir, spec_count = find_data_directory(spec_dir_config, alt_spec_dir, "*.npy", "spectrogram")
-    synth_label_dir, label_count = find_data_directory(label_dir_config, alt_label_dir, "*.lab", "label")
-    
-    # Final check - fail if we still don't have data
-    if spec_count == 0 or label_count == 0:
-        raise RuntimeError(f"ERROR: Missing spectrogram or label files. Found {spec_count} spectrogram files and {label_count} label files.")
+    # For combined mode, also find Maestro paths using standardized directory structure
+    if args.dataset_type == 'combined':
+        # Use standardized paths based on the DATA_ROOT
+        data_root = os.environ.get('DATA_ROOT', '/mnt/storage/data')
+        
+        # Standard paths for Maestro dataset
+        maestro_spec_dir = os.path.join(data_root, "logits/maestro_synth/spectrograms")
+        maestro_label_dir = os.path.join(data_root, "logits/maestro_synth/labels")
+        maestro_logits_dir = os.path.join(data_root, "logits/maestro_synth/logits")
+        
+        # Find FMA data directories
+        fma_spec_dir, fma_spec_count = find_data_directory(spec_dir_config, alt_spec_dir, "*.npy", "FMA spectrogram")
+        fma_label_dir, fma_label_count = find_data_directory(label_dir_config, alt_label_dir, "*.lab", "FMA label")
+        fma_logits_dir = None
+        if args.logits_dir:
+            fma_logits_dir, _ = find_data_directory(args.logits_dir, None, "*.npy", "FMA logits")
+        else:
+            # Use standard path for FMA logits
+            fma_logits_dir = os.path.join(data_root, "logits/synth/logits")
+        
+        # Find Maestro data directories
+        maestro_spec_count = count_files_in_subdirectories(maestro_spec_dir, "*.npy")
+        maestro_label_count = count_files_in_subdirectories(maestro_label_dir, "*.lab")
+        
+        # Log combined dataset files
+        logger.info(f"\n=== Combined Dataset Files ===")
+        logger.info(f"FMA: {fma_spec_count} spectrograms, {fma_label_count} labels")
+        logger.info(f"Maestro: {maestro_spec_count} spectrograms, {maestro_label_count} labels (in {maestro_spec_dir})")
+        
+        # Final check - fail if we have no data from either dataset
+        total_spec_count = fma_spec_count + maestro_spec_count
+        total_label_count = fma_label_count + maestro_label_count
+        
+        if total_spec_count == 0 or total_label_count == 0:
+            raise RuntimeError(f"ERROR: Missing spectrogram or label files in combined mode. Found {total_spec_count} total spectrogram files and {total_label_count} total label files.")
+        
+        # Use lists for spec_dir, label_dir, and logits_dir in combined mode
+        spec_dir = [fma_spec_dir, maestro_spec_dir]
+        label_dir = [fma_label_dir, maestro_label_dir]
+        logits_dir = [fma_logits_dir, maestro_logits_dir]
+        
+    else:
+        # Original single dataset mode
+        synth_spec_dir, spec_count = find_data_directory(spec_dir_config, alt_spec_dir, "*.npy", "spectrogram")
+        synth_label_dir, label_count = find_data_directory(label_dir_config, alt_label_dir, "*.lab", "label")
+        
+        # Final check - fail if we still don't have data
+        if spec_count == 0 or label_count == 0:
+            raise RuntimeError(f"ERROR: Missing spectrogram or label files. Found {spec_count} spectrogram files and {label_count} label files.")
+        
+        # Use single directories for spec_dir, label_dir
+        spec_dir = synth_spec_dir
+        label_dir = synth_label_dir
+        logits_dir = args.logits_dir
     
     # Use the mapping defined in chords.py
     master_mapping = idx2voca_chord()
@@ -469,67 +508,52 @@ def main():
     # Initialize SynthDataset with optimized settings
     logger.info("\n=== Creating dataset ===")
     dataset_args.update({
-        'spec_dir': synth_spec_dir,
-        'label_dir': synth_label_dir,
+        'spec_dir': spec_dir,
+        'label_dir': label_dir,
         'chord_mapping': chord_mapping,
-        'seq_len': config.training.get('seq_len', 10),
-        'stride': config.training.get('seq_stride', 5),
-        'frame_duration': config.feature.get('hop_duration', 0.1),
+        'seq_len': config.feature.get('seq_len', 10),
+        'stride': config.feature.get('stride', 5),
+        'frame_duration': config.feature.get('frame_duration', 0.1),
+        'num_workers': 0,  # Force single worker for GPU optimization
+        'cache_file': os.path.join(project_root, 'dataset_cache.pkl') if not args.disable_cache else None,
         'verbose': True,
+        'use_cache': not args.disable_cache,
+        'metadata_only': args.metadata_cache,
+        'cache_fraction': args.cache_fraction,
+        'logits_dir': logits_dir,  # Add teacher logits directory for KD
+        'lazy_init': args.lazy_init,
+        'require_teacher_logits': use_kd,  # Only require teacher logits if KD is enabled
         'device': device,
-        'prefetch_factor': float(args.prefetch_factor) if args.prefetch_factor else 1,
-        'num_workers': 6,
-        # debug area
-        'use_cache': not config.data.get('disable_cache', False),
-        'metadata_only': str(args.metadata_cache).lower() == "true",
-        'cache_fraction': config.data.get('cache_fraction', 0.1),
-        'lazy_init': str(args.lazy_init).lower() == "true",
-        'batch_gpu_cache': str(args.batch_gpu_cache).lower() == "true",
+        'pin_memory': False,
+        'prefetch_factor': args.prefetch_factor,
+        'batch_gpu_cache': args.batch_gpu_cache
     })
     
-    # print out dataset args
-    logger.info(f"Dataset arguments: {dataset_args}")
-    # Apply knowledge distillation settings
-    if use_kd and args.logits_dir:
-        logits_dir = resolve_path(args.logits_dir, storage_root, project_root)
-        logger.info(f"Using teacher logits from: {logits_dir}")
-        dataset_args['logits_dir'] = logits_dir
-    
     # Create the dataset
-    logger.info(f"Creating SynthDataset with dataset_type='{dataset_args['dataset_type']}'...")
+    logger.info("Creating dataset with the following parameters:")
+    for key, value in dataset_args.items():
+        logger.info(f"  {key}: {value}")
+        
     synth_dataset = SynthDataset(**dataset_args)
     
-    # Log dataset statistics
-    logger.info("\n=== Dataset Statistics ===")
-    logger.info(f"Total segments: {len(synth_dataset)}")
-    logger.info(f"Training segments: {len(synth_dataset.train_indices)}")
-    logger.info(f"Validation segments: {len(synth_dataset.eval_indices)}")
-    logger.info(f"Test segments: {len(synth_dataset.test_indices)}")
-    
-    # Check for empty datasets
-    if len(synth_dataset.train_indices) == 0:
-        logger.error("ERROR: Training dataset is empty after processing. Cannot proceed with training.")
-        return
-    
-    if len(synth_dataset.eval_indices) == 0:
-        logger.warning("WARNING: Validation dataset is empty. Will skip validation steps.")
-    
+    # Create data loaders for each subset
+    batch_size = config.training.get('batch_size', 16)
+    logger.info(f"Using batch size: {batch_size}")
     
     train_loader = synth_dataset.get_train_iterator(
-        batch_size=config.training['batch_size'], 
-        shuffle=False,
-        num_workers=0,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,  # Force single worker for GPU optimization
         pin_memory=False
     )
     
     val_loader = synth_dataset.get_eval_iterator(
-        batch_size=config.training['batch_size'], 
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=0,  # Use 0 for validation to avoid memory issues
+        num_workers=0,  # Force single worker for GPU optimization
         pin_memory=False
     )
-    
-    # Check train loader
+
     logger.info("\n=== Checking data loaders ===")
     try:
         batch = next(iter(train_loader))

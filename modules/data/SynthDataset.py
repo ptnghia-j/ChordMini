@@ -23,22 +23,14 @@ def process_file_wrapper(args):
     dataset_instance, spec_file, file_id, label_files_dict, return_skip_reason = args
     return dataset_instance._process_file(spec_file, file_id, label_files_dict, return_skip_reason)
 
-# We can simplify the multiprocessing setup since we're using a single worker
-# This code is still useful for the __main__ case to ensure proper testing behavior
-if __name__ == "__main__":
-    try:
-        multiprocessing.set_start_method('spawn', force=True)
-        print("Set multiprocessing start method to 'spawn' for testing")
-    except RuntimeError:
-        warnings.warn("Could not set multiprocessing start method to 'spawn'.")
-
 class SynthDataset(Dataset):
     """
     Dataset for loading preprocessed spectrograms and chord labels.
     Optimized implementation for GPU acceleration with single worker.
-    Supports two dataset formats:
+    Supports three dataset formats:
     - 'fma': Uses numeric 6-digit IDs with format ddd/dddbbb_spec.npy 
     - 'maestro': Uses arbitrary filenames with format maestro-v3.0.0/file-name_spec.npy
+    - 'combined': Loads both 'fma' and 'maestro' datasets simultaneously
     """
     def __init__(self, spec_dir, label_dir, chord_mapping=None, seq_len=10, stride=None, 
                  frame_duration=0.1, num_workers=0, cache_file=None, verbose=True,
@@ -50,13 +42,21 @@ class SynthDataset(Dataset):
         Initialize the dataset with optimized settings for GPU acceleration.
         
         Args:
-            spec_dir: Directory containing spectrograms
-            label_dir: Directory containing labels
+            spec_dir: Directory containing spectrograms (or list of directories for 'combined' type)
+            label_dir: Directory containing labels (or list of directories for 'combined' type)
             chord_mapping: Mapping of chord names to indices
             seq_len: Sequence length for segmentation
             stride: Stride for segmentation (default: same as seq_len)
             frame_duration: Duration of each frame in seconds
             num_workers: Number of workers for data loading
+            cache_file: Path to cache file
+            verbose: Whether to print verbose output
+            use_cache: Whether to use caching
+            metadata_only: Whether to cache only metadata
+            cache_fraction: Fraction of samples to cache
+            logits_dir: Directory containing teacher logits (or list of directories for 'combined' type)
+            lazy_init: Whether to use lazy initialization
+            require_teacher_logits: Whether to require teacher logits
             cache_file: Path to cache file
             verbose: Whether to print verbose output
             use_cache: Whether to use caching
