@@ -254,3 +254,26 @@ dataset_cache.pkl
 # Fix the typo in the previous line that combined two patterns
 dataset_cache_*.pkl
 checkpoints/*.pth
+
+# Consolidated large file patterns - add to existing .gitignore
+# Model files
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.tflite
+*.pb
+
+# Audio files
+*.mp3
+*.wav
+*.ogg
+*.flac
+*.m4a
+
+# Data cache files
+*.npy
+cache/features_production/
+cache/
+**/cache/
