@@ -207,7 +207,7 @@ spec:
               value: "10"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
-              value: "0.2"  # Set dropout probability (0-1)
+              value: "0.3"  # Set dropout probability (0-1)
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
@@ -223,12 +223,12 @@ spec:
               value: "6"     # Prefetch 6 batches for better throughput
             # Add dataset type environment variable with combined option
             - name: DATASET_TYPE
-              value: "fma"  # Options: "fma", "maestro", or "combined"
+              value: "combined"  # Options: "fma", "maestro", or "combined"
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
             - name: SUB_DIR
-              value: "fma-logits"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
+              value: "combined-logits"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
@@ -239,7 +239,7 @@ spec:
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: "null"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: "0.01"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
           command:
@@ -306,13 +306,8 @@ spec:
                 echo "- FMA: Found $FMA_SPEC_COUNT spectrogram files and $FMA_LABEL_COUNT label files"
                 echo "- Maestro: Found $MAESTRO_SPEC_COUNT spectrogram files and $MAESTRO_LABEL_COUNT label files"
                 
-                # Add dataset type and Maestro paths to training command
-                DATASET_ARG="--dataset_type combined --maestro_spec_dir ${DATA_ROOT}/logits/maestro_synth/spectrograms --maestro_label_dir ${DATA_ROOT}/logits/maestro_synth/labels"
-                
-                # Add Maestro logits path if KD is enabled
-                if [ "${USE_KD_LOSS}" = "true" ]; then
-                  DATASET_ARG="$DATASET_ARG --maestro_logits_dir ${DATA_ROOT}/logits/maestro_synth/logits"
-                fi
+                # UPDATED: Simplified dataset type argument - no need for maestro paths
+                DATASET_ARG="--dataset_type combined"
               else
                 SPEC_COUNT=$(find ./data/logits/synth/spectrograms -type f -name "*.npy" | wc -l)
                 LABEL_COUNT=$(find ./data/logits/synth/labels -type f -name "*.lab" | wc -l)
@@ -393,6 +388,29 @@ spec:
                 echo "Note: Teacher logits must be included in the batch data"
               fi
               
+              # Handle KD paths when KD is enabled with more flexible configuration
+              if [ "${USE_KD_LOSS}" = "true" ]; then
+                echo "Knowledge distillation enabled - using teacher logits"
+                
+                # Define the logits paths based on dataset type
+                if [ "${DATASET_TYPE}" = "maestro" ]; then
+                  # For Maestro dataset
+                  KD_ARGS="--logits_dir ${DATA_ROOT}/logits/maestro_synth/logits"
+                  echo "Using Maestro logits from: ${DATA_ROOT}/logits/maestro_synth/logits"
+                elif [ "${DATASET_TYPE}" = "combined" ]; then
+                  # UPDATED: For combined dataset, just specify the FMA logits directory
+                  # The train_student.py script will find Maestro logits automatically
+                  KD_ARGS="--logits_dir ${DATA_ROOT}/logits/synth/logits"
+                  echo "Using combined dataset - train_student.py will find logits in standard locations"
+                else
+                  # Default for FMA dataset
+                  KD_ARGS="--logits_dir ${DATA_ROOT}/logits/synth/logits"
+                  echo "Using FMA logits from: ${DATA_ROOT}/logits/synth/logits"
+                fi
+              else
+                KD_ARGS=""
+              fi
+              
               # Get model scale from environment
               MODEL_SCALE_ARG=""
               if [ "${MODEL_SCALE}" != "" ] && [ "${MODEL_SCALE}" != "1.0" ]; then
@@ -416,28 +434,6 @@ spec:
               if [ "${CACHE_FRACTION}" != "" ] && [ "${CACHE_FRACTION}" != "1.0" ]; then
                 echo "Using partial dataset caching: ${CACHE_FRACTION} of samples"
                 CACHE_ARGS="${CACHE_ARGS} --cache_fraction ${CACHE_FRACTION}"
-              fi
-              
-              # Handle KD paths when KD is enabled with more flexible configuration
-              if [ "${USE_KD_LOSS}" = "true" ]; then
-                echo "Knowledge distillation enabled - using teacher logits"
-                
-                # Define the logits paths based on dataset type
-                if [ "${DATASET_TYPE}" = "maestro" ]; then
-                  # For Maestro dataset
-                  KD_ARGS="--logits_dir ${DATA_ROOT}/logits/maestro_synth/logits"
-                  echo "Using Maestro logits from: ${DATA_ROOT}/logits/maestro_synth/logits"
-                elif [ "${DATASET_TYPE}" = "combined" ]; then
-                  # For combined dataset
-                  KD_ARGS="--logits_dir ${DATA_ROOT}/logits/synth/logits --maestro_logits_dir ${DATA_ROOT}/logits/maestro_synth/logits"
-                  echo "Using combined logits from FMA and Maestro directories"
-                else
-                  # Default for FMA dataset
-                  KD_ARGS="--logits_dir ${DATA_ROOT}/logits/synth/logits"
-                  echo "Using FMA logits from: ${DATA_ROOT}/logits/synth/logits"
-                fi
-              else
-                KD_ARGS=""
               fi
               
               # GPU acceleration options
@@ -543,8 +539,10 @@ spec:
                 SPEC_DIR_ARG="--spec_dir ${DATA_ROOT}/logits/maestro_synth/spectrograms"
                 LABEL_DIR_ARG="--label_dir ${DATA_ROOT}/logits/maestro_synth/labels"
               elif [ "${DATASET_TYPE}" = "combined" ]; then
-                SPEC_DIR_ARG="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms --maestro_spec_dir ${DATA_ROOT}/logits/maestro_synth/spectrograms"
-                LABEL_DIR_ARG="--label_dir ${DATA_ROOT}/logits/synth/labels --maestro_label_dir ${DATA_ROOT}/logits/maestro_synth/labels"
+                # UPDATED: For combined dataset, only specify the FMA directories
+                # The train_student.py script will find Maestro directories automatically
+                SPEC_DIR_ARG="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms"
+                LABEL_DIR_ARG="--label_dir ${DATA_ROOT}/logits/synth/labels"
               else
                 # Default FMA dataset
                 SPEC_DIR_ARG="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms"
@@ -563,11 +561,11 @@ spec:
               python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
             requests:
-              cpu: "5"             
+              cpu: "6"             
               memory: "48Gi"    
               nvidia.com/gpu: "1"
             limits:
-              cpu: "10"             
+              cpu: "12"             
               memory: "108Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:

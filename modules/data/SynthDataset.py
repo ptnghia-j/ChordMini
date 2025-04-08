@@ -57,22 +57,12 @@ class SynthDataset(Dataset):
             logits_dir: Directory containing teacher logits (or list of directories for 'combined' type)
             lazy_init: Whether to use lazy initialization
             require_teacher_logits: Whether to require teacher logits
-            cache_file: Path to cache file
-            verbose: Whether to print verbose output
-            use_cache: Whether to use caching
-            metadata_only: Whether to cache only metadata
-            cache_fraction: Fraction of samples to cache
-            logits_dir: Directory containing teacher logits
-            lazy_init: Whether to use lazy initialization
-            require_teacher_logits: Whether to require teacher logits
             device: Device to use (default: auto-detect)
             pin_memory: Whether to pin memory for faster GPU transfer
             prefetch_factor: Number of batches to prefetch (for DataLoader)
             batch_gpu_cache: Whether to cache batches on GPU for repeated access patterns
             small_dataset_percentage: Optional percentage of the dataset to use (0-1.0)
-            dataset_type: Type of dataset format ('fma' or 'maestro')
-                - 'fma': Uses numeric 6-digit IDs with directory structure ddd/dddbbb_spec.npy
-                - 'maestro': Uses arbitrary filenames with structure maestro-v3.0.0/file-name_spec.npy
+            dataset_type: Type of dataset format ('fma', 'maestro', or 'combined')
         """
         # First, log initialization time start to track potential timeout issues
         import time
@@ -82,18 +72,33 @@ class SynthDataset(Dataset):
             print(f"Using spec_dir: {spec_dir}")
             print(f"Using label_dir: {label_dir}")
         
+        # Support for both single path and list of paths for combined dataset mode
+        self.is_combined_mode = isinstance(spec_dir, list) and isinstance(label_dir, list)
+        
+        # Convert to list format for consistency internally
+        self.spec_dirs = [Path(d) for d in spec_dir] if isinstance(spec_dir, list) else [Path(spec_dir)]
+        self.label_dirs = [Path(d) for d in label_dir] if isinstance(label_dir, list) else [Path(label_dir)]
+        
+        # For compatibility with existing methods that expect self.spec_dir and self.label_dir
+        # Use the first entry as default for these attributes
+        self.spec_dir = self.spec_dirs[0] if self.spec_dirs else None
+        self.label_dir = self.label_dirs[0] if self.label_dirs else None
+        
+        # Handle logits directories similarly
+        if logits_dir is not None:
+            self.logits_dirs = [Path(d) for d in logits_dir] if isinstance(logits_dir, list) else [Path(logits_dir)]
+            self.logits_dir = self.logits_dirs[0] if self.logits_dirs else None
+        else:
+            self.logits_dirs = None
+            self.logits_dir = None
+            
         # Check for CUDA availability
         self.cuda_available = torch.cuda.is_available()
         
         # Force num_workers to 0 for GPU compatibility
         self.num_workers = num_workers
-        # if num_workers is not None and num_workers > 0 and verbose:
-        #     print(f"Forcing num_workers to 0 (was {num_workers}) for single-worker GPU optimization")
         
         # Initialize basic parameters
-        self.spec_dir = Path(spec_dir)
-        self.label_dir = Path(label_dir)
-        self.logits_dir = Path(logits_dir) if logits_dir is not None else None
         self.chord_mapping = chord_mapping
         self.seq_len = seq_len
         self.stride = stride if stride is not None else seq_len
@@ -106,9 +111,9 @@ class SynthDataset(Dataset):
         self.cache_fraction = cache_fraction  # Fraction of samples to cache (default: 10%)
         self.lazy_init = lazy_init
         self.require_teacher_logits = require_teacher_logits
-        self.dataset_type = dataset_type  # Dataset format type ('fma' or 'maestro')
+        self.dataset_type = dataset_type  # Dataset format type ('fma', 'maestro', or 'combined')
         
-        if self.dataset_type not in ['fma', 'maestro']:
+        if self.dataset_type not in ['fma', 'maestro', 'combined']:
             warnings.warn(f"Unknown dataset_type '{dataset_type}', defaulting to 'fma'")
             self.dataset_type = 'fma'
         
@@ -131,21 +136,9 @@ class SynthDataset(Dataset):
         if self.dataset_type == 'maestro':
             # For Maestro dataset, match any filename pattern ending with _spec, _logits, or .lab
             self.file_pattern = re.compile(r'(.+?)(?:_spec|_logits)?\.(?:npy|lab)$')
-            # if self.verbose:
-            #     print(f"Using Maestro dataset format with pattern matching")
-            #     print(f"Expected file paths:")
-            #     print(f"  - Spectrograms: {spec_dir}/maestro-v3.0.0/file-name_spec.npy")
-            #     print(f"  - Labels: {label_dir}/maestro-v3.0.0/file-name.lab")
-            #     print(f"  - Logits: {logits_dir}/maestro-v3.0.0/file-name_logits.npy (if available)")
         else:
             # Default for FMA dataset - the existing 6-digit numeric ID pattern
             self.numeric_id_pattern = re.compile(r'(\d{6})')
-            # if self.verbose:
-            #     print(f"Using FMA dataset format with 6-digit numeric ID pattern")
-            #     print(f"Expected file paths:")
-            #     print(f"  - Spectrograms: {spec_dir}/ddd/dddbbb_spec.npy")
-            #     print(f"  - Labels: {label_dir}/ddd/dddbbb.lab")
-            #     print(f"  - Logits: {logits_dir}/ddd/dddbbb_logits.npy (if available)")
         
         # Auto-detect device if not provided - use device module with safer initialization
         if device is None:
@@ -201,170 +194,8 @@ class SynthDataset(Dataset):
         else:
             if verbose:
                 print(f"Using lazy initialization (faster startup) at {time.time() - init_start_time:.1f}s from init start")
-            # In lazy mode, scan paths and build lightweight metadata, but don't load files
             self.samples = []
             self.segment_indices = []
-            
-            # Create a mapping of label files for quick lookup
-            label_files_dict = {}
-            for label_path in Path(label_dir).glob("**/*.lab"):
-                if self.dataset_type == 'maestro':
-                    # For Maestro dataset, extract the file name without extension
-                    file_match = self.file_pattern.search(str(label_path.name))
-                    if file_match:
-                        file_id = file_match.group(1)  # Base filename without extension
-                        parent_dir = label_path.parent.name  # Get parent directory name
-                        combined_id = f"{parent_dir}/{file_id}"  # Combined ID with directory
-                        label_files_dict[combined_id] = label_path
-                else:
-                    # For FMA dataset, extract the 6-digit ID from the filename
-                    numeric_match = self.numeric_id_pattern.search(str(label_path.stem))
-                    if numeric_match:
-                        numeric_id = numeric_match.group(1)
-                        label_files_dict[numeric_id] = label_path
-            
-            if self.verbose:
-                print(f"Found {len(label_files_dict)} label files with valid IDs")
-            
-            # Store file paths for lazy loading, focusing on files with matching IDs
-            self.spec_files = []
-            for spec_path in Path(spec_dir).glob("**/*.npy"):
-                if self.dataset_type == 'maestro':
-                    # For Maestro dataset
-                    file_match = self.file_pattern.search(str(spec_path.name))
-                    if file_match:
-                        file_id = file_match.group(1)  # Extract base filename
-                        if file_id.endswith('_spec'):
-                            file_id = file_id[:-5]  # Remove '_spec' suffix if present
-                        parent_dir = spec_path.parent.name  # Get parent directory name
-                        combined_id = f"{parent_dir}/{file_id}"  # Combined ID with directory
-                        
-                        # Only include files that have matching label files
-                        if combined_id in label_files_dict:
-                            self.spec_files.append((spec_path, combined_id))
-                else:
-                    # For FMA dataset - extract the 6-digit ID from the filename
-                    numeric_match = self.numeric_id_pattern.search(str(spec_path.stem))
-                    if numeric_match:
-                        numeric_id = numeric_match.group(1)
-                        # Only include files that have matching label files
-                        if numeric_id in label_files_dict:
-                            self.spec_files.append((spec_path, numeric_id))
-            
-            if self.verbose:
-                print(f"Found {len(self.spec_files)} spectrogram files with valid IDs (lazy mode)")
-            
-            # Track which song IDs we've processed to avoid duplicates
-            processed_song_ids = set()
-            # Build minimal metadata for each file without loading content
-            song_samples = {}  # Group indices by song_id
-            
-            for spec_file, song_id in self.spec_files:
-                # Skip if we've already processed this ID
-                if song_id in processed_song_ids:
-                    continue
-                
-                # Get directory information based on dataset type
-                if self.dataset_type == 'maestro':
-                    # For Maestro, the directory prefix is the parent directory name (e.g., 'maestro-v3.0.0')
-                    dir_prefix = spec_file.parent.name
-                else:
-                    # For FMA, get the 3-digit directory prefix from the numeric ID
-                    dir_prefix = song_id[:3] if len(song_id) >= 3 else song_id
-                
-                # Construct the paths to the label file based on dataset type
-                label_file = label_files_dict.get(song_id)
-                if not label_file or not label_file.exists():
-                    continue  # Skip if no matching label file
-                
-                # Parse the label file
-                chord_labels = self._parse_label_file(label_file)
-                if not chord_labels:
-                    continue  # Skip if label file is empty or invalid
-                
-                # Get shape info without loading the full data
-                try:
-                    # Use memory-mapped mode to get shape without loading
-                    spec_info = np.load(spec_file, mmap_mode='r')
-                    spec_shape = spec_info.shape
-                    
-                    # Create metadata for each frame
-                    for t in range(spec_shape[0] if len(spec_shape) > 1 else 1):
-                        frame_time = t * self.frame_duration
-                        chord_label = self._find_chord_at_time(chord_labels, frame_time)
-                        
-                        # Make sure the chord label exists in the mapping
-                        if self.chord_mapping is None:
-                            if chord_label not in self.chord_to_idx:
-                                self.chord_to_idx[chord_label] = len(self.chord_to_idx)
-                        elif chord_label not in self.chord_mapping:
-                            chord_label = "N"  # Use no-chord for unknown chords
-                        
-                        # Store metadata (not the actual spectrogram)
-                        sample_idx = len(self.samples)
-                        sample_data = {
-                            'spec_path': str(spec_file),
-                            'chord_label': chord_label,
-                            'song_id': song_id,
-                            'frame_idx': t,
-                            'dir_prefix': dir_prefix  # Store the directory prefix for faster lookup
-                        }
-                        
-                        # Add logits path if logits directory is provided
-                        if self.logits_dir is not None:
-                            # Construct logits path based on dataset type
-                            if self.dataset_type == 'maestro':
-                                # For Maestro, construct path with parent dir intact
-                                if '/' in song_id:  # Combined format: "dir/filename"
-                                    parent_dir, base_name = song_id.split('/', 1)
-                                    logits_path = self.logits_dir / parent_dir / f"{base_name}_logits.npy"
-                                else:
-                                    # Fallback if no directory separator
-                                    logits_path = self.logits_dir / f"{song_id}_logits.npy"
-                            else:
-                                # For FMA, use the existing 3-digit directory structure
-                                logits_path = self.logits_dir / dir_prefix / f"{song_id}_logits.npy"
-                                
-                            if os.path.exists(logits_path):
-                                sample_data['logit_path'] = str(logits_path)
-                        
-                        self.samples.append(sample_data)
-                        
-                        # Track this sample in the song group for segmenting
-                        if song_id not in song_samples:
-                            song_samples[song_id] = []
-                        song_samples[song_id].append(sample_idx)
-                    
-                    # Mark this song ID as processed
-                    processed_song_ids.add(song_id)
-                        
-                except Exception as e:
-                    if verbose:
-                        print(f"Error scanning file {spec_file}: {e}")
-            
-            # Now generate segments from the metadata (similar to _generate_segments)
-            if song_samples:
-                if verbose:
-                    print(f"Found {len(song_samples)} unique songs with metadata")
-                
-                for song_id, indices in song_samples.items():
-                    if len(indices) < self.seq_len:
-                        # For very short songs, create a single segment with padding
-                        if len(indices) > 0:
-                            self.segment_indices.append((indices[0], indices[0] + self.seq_len))
-                        continue
-                    
-                    # Create segments with stride, respecting song boundaries
-                    for start_idx in range(0, len(indices) - self.seq_len + 1, self.stride):
-                        segment_start = indices[start_idx]
-                        segment_end = indices[start_idx + self.seq_len - 1] + 1
-                        self.segment_indices.append((segment_start, segment_end))
-                
-                if verbose:
-                    print(f"Generated {len(self.segment_indices)} segments in lazy mode")
-            else:
-                warnings.warn("No valid samples found in lazy mode initialization")
-
             
         # Split data for train/eval/test
         total_segs = len(self.segment_indices)
@@ -377,7 +208,6 @@ class SynthDataset(Dataset):
         self._zero_logit_cache = {}
         
         # Create a thread-local tensor cache to store commonly accessed tensors on GPU
-        # This minimizes CPU-GPU transfers for frequently used tensors
         if self.device.type == 'cuda':
             try:
                 self._init_gpu_cache()
@@ -385,7 +215,6 @@ class SynthDataset(Dataset):
                 if self.verbose:
                     print(f"Warning: Could not initialize GPU cache: {e}")
                     print("GPU caching will be disabled")
-                # Reset GPU cache to avoid potential errors
                 self._zero_spec_cache = {}
                 self._zero_logit_cache = {}
                 self.batch_gpu_cache = None
@@ -394,45 +223,102 @@ class SynthDataset(Dataset):
         init_time = time.time() - init_start_time
         if verbose:
             print(f"Dataset initialization completed in {init_time:.2f} seconds")
-            # Add a warning if initialization was slow
-            if init_time > 60:  # More than a minute
+            if init_time > 60:
                 print(f"NOTE: Slow initialization detected ({init_time:.1f}s). For large datasets, consider:")
                 print("1. Using lazy_init=True to speed up startup")
                 print("2. Using metadata_only=True to reduce memory usage")
                 print("3. Using a smaller dataset with small_dataset_percentage=0.01")
 
     def _init_gpu_cache(self):
-        """Initialize GPU cache for common tensors to minimize transfers with enhanced error handling"""
-        if self.device.type == 'cuda':
-            try:
-                # Common zero tensors for different dimensions
-                freq_dims = [144, 128, 256, 512]  # Common frequency dimensions
-                for dim in freq_dims:
-                    # Allocate once and reuse - more efficient than creating each time
-                    self._zero_spec_cache[dim] = torch.zeros(dim, device=self.device)
+        """Initialize GPU cache with commonly used zero tensors for better memory efficiency"""
+        if not hasattr(self, 'device') or self.device.type != 'cuda':
+            return
+        
+        # Pre-allocate common tensor shapes to avoid repeated allocation
+        common_shapes = [
+            (self.seq_len, 144),  # Standard spectrogram sequence
+            (1, 144),            # Single frame
+            (self.seq_len, 25)    # Common logits/predictions size
+        ]
+        
+        # Create zero tensors for common shapes and cache them
+        for shape in common_shapes:
+            # Cache for spectrograms
+            if shape not in self._zero_spec_cache:
+                self._zero_spec_cache[shape] = torch.zeros(shape, dtype=torch.float32, device=self.device)
+            
+            # Cache for logits
+            if shape not in self._zero_logit_cache:
+                self._zero_logit_cache[shape] = torch.zeros(shape, dtype=torch.float32, device=self.device)
                 
-                # Common zero tensors for logits
-                logit_dims = [25, 72, 170]  # Common chord class counts
-                for dim in logit_dims:
-                    self._zero_logit_cache[dim] = torch.zeros(dim, device=self.device)
+        # Store the N chord index for quick lookup
+        self._n_chord_idx = self.chord_to_idx.get("N", 0)
+
+    def _load_logits_file(self, logit_file):
+        """Load teacher logits file with error handling"""
+        try:
+            teacher_logits = np.load(logit_file)
+            if np.isnan(teacher_logits).any():
+                # Handle corrupted logits with NaN values
+                if self.verbose:
+                    print(f"Warning: NaN values in logits file {logit_file}, fixing...")
+                teacher_logits = np.nan_to_num(teacher_logits, nan=0.0)
+            return teacher_logits
+        except Exception as e:
+            if self.require_teacher_logits:
+                raise RuntimeError(f"Error loading required logits file {logit_file}: {e}")
+            if self.verbose:
+                print(f"Warning: Error loading logits file {logit_file}: {e}")
+            return None
+    
+    def get_tensor_cache(self, shape, is_logits=False):
+        """Get a cached zero tensor of the appropriate shape, or create a new one"""
+        if is_logits:
+            cache_dict = self._zero_logit_cache
+        else:
+            cache_dict = self._zero_spec_cache
+            
+        if shape in cache_dict:
+            # Return a clone to avoid modifying the cached tensor
+            return cache_dict[shape].clone()
+        else:
+            # Create a new tensor if not in cache
+            return torch.zeros(shape, dtype=torch.float32, device=self.device)
+            
+    def normalize_spectrogram(self, spec, mean=None, std=None):
+        """Normalize a spectrogram using mean and std"""
+        if mean is None and std is None:
+            # Default normalization if no parameters provided
+            spec_mean = torch.mean(spec)
+            spec_std = torch.std(spec)
+            if spec_std == 0:
+                spec_std = 1.0
+            return (spec - spec_mean) / spec_std
+        else:
+            # Use provided normalization parameters
+            return (spec - mean) / (std if std != 0 else 1.0)
+    
+    def apply_gpu_cache(self, batch):
+        """Apply GPU batch caching for repeated access patterns"""
+        if not self.gpu_batch_cache:
+            return batch
+            
+        # Generate a cache key from the batch
+        key_tensor = batch['spectro'][:, 0, 0] if isinstance(batch['spectro'], torch.Tensor) and len(batch['spectro'].shape) > 2 else None
+        
+        if key_tensor is not None:
+            # Create a tuple key from the first values
+            key = tuple(key_tensor.cpu().numpy().tolist())
+            
+            # Check if batch is already cached
+            if key in self.gpu_batch_cache:
+                return self.gpu_batch_cache[key]
+            
+            # Cache the new batch (only if it's small enough)
+            if len(self.gpu_batch_cache) < 1000:  # Limit cache size
+                self.gpu_batch_cache[key] = batch
                 
-                # Cache chord indices for quick lookup
-                if self.chord_mapping:
-                    self._n_chord_idx = torch.tensor(self.chord_to_idx.get("N", 0), 
-                                                   device=self.device, dtype=torch.long)
-                else:
-                    self._n_chord_idx = torch.tensor(0, device=self.device, dtype=torch.long)
-                    
-                if self.verbose:
-                    cache_mb = sum(tensor.element_size() * tensor.nelement() 
-                                 for tensor in list(self._zero_spec_cache.values()) + 
-                                 list(self._zero_logit_cache.values())) / (1024 * 1024)
-                    print(f"Allocated {cache_mb:.2f}MB for GPU tensor cache")
-            except Exception as e:
-                if self.verbose:
-                    print(f"Error initializing GPU cache: {e}")
-                self._zero_spec_cache = {}
-                self._zero_logit_cache = {}
+        return batch
 
     def _load_data(self):
         """Load data from files or cache with optimized memory usage and error handling"""
@@ -444,43 +330,9 @@ class SynthDataset(Dataset):
                 with open(self.cache_file, 'rb') as f:
                     cache_data = pickle.load(f)
                 
-                # Verify cache format
                 if isinstance(cache_data, dict) and 'samples' in cache_data and 'chord_to_idx' in cache_data:
                     self.samples = cache_data['samples']
                     self.chord_to_idx = cache_data['chord_to_idx']
-                    
-                    # IMPORTANT: Check if we're using small_dataset_percentage and if cache is not already filtered
-                    if self.small_dataset_percentage is not None and self.small_dataset_percentage < 1.0:
-                        original_count = len(self.samples)
-                        if 'small_dataset_percentage' not in cache_data or cache_data.get('small_dataset_percentage') != self.small_dataset_percentage:
-                            if self.verbose:
-                                print(f"NOTE: Cache was created with full dataset but now using small_dataset_percentage={self.small_dataset_percentage}")
-                                print(f"Will filter samples from {original_count} to {int(original_count * self.small_dataset_percentage)} (approx)")
-                            
-                            # Group samples by song_id to maintain song integrity in the subset
-                            song_groups = {}
-                            for sample in self.samples:
-                                song_id = sample['song_id']
-                                if song_id not in song_groups:
-                                    song_groups[song_id] = []
-                                song_groups[song_id].append(sample)
-                            
-                            # Select only the percentage of songs needed
-                            songs_to_keep = max(1, int(len(song_groups) * self.small_dataset_percentage))
-                            selected_song_ids = list(song_groups.keys())[:songs_to_keep]
-                            
-                            # Filter samples to only those from selected songs
-                            filtered_samples = []
-                            for song_id in selected_song_ids:
-                                filtered_samples.extend(song_groups[song_id])
-                            
-                            # Update samples with filtered set
-                            self.samples = filtered_samples
-                            if self.verbose:
-                                print(f"Filtered from {original_count} to {len(self.samples)} samples ({len(self.samples)/original_count*100:.1f}%)")
-                        else:
-                            if self.verbose:
-                                print(f"Cache already filtered to small_dataset_percentage={cache_data.get('small_dataset_percentage')}")
                     
                     if self.verbose:
                         print(f"Loaded {len(self.samples)} samples from cache in {time.time() - start_time:.2f}s")
@@ -493,84 +345,64 @@ class SynthDataset(Dataset):
                     print(f"Error loading cache, rebuilding dataset: {e}")
         
         # Check if directories exist
-        if not self.spec_dir.exists():
-            warnings.warn(f"Spectrogram directory does not exist: {self.spec_dir}")
-        if not self.label_dir.exists():
-            warnings.warn(f"Label directory does not exist: {self.label_dir}")
-
-        # Find spectrogram files faster with specific pattern
-        if self.verbose:
-            print("Finding spectrogram files (this may take a moment)...")
+        for spec_path in self.spec_dirs:
+            if not spec_path.exists():
+                warnings.warn(f"Spectrogram directory does not exist: {spec_path}")
         
-        # First, create a mapping of label files for quick lookup
+        for label_path in self.label_dirs:
+            if not label_path.exists():
+                warnings.warn(f"Label directory does not exist: {label_path}")
+        
+        # First, create a mapping of label files for quick lookup from all label directories
         label_files_dict = {}
-        for label_path in self.label_dir.glob("**/*.lab"):
-            if self.dataset_type == 'maestro':
-                # For Maestro dataset, extract the file name without extension
-                file_match = self.file_pattern.search(str(label_path.name))
-                if file_match:
-                    file_id = file_match.group(1)  # Base filename
-                    parent_dir = label_path.parent.name  # Get parent directory name
-                    combined_id = f"{parent_dir}/{file_id}"  # Combined ID with directory
-                    label_files_dict[combined_id] = label_path
-            else:
-                # For FMA dataset, extract the 6-digit ID from the filename
-                numeric_match = self.numeric_id_pattern.search(str(label_path.stem))
-                if numeric_match:
-                    numeric_id = numeric_match.group(1)
-                    label_files_dict[numeric_id] = label_path
-        
-        if self.verbose:
-            print(f"Found {len(label_files_dict)} label files with valid IDs")
-        
-        # Find all spectrogram files based on dataset type
-        valid_spec_files = []
-        
-        if self.dataset_type == 'maestro':
-            # For Maestro dataset, search in all subdirectories
-            for spec_path in self.spec_dir.glob("**/*.npy"):
-                file_match = self.file_pattern.search(str(spec_path.name))
-                if file_match:
-                    file_id = file_match.group(1)  # Extract base filename
-                    if file_id.endswith('_spec'):
-                        file_id = file_id[:-5]  # Remove '_spec' suffix
-                    parent_dir = spec_path.parent.name  # Get parent directory name
-                    combined_id = f"{parent_dir}/{file_id}"  # Combined ID with directory
-                    
-                    # Only include files that have matching label files
-                    if combined_id in label_files_dict:
-                        valid_spec_files.append((spec_path, combined_id))
-        else:
-            # For FMA dataset - look for the specific format first: {dir_prefix}/{numeric_id}_spec.npy
-            for prefix_dir in self.spec_dir.glob("**/"):
-                if prefix_dir.is_dir() and len(prefix_dir.name) == 3 and prefix_dir.name.isdigit():
-                    dir_prefix = prefix_dir.name
-                    # Look for files with pattern {numeric_id}_spec.npy where numeric_id starts with dir_prefix
-                    for spec_path in prefix_dir.glob(f"{dir_prefix}???_spec.npy"):
-                        # Extract the 6-digit ID from the filename
-                        filename = spec_path.stem
-                        if filename.endswith("_spec"):
-                            filename = filename[:-5]  # Remove '_spec' suffix
-                        
-                        numeric_match = self.numeric_id_pattern.search(filename)
-                        if numeric_match:
-                            numeric_id = numeric_match.group(1)
-                            # Only include files that have matching label files
-                            if numeric_id in label_files_dict:
-                                valid_spec_files.append((spec_path, numeric_id))
-            
-            # If we didn't find any files with the specific pattern, fall back to the general search
-            if not valid_spec_files and self.verbose:
-                print("No spectrogram files found with pattern {dir_prefix}/{numeric_id}_spec.npy, trying general search...")
-                
-                for spec_path in self.spec_dir.glob("**/*.npy"):
-                    # Extract the 6-digit ID from the filename
-                    numeric_match = self.numeric_id_pattern.search(str(spec_path.stem))
+        for label_dir in self.label_dirs:
+            for label_path in label_dir.glob("**/*.lab"):
+                if self.dataset_type == 'maestro':
+                    file_match = self.file_pattern.search(str(label_path.name))
+                    if file_match:
+                        file_id = file_match.group(1)
+                        parent_dir = label_path.parent.name
+                        combined_id = f"{parent_dir}/{file_id}"
+                        label_files_dict[combined_id] = label_path
+                else:
+                    numeric_match = self.numeric_id_pattern.search(str(label_path.stem))
                     if numeric_match:
                         numeric_id = numeric_match.group(1)
-                        # Only include files that have matching label files
-                        if numeric_id in label_files_dict:
-                            valid_spec_files.append((spec_path, numeric_id))
+                        label_files_dict[numeric_id] = label_path
+        
+        if self.verbose:
+            print(f"Found {len(label_files_dict)} label files with valid IDs across all directories")
+        
+        # Find all spectrogram files from all spectrogram directories
+        valid_spec_files = []
+        
+        for spec_dir in self.spec_dirs:
+            if self.dataset_type == 'maestro':
+                for spec_path in spec_dir.glob("**/*.npy"):
+                    file_match = self.file_pattern.search(str(spec_path.name))
+                    if file_match:
+                        file_id = file_match.group(1)
+                        if file_id.endswith('_spec'):
+                            file_id = file_id[:-5]
+                        parent_dir = spec_path.parent.name
+                        combined_id = f"{parent_dir}/{file_id}"
+                        
+                        if combined_id in label_files_dict:
+                            valid_spec_files.append((spec_path, combined_id))
+            else:
+                for prefix_dir in spec_dir.glob("**/"):
+                    if prefix_dir.is_dir() and len(prefix_dir.name) == 3 and prefix_dir.name.isdigit():
+                        dir_prefix = prefix_dir.name
+                        for spec_path in prefix_dir.glob(f"{dir_prefix}???_spec.npy"):
+                            filename = spec_path.stem
+                            if filename.endswith("_spec"):
+                                filename = filename[:-5]
+                            
+                            numeric_match = self.numeric_id_pattern.search(filename)
+                            if numeric_match:
+                                numeric_id = numeric_match.group(1)
+                                if numeric_id in label_files_dict:
+                                    valid_spec_files.append((spec_path, numeric_id))
         
         if not valid_spec_files:
             warnings.warn(f"No valid spectrogram files found for dataset type '{self.dataset_type}'. Check your data paths.")
@@ -578,7 +410,6 @@ class SynthDataset(Dataset):
             
         if self.verbose:
             print(f"Found {len(valid_spec_files)} valid spectrogram files")
-            # Print sample paths to help diagnose directory structure
             if valid_spec_files:
                 print("Sample spectrogram paths:")
                 for i, (path, _) in enumerate(valid_spec_files[:3]):
@@ -616,43 +447,58 @@ class SynthDataset(Dataset):
             'format_error': 0
         }
         
-        # Calculate number of processes to use (leave one core free)
-        num_cpus = self.num_workers
+        num_cpus = max(1, self.num_workers)
         
-        # Adjust num_cpus for very small datasets to prevent overhead
-        if len(valid_spec_files) < num_cpus * 4:  # If files are fewer than 4× the CPUs
+        if len(valid_spec_files) < num_cpus * 4:
             num_cpus = max(1, len(valid_spec_files) // 2)
             if self.verbose:
                 print(f"Small dataset detected, reducing worker count to {num_cpus}")
 
-        # Create arguments list with self instance for each file
         args_list = [(self, spec_file, file_id, label_files_dict, True) 
                     for spec_file, file_id in valid_spec_files]
         
         if self.verbose:
             print(f"Processing {len(args_list)} files with {num_cpus} parallel workers")
             
-        # Use multiprocessing with context manager for clean exit
-        with Pool(processes=num_cpus) as pool:
-            # Map the processing function to the arguments using imap for progress tracking
-            process_results = list(tqdm(
-                pool.imap(process_file_wrapper, args_list),
-                total=len(args_list),
-                desc=f"Loading data (parallel {'lazy' if self.lazy_init else 'full'})",
-                disable=not self.verbose
-            ))
+        try:
+            with Pool(processes=num_cpus) as pool:
+                process_results = list(tqdm(
+                    pool.imap(process_file_wrapper, args_list),
+                    total=len(args_list),
+                    desc=f"Loading data (parallel {'lazy' if self.lazy_init else 'full'})",
+                    disable=not self.verbose
+                ))
+            
+            for samples, skip_reason in process_results:
+                self.total_processed += 1
+                if samples:
+                    self.samples.extend(samples)
+                else:
+                    self.total_skipped += 1
+                    if skip_reason in self.skipped_reasons:
+                        self.skipped_reasons[skip_reason] += 1
         
-        # Process results from parallel execution
-        for samples, skip_reason in process_results:
-            self.total_processed += 1
-            if samples:
-                self.samples.extend(samples)
-            else:
-                self.total_skipped += 1
-                if skip_reason in self.skipped_reasons:
-                    self.skipped_reasons[skip_reason] += 1
+        except Exception as e:
+            import traceback
+            error_msg = traceback.format_exc()
+            if self.verbose:
+                print(f"ERROR in multiprocessing: {e}")
+                print(f"Traceback:\n{error_msg}")
+                print(f"Attempting fallback to sequential processing...")
+            
+            process_results = []
+            for args in tqdm(args_list, desc="Loading data (sequential fallback)"):
+                process_results.append(process_file_wrapper(args))
+            
+            for samples, skip_reason in process_results:
+                self.total_processed += 1
+                if samples:
+                    self.samples.extend(samples)
+                else:
+                    self.total_skipped += 1
+                    if skip_reason in self.skipped_reasons:
+                        self.skipped_reasons[skip_reason] += 1
         
-        # Log statistics about skipped files
         if hasattr(self, 'total_processed') and self.total_processed > 0:
             skip_percentage = (self.total_skipped / self.total_processed) * 100
             if self.verbose:
@@ -665,54 +511,17 @@ class SynthDataset(Dataset):
                             reason_pct = (count / self.total_skipped) * 100 if self.total_skipped > 0 else 0
                             print(f"    - {reason}: {count} ({reason_pct:.1f}%)")
         
-        # Cache the dataset for future use with proper error handling
         if self.samples and self.use_cache:
             try:
                 cache_dir = os.path.dirname(self.cache_file)
                 if cache_dir and not os.path.exists(cache_dir):
                     os.makedirs(cache_dir, exist_ok=True)
                 
-                # If using partial caching, select a contiguous portion instead of random songs
-                if self.cache_fraction < 1.0:
-                    # Group samples by song_id
-                    song_groups = {}
-                    for sample in self.samples:
-                        song_id = sample['song_id']
-                        if song_id not in song_groups:
-                            song_groups[song_id] = []
-                        song_groups[song_id].append(sample)
-                    
-                    # Get a sorted list of song IDs for deterministic results
-                    song_ids = sorted(song_groups.keys())
-                    
-                    # Select a contiguous portion of songs up to the target fraction
-                    total_samples = len(self.samples)
-                    target_samples = max(1, int(total_samples * self.cache_fraction))
-                    
-                    samples_to_cache = []
-                    samples_selected = 0
-                    
-                    # Take the first n songs that fit within our target sample count
-                    for song_id in song_ids:
-                        if samples_selected >= target_samples:
-                            break
-                        
-                        song_samples = song_groups[song_id]
-                        samples_to_cache.extend(song_samples)
-                        samples_selected += len(song_samples)
-                    
-                    if self.verbose:
-                        song_count = len(samples_to_cache) // 100  # Approximate song count for display
-                        print(f"Caching first {len(samples_to_cache)} samples from {song_count} songs "
-                              f"({len(samples_to_cache)/total_samples*100:.1f}% of total)")
-                else:
-                    samples_to_cache = self.samples
+                samples_to_cache = self.samples
                 
-                # If metadata-only, create and store metadata
                 if self.metadata_only:
                     samples_meta = []
                     for sample in samples_to_cache:
-                        # Store metadata and file path instead of actual array
                         meta = {k: sample[k] for k in sample if k != 'spectro'}
                         spec_path = os.path.join(self.spec_dir, f"{sample['song_id']}.npy")
                         if os.path.exists(spec_path):
@@ -728,7 +537,6 @@ class SynthDataset(Dataset):
                             'small_dataset_percentage': self.small_dataset_percentage
                         }, f)
                 else:
-                    # Full cache including spectrograms (original approach)
                     with open(self.cache_file, 'wb') as f:
                         pickle.dump({
                             'samples': samples_to_cache,
@@ -746,19 +554,14 @@ class SynthDataset(Dataset):
                 if self.verbose:
                     print(f"Error saving cache (will continue without caching): {e}")
                 
-        # Report on spectrogram dimensions
         if self.samples:
-            # Safely analyze the first sample to determine dimensions
             first_sample = self.samples[0]
             
-            # Check if 'spectro' key exists in the sample, and if not, try to load it from path
             if 'spectro' in first_sample:
                 first_spec = first_sample['spectro']
             elif 'spec_path' in first_sample and os.path.exists(first_sample['spec_path']):
                 try:
-                    # Load the spectrogram from file
                     first_spec = np.load(first_sample['spec_path'])
-                    # If it's a multi-frame spectrogram and we have a frame index, get that frame
                     if 'frame_idx' in first_sample and len(first_spec.shape) > 1:
                         frame_idx = first_sample['frame_idx']
                         if frame_idx < first_spec.shape[0]:
@@ -766,16 +569,13 @@ class SynthDataset(Dataset):
                 except Exception as e:
                     if self.verbose:
                         print(f"Error loading first spectrogram for dimension check: {e}")
-                    # Use default expected dimensions
-                    first_spec = np.zeros((144,))  # Default expected CQT shape
+                    first_spec = np.zeros((144,))
             else:
-                # If no spectrogram data is available, use default shape
-                first_spec = np.zeros((144,))  # Default expected CQT shape
+                first_spec = np.zeros((144,))
                 if self.verbose:
                     print("WARNING: Could not determine spectrogram shape from first sample")
                     print("Using default frequency dimension of 144")
             
-            # Now safely determine frequency dimension from the loaded/created spectrogram
             freq_dim = first_spec.shape[-1] if hasattr(first_spec, 'shape') and len(first_spec.shape) > 0 else 144
             spec_type = "CQT (Constant-Q Transform)" if freq_dim <= 256 else "STFT"
             
@@ -783,7 +583,6 @@ class SynthDataset(Dataset):
                 print(f"Loaded {len(self.samples)} valid samples")
                 print(f"Spectrogram frequency dimension: {freq_dim} (likely {spec_type})")
                 
-                # Report on class distribution
                 chord_counter = Counter(sample['chord_label'] for sample in self.samples)
                 print(f"Found {len(chord_counter)} unique chord classes")
                 
@@ -791,31 +590,17 @@ class SynthDataset(Dataset):
                 print(f"Dataset loading completed in {end_time - start_time:.2f} seconds")
         else:
             warnings.warn("No samples loaded. Check your data paths and structure.")
-    
     def _process_file(self, spec_file, file_id, label_files_dict, return_skip_reason=False):
         """Process a single spectrogram file based on dataset type"""
         samples = []
         skip_reason = None
         
         try:
-            # Handle directory prefix based on dataset type
             if self.dataset_type == 'maestro':
-                # For Maestro, the directory prefix is the parent directory name
                 dir_prefix = spec_file.parent.name
-                if self.verbose and not hasattr(self, '_maestro_path_logged'):
-                    # print(f"Maestro dataset format: using parent directory '{dir_prefix}' for organization")
-                    # print(f"Example spec file path: {spec_file}")
-                    # print(f"Example ID (combined dir/file): {file_id}")
-                    self._maestro_path_logged = True
             else:
-                # For FMA, extract the 3-digit prefix from the numeric ID
                 dir_prefix = file_id[:3] if len(file_id) >= 3 else file_id
-                if self.verbose and not hasattr(self, '_fma_path_logged'):
-                    # print(f"FMA dataset format: using 3-digit prefix '{dir_prefix}' from ID {file_id}")
-                    # print(f"Example spec file path: {spec_file}")
-                    self._fma_path_logged = True
             
-            # Get the matching label file directly from the dictionary
             label_file = label_files_dict.get(file_id)
             if not label_file or not os.path.exists(str(label_file)):
                 if hasattr(self, 'skipped_reasons'):
@@ -825,44 +610,36 @@ class SynthDataset(Dataset):
                     return [], skip_reason
                 return []
             
-            # Find matching logit file if logits_dir is provided
             logit_file = None
-            if self.logits_dir is not None:
-                # Construct the expected logits path based on dataset type
-                if self.dataset_type == 'maestro':
-                    # For Maestro, use directory structure from file_id
-                    if '/' in file_id:
-                        parent_dir, base_name = file_id.split('/', 1)
-                        logit_file = self.logits_dir / parent_dir / f"{base_name}_logits.npy"
-                        if self.verbose and not hasattr(self, '_maestro_logit_path_logged'):
-                            # print(f"Maestro logit path example: {logit_file}")
-                            self._maestro_logit_path_logged = True
+            if self.logits_dirs is not None:
+                for logits_dir in self.logits_dirs:
+                    if self.dataset_type == 'maestro':
+                        if '/' in file_id:
+                            parent_dir, base_name = file_id.split('/', 1)
+                            temp_logit_file = logits_dir / parent_dir / f"{base_name}_logits.npy"
+                            if os.path.exists(temp_logit_file):
+                                logit_file = temp_logit_file
+                                break
+                        else:
+                            temp_logit_file = logits_dir / f"{file_id}_logits.npy"
+                            if os.path.exists(temp_logit_file):
+                                logit_file = temp_logit_file
+                                break
                     else:
-                        logit_file = self.logits_dir / f"{file_id}_logits.npy"
-                else:
-                    # For FMA, use the 3-digit directory structure
-                    logit_file = self.logits_dir / dir_prefix / f"{file_id}_logits.npy"
-                    if self.verbose and not hasattr(self, '_fma_logit_path_logged'):
-                        # print(f"FMA logit path example: {logit_file}")
-                        self._fma_logit_path_logged = True
+                        temp_logit_file = logits_dir / dir_prefix / f"{file_id}_logits.npy"
+                        if os.path.exists(temp_logit_file):
+                            logit_file = temp_logit_file
+                            break
             
-            # At this point, we have all required components (spec, label, and logits if enabled)
-            
-            # Load spectrogram data - if metadata_only, we'll store the path instead
             if self.metadata_only:
-                # Just check if file exists and record metadata
                 if os.path.exists(spec_file):
-                    # Load minimal information needed for song identification and structure
                     spec_info = np.load(spec_file, mmap_mode='r')
                     spec_shape = spec_info.shape
-                    # Parse the label file to obtain chord_labels
                     chord_labels = self._parse_label_file(label_file)
-                    # Create sample with metadata only
                     for t in range(spec_shape[0] if len(spec_shape) > 1 else 1):
                         frame_time = t * self.frame_duration
                         chord_label = self._find_chord_at_time(chord_labels, frame_time)
                         
-                        # Make sure the chord label exists in the mapping
                         if self.chord_mapping is None:
                             if chord_label not in self.chord_to_idx:
                                 self.chord_to_idx[chord_label] = len(self.chord_to_idx)
@@ -870,16 +647,13 @@ class SynthDataset(Dataset):
                             warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
                             chord_label = "N"
                         
-                        # Store the path format based on dataset type
                         if self.dataset_type == 'maestro':
-                            # For Maestro, keep the full path as is
                             expected_spec_path = str(spec_file)
                         else:
-                            # For FMA, ensure the path follows the expected format
                             expected_spec_path = str(self.spec_dir / dir_prefix / f"{file_id}_spec.npy")
                         
                         samples.append({
-                            'spec_path': str(spec_file),  # Keep original path for loading
+                            'spec_path': str(spec_file),
                             'expected_spec_path': expected_spec_path,
                             'chord_label': chord_label,
                             'song_id': file_id,
@@ -887,41 +661,34 @@ class SynthDataset(Dataset):
                             'dir_prefix': dir_prefix
                         })
                         
-                        # Record logit path if available
                         if logit_file is not None:
                             samples[-1]['logit_path'] = str(logit_file)
             else:
-                # Original behavior - load full spectrogram
                 spec = np.load(spec_file)
                 
-                # Check for NaN values
                 if np.isnan(spec).any():
                     warnings.warn(f"NaN values found in {spec_file}, replacing with zeros")
                     spec = np.nan_to_num(spec, nan=0.0)
                 
-                # Load label file
                 chord_labels = self._parse_label_file(label_file)
                 
-                # Create a sample for each frame
-                if len(spec.shape) <= 1:  # Single frame
+                if len(spec.shape) <= 1:
                     chord_label = self._find_chord_at_time(chord_labels, 0.0)
                     
-                    # Make sure the chord label exists in the mapping
                     if self.chord_mapping is None:
                         if chord_label not in self.chord_to_idx:
                             self.chord_to_idx[chord_label] = len(self.chord_to_idx)
                     elif chord_label not in self.chord_mapping:
                         warnings.warn(f"Unknown chord label {chord_label} found in {label_file}")
-                        return []  # Skip this file if label not in mapping
+                        return []
                         
                     sample_dict = {
                         'spectro': spec,
                         'chord_label': chord_label,
-                        'song_id': numeric_id,
+                        'song_id': file_id,
                         'dir_prefix': dir_prefix
                     }
                     
-                    # Add logits if available
                     if logit_file is not None:
                         try:
                             teacher_logits = self._load_logits_file(logit_file)
@@ -929,24 +696,22 @@ class SynthDataset(Dataset):
                                 sample_dict['teacher_logits'] = teacher_logits
                         except Exception as e:
                             warnings.warn(f"Error loading logits file {logit_file}: {e}")
-                            return []  # Skip this file if logits can't be loaded
+                            return []
                     
                     samples.append(sample_dict)
-                else:  # Multiple frames
-                    # Pre-load logits for frame-wise access
+                else:
                     teacher_logits = None
                     if logit_file is not None:
                         try:
                             teacher_logits = self._load_logits_file(logit_file)
                         except Exception as e:
                             warnings.warn(f"Error loading logits file {logit_file}: {e}")
-                            return []  # Skip this file if logits can't be loaded
+                            return []
                     
                     for t in range(spec.shape[0]):
                         frame_time = t * self.frame_duration
                         chord_label = self._find_chord_at_time(chord_labels, frame_time)
                         
-                        # Make sure the chord label exists in the mapping
                         if self.chord_mapping is None:
                             if chord_label not in self.chord_to_idx:
                                 self.chord_to_idx[chord_label] = len(self.chord_to_idx)
@@ -957,19 +722,16 @@ class SynthDataset(Dataset):
                         sample_dict = {
                             'spectro': spec[t],
                             'chord_label': chord_label,
-                            'song_id': file_id,  # Changed from numeric_id to file_id
+                            'song_id': file_id,
                             'dir_prefix': dir_prefix,
                             'frame_idx': t
                         }
                         
-                        # Add frame-specific logits if available
                         if teacher_logits is not None:
                             if isinstance(teacher_logits, np.ndarray):
                                 if len(teacher_logits.shape) > 1 and t < teacher_logits.shape[0]:
-                                    # Multi-frame logits - extract the specific frame
                                     sample_dict['teacher_logits'] = teacher_logits[t]
                                 else:
-                                    # Single-frame logits - use as is
                                     sample_dict['teacher_logits'] = teacher_logits
                             
                         samples.append(sample_dict)
@@ -985,72 +747,13 @@ class SynthDataset(Dataset):
             
             warnings.warn(f"Error processing file {spec_file}: {str(e)}")
             
-            # Log the first few errors in detail to help debugging
-            if not hasattr(self, '_error_count'):
-                self._error_count = 0
-            
-            if self._error_count < 5 and self.verbose:
-                import traceback
-                print(f"\nDetailed error processing {spec_file}:")
-                print(traceback.format_exc())
-                self._error_count += 1
-            
             if return_skip_reason:
                 return [], skip_reason
             return []
             
-        # Return processed samples
         if return_skip_reason:
             return samples, skip_reason
         return samples
-    
-    def _load_logits_file(self, logit_file):
-        """Load logits from file with format detection and error handling"""
-        try:
-            # For npy files, load directly with additional error handling
-            try:
-                teacher_logits = np.load(logit_file)
-            except (ValueError, OSError) as e:
-                if "corrupt" in str(e).lower():
-                    # Special handling for corrupt files
-                    warnings.warn(f"Corrupt numpy file detected at {logit_file}: {str(e)}")
-                    return None
-                raise  # Re-raise other errors
-            
-            # # Sanity check shape and values
-            # if isinstance(teacher_logits, np.ndarray):
-            #     if self.verbose and not hasattr(self, '_logit_shape_reported'):
-            #         print(f"Teacher logits shape: {teacher_logits.shape}, min: {teacher_logits.min()}, max: {teacher_logits.max()}")
-            #         self._logit_shape_reported = True
-                
-            #     # Handle NaN or inf values
-            #     if np.isnan(teacher_logits).any() or np.isinf(teacher_logits).any():
-            #         teacher_logits = np.nan_to_num(teacher_logits, nan=0.0, posinf=100.0, neginf=-100.0)
-            #         if self.verbose and not hasattr(self, '_logit_nan_reported'):
-            #             print(f"WARNING: NaN or inf values found in teacher logits and replaced")
-            #             self._logit_nan_reported = True
-                
-            #     return teacher_logits
-            # else:
-            #     if self.verbose and not hasattr(self, '_logit_type_warning'):
-            #         print(f"WARNING: Loaded teacher logits has unexpected type: {type(teacher_logits)}")
-            #         self._logit_type_warning = True
-            #     return None
-                
-        except Exception as e:
-            warnings.warn(f"Error loading logits file {logit_file}: {str(e)}")
-            
-            # Add more context for the first few errors
-            if not hasattr(self, '_logits_error_count'):
-                self._logits_error_count = 0
-                
-            if self._logits_error_count < 5 and self.verbose:
-                import traceback
-                print(f"\nDetailed error loading logits file {logit_file}:")
-                print(traceback.format_exc())
-                self._logits_error_count += 1
-                
-            return None
     
     def _parse_label_file(self, label_file):
         """Parse a label file into a list of (start_time, end_time, chord) tuples"""
@@ -1073,18 +776,16 @@ class SynthDataset(Dataset):
     def _find_chord_at_time(self, chord_labels, time):
         """Find the chord label at a specific time point"""
         if not chord_labels:
-            return "N"  # Return no-chord for empty label files
+            return "N"
             
         for start, end, chord in chord_labels:
             if start <= time < end:
                 return chord
                 
-        # If we have chord labels but time is out of bounds
         if chord_labels and time >= chord_labels[-1][1]:
-            # Use the last chord if the time exceeds the end
             return chord_labels[-1][2]
             
-        return "N"  # No chord found
+        return "N"
     
     def _generate_segments(self):
         """Generate segments more efficiently using song boundaries"""
@@ -1092,16 +793,13 @@ class SynthDataset(Dataset):
             warnings.warn("No samples to generate segments from")
             return
         
-        # Optional filtering of samples that don't have teacher logits when required
         if self.require_teacher_logits:
             original_count = len(self.samples)
             filtered_samples = []
             for sample in self.samples:
-                # Include sample only if it has teacher logits or a valid logit path
                 if 'teacher_logits' in sample or ('logit_path' in sample and os.path.exists(sample['logit_path'])):
                     filtered_samples.append(sample)
             
-            # Update samples with the filtered list
             self.samples = filtered_samples
             
             if self.verbose:
@@ -1111,12 +809,10 @@ class SynthDataset(Dataset):
                 print(f"Filtered out {removed} samples without teacher logits ({removed_percent:.1f}%)")
                 print(f"Remaining samples with teacher logits: {new_count}")
                 
-                # Check if we filtered too aggressively
-                if new_count < original_count * 0.1:  # Less than 10% samples remain
+                if new_count < original_count * 0.1:
                     warnings.warn(f"WARNING: Only {new_count} samples ({new_count/original_count*100:.1f}%) have teacher logits.")
                     warnings.warn(f"This may indicate an issue with logits availability or paths.")
         
-        # Group samples by song_id
         song_samples = {}
         for i, sample in enumerate(self.samples):
             song_id = sample['song_id']
@@ -1127,19 +823,16 @@ class SynthDataset(Dataset):
         if self.verbose:
             print(f"Found {len(song_samples)} unique songs")
         
-        # Generate segments for each song
         start_time = time.time()
         total_segments = 0
         
         for song_id, indices in song_samples.items():
             if len(indices) < self.seq_len:
-                # For very short songs, create a single segment with padding
                 if len(indices) > 0:
                     self.segment_indices.append((indices[0], indices[0] + self.seq_len))
                     total_segments += 1
                 continue
                 
-            # Create segments with stride, respecting song boundaries
             for start_idx in range(0, len(indices) - self.seq_len + 1, self.stride):
                 segment_start = indices[start_idx]
                 segment_end = indices[start_idx + self.seq_len - 1] + 1
@@ -1149,395 +842,208 @@ class SynthDataset(Dataset):
         if self.verbose:
             end_time = time.time()
             print(f"Generated {total_segments} segments in {end_time - start_time:.2f} seconds")
-    
-    def _get_zero_tensor(self, shape, tensor_type='spec'):
-        """
-        Get a zero tensor of the given shape from cache for efficient reuse.
-        Enhanced with safer error handling for CUDA issues.
-        
-        Args:
-            shape: Shape or dimension (int) for the zero tensor
-            tensor_type: 'spec' for spectrogram, 'logit' for logits
-            
-        Returns:
-            torch.Tensor: Zero tensor of the given shape on the appropriate device
-        """
-        try:
-            # Handle scalar dimension or tuple shapes
-            if isinstance(shape, (list, tuple)):
-                if len(shape) == 1:
-                    dim = shape[0]
-                else:
-                    # For multi-dimensional shapes, we create a new tensor
-                    return torch.zeros(shape, device=self.device, dtype=torch.float)
-            else:
-                dim = shape
-                
-            # Use cached tensor if available and CUDA is working
-            if self.device.type == 'cuda':
-                try:
-                    if tensor_type == 'spec' and dim in self._zero_spec_cache:
-                        return self._zero_spec_cache[dim].clone()
-                    elif tensor_type == 'logit' and dim in self._zero_logit_cache:
-                        return self._zero_logit_cache[dim].clone()
-                except RuntimeError:
-                    # If CUDA error occurs with cached tensors, clear cache and continue with fresh tensors
-                    if self.verbose and not hasattr(self, '_cuda_cache_warning'):
-                        print("CUDA error with cached tensors. Clearing cache and creating fresh tensors.")
-                        self._cuda_cache_warning = True
-                    self._zero_spec_cache = {}
-                    self._zero_logit_cache = {}
-            
-            # Create a new tensor (either as fallback or if no cached tensor)
-            return torch.zeros(dim, device=self.device, dtype=torch.float)
-            
-        except Exception as e:
-            # If any CUDA error happens, fall back to CPU tensors
-            if self.verbose and not hasattr(self, '_device_fallback_warning'):
-                print(f"Error creating tensor on {self.device}: {e}")
-                print("Falling back to CPU tensors")
-                self._device_fallback_warning = True
-            
-            # Use CPU as fallback device
-            return torch.zeros(shape if isinstance(shape, (list, tuple)) else (shape,), 
-                              dtype=torch.float, device='cpu')
 
     def __len__(self):
         return len(self.segment_indices)
-    
+
     def __getitem__(self, idx):
         """Get a segment by index, with proper padding and direct GPU loading with improved performance"""
         if not self.segment_indices:
             raise IndexError("Dataset is empty - no segments available")
-        
-        # Initialize self.gpu_batch_cache if it's None to avoid TypeError
-        if self.batch_gpu_cache and self.gpu_batch_cache is None:
-            self.gpu_batch_cache = {}
             
-        # Try to use GPU batch cache with error handling
-        if self.batch_gpu_cache and idx in self.gpu_batch_cache:
-            try:
-                return self.gpu_batch_cache[idx]
-            except RuntimeError:
-                # Clear cache if CUDA error occurs
-                self.gpu_batch_cache = {}
-                if self.verbose and not hasattr(self, '_cache_error_warned'):
-                    print("CUDA error with cached batch. Clearing GPU batch cache.")
-                    self._cache_error_warned = True
-        
-        # Initialize target device and get segment indices
-        target_device = self.device
+        # Get segment indices
         seg_start, seg_end = self.segment_indices[idx]
         
-        try:
-            # Performance optimization: Pre-allocate lists with known size to avoid resizing
-            sequence = []
-            label_seq = []
-            teacher_logits_seq = []
-            has_teacher_logits = False
-            
-            # Get first sample to determine shape for padding
-            first_sample = self.samples[seg_start]
-            start_song_id = first_sample['song_id']
-            
-            # Skip unnecessary processing for determining first_spec shape
-            # Just use a standard expected dimension for initial allocation
-            expected_dim = 144
-            
-            # Check for teacher logits availability in the dataset
-            check_for_logits = self.logits_dir is not None
-            
-            # Process each sample in the segment, using consistent device
-            for i in range(seg_start, seg_end):
-                if i >= len(self.samples):
-                    # We've reached the end of the dataset, add padding
-                    padding_shape = sequence[-1].shape if sequence else (expected_dim,)
-                    sequence.append(torch.zeros(padding_shape, dtype=torch.float, device=target_device))
-                    label_seq.append(torch.tensor(self.chord_to_idx.get("N", 0), dtype=torch.long, device=target_device))
-                    
-                    if has_teacher_logits or check_for_logits:
-                        logit_shape = teacher_logits_seq[0].shape if teacher_logits_seq else (170,)
-                        teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float, device=target_device))
-                    continue
-                    
-                sample_i = self.samples[i]
-                
-                # Check if we've crossed a song boundary (skip padding and break)
-                if sample_i['song_id'] != start_song_id:
-                    break
-                    
-                # Lazy load spectrogram directly to target device
-                if 'spectro' not in sample_i and 'spec_path' in sample_i:
-                    try:
-                        spec_path = sample_i['spec_path']
-                        spec = np.load(spec_path)
-                        
-                        # For multi-frame spectrograms, extract the specific frame
-                        if sample_i.get('frame_idx') is not None and len(spec.shape) > 1:
-                            frame_idx = sample_i['frame_idx']
-                            if frame_idx < spec.shape[0]:
-                                spec_vec = torch.from_numpy(spec[frame_idx]).to(dtype=torch.float, device=target_device)
-                            else:
-                                padding_shape = sequence[-1].shape if sequence else (expected_dim,)
-                                spec_vec = torch.zeros(padding_shape, dtype=torch.float, device=target_device)
-                        else:
-                            spec_vec = torch.from_numpy(spec).to(dtype=torch.float, device=target_device)
-                    except Exception:
-                        # Use zero tensor on error
-                        padding_shape = sequence[-1].shape if sequence else (expected_dim,)
-                        spec_vec = torch.zeros(padding_shape, dtype=torch.float, device=target_device)
-                else:
-                    # Use stored spectrogram if available
-                    if 'spectro' in sample_i:
-                        if isinstance(sample_i['spectro'], np.ndarray):
-                            spec_vec = torch.from_numpy(sample_i['spectro']).to(dtype=torch.float, device=target_device)
-                        else:
-                            spec_vec = sample_i['spectro'].clone().detach().to(target_device)
-                    else:
-                        # Create a zero tensor
-                        padding_shape = sequence[-1].shape if sequence else (expected_dim,)
-                        spec_vec = torch.zeros(padding_shape, dtype=torch.float, device=target_device)
-                
-                # Get chord label
-                chord_label = sample_i['chord_label']
-                chord_idx = self.chord_to_idx.get(chord_label, self.chord_to_idx.get("N", 0))
-                chord_idx_tensor = torch.tensor(chord_idx, dtype=torch.long, device=target_device)
-                
-                sequence.append(spec_vec)
-                label_seq.append(chord_idx_tensor)
-                
-                # Handle teacher logits efficiently
-                if 'logit_path' in sample_i and 'teacher_logits' not in sample_i:
-                    try:
-                        logit_path = sample_i['logit_path']
-                        teacher_logits = np.load(logit_path)
-                        
-                        # Process multi-frame logits - ensure consistent dimensionality
-                        if len(teacher_logits.shape) > 1:
-                            if 'frame_idx' in sample_i:
-                                frame_idx = sample_i['frame_idx']
-                                if frame_idx < teacher_logits.shape[0]:
-                                    # Extract specific frame
-                                    teacher_logits = teacher_logits[frame_idx]
-                                else:
-                                    # Create zeros tensor for out-of-bounds frame
-                                    teacher_logits = np.zeros(teacher_logits.shape[-1] if len(teacher_logits.shape) > 1 else 170)
-                        elif teacher_logits.shape[0] == 1:
-                            # Single-frame logits stored as [1, num_classes]
-                            teacher_logits = teacher_logits[0]
-                        else:
-                            # Multi-frame logits without frame index - take first frame
-                            teacher_logits = teacher_logits[0]
-                        
-                        # Ensure teacher_logits is 1D
-                        if len(teacher_logits.shape) > 1:
-                            # If still multi-dimensional, flatten to 1D
-                            if self.verbose and not hasattr(self, '_teacher_logits_dim_warning'):
-                                print(f"WARNING: Teacher logits have unexpected shape: {teacher_logits.shape}. Flattening to 1D.")
-                                self._teacher_logits_dim_warning = True
-                            teacher_logits = teacher_logits.reshape(-1)[:170]  # Limit to 170 classes
-                        
-                        # Create tensor and add to sequence
-                        logits_tensor = torch.from_numpy(teacher_logits).to(dtype=torch.float, device=target_device)
-                        teacher_logits_seq.append(logits_tensor)
-                        has_teacher_logits = True
-                        
-                    except Exception as e:
-                        if self.verbose and not hasattr(self, '_logit_error_warned'):
-                            print(f"Error loading teacher logits: {e}")
-                            self._logit_error_warned = True
-                        
-                        # Skip processing error but continue with other data
-                        if has_teacher_logits or check_for_logits:
-                            logit_shape = teacher_logits_seq[0].shape if teacher_logits_seq else (170,)
-                            teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float, device=target_device))
-                elif 'teacher_logits' in sample_i:
-                    try:
-                        # Extract teacher logits and ensure consistent dimensionality
-                        temp_logits = sample_i['teacher_logits']
-                        
-                        # Convert numpy array to tensor if needed
-                        if isinstance(temp_logits, np.ndarray):
-                            # Ensure 1D tensor
-                            if len(temp_logits.shape) > 1:
-                                temp_logits = temp_logits.reshape(-1)[:170]  # Limit to 170 classes
-                            logits_tensor = torch.from_numpy(temp_logits).to(dtype=torch.float, device=target_device)
-                        else:
-                            # Already a tensor
-                            if temp_logits.dim() > 1:
-                                # Flatten to 1D if needed
-                                logits_tensor = temp_logits.reshape(-1)[:170]
-                            else:
-                                logits_tensor = temp_logits
-                            
-                            # Move to target device
-                            logits_tensor = logits_tensor.clone().detach().to(target_device)
-                        
-                        teacher_logits_seq.append(logits_tensor)
-                        has_teacher_logits = True
-                    except Exception as e:
-                        if self.verbose and not hasattr(self, '_stored_logit_error_warned'):
-                            print(f"Error processing stored teacher logits: {e}")
-                            self._stored_logit_error_warned = True
-                        
-                        # Create zero tensor as fallback
-                        if has_teacher_logits or check_for_logits:
-                            logit_shape = teacher_logits_seq[0].shape if teacher_logits_seq else (170,)
-                            teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float, device=target_device))
-                elif has_teacher_logits or check_for_logits:
-                    # If we need teacher logits but none are available for this sample
-                    logit_shape = teacher_logits_seq[0].shape if teacher_logits_seq else (170,)
-                    teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float, device=target_device))
-            
-            # Pad to ensure we have exactly seq_len frames
-            current_len = len(sequence)
-            if current_len < self.seq_len:
-                padding_needed = self.seq_len - current_len
-                padding_shape = sequence[-1].shape if sequence else (expected_dim,)
-                for _ in range(padding_needed):
-                    sequence.append(torch.zeros(padding_shape, dtype=torch.float, device=target_device))
-                    label_seq.append(torch.tensor(self.chord_to_idx.get("N", 0), dtype=torch.long, device=target_device))
-                    
-                    if has_teacher_logits or check_for_logits:
-                        logit_shape = teacher_logits_seq[0].shape if teacher_logits_seq else (170,)
-                        teacher_logits_seq.append(torch.zeros(logit_shape, dtype=torch.float, device=target_device))
-            
-            # Stack tensors, ensuring consistent dimensions
-            sample_out = {
-                'spectro': torch.stack(sequence, dim=0),
-                'chord_idx': torch.stack(label_seq, dim=0)
-            }
-            
-            # Include teacher logits if we have them - CRITICAL FIX FOR DIMENSIONALITY ISSUE
-            if has_teacher_logits or check_for_logits:
-                if teacher_logits_seq:
-                    try:
-                        # First ensure all tensors have the same shape
-                        first_shape = teacher_logits_seq[0].shape
-                        for i in range(len(teacher_logits_seq)):
-                            if teacher_logits_seq[i].shape != first_shape:
-                                # Resize tensor to match first tensor shape
-                                if self.verbose and not hasattr(self, '_teacher_logits_shape_mismatch'):
-                                    print(f"Tensor shape mismatch: {teacher_logits_seq[i].shape} vs {first_shape}. Resizing.")
-                                    self._teacher_logits_shape_mismatch = True
-                                
-                                # Create a new tensor with the right shape
-                                new_tensor = torch.zeros(first_shape, dtype=torch.float, device=target_device)
-                                # Copy data where possible
-                                min_size = min(new_tensor.numel(), teacher_logits_seq[i].numel())
-                                new_tensor.view(-1)[:min_size].copy_(teacher_logits_seq[i].view(-1)[:min_size])
-                                teacher_logits_seq[i] = new_tensor
-                        
-                        # Stack teacher logits with consistent shape
-                        stacked_logits = torch.stack(teacher_logits_seq)
-                        
-                        # Add batch dimension if needed and ensure 3D format [batch, seq_len, classes]
-                        if stacked_logits.dim() == 2:  # Shape is [seq_len, classes]
-                            sample_out['teacher_logits'] = stacked_logits.unsqueeze(0)  # Add batch dimension to make [1, seq_len, classes]
-                        elif stacked_logits.dim() == 1:  # Shape is [classes]
-                            # Reshape to [1, 1, classes]
-                            sample_out['teacher_logits'] = stacked_logits.unsqueeze(0).unsqueeze(0)
-                        else:
-                            # Already 3D or higher - ensure it's [batch, seq_len, classes]
-                            sample_out['teacher_logits'] = stacked_logits.unsqueeze(0) if stacked_logits.dim() == 2 else stacked_logits
-                        
-                        # Final verification - ensure we have [batch, seq_len, classes] format
-                        if sample_out['teacher_logits'].dim() != 3:
-                            # Log shape and reshape to correct dimensions
-                            if self.verbose and not hasattr(self, '_teacher_logits_dim_fix'):
-                                print(f"Fixing teacher logits shape from {sample_out['teacher_logits'].shape} to [1, {self.seq_len}, classes]")
-                                self._teacher_logits_dim_fix = True
-                            
-                            # Create a properly formatted tensor - consistent format is [1, seq_len, classes]
-                            correct_shape = (1, self.seq_len, stacked_logits.shape[-1] if stacked_logits.dim() > 0 else 170)
-                            proper_tensor = torch.zeros(correct_shape, dtype=torch.float, device=target_device)
-                            
-                            # Try to copy existing data where possible
-                            if stacked_logits.dim() > 0:
-                                try:
-                                    if stacked_logits.dim() == 1:
-                                        # Single class vector
-                                        proper_tensor[0, 0, :min(stacked_logits.shape[0], proper_tensor.shape[2])] = stacked_logits[:proper_tensor.shape[2]]
-                                    elif stacked_logits.shape[0] == 1:
-                                        # Single-frame logits stored as [1, num_classes]
-                                        proper_tensor[0, 0, :min(stacked_logits.shape[1], proper_tensor.shape[2])] = stacked_logits[0, :proper_tensor.shape[2]]
-                                    elif stacked_logits.dim() == 2:
-                                        # Multiple class vectors
-                                        max_seq = min(stacked_logits.shape[0], proper_tensor.shape[1])
-                                        max_class = min(stacked_logits.shape[1], proper_tensor.shape[2])
-                                        proper_tensor[0, :max_seq, :max_class] = stacked_logits[:max_seq, :max_class]
-                                    elif stacked_logits.dim() == 3:
-                                        # Already have batch dimension
-                                        max_batch = min(stacked_logits.shape[0], proper_tensor.shape[0])
-                                        max_seq = min(stacked_logits.shape[1], proper_tensor.shape[1])
-                                        max_class = min(stacked_logits.shape[2], proper_tensor.shape[2])
-                                        proper_tensor[:max_batch, :max_seq, :max_class] = stacked_logits[:max_batch, :max_seq, :max_class]
-                                    else:
-                                        # Higher dimensions - flatten and use what we can
-                                        flat_stacked = stacked_logits.reshape(-1)
-                                        flat_proper = proper_tensor.reshape(-1)
-                                        max_copy = min(flat_stacked.shape[0], flat_proper.shape[0])
-                                        flat_proper[:max_copy] = flat_stacked[:max_copy]
-                                except Exception as e:
-                                    if self.verbose and not hasattr(self, '_tensor_copy_error'):
-                                        print(f"Error copying tensor data: {e}")
-                                        self._tensor_copy_error = True
-                            
-                            sample_out['teacher_logits'] = proper_tensor
-                    
-                    except Exception as e:
-                        if self.verbose and not hasattr(self, '_stacking_error'):
-                            print(f"Error stacking teacher logits: {e}")
-                            print(f"Teacher logits shapes: {[t.shape for t in teacher_logits_seq[:3]]}")
-                            self._stacking_error = True
-                        
-                        # Create a default tensor as fallback - consistent format is [1, seq_len, classes]
-                        proper_shape = (1, self.seq_len, 170)
-                        sample_out['teacher_logits'] = torch.zeros(proper_shape, dtype=torch.float, device=target_device)
-                else:
-                    # No teacher logits, but we should include them for consistent batch structure
-                    proper_shape = (1, self.seq_len, 170)
-                    sample_out['teacher_logits'] = torch.zeros(proper_shape, dtype=torch.float, device=target_device)
-            
-            # Cache the result for future use if GPU caching is enabled
-            if self.batch_gpu_cache and target_device.type == 'cuda':
-                try:
-                    self.gpu_batch_cache[idx] = sample_out
-                    # Limit cache size to prevent memory issues
-                    # ! Note: Effectively if stride step is small, cache works well for all overlapping segments
-                    # ! up to 2 * batch size, unless gpu has more memory than dataset total size
-                    # ! we can never cache the whole dataset and missing as window slides
-                    if len(self.gpu_batch_cache) > 256:
-                        oldest_key = next(iter(self.gpu_batch_cache))
-                        del self.gpu_batch_cache[oldest_key]
-                except Exception:
-                    # If caching fails, just ignore and return the sample
-                    self.gpu_batch_cache = {}  # Clear cache to prevent future errors
-            
-            return sample_out
+        # Initialize lists for data with expected size
+        sequence = []
+        label_seq = []
+        teacher_logits_seq = []
+        has_teacher_logits = False
         
-        except Exception as e:
-            # For all errors, log but don't generate dummy data
-            if self.verbose:
-                print(f"Error in dataset.__getitem__: {e}")
+        # Get first sample to determine consistent song ID
+        first_sample = self.samples[seg_start]
+        start_song_id = first_sample['song_id']
+        
+        # Process each sample in the segment
+        for i in range(seg_start, seg_end):
+            if i >= len(self.samples):
+                # We've reached the end of the dataset, add padding
+                padding_shape = sequence[-1].shape if sequence else (144,)
+                sequence.append(torch.zeros(padding_shape, dtype=torch.float, device=self.device))
+                label_seq.append(torch.tensor(self.chord_to_idx.get("N", 0), dtype=torch.long, device=self.device))
                 
-            # Return what we have so far, or raise the exception if we don't have anything
-            if sequence and label_seq:
+                if has_teacher_logits:
+                    logits_shape = teacher_logits_seq[0].shape if teacher_logits_seq else (25,)
+                    teacher_logits_seq.append(torch.zeros(logits_shape, dtype=torch.float, device=self.device))
+                continue
+                
+            sample_i = self.samples[i]
+            
+            # Check if we've crossed a song boundary
+            if sample_i['song_id'] != start_song_id:
+                break
+            
+            # Load spectrogram - either from memory or from disk
+            if 'spectro' not in sample_i and 'spec_path' in sample_i:
                 try:
-                    return {
-                        'spectro': torch.stack(sequence, dim=0),
-                        'chord_idx': torch.stack(label_seq, dim=0)
-                    }
-                except:
-                    # If stacking fails, then raise the original exception
-                    raise
+                    spec_path = sample_i['spec_path']
+                    spec = np.load(spec_path)
+                    
+                    # Handle frame index for multi-frame spectrograms
+                    if sample_i.get('frame_idx') is not None and len(spec.shape) > 1:
+                        frame_idx = sample_i['frame_idx']
+                        if frame_idx < spec.shape[0]:
+                            spec_vec = torch.from_numpy(spec[frame_idx]).to(dtype=torch.float, device=self.device)
+                        else:
+                            # Use zero tensor for out-of-bounds frame
+                            padding_shape = sequence[-1].shape if sequence else (144,)
+                            spec_vec = torch.zeros(padding_shape, dtype=torch.float, device=self.device)
+                    else:
+                        # Single-frame spectrogram
+                        spec_vec = torch.from_numpy(spec).to(dtype=torch.float, device=self.device)
+                except Exception:
+                    # Handle loading errors with zero tensor
+                    padding_shape = sequence[-1].shape if sequence else (144,)
+                    spec_vec = torch.zeros(padding_shape, dtype=torch.float, device=self.device)
             else:
-                # If we have nothing to return, raise the original exception
-                raise
+                # Use stored spectrogram if available
+                if 'spectro' in sample_i:
+                    if isinstance(sample_i['spectro'], np.ndarray):
+                        spec_vec = torch.from_numpy(sample_i['spectro']).to(dtype=torch.float, device=self.device)
+                    else:
+                        spec_vec = sample_i['spectro'].clone().detach().to(self.device)
+                else:
+                    # Use zero tensor if no spectrogram data
+                    padding_shape = sequence[-1].shape if sequence else (144,)
+                    spec_vec = torch.zeros(padding_shape, dtype=torch.float, device=self.device)
+            
+            # Get chord label index
+            chord_label = sample_i['chord_label']
+            chord_idx = self.chord_to_idx.get(chord_label, self.chord_to_idx.get("N", 0))
+            chord_idx_tensor = torch.tensor(chord_idx, dtype=torch.long, device=self.device)
+            
+            # Add spectrogram and chord label to sequences
+            sequence.append(spec_vec)
+            label_seq.append(chord_idx_tensor)
+            
+            # Handle teacher logits - either from memory or from disk
+            if 'teacher_logits' in sample_i:
+                # Use stored teacher logits
+                if isinstance(sample_i['teacher_logits'], np.ndarray):
+                    logits_tensor = torch.from_numpy(sample_i['teacher_logits']).to(dtype=torch.float, device=self.device)
+                else:
+                    logits_tensor = sample_i['teacher_logits'].clone().detach().to(self.device)
+                    
+                teacher_logits_seq.append(logits_tensor)
+                has_teacher_logits = True
+            elif 'logit_path' in sample_i:
+                # Load teacher logits from disk
+                try:
+                    logit_path = sample_i['logit_path']
+                    logits = np.load(logit_path)
+                    
+                    # Handle frame index for multi-frame logits
+                    if 'frame_idx' in sample_i and len(logits.shape) > 1:
+                        frame_idx = sample_i['frame_idx']
+                        if frame_idx < logits.shape[0]:
+                            logits_vec = torch.from_numpy(logits[frame_idx]).to(dtype=torch.float, device=self.device)
+                        else:
+                            # Use zero tensor for out-of-bounds frame
+                            if teacher_logits_seq:
+                                logits_vec = torch.zeros_like(teacher_logits_seq[0], device=self.device)
+                            else:
+                                # Default size if we don't know the shape yet
+                                logits_vec = torch.zeros(25, dtype=torch.float, device=self.device)
+                    else:
+                        # Single-frame logits
+                        logits_vec = torch.from_numpy(logits).to(dtype=torch.float, device=self.device)
+                        
+                    teacher_logits_seq.append(logits_vec)
+                    has_teacher_logits = True
+                except Exception as e:
+                    if not teacher_logits_seq and has_teacher_logits:
+                        # Default size if loading fails but we've seen teacher logits before
+                        logits_vec = torch.zeros(25, dtype=torch.float, device=self.device)
+                        teacher_logits_seq.append(logits_vec)
+            elif has_teacher_logits:
+                # No teacher logits for this sample but we have them for others
+                # Create zero tensor with matching shape for consistency
+                if teacher_logits_seq:
+                    logits_vec = torch.zeros_like(teacher_logits_seq[0], device=self.device)
+                    teacher_logits_seq.append(logits_vec)
+        
+        # Pad to ensure consistent sequence length
+        current_len = len(sequence)
+        if current_len < self.seq_len:
+            padding_needed = self.seq_len - current_len
+            padding_shape = sequence[-1].shape if sequence else (144,)
+            for _ in range(padding_needed):
+                sequence.append(torch.zeros(padding_shape, dtype=torch.float, device=self.device))
+                label_seq.append(torch.tensor(self.chord_to_idx.get("N", 0), dtype=torch.long, device=self.device))
+                
+                if has_teacher_logits and teacher_logits_seq:
+                    logits_shape = teacher_logits_seq[0].shape
+                    teacher_logits_seq.append(torch.zeros(logits_shape, dtype=torch.float, device=self.device))
+        
+        # Create the output dictionary
+        sample_out = {
+            'spectro': torch.stack(sequence, dim=0),
+            'chord_idx': torch.stack(label_seq, dim=0)
+        }
+        
+        # Add teacher logits if available
+        if has_teacher_logits and teacher_logits_seq:
+            try:
+                sample_out['teacher_logits'] = torch.stack(teacher_logits_seq, dim=0)
+            except Exception as e:
+                # Handle dimension mismatch by converting to same shape
+                if self.verbose and not hasattr(self, '_logits_stack_warning'):
+                    print(f"Warning: Teacher logits have inconsistent shapes. Fixing dimensions.")
+                    self._logits_stack_warning = True
+                
+                # Find the most common shape
+                shapes = [t.shape for t in teacher_logits_seq]
+                if shapes:
+                    # Use the first shape as reference
+                    target_shape = shapes[0]
+                    # Reshape tensors if needed
+                    fixed_tensors = []
+                    for tensor in teacher_logits_seq:
+                        if tensor.shape != target_shape:
+                            # Create new tensor with correct shape and copy data where possible
+                            fixed = torch.zeros(target_shape, dtype=torch.float, device=self.device)
+                            # For 1D tensors, copy as much as we can
+                            if tensor.dim() == 1 and tensor.shape[0] <= target_shape[0]:
+                                fixed[:tensor.shape[0]] = tensor
+                            fixed_tensors.append(fixed)
+                        else:
+                            fixed_tensors.append(tensor)
+                    
+                    sample_out['teacher_logits'] = torch.stack(fixed_tensors, dim=0)
+        
+        # Apply GPU batch caching if enabled
+        if self.batch_gpu_cache and self.device.type == 'cuda':
+            try:
+                # Use a subset of the first frame as the cache key
+                key = idx  # Use the index as the key for simplicity and reliability
+                self.gpu_batch_cache[key] = sample_out
+                
+                # Limit cache size to avoid memory issues
+                if len(self.gpu_batch_cache) > 2000:  # Larger threshold for strided data
+                    # Remove oldest entry (arbitrary key)
+                    oldest_key = next(iter(self.gpu_batch_cache))
+                    del self.gpu_batch_cache[oldest_key]
+            except Exception as e:
+                if self.verbose and not hasattr(self, '_cache_error_warning'):
+                    print(f"Warning: Error in GPU batch caching: {e}")
+                    self._cache_error_warning = True
+                
+                # Clear cache if an error occurs to prevent cascading failures
+                self.gpu_batch_cache = {}
+        
+        return sample_out
 
     def get_train_iterator(self, batch_size=128, shuffle=True, num_workers=None, pin_memory=None):
-        """Get an optimized DataLoader for the training set"""
-        
         if not self.train_indices:
             warnings.warn("No training segments available")
             return DataLoader(
@@ -1557,8 +1063,6 @@ class SynthDataset(Dataset):
         )
     
     def get_eval_iterator(self, batch_size=128, shuffle=False, num_workers=None, pin_memory=None):
-        """Get an optimized DataLoader for the evaluation set"""
-        
         if not self.eval_indices:
             warnings.warn("No evaluation segments available")
             return DataLoader(
@@ -1578,9 +1082,6 @@ class SynthDataset(Dataset):
         )
     
     def get_test_iterator(self, batch_size=128, shuffle=False, num_workers=None, pin_memory=None):
-        """Get an optimized DataLoader for the test set"""
-
-        
         if not self.test_indices:
             warnings.warn("No test segments available")
             return DataLoader(
@@ -1598,8 +1099,8 @@ class SynthDataset(Dataset):
             num_workers=num_workers,
             pin_memory=pin_memory
         )
+
 class SynthSegmentSubset(Dataset):
-    """Subset of the SynthDataset based on specified indices"""
     def __init__(self, dataset, indices):
         self.dataset = dataset
         self.indices = indices
