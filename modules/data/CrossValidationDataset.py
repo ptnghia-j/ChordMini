@@ -298,26 +298,39 @@ class CrossValidationDataset(Dataset):
                 while curSec < current_start_second + inst_len:
                     try:
                         # Find chords for current time frame
+                        # First, look for chords that contain the current time point
                         available_chords = chord_info.loc[(chord_info['start'] <= curSec) & 
-                                                         (chord_info['end'] > curSec + time_interval)].copy()
+                                                         (chord_info['end'] > curSec)].copy()
                         
                         if len(available_chords) == 0:
-                            # If no chord spans the entire interval, look for overlapping chords
+                            # If no direct match, try to find chords with a small tolerance window
+                            tolerance = time_interval / 2
                             available_chords = chord_info.loc[
-                                ((chord_info['start'] >= curSec) & (chord_info['start'] <= curSec + time_interval)) | 
-                                ((chord_info['end'] >= curSec) & (chord_info['end'] <= curSec + time_interval))
+                                # Chords starting just before or at the current time
+                                ((chord_info['start'] >= curSec - tolerance) & (chord_info['start'] <= curSec + tolerance)) |
+                                # Chords ending just after or at the current time
+                                ((chord_info['end'] >= curSec - tolerance) & (chord_info['end'] <= curSec + tolerance)) |
+                                # Chords that completely contain the current time point with tolerance
+                                ((chord_info['start'] <= curSec - tolerance) & (chord_info['end'] >= curSec + tolerance))
                             ].copy()
+                            
+                            # Log when we need to use the tolerance window
+                            if len(available_chords) > 0 and len(chord_list) % 100 == 0:  # Limit logging
+                                logger.debug(f"Used tolerance window to find chord at {curSec}s")
                         
                         if len(available_chords) == 1:
                             # If only one chord, use it
                             chord = available_chords['chord_id'].iloc[0]
                         elif len(available_chords) > 1:
-                            # If multiple chords, pick the one that covers the most of the interval
-                            max_starts = available_chords.apply(lambda row: max(row['start'], curSec), axis=1)
+                            # If multiple chords, pick the one that covers the most of the current time point
+                            tolerance_value = tolerance if 'tolerance' in locals() else 0
+                            
+                            # Calculate overlap with the current time point
+                            max_starts = available_chords.apply(lambda row: max(row['start'], curSec - tolerance_value), axis=1)
                             available_chords['max_start'] = max_starts
                             
                             min_ends = available_chords.apply(
-                                lambda row: min(row['end'], curSec + time_interval), axis=1)
+                                lambda row: min(row['end'], curSec + tolerance_value), axis=1)
                             available_chords['min_end'] = min_ends
                             
                             chords_lengths = available_chords['min_end'] - available_chords['max_start']
@@ -328,6 +341,13 @@ class CrossValidationDataset(Dataset):
                         else:
                             # No chord found, use no-chord class
                             chord = 169 if large_voca else 24
+                            
+                            # Log when no chord is found (but limit logging frequency)
+                            if current_start_second < 5.0 or (current_start_second + inst_len) > (origin_length_in_sec - 5.0):
+                                # Don't log for beginning/end of song where no-chord is expected
+                                pass
+                            elif len(chord_list) % 100 == 0:  # Only log occasionally to avoid flood
+                                logger.debug(f"No chord found at time {curSec}s")
                     except Exception as e:
                         # Error handling for chord extraction
                         chord = 169 if large_voca else 24
@@ -344,22 +364,19 @@ class CrossValidationDataset(Dataset):
                     
                     chord_list.append(chord)
                     curSec += time_interval
-                
+
                 # Check if we have the right number of chords
                 if len(chord_list) == no_of_chord_datapoints_per_sequence:
                     # Extract audio segment
                     sequence_start_time = current_start_second
                     sequence_end_time = current_start_second + inst_len
-                    
                     start_index = int(sequence_start_time * song_hz)
                     end_index = int(sequence_end_time * song_hz)
-                    
                     song_seq = x[start_index:end_index]
                     
                     # Extract CQT feature
                     n_bins = self.config.feature.get('n_bins', 144)
                     bins_per_octave = self.config.feature.get('bins_per_octave', 24)
-                    
                     feature = librosa.cqt(
                         song_seq, 
                         sr=song_hz,
@@ -379,7 +396,6 @@ class CrossValidationDataset(Dataset):
                     # Create result dictionary
                     etc = f"{current_start_second:.1f}_{current_start_second + inst_len:.1f}"
                     aug = f"{stretch_factor:.2f}_{shift_factor}"
-                    
                     result = {
                         'feature': feature,
                         'chord': chord_list,
@@ -391,275 +407,80 @@ class CrossValidationDataset(Dataset):
                     cache_filename = f"{aug}_{len(results)}.pt"
                     cache_filepath = os.path.join(cache_path, cache_filename)
                     torch.save(result, cache_filepath)
-                    
                     results.append(cache_filepath)
                 
                 # Move to next segment
                 current_start_second += skip_interval
             
             return results
-            
+                    
         except Exception as e:
             logger.error(f"Error processing {audio_path}: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return None
 
-    def generate_teacher_predictions(self):
-        """Generate predictions from teacher model for knowledge distillation"""
-        if self.teacher_model is None or self._kd_data_generated:
-            return
-            
-        logger.info("Generating teacher model predictions for knowledge distillation")
-        self.teacher_model.eval()
+    def analyze_chord_distribution(self):
+        """
+        Analyze the distribution of chords in the dataset to identify potential imbalance issues.
+        This helps diagnose issues like excessive 'N' chord labeling.
+        """
+        logger.info("Analyzing chord distribution in the dataset...")
         
-        # Process all paths
-        for i, path in enumerate(self.paths):
-            if i % 100 == 0:
-                logger.info(f"Generating KD data: {i}/{len(self.paths)}")
-                
-            # Skip if path is not a file (dictionary for on-the-fly processing)
-            if isinstance(path, dict):
-                continue
-                
+        # Initialize counters
+        chord_counts = {}
+        total_frames = 0
+        n_chord_frames = 0
+        large_voca = self.config.feature.get('large_voca', False)
+        n_chord_id = 169 if large_voca else 24
+        
+        # Sample up to 100 files for analysis
+        sample_paths = self.paths[:min(100, len(self.paths))]
+        
+        # Process each file
+        for path in sample_paths:
             try:
-                # Load data
-                data = torch.load(path)
-                feature = data['feature']
-                
-                # Convert to log-magnitude and ensure shape is correct
-                feature = np.log(np.abs(feature) + 1e-6)
-                feature = torch.tensor(feature, dtype=torch.float32).unsqueeze(0).to(self.device)
-                
-                # Generate teacher predictions
-                with torch.no_grad():
-                    teacher_logits = self.teacher_model(feature.permute(0, 2, 1))
-                    if isinstance(teacher_logits, tuple):
-                        teacher_logits = teacher_logits[0]
+                # Skip if it's a dictionary (on-the-fly processing)
+                if isinstance(path, dict):
+                    continue
                     
-                # Store teacher predictions with data
-                data['teacher_logits'] = teacher_logits.cpu()
-                torch.save(data, path)
-            except Exception as e:
-                logger.error(f"Error generating teacher predictions for {path}: {e}")
-        
-        self._kd_data_generated = True
-        logger.info("Teacher predictions generation completed")
-
-    def __len__(self):
-        """Return the number of samples in the dataset"""
-        return len(self.paths)
-
-    def __getitem__(self, idx):
-        """Get a sample by index"""
-        path = self.paths[idx]
-        
-        # Check if path is a file or a dictionary for on-the-fly processing
-        if isinstance(path, dict):
-            # Process file on-the-fly
-            logger.debug(f"Processing file on-the-fly: {path['song_name']}")
-            
-            # Process with default parameters (no augmentation for on-the-fly)
-            processed_paths = self._process_audio_file(
-                path['audio_path'], 
-                path['label_path'], 
-                path['cache_path']
-            )
-            
-            if processed_paths and len(processed_paths) > 0:
-                # Replace the dictionary entry with the first processed file
-                self.paths[idx] = processed_paths[0]
-                # Add other processed files to the dataset
-                self.paths.extend(processed_paths[1:])
+                # Load data from file
+                data = torch.load(path)
                 
-                # Load the newly processed file
-                path = processed_paths[0]
-            else:
-                # Return dummy data if processing failed
-                logger.warning(f"Failed to process {path['song_name']} on-the-fly")
-                return self._get_dummy_data()
+                # Count chord occurrences
+                for chord_id in data['chord']:
+                    chord_id = int(chord_id)  # Convert to int for consistent key type
+                    if chord_id not in chord_counts:
+                        chord_counts[chord_id] = 0
+                    chord_counts[chord_id] += 1
+                    total_frames += 1
+                    
+                    # Check if it's not an 'N' chord
+                    if chord_id != n_chord_id:
+                        n_chord_frames += 1
+                        
+            except Exception as e:
+                logger.error(f"Error analyzing file {path}: {e}")
         
-        # Load data from cache
-        try:
-            data = torch.load(path)
-            
-            # Convert feature to log-magnitude and torch tensor
-            feature = np.log(np.abs(data['feature']) + 1e-6)
-            feature = torch.tensor(feature, dtype=torch.float32)
-            
-            # Convert chord to torch tensor
-            chord = torch.tensor(data['chord'], dtype=torch.long)
-            
-            # Set up return dictionary
-            result = {
-                'spectro': feature, 
-                'chord_idx': chord,
-                'song_id': data.get('song_name', Path(path).stem),
-                'file_path': path
-            }
-            
-            # Add teacher logits if available
-            if 'teacher_logits' in data:
-                result['teacher_logits'] = data['teacher_logits']
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error loading {path}: {e}")
-            return self._get_dummy_data()
-    
-    def _get_dummy_data(self):
-        """Return dummy data in case of errors"""
-        # Determine feature and chord sizes based on config
-        inst_len = self.config.mp3.get('inst_len', 10.0)
-        hop_length = self.config.feature.get('hop_length', 2048)
-        song_hz = self.config.mp3.get('song_hz', 22050)
-        time_interval = hop_length / song_hz
-        seq_len = math.ceil(inst_len / time_interval)
-        n_bins = self.config.feature.get('n_bins', 144)
+        # Calculate statistics
+        n_chord_percent = (n_chord_frames / total_frames * 100) if total_frames > 0 else 0
+        n_percent = ((total_frames - n_chord_frames) / total_frames * 100) if total_frames > 0 else 0
         
-        # Create dummy data
-        dummy_feature = torch.zeros(n_bins, seq_len, dtype=torch.float32)
-        dummy_chord = torch.zeros(seq_len, dtype=torch.long)
+        logger.info(f"Analyzed {total_frames} frames from {len(sample_paths)} files")
+        logger.info(f"  Chord frames (non-N): {n_chord_frames} ({n_chord_percent:.2f}%)")
+        logger.info(f"  No-chord frames (N): {total_frames - n_chord_frames} ({n_percent:.2f}%)")
+        
+        # Sort and display chord distribution
+        if chord_counts:
+            sorted_counts = sorted(chord_counts.items(), key=lambda x: x[1], reverse=True)
+            logger.info("Top 10 chord IDs by frequency:")
+            for chord_id, count in sorted_counts[:10]:
+                percentage = (count / total_frames * 100) if total_frames > 0 else 0
+                logger.info(f"  Chord ID {chord_id}: {count} frames ({percentage:.2f}%)")
         
         return {
-            'spectro': dummy_feature, 
-            'chord_idx': dummy_chord,
-            'song_id': 'dummy',
-            'file_path': 'dummy'
+            'total_frames': total_frames,
+            'chord_frames': n_chord_frames,
+            'no_chord_frames': total_frames - n_chord_frames,
+            'chord_counts': chord_counts
         }
-        
-    def get_data_loader(self, batch_size=16, shuffle=True, num_workers=4, pin_memory=True):
-        """Get a data loader for this dataset"""
-        return DataLoader(
-            self,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            collate_fn=self._collate_fn
-        )
-    
-    @staticmethod
-    def _collate_fn(batch):
-        """Custom collate function to handle variable length sequences"""
-        # Check if the batch is empty
-        if len(batch) == 0:
-            return {}
-            
-        # Extract all spectrograms and chords
-        spectros = [item['spectro'] for item in batch]
-        chords = [item['chord_idx'] for item in batch]
-        
-        # Get maximum sequence length
-        max_len = max(s.shape[1] for s in spectros)
-        
-        # Pad sequences to max_len
-        padded_spectros = []
-        for spectro in spectros:
-            curr_len = spectro.shape[1]
-            if curr_len < max_len:
-                # Pad with zeros
-                padding = torch.zeros(spectro.shape[0], max_len - curr_len, dtype=spectro.dtype)
-                padded_spectros.append(torch.cat([spectro, padding], dim=1))
-            else:
-                padded_spectros.append(spectro)
-        
-        # Stack spectrograms and chords
-        spectros_tensor = torch.stack(padded_spectros)
-        chords_tensor = torch.stack(chords)
-        
-        # Transpose spectrograms to (batch, freq, time)
-        spectros_tensor = spectros_tensor.permute(0, 2, 1)
-        
-        # Create output dictionary
-        result = {
-            'spectro': spectros_tensor,
-            'chord_idx': chords_tensor,
-            'song_ids': [item['song_id'] for item in batch]
-        }
-        
-        # Add teacher logits if available
-        if 'teacher_logits' in batch[0]:
-            teacher_logits = [item.get('teacher_logits') for item in batch]
-            # Make sure all teacher logits are available and have the same shape
-            if all(t is not None for t in teacher_logits):
-                result['teacher_logits'] = torch.stack(teacher_logits)
-            else:
-                # Handle missing teacher logits
-                has_none = [i for i, t in enumerate(teacher_logits) if t is None]
-                logger.warning(f"Missing teacher logits in batch at indices: {has_none}")
-        
-        return result
-
-    def generate_all_features(self):
-        """Process all audio files to extract features (for pre-processing)"""
-        from tqdm import tqdm
-        import time
-        
-        # Count total operations to be performed
-        total_songs = len(self.all_song_paths)
-        stretch_factors = [1.0]
-        shift_factors = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6]
-        total_operations = total_songs * len(stretch_factors) * len(shift_factors)
-        
-        logger.info(f"Starting feature extraction for {total_songs} songs with {len(shift_factors)} pitch shifts")
-        logger.info(f"Total operations: {total_operations} (this may take a while)")
-        
-        # Process each song with a progress bar
-        operations_completed = 0
-        start_time = time.time()
-        
-        for song_name, info in tqdm(self.all_song_paths.items(), desc="Processing songs", total=total_songs):
-            # Skip if already processed
-            cache_files = glob.glob(os.path.join(info['cache_path'], "*.pt"))
-            if cache_files:
-                logger.info(f"Song {song_name} already has cached features ({len(cache_files)} files)")
-                operations_completed += len(stretch_factors) * len(shift_factors)
-                continue
-                
-            song_start_time = time.time()
-            logger.info(f"Processing {song_name}")
-            
-            # Track successful operations for this song
-            song_operations = 0
-            
-            # Generate features with various augmentations
-            for stretch_factor in stretch_factors:
-                for shift_factor in tqdm(shift_factors, desc=f"Pitch shifts for {song_name}", leave=False):
-                    try:
-                        result = self._process_audio_file(
-                            info['audio_path'],
-                            info['label_path'],
-                            info['cache_path'],
-                            stretch_factor,
-                            shift_factor
-                        )
-                        
-                        if result:
-                            song_operations += 1
-                        
-                        operations_completed += 1
-                        
-                        # Log progress occasionally
-                        if operations_completed % 10 == 0:
-                            elapsed = time.time() - start_time
-                            if elapsed > 0:
-                                ops_per_second = operations_completed / elapsed
-                                estimated_total = total_operations / ops_per_second if ops_per_second > 0 else 0
-                                remaining = max(0, estimated_total - elapsed)
-                                
-                                logger.info(f"Progress: {operations_completed}/{total_operations} operations " +
-                                          f"({operations_completed/total_operations:.1%}), " +
-                                          f"~{remaining/60:.1f} minutes remaining")
-                    except Exception as e:
-                        logger.error(f"Error processing {song_name} with shift={shift_factor}: {e}")
-                        operations_completed += 1
-            
-            song_time = time.time() - song_start_time
-            logger.info(f"Completed {song_name}: {song_operations} operations in {song_time:.1f}s " +
-                      f"({song_operations/song_time:.1f} ops/s)")
-            
-            # Clean up memory
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()

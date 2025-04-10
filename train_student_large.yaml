@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-mini-large-01
+  name: chord-mini-large-02
   namespace: csuf-titans
   labels:
     app: chord-student-training
@@ -20,7 +20,7 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-GeForce-RTX-3090
+                - NVIDIA-GeForce-RTX-4090
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -181,7 +181,7 @@ spec:
             - name: LEARNING_RATE
               value: "0.001"  # Base learning rate
             - name: MIN_LEARNING_RATE
-              value: "0.00005"  # Minimum learning rate for schedulers
+              value: "0.00001"  # Minimum learning rate for schedulers
             # Knowledge distillation settings
             - name: USE_KD_LOSS
               value: "true"  # Set to "true" to enable KD loss
@@ -202,9 +202,9 @@ spec:
             - name: WARMUP_START_LR
               value: "0.0004"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.0008"  # Final learning rate after warm-up
+              value: "0.0006"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "10"  # Number of epochs for warm-up
+              value: "4"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
               value: "0.2"  # Set dropout probability (0-1)
@@ -228,7 +228,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
             - name: SUB_DIR
-              value: "combined-logits-01"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
+              value: "combined-logits-02"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
@@ -561,12 +561,12 @@ spec:
               python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
             requests:
-              cpu: "4"             
+              cpu: "3"             
               memory: "72Gi"    
               nvidia.com/gpu: "1"
             limits:
               cpu: "12"             
-              memory: "128Gi" 
+              memory: "132Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage

@@ -229,6 +229,11 @@ def main():
         device=device
     )
     
+    # After creating datasets
+    logger.info("Analyzing chord distributions:")
+    val_dataset.analyze_chord_distribution()
+    train_dataset.analyze_chord_distribution()
+    
     # Generate teacher predictions for training data if using KD
     if args.use_kd_loss and teacher_model is not None:
         logger.info("Generating teacher predictions for knowledge distillation")
