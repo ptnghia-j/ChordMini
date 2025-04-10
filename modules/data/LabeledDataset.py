@@ -570,18 +570,87 @@ class LabeledDataset(Dataset):
         Returns:
             List of chord labels for each frame
         """
-        frame_level_chords = ["N"] * num_frames  # Initialize with "N" (no chord)
+        # Initialize with "N" (no chord)
+        frame_level_chords = ["N"] * num_frames
         
-        for chord, (start, end) in zip(chord_labels, timestamps):
-            start_frame = max(0, int(start * feature_per_second))
-            end_frame = min(int(end * feature_per_second) + 1, num_frames)
+        # Calculate frame duration in seconds
+        frame_duration = 1.0 / feature_per_second
+        
+        # Keep track of statistics for debugging
+        assigned_frames = 0
+        n_chord_frames = 0
+        
+        # FIRST PASS: Exact matching - assign chords where frame is fully within chord boundaries
+        for i in range(num_frames):
+            # Calculate time for this frame center
+            frame_time = (i + 0.5) * frame_duration
             
-            # Set chord label for frames in this segment
-            for i in range(start_frame, end_frame):
-                frame_level_chords[i] = chord
+            # Find chord that contains this time point
+            found_chord = False
+            for chord, (start, end) in zip(chord_labels, timestamps):
+                # Use a small tolerance to account for floating point errors
+                if start <= frame_time < end:
+                    frame_level_chords[i] = chord
+                    found_chord = True
+                    assigned_frames += 1
+                    break
+            
+            if not found_chord:
+                n_chord_frames += 1
+        
+        # SECOND PASS: If there are still many N chords, use proximity matching with tolerance
+        if n_chord_frames > 0.5 * num_frames:  # If more than 50% are N chords, try with tolerance
+            tolerance = frame_duration * 0.5  # Half a frame tolerance
+            
+            for i in range(num_frames):
+                if frame_level_chords[i] != "N":
+                    continue  # Skip already assigned frames
+                    
+                # Calculate time for this frame center
+                frame_time = (i + 0.5) * frame_duration
+                
+                # Find nearest chord within tolerance
+                min_distance = float('inf')
+                nearest_chord = None
+                
+                for chord, (start, end) in zip(chord_labels, timestamps):
+                    # If frame is before chord starts
+                    if frame_time < start:
+                        distance = start - frame_time
+                    # If frame is after chord ends
+                    elif frame_time >= end:
+                        distance = frame_time - end
+                    # Should not get here if first pass worked correctly
+                    else:
+                        distance = 0
+                        
+                    if distance < min_distance:
+                        min_distance = distance
+                        nearest_chord = chord
+                
+                # Assign nearest chord if within tolerance
+                if nearest_chord is not None and min_distance <= tolerance:
+                    frame_level_chords[i] = nearest_chord
+                    assigned_frames += 1
+                    n_chord_frames -= 1
+        
+        # Log statistics - only if significant number of frames are unassigned
+        if n_chord_frames > 0.1 * num_frames:  # If more than 10% are still N chords
+            n_percent = (n_chord_frames / num_frames) * 100
+            logger.debug(f"Chord assignment: {assigned_frames}/{num_frames} frames assigned ({assigned_frames/num_frames:.1%})")
+            logger.debug(f"N chord frames: {n_chord_frames}/{num_frames} ({n_percent:.1f}%)")
+            
+            # If almost all frames are N, this is likely a file format or parsing issue
+            if n_chord_frames > 0.9 * num_frames:
+                logger.warning(f"WARNING: {n_percent:.1f}% of frames labeled as N. Possible parsing issue with chord file.")
+                
+                # Show first few timestamps to aid debugging
+                if timestamps:
+                    logger.debug(f"First 3 timestamps: {timestamps[:3]}")
+                    logger.debug(f"Song length in frames: {num_frames}, feature_per_second: {feature_per_second}")
         
         return frame_level_chords
-    
+        
     def _split_dataset(self, train_ratio, val_ratio, test_ratio):
         """
         Split dataset into train, validation, and test sets.
@@ -601,7 +670,7 @@ class LabeledDataset(Dataset):
         # Calculate split indices
         train_split = int(len(song_ids) * train_ratio)
         val_split = int(len(song_ids) * (train_ratio + val_ratio))
-        
+            
         # Split song IDs
         train_song_ids = set(song_ids[:train_split])
         val_song_ids = set(song_ids[train_split:val_split])
@@ -613,11 +682,69 @@ class LabeledDataset(Dataset):
         self.test_indices = [i for i, sample in enumerate(self.samples) if sample['song_id'] in test_song_ids]
         
         logger.info(f"Dataset split - Train: {len(self.train_indices)}, Val: {len(self.val_indices)}, Test: {len(self.test_indices)}")
-    
+
+    def analyze_label_file(self, label_path):
+        """Analyze a single label file to diagnose potential issues"""
+        logger.info(f"Analyzing label file: {os.path.basename(label_path)}")
+        
+        try:
+            # Attempt to parse the file - first few lines raw
+            with open(label_path, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()[:10]  # First 10 lines
+            
+            logger.info(f"First few lines of file: {lines}")
+            
+            # Now parse with our normal method
+            chord_labels, timestamps = self._parse_label_file(label_path)
+            
+            if len(chord_labels) == 0:
+                logger.error(f"No chords parsed from file - possible format issue")
+                return
+                
+            logger.info(f"Parsed {len(chord_labels)} chords")
+            logger.info(f"First 5 chords: {chord_labels[:5]}")
+            logger.info(f"First 5 timestamps: {timestamps[:5]}")
+            
+            # Calculate song duration
+            if timestamps:
+                duration = timestamps[-1][1]
+                logger.info(f"Song duration from labels: {duration:.2f} seconds")
+                
+                # Calculate frame rate and expected frame count
+                feature_per_second = 1.0 / self.feature_config.feature.get('hop_duration', 0.1)
+                expected_frames = int(duration * feature_per_second)
+                logger.info(f"Expected frames at {feature_per_second:.2f} frames/sec: {expected_frames}")
+                
+                # Check for gaps in chord coverage
+                total_chord_time = 0
+                for _, (start, end) in enumerate(timestamps):
+                    total_chord_time += (end - start)
+                
+                coverage = (total_chord_time / duration) * 100
+                logger.info(f"Chord time coverage: {coverage:.2f}% of song duration")
+                
+                if coverage < 90:
+                    logger.warning(f"Low chord coverage ({coverage:.2f}%) may result in many N labels")
+            
+            # Check for chord mapping issues
+            mapped = self._chord_names_to_indices(chord_labels)
+            n_chord_id = 169 if self.feature_config.feature.get('large_voca', False) else 24
+            n_count = sum(1 for idx in mapped if idx == n_chord_id)
+            
+            if n_count > 0:
+                logger.info(f"N chords in file: {n_count}/{len(mapped)} ({n_count/len(mapped):.2%})")
+                if n_count > 0.5 * len(mapped):
+                    logger.warning(f"HIGH NUMBER OF N CHORDS: Check mapping and chord format")
+            
+        except Exception as e:
+            logger.error(f"Error analyzing label file: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
     def __len__(self):
         """Return the number of samples in the dataset"""
         return len(self.samples)
-    
+
     def __getitem__(self, idx):
         """Get a sample by index"""
         sample = self.samples[idx]

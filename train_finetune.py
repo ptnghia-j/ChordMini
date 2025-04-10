@@ -8,6 +8,7 @@ import glob
 import gc
 import traceback
 import json
+import random
 from pathlib import Path
 from collections import Counter
 
@@ -465,6 +466,12 @@ def main():
         feature_config=feature_config,
         device=device
     )
+    
+    # Sample a few label files to analyze
+    sample_songs = random.sample(labeled_dataset.audio_label_pairs, min(5, len(labeled_dataset.audio_label_pairs)))
+    logger.info("Analyzing sample label files for diagnostic purposes...")
+    for audio_path, label_path in sample_songs:
+        labeled_dataset.analyze_label_file(label_path)
     
     # Create data loaders for each subset
     batch_size = config.training.get('batch_size', 16)
