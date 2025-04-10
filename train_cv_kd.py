@@ -195,6 +195,10 @@ def main():
             device=device
         )
         
+        # Analyze label files before processing
+        logger.info("Analyzing label files to understand structure...")
+        preprocess_dataset.analyze_label_files(num_files=10)
+        
         # Generate all features
         preprocess_dataset.generate_all_features()
         logger.info("Preprocessing completed")

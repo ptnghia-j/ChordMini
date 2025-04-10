@@ -354,12 +354,12 @@ spec:
               python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
             requests:
-              cpu: "5"             
-              memory: "58Gi"    
+              cpu: "2"             
+              memory: "16Gi"    
               nvidia.com/gpu: "1"
             limits:
-              cpu: "10"             
-              memory: "108Gi" 
+              cpu: "5"             
+              memory: "24Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage

@@ -270,6 +270,11 @@ class CrossValidationDataset(Dataset):
             time_interval = hop_length / song_hz
             no_of_chord_datapoints_per_sequence = math.ceil(inst_len / time_interval)
             
+            # Log info about time granularity
+            logger.debug(f"Audio file: {os.path.basename(audio_path)}")
+            logger.debug(f"Time interval between frames: {time_interval:.6f} seconds")
+            logger.debug(f"Number of frames per sequence: {no_of_chord_datapoints_per_sequence}")
+            
             # Get audio information
             last_sec = chord_info.iloc[-1]['end']
             last_sec_hz = int(last_sec * song_hz)
@@ -290,6 +295,9 @@ class CrossValidationDataset(Dataset):
             results = []
             current_start_second = 0
             
+            # Added: Track stats for debugging
+            chord_stats = {"total_frames": 0, "n_chords": 0, "valid_chords": 0}
+            
             while current_start_second + inst_len < origin_length_in_sec:
                 # Extract chord sequence for this segment
                 chord_list = []
@@ -297,60 +305,75 @@ class CrossValidationDataset(Dataset):
                 
                 while curSec < current_start_second + inst_len:
                     try:
-                        # Find chords for current time frame
-                        # First, look for chords that contain the current time point
-                        available_chords = chord_info.loc[(chord_info['start'] <= curSec) & 
-                                                         (chord_info['end'] > curSec)].copy()
+                        # FIXED: Better chord boundary handling - ensure every frame gets the correct chord
                         
-                        if len(available_chords) == 0:
-                            # If no direct match, try to find chords with a small tolerance window
-                            tolerance = time_interval / 2
-                            available_chords = chord_info.loc[
-                                # Chords starting just before or at the current time
-                                ((chord_info['start'] >= curSec - tolerance) & (chord_info['start'] <= curSec + tolerance)) |
-                                # Chords ending just after or at the current time
-                                ((chord_info['end'] >= curSec - tolerance) & (chord_info['end'] <= curSec + tolerance)) |
-                                # Chords that completely contain the current time point with tolerance
-                                ((chord_info['start'] <= curSec - tolerance) & (chord_info['end'] >= curSec + tolerance))
-                            ].copy()
-                            
-                            # Log when we need to use the tolerance window
-                            if len(available_chords) > 0 and len(chord_list) % 100 == 0:  # Limit logging
-                                logger.debug(f"Used tolerance window to find chord at {curSec}s")
+                        # Step 1: First look for chords that strictly contain the current time point
+                        # A chord contains a time point if: start <= time < end
+                        exact_matches = chord_info.loc[(chord_info['start'] <= curSec) & 
+                                                     (chord_info['end'] > curSec)]
                         
-                        if len(available_chords) == 1:
-                            # If only one chord, use it
-                            chord = available_chords['chord_id'].iloc[0]
-                        elif len(available_chords) > 1:
-                            # If multiple chords, pick the one that covers the most of the current time point
-                            tolerance_value = tolerance if 'tolerance' in locals() else 0
-                            
-                            # Calculate overlap with the current time point
-                            max_starts = available_chords.apply(lambda row: max(row['start'], curSec - tolerance_value), axis=1)
-                            available_chords['max_start'] = max_starts
-                            
-                            min_ends = available_chords.apply(
-                                lambda row: min(row['end'], curSec + tolerance_value), axis=1)
-                            available_chords['min_end'] = min_ends
-                            
-                            chords_lengths = available_chords['min_end'] - available_chords['max_start']
-                            available_chords['chord_length'] = chords_lengths
-                            
-                            # Get chord with maximum coverage
-                            chord = available_chords.loc[available_chords['chord_length'].idxmax()]['chord_id']
+                        if len(exact_matches) > 0:
+                            # Found exact match - use the first one if multiple
+                            chord = exact_matches['chord_id'].iloc[0]
+                            chord_stats["valid_chords"] += 1
                         else:
-                            # No chord found, use no-chord class
-                            chord = 169 if large_voca else 24
+                            # Step 2: If no exact match, handle boundary cases
                             
-                            # Log when no chord is found (but limit logging frequency)
-                            if current_start_second < 5.0 or (current_start_second + inst_len) > (origin_length_in_sec - 5.0):
-                                # Don't log for beginning/end of song where no-chord is expected
-                                pass
-                            elif len(chord_list) % 100 == 0:  # Only log occasionally to avoid flood
-                                logger.debug(f"No chord found at time {curSec}s")
+                            # Get chords that end exactly at this time point (curSec == end)
+                            end_boundary_matches = chord_info.loc[chord_info['end'] == curSec]
+                            
+                            # Get chords that start exactly at this time point (curSec == start)
+                            start_boundary_matches = chord_info.loc[chord_info['start'] == curSec]
+                            
+                            if len(end_boundary_matches) > 0:
+                                # There's a chord ending exactly at this time - use it
+                                # (Preference given to the chord that just ended)
+                                chord = end_boundary_matches['chord_id'].iloc[0]
+                                chord_stats["valid_chords"] += 1
+                            elif len(start_boundary_matches) > 0:
+                                # There's a chord starting exactly at this time - use it
+                                chord = start_boundary_matches['chord_id'].iloc[0]
+                                chord_stats["valid_chords"] += 1
+                            else:
+                                # Step 3: If still no match, find the closest chord by distance
+                                # But without any minimum distance threshold
+                                closest_chord = None
+                                min_distance = float('inf')
+                                
+                                for _, row in chord_info.iterrows():
+                                    # If curSec is before chord starts, distance is to start time
+                                    if curSec < row['start']:
+                                        distance = row['start'] - curSec
+                                    # If curSec is after chord ends, distance is to end time
+                                    elif curSec > row['end']:
+                                        distance = curSec - row['end']
+                                    else:
+                                        # Should be covered by exact match case, but just in case
+                                        distance = 0
+                                    
+                                    # Update closest chord if this one is closer
+                                    if distance < min_distance:
+                                        min_distance = distance
+                                        closest_chord = row
+                                
+                                # Always use the closest chord regardless of distance
+                                # Only fall back to "N" if no chords exist at all
+                                if closest_chord is not None:
+                                    chord = closest_chord['chord_id']
+                                    chord_stats["valid_chords"] += 1
+                                    
+                                    # Log if this chord is far away
+                                    if min_distance > time_interval and len(chord_list) % 100 == 0:
+                                        logger.debug(f"Using distant chord at {curSec}s, distance={min_distance:.3f}s")
+                                else:
+                                    # No chord found at all, use no-chord class
+                                    chord = 169 if large_voca else 24
+                                    chord_stats["n_chords"] += 1
+                    
                     except Exception as e:
                         # Error handling for chord extraction
                         chord = 169 if large_voca else 24
+                        chord_stats["n_chords"] += 1
                         logger.warning(f"Error extracting chord at {curSec}s: {e}")
                     
                     # Handle pitch shifting for chord IDs
@@ -363,8 +386,15 @@ class CrossValidationDataset(Dataset):
                             chord = chord % 24
                     
                     chord_list.append(chord)
+                    chord_stats["total_frames"] += 1
                     curSec += time_interval
-
+                
+                # Log chord stats for this segment
+                if len(results) == 0:  # Only log for first segment
+                    n_percent = (chord_stats["n_chords"] / chord_stats["total_frames"]) * 100 if chord_stats["total_frames"] > 0 else 0
+                    logger.debug(f"Chord stats for first segment: {chord_stats['valid_chords']} valid chords, "
+                               f"{chord_stats['n_chords']} N chords ({n_percent:.1f}%) out of {chord_stats['total_frames']} frames")
+                
                 # Check if we have the right number of chords
                 if len(chord_list) == no_of_chord_datapoints_per_sequence:
                     # Extract audio segment
@@ -419,6 +449,53 @@ class CrossValidationDataset(Dataset):
             import traceback
             logger.error(traceback.format_exc())
             return None
+
+    def analyze_label_files(self, num_files=5):
+        """
+        Analyze the first few label files to understand their structure and content.
+        This helps identify issues with chord parsing.
+        """
+        logger.info(f"Analyzing the first {num_files} label files...")
+        
+        for idx, (audio_path, label_path) in enumerate(self.audio_label_pairs[:num_files]):
+            try:
+                logger.info(f"File {idx+1}: {os.path.basename(label_path)}")
+                
+                # Read raw content of label file
+                with open(label_path, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read()
+                
+                # Count lines and show first few lines
+                lines = content.strip().split('\n')
+                logger.info(f"  Total lines: {len(lines)}")
+                logger.info(f"  First 3 lines: {lines[:3]}")
+                
+                # Parse with Chords class
+                large_voca = self.config.feature.get('large_voca', False)
+                chord_class = Chords()
+                
+                try:
+                    if large_voca:
+                        chord_info = chord_class.get_converted_chord_voca(label_path)
+                    else:
+                        chord_info = chord_class.get_converted_chord(label_path)
+                    
+                    logger.info(f"  Successfully parsed {len(chord_info)} chords")
+                    logger.info(f"  First few chords: {chord_info.iloc[:3]['chord_id'].tolist()}")
+                    logger.info(f"  Time range: {chord_info['start'].min():.2f} to {chord_info['end'].max():.2f} seconds")
+                    
+                    # Check for N chord frequency
+                    n_chord_id = 169 if large_voca else 24
+                    n_count = (chord_info['chord_id'] == n_chord_id).sum()
+                    logger.info(f"  'N' chords in file: {n_count}/{len(chord_info)} ({n_count/len(chord_info):.2%})")
+                    
+                except Exception as e:
+                    logger.error(f"  Error parsing with Chords class: {e}")
+            
+            except Exception as e:
+                logger.error(f"Error analyzing {label_path}: {e}")
+        
+        logger.info("Label file analysis complete")
 
     def analyze_chord_distribution(self):
         """
