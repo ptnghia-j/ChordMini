@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 from modules.utils import logger
 from modules.utils.mir_eval_modules import audio_file_to_features
+from modules.utils.chords import Chords
 
 class ConfigDict(dict):
     """
@@ -168,6 +169,12 @@ class LabeledDataset(Dataset):
         random.seed(random_seed)
         np.random.seed(random_seed)
         
+        # Initialize Chords class for parsing and mapping operations
+        self.chord_processor = Chords()
+        if chord_mapping:
+            self.chord_processor.set_chord_mapping(chord_mapping)
+        self.chord_mapping = chord_mapping
+        
         # Find all matched audio and label files
         logger.info("Finding audio and label files...")
         self.audio_label_pairs = self._find_matching_pairs()
@@ -192,6 +199,159 @@ class LabeledDataset(Dataset):
             
         # Split dataset into train, validation, and test sets
         self._split_dataset(train_ratio, val_ratio, test_ratio)
+
+    def _parse_label_file(self, label_path):
+        """
+        Parse chord labels from a label file using the Chords class.
+        
+        Args:
+            label_path: Path to label file
+            
+        Returns:
+            Tuple of (chord_labels, timestamps)
+            chord_labels: List of chord labels
+            timestamps: List of (start_time, end_time) tuples
+        """
+        chord_labels = []
+        timestamps = []
+        
+        try:
+            # First try to use the Chords class functionality
+            use_large_voca = hasattr(self.feature_config, 'feature') and self.feature_config.feature.get('large_voca', False)
+            
+            try:
+                if use_large_voca:
+                    # Get converted chord with large vocabulary
+                    df = self.chord_processor.get_converted_chord_voca(label_path)
+                else:
+                    # Get converted chord with standard vocabulary
+                    df = self.chord_processor.get_converted_chord(label_path)
+                
+                # Extract chord labels and timestamps from dataframe
+                for _, row in df.iterrows():
+                    start_time = row['start']
+                    end_time = row['end']
+                    chord_id = row['chord_id']
+                    
+                    # Convert chord ID back to name using idx2voca_chord or chord mapping
+                    if self.chord_mapping:
+                        # Find the chord name from the mapping
+                        for name, idx in self.chord_mapping.items():
+                            if idx == chord_id:
+                                chord_name = name
+                                break
+                        else:
+                            # If chord ID not found in mapping, use N for no chord
+                            chord_name = "N"
+                    else:
+                        # If no mapping provided, use the chord ID as string
+                        chord_name = str(chord_id)
+                    
+                    chord_labels.append(chord_name)
+                    timestamps.append((start_time, end_time))
+                
+                logger.debug(f"Parsed {len(chord_labels)} chord labels using Chords class from {label_path}")
+                return chord_labels, timestamps
+            
+            except Exception as e:
+                logger.warning(f"Failed to use Chords class for parsing {label_path}: {e}")
+                logger.warning("Falling back to manual parsing")
+                
+            # Fall back to manual parsing if Chords class fails
+            with open(label_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 3:
+                        start_time = float(parts[0])
+                        end_time = float(parts[1])
+                        chord = parts[2]
+                        
+                        chord_labels.append(chord)
+                        timestamps.append((start_time, end_time))
+        except UnicodeDecodeError:
+            # Try with different encoding
+            with open(label_path, 'r', encoding='latin-1') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 3:
+                        start_time = float(parts[0])
+                        end_time = float(parts[1])
+                        chord = parts[2]
+                        
+                        chord_labels.append(chord)
+                        timestamps.append((start_time, end_time))
+        
+        return chord_labels, timestamps
+    
+    def _chord_names_to_indices(self, chord_names):
+        """
+        Convert chord names to indices using the Chords class.
+        
+        Args:
+            chord_names: List of chord names
+            
+        Returns:
+            List of chord indices
+        """
+        if self.chord_mapping is None:
+            # If no mapping is provided, return raw chord names
+            return chord_names
+        
+        indices = []
+        unknown_chords = set()
+        
+        # Check if large vocabulary is enabled
+        use_large_voca = hasattr(self.feature_config, 'feature') and self.feature_config.feature.get('large_voca', False)
+        
+        for chord in chord_names:
+            if chord in self.chord_mapping:
+                indices.append(self.chord_mapping[chord])
+            else:
+                try:
+                    # Try to use the Chords class to convert
+                    # First, preprocess the chord name with lab_file_error_modify
+                    modified_chord = chord
+                    if hasattr(self.chord_processor, 'lab_file_error_modify'):
+                        modified_chord = self.chord_processor.lab_file_error_modify([chord])[0]
+                    
+                    # Parse the chord and get its root and properties
+                    root, bass, intervals, is_major = self.chord_processor.chord(modified_chord)
+                    
+                    # Convert to index based on vocabulary size
+                    if use_large_voca:
+                        # For large vocabulary, use convert_to_id_voca
+                        quality = None
+                        # Extract quality from chord name if it contains a colon
+                        if ':' in modified_chord:
+                            _, quality = modified_chord.split(':', 1)
+                            if '/' in quality:
+                                quality, _ = quality.split('/', 1)
+                        
+                        idx = self.chord_processor.convert_to_id_voca(root=root, quality=quality)
+                    else:
+                        # For standard vocabulary, use convert_to_id
+                        idx = self.chord_processor.convert_to_id(root=root, is_major=is_major)
+                    
+                    indices.append(idx)
+                    
+                except Exception as e:
+                    # If conversion fails, use fallback
+                    if "X" in self.chord_mapping:
+                        indices.append(self.chord_mapping["X"])  # Use 'X' (unknown) for unknown chords
+                    elif "N" in self.chord_mapping:
+                        indices.append(self.chord_mapping["N"])  # Fallback to 'N' if 'X' not available
+                    else:
+                        # If neither 'X' nor 'N' in mapping, use the first index
+                        indices.append(0)
+                    unknown_chords.add(chord)
+        
+        # Log unknown chords (at debug level)
+        if 0 < len(unknown_chords) < 20:
+            logger.debug(f"Unknown chords (mapped to X): {unknown_chords}")
+        elif len(unknown_chords) >= 20:
+            logger.debug(f"Many unknown chords ({len(unknown_chords)}) found, showing first 10: {list(unknown_chords)[:10]}")
+        
+        return indices
 
     def _extract_samples(self):
         """
@@ -221,42 +381,7 @@ class LabeledDataset(Dataset):
                         except Exception as e:
                             logger.warning(f"Error loading cached features for {audio_path}: {e}")
                             # Extract features with better error handling
-                            try:
-                                feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, self.feature_config)
-                            except (AttributeError, KeyError) as ae:
-                                err_msg = str(ae)
-                                if "'dict' object has no attribute 'mp3'" in err_msg or \
-                                   "'ConfigDict' object has no attribute 'feature'" in err_msg or \
-                                   "'inst_len'" in err_msg or \
-                                   "'bins_per_octave'" in err_msg:  # Handle missing key errors
-                                    # Create a SimpleNamespace object that provides all required attributes
-                                    logger.warning(f"Creating compatible config object for {audio_path}: {err_msg}")
-                                    config_obj = SimpleNamespace()
-                                    
-                                    # Set up mp3 config with all required parameters
-                                    config_obj.mp3 = {
-                                        'song_hz': self.feature_config.get('mp3', {}).get('song_hz', 22050),
-                                        'inst_len': self.feature_config.get('mp3', {}).get('inst_len', 10.0),
-                                        'skip_interval': self.feature_config.get('mp3', {}).get('skip_interval', 5.0)
-                                    }
-                                    
-                                    # Set up feature config with all required parameters
-                                    config_obj.feature = SimpleNamespace()
-                                    # Add common feature parameters
-                                    config_obj.feature.get = lambda key, default: self.feature_config.get('feature', {}).get(key, default)
-                                    
-                                    # Add required feature attributes directly
-                                    feature_dict = self.feature_config.get('feature', {})
-                                    config_obj.feature['n_fft'] = feature_dict.get('n_fft', 512)
-                                    config_obj.feature['hop_length'] = feature_dict.get('hop_length', 2048)
-                                    config_obj.feature['n_bins'] = feature_dict.get('n_bins', 144)
-                                    config_obj.feature['bins_per_octave'] = feature_dict.get('bins_per_octave', 24)
-                                    config_obj.feature['hop_duration'] = feature_dict.get('hop_duration', 0.09288)
-                                    
-                                    feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, config_obj)
-                                else:
-                                    raise
-                                    
+                            feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, self.feature_config)
                             np.save(cache_path, {
                                 'feature': feature,
                                 'feature_per_second': feature_per_second,
@@ -264,42 +389,7 @@ class LabeledDataset(Dataset):
                             })
                     else:
                         # Extract features with better error handling
-                        try:
-                            feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, self.feature_config)
-                        except (AttributeError, KeyError) as ae:
-                            err_msg = str(ae)
-                            if "'dict' object has no attribute 'mp3'" in err_msg or \
-                               "'ConfigDict' object has no attribute 'feature'" in err_msg or \
-                               "'inst_len'" in err_msg or \
-                               "'bins_per_octave'" in err_msg:  # Handle missing key errors
-                                # Create a SimpleNamespace object that provides all required attributes
-                                logger.warning(f"Creating compatible config object for {audio_path}: {err_msg}")
-                                config_obj = SimpleNamespace()
-                                
-                                # Set up mp3 config with all required parameters
-                                config_obj.mp3 = {
-                                    'song_hz': self.feature_config.get('mp3', {}).get('song_hz', 22050),
-                                    'inst_len': self.feature_config.get('mp3', {}).get('inst_len', 10.0),
-                                    'skip_interval': self.feature_config.get('mp3', {}).get('skip_interval', 5.0)
-                                }
-                                
-                                # Set up feature config with all required parameters
-                                config_obj.feature = SimpleNamespace()
-                                # Add common feature parameters
-                                config_obj.feature.get = lambda key, default: self.feature_config.get('feature', {}).get(key, default)
-                                
-                                # Add required feature attributes directly
-                                feature_dict = self.feature_config.get('feature', {})
-                                config_obj.feature['n_fft'] = feature_dict.get('n_fft', 512)
-                                config_obj.feature['hop_length'] = feature_dict.get('hop_length', 2048)
-                                config_obj.feature['n_bins'] = feature_dict.get('n_bins', 144)
-                                config_obj.feature['bins_per_octave'] = feature_dict.get('bins_per_octave', 24)
-                                config_obj.feature['hop_duration'] = feature_dict.get('hop_duration', 0.09288)
-                                
-                                feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, config_obj)
-                            else:
-                                raise
-                                
+                        feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, self.feature_config)
                         np.save(cache_path, {
                             'feature': feature,
                             'feature_per_second': feature_per_second,
@@ -307,41 +397,7 @@ class LabeledDataset(Dataset):
                         })
                 else:
                     # Extract features with better error handling
-                    try:
-                        feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, self.feature_config)
-                    except (AttributeError, KeyError) as ae:
-                        err_msg = str(ae)
-                        if "'dict' object has no attribute 'mp3'" in err_msg or \
-                           "'ConfigDict' object has no attribute 'feature'" in err_msg or \
-                           "'inst_len'" in err_msg or \
-                           "'bins_per_octave'" in err_msg:  # Handle missing key errors
-                            # Create a SimpleNamespace object that provides all required attributes
-                            logger.warning(f"Creating compatible config object for {audio_path}: {err_msg}")
-                            config_obj = SimpleNamespace()
-                            
-                            # Set up mp3 config with all required parameters
-                            config_obj.mp3 = {
-                                'song_hz': self.feature_config.get('mp3', {}).get('song_hz', 22050),
-                                'inst_len': self.feature_config.get('mp3', {}).get('inst_len', 10.0),
-                                'skip_interval': self.feature_config.get('mp3', {}).get('skip_interval', 5.0)
-                            }
-                            
-                            # Set up feature config with all required parameters
-                            config_obj.feature = SimpleNamespace()
-                            # Add common feature parameters
-                            config_obj.feature.get = lambda key, default: self.feature_config.get('feature', {}).get(key, default)
-                            
-                            # Add required feature attributes directly
-                            feature_dict = self.feature_config.get('feature', {})
-                            config_obj.feature['n_fft'] = feature_dict.get('n_fft', 512)
-                            config_obj.feature['hop_length'] = feature_dict.get('hop_length', 2048)
-                            config_obj.feature['n_bins'] = feature_dict.get('n_bins', 144)
-                            config_obj.feature['bins_per_octave'] = feature_dict.get('bins_per_octave', 24)
-                            config_obj.feature['hop_duration'] = feature_dict.get('hop_duration', 0.09288)
-                            
-                            feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, config_obj)
-                        else:
-                            raise
+                    feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, self.feature_config)
                 
                 # Transpose to get (time, frequency) format
                 feature = feature.T
@@ -501,47 +557,6 @@ class LabeledDataset(Dataset):
         
         return audio_label_pairs
     
-    def _parse_label_file(self, label_path):
-        """
-        Parse chord labels from a label file.
-        
-        Args:
-            label_path: Path to label file
-            
-        Returns:
-            Tuple of (chord_labels, timestamps)
-            chord_labels: List of chord labels
-            timestamps: List of (start_time, end_time) tuples
-        """
-        chord_labels = []
-        timestamps = []
-        
-        try:
-            with open(label_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) >= 3:
-                        start_time = float(parts[0])
-                        end_time = float(parts[1])
-                        chord = parts[2]
-                        
-                        chord_labels.append(chord)
-                        timestamps.append((start_time, end_time))
-        except UnicodeDecodeError:
-            # Try with different encoding
-            with open(label_path, 'r', encoding='latin-1') as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) >= 3:
-                        start_time = float(parts[0])
-                        end_time = float(parts[1])
-                        chord = parts[2]
-                        
-                        chord_labels.append(chord)
-                        timestamps.append((start_time, end_time))
-        
-        return chord_labels, timestamps
-    
     def _chord_labels_to_frames(self, chord_labels, timestamps, num_frames, feature_per_second):
         """
         Convert chord labels to frame-level representation.
@@ -566,44 +581,6 @@ class LabeledDataset(Dataset):
                 frame_level_chords[i] = chord
         
         return frame_level_chords
-    
-    def _chord_names_to_indices(self, chord_names):
-        """
-        Convert chord names to indices using chord mapping.
-        
-        Args:
-            chord_names: List of chord names
-            
-        Returns:
-            List of chord indices
-        """
-        if self.chord_mapping is None:
-            # If no mapping is provided, return raw chord names
-            return chord_names
-        
-        indices = []
-        unknown_chords = set()
-        for chord in chord_names:
-            if chord in self.chord_mapping:
-                indices.append(self.chord_mapping[chord])
-            else:
-                # Handle unknown chords - map to X (unknown) instead of N (no chord)
-                if "X" in self.chord_mapping:
-                    indices.append(self.chord_mapping["X"])  # Use 'X' (index 168) for unknown chords
-                elif "N" in self.chord_mapping:
-                    indices.append(self.chord_mapping["N"])  # Fallback to 'N' if 'X' not available
-                else:
-                    # If neither 'X' nor 'N' in mapping, use the first index
-                    indices.append(0)
-                unknown_chords.add(chord)
-        
-        # Change to debug level for unknown chord warnings
-        if 0 < len(unknown_chords) < 20:
-            logger.debug(f"Unknown chords (mapped to X): {unknown_chords}")
-        elif len(unknown_chords) >= 20:
-            logger.debug(f"Many unknown chords ({len(unknown_chords)}) found, showing first 10: {list(unknown_chords)[:10]}")
-        
-        return indices
     
     def _split_dataset(self, train_ratio, val_ratio, test_ratio):
         """

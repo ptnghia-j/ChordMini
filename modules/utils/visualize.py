@@ -713,3 +713,227 @@ def visualize_transitions(hmm_model, idx_to_chord, top_k=10, save_path='transiti
         fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
     
     return fig
+
+def extract_chord_quality(chord_name):
+    """
+    Extract the quality from a chord name.
+    
+    Args:
+        chord_name: Chord name string (e.g., 'C:maj', 'A:min7')
+        
+    Returns:
+        Chord quality string
+    """
+    # Handle special cases
+    if chord_name in ["N", "X", "None", "Unknown"]:
+        return "N"
+        
+    # Remove root note and colon if present
+    if ":" in chord_name:
+        quality = chord_name.split(":", 1)[1]
+    else:
+        # Try to extract quality without colon
+        root_notes = ["A", "B", "C", "D", "E", "F", "G"]
+        for note in root_notes:
+            if chord_name.startswith(note):
+                # Check if there's a flat or sharp
+                if len(chord_name) > 1 and chord_name[1] in ['b', '#']:
+                    quality = chord_name[2:]  # Skip root with accidental
+                else:
+                    quality = chord_name[1:]  # Skip root without accidental
+                break
+        else:
+            # If no root note is found, return the full name
+            quality = chord_name
+            
+    # Map common quality names to standardized ones
+    quality_mapping = {
+        "major": "maj", "maj": "maj", "": "maj",
+        "minor": "min", "min": "min", "m": "min",
+        "dim": "dim", "°": "dim", "o": "dim",
+        "aug": "aug", "+": "aug",
+        "min6": "min6", "m6": "min6",
+        "maj6": "maj6", "6": "maj6",
+        "min7": "min7", "m7": "min7",
+        "minmaj7": "min-maj7", "mmaj7": "min-maj7", "m(maj7)": "min-maj7",
+        "maj7": "maj7", "M7": "maj7",
+        "7": "7", "dom7": "7",
+        "dim7": "dim7", "°7": "dim7", "o7": "dim7",
+        "hdim7": "hdim7", "m7b5": "hdim7", "ø": "hdim7",
+        "sus2": "sus2",
+        "sus4": "sus4", "sus": "sus4"
+    }
+    
+    # Try direct mapping
+    if quality in quality_mapping:
+        return quality_mapping[quality]
+    
+    # Handle compound qualities
+    for q_name, q_standard in quality_mapping.items():
+        if quality.startswith(q_name):
+            return q_standard
+            
+    # If no match is found, return as is
+    return quality
+
+def group_chords_by_focus_qualities(predictions, targets, idx_to_chord, focus_qualities=None):
+    """
+    Group chords by specific focus qualities.
+    
+    Args:
+        predictions: List of predicted chord indices
+        targets: List of target chord indices
+        idx_to_chord: Dictionary mapping indices to chord names
+        focus_qualities: List of qualities to focus on
+        
+    Returns:
+        tuple: (pred_qualities_idx, target_qualities_idx, qualities_list, quality_to_idx, idx_to_quality)
+    """
+    if focus_qualities is None:
+        focus_qualities = ["maj", "min", "dim", "aug", "min6", "maj6", "min7", 
+                          "min-maj7", "maj7", "7", "dim7", "hdim7", "sus2", "sus4"]
+                          
+    # Add "N" and "other" to cover all cases
+    if "N" not in focus_qualities:
+        focus_qualities.append("N")
+    if "other" not in focus_qualities:
+        focus_qualities.append("other")
+        
+    # Create mapping dictionaries
+    quality_to_idx = {q: i for i, q in enumerate(focus_qualities)}
+    idx_to_quality = {}
+    
+    # Map chord indices to qualities
+    for idx, chord in idx_to_chord.items():
+        quality = extract_chord_quality(chord)
+        if quality in quality_to_idx:
+            idx_to_quality[idx] = quality
+        else:
+            idx_to_quality[idx] = "other"
+            
+    # Map predictions and targets to quality indices
+    pred_qualities_idx = []
+    target_qualities_idx = []
+    
+    for pred, target in zip(predictions, targets):
+        pred_quality = idx_to_quality.get(pred, "other")
+        target_quality = idx_to_quality.get(target, "other")
+        
+        pred_qualities_idx.append(quality_to_idx[pred_quality])
+        target_qualities_idx.append(quality_to_idx[target_quality])
+        
+    return np.array(pred_qualities_idx), np.array(target_qualities_idx), focus_qualities, quality_to_idx, idx_to_quality
+
+def plot_chord_quality_distribution_accuracy(predictions, targets, idx_to_chord, save_path=None, 
+                                            figsize=(14, 8), title=None, dpi=300,
+                                            focus_qualities=None):
+    """
+    Create a bar chart of chord quality distribution with overlaid accuracy line.
+    
+    Args:
+        predictions: List of predicted chord indices
+        targets: List of target chord indices
+        idx_to_chord: Dictionary mapping indices to chord names
+        save_path: Path to save the figure (if None, just returns the figure)
+        figsize: Figure size (width, height) in inches
+        title: Plot title
+        dpi: DPI for saved figure
+        focus_qualities: List of chord qualities to focus on
+        
+    Returns:
+        matplotlib figure
+    """
+    if focus_qualities is None:
+        focus_qualities = ["maj", "min", "dim", "aug", "min6", "maj6", "min7", 
+                          "min-maj7", "maj7", "7", "dim7", "hdim7", "sus2", "sus4"]
+
+    # Group chords by quality
+    pred_qualities, target_qualities, qualities_list, _, idx_to_quality = group_chords_by_focus_qualities(
+        predictions, targets, idx_to_chord, focus_qualities
+    )
+
+    # Calculate counts for each quality
+    quality_counts = Counter(target_qualities)
+    
+    # Calculate accuracy for each quality
+    quality_accuracy = {}
+    for i, quality in enumerate(qualities_list):
+        # Find indices where target is this quality
+        quality_indices = np.where(target_qualities == i)[0]
+        if len(quality_indices) > 0:
+            # Calculate correct predictions for this quality
+            correct = np.sum(pred_qualities[quality_indices] == i)
+            accuracy = correct / len(quality_indices)
+        else:
+            accuracy = 0
+        quality_accuracy[quality] = accuracy
+
+    # Prepare data for plotting
+    filtered_qualities = []
+    filtered_counts = []
+    filtered_accuracies = []
+    
+    total_samples = len(targets)
+    
+    # Filter to only include focus qualities (excluding "other" and "N" for cleaner visualization)
+    for quality in focus_qualities:
+        if quality in qualities_list and quality not in ["other", "N"]:
+            idx = qualities_list.index(quality)
+            count = quality_counts.get(idx, 0)
+            if count > 0:  # Only include qualities that appear in the data
+                filtered_qualities.append(quality)
+                filtered_counts.append(count)
+                filtered_accuracies.append(quality_accuracy[quality])
+
+    # Calculate percentages
+    percentages = [100 * count / total_samples for count in filtered_counts]
+
+    # Create figure
+    fig, ax1 = plt.subplots(figsize=figsize)
+
+    # Plot distribution bars
+    bars = ax1.bar(filtered_qualities, percentages, alpha=0.7, color='steelblue', label='Distribution (%)')
+    ax1.set_ylabel('Distribution (%)', color='steelblue')
+    ax1.tick_params(axis='y', labelcolor='steelblue')
+    ax1.set_ylim(0, max(percentages) * 1.2 if percentages else 10)  # Add some headroom
+
+    # Add percentage labels above bars
+    for bar, pct in zip(bars, percentages):
+        height = bar.get_height()
+        ax1.annotate(f'{pct:.1f}%',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3),  # 3 points vertical offset
+                    textcoords="offset points",
+                    ha='center', va='bottom', color='steelblue')
+
+    # Create second y-axis for accuracy
+    ax2 = ax1.twinx()
+    ax2.plot(filtered_qualities, filtered_accuracies, 'ro-', linewidth=2, markersize=8, label='Accuracy')
+    ax2.set_ylabel('Accuracy', color='red')
+    ax2.tick_params(axis='y', labelcolor='red')
+    ax2.set_ylim(0, 1.0)
+
+    # Add accuracy values as text
+    for i, acc in enumerate(filtered_accuracies):
+        ax2.annotate(f'{acc:.2f}',
+                    xy=(i, acc),
+                    xytext=(0, 5),  # 5 points vertical offset
+                    textcoords="offset points",
+                    ha='center', va='bottom', color='red')
+
+    # Add a legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+
+    # Set title and adjust layout
+    plt.title(title or "Chord Quality Distribution and Accuracy")
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+
+    # Save the figure if requested
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+
+    return fig

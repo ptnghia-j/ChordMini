@@ -240,7 +240,7 @@ spec:
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: "null"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: "0.2"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
           command:
@@ -570,12 +570,12 @@ spec:
               python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
             requests:
-              cpu: "4"             
+              cpu: "5"             
               memory: "24Gi"    
               nvidia.com/gpu: "1"
             limits:
-              cpu: "8"             
-              memory: "48Gi" 
+              cpu: "10"             
+              memory: "64Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage

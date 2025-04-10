@@ -132,13 +132,11 @@ class SynthDataset(Dataset):
         else:
             self.chord_to_idx = {}
             
-        # Set up regex patterns based on dataset type
-        if self.dataset_type == 'maestro':
-            # For Maestro dataset, match any filename pattern ending with _spec, _logits, or .lab
-            self.file_pattern = re.compile(r'(.+?)(?:_spec|_logits)?\.(?:npy|lab)$')
-        else:
-            # Default for FMA dataset - the existing 6-digit numeric ID pattern
-            self.numeric_id_pattern = re.compile(r'(\d{6})')
+        # Set up regex patterns - always define both patterns regardless of dataset type
+        # For Maestro dataset, match any filename pattern ending with _spec, _logits, or .lab
+        self.file_pattern = re.compile(r'(.+?)(?:_spec|_logits)?\.(?:npy|lab)$')
+        # For FMA dataset - the 6-digit numeric ID pattern
+        self.numeric_id_pattern = re.compile(r'(\d{6})')
         
         # Auto-detect device if not provided - use device module with safer initialization
         if device is None:
@@ -355,41 +353,83 @@ class SynthDataset(Dataset):
         
         # First, create a mapping of label files for quick lookup from all label directories
         label_files_dict = {}
+        maestro_label_count = 0
+        fma_label_count = 0
+        
         for label_dir in self.label_dirs:
+            # Add debug info about which directories we're scanning
+            if self.verbose:
+                is_maestro = "maestro" in str(label_dir).lower()
+                print(f"Scanning {'Maestro' if is_maestro else 'FMA'} labels from: {label_dir}")
+                
+            # Use recursive glob to scan all subdirectories
             for label_path in label_dir.glob("**/*.lab"):
-                if self.dataset_type == 'maestro':
-                    file_match = self.file_pattern.search(str(label_path.name))
-                    if file_match:
-                        file_id = file_match.group(1)
-                        parent_dir = label_path.parent.name
-                        combined_id = f"{parent_dir}/{file_id}"
-                        label_files_dict[combined_id] = label_path
-                else:
+                is_maestro = "maestro" in str(label_dir).lower()
+                
+                if is_maestro:  # Maestro label file handling
+                    # Get the full path relative to label_dir for consistent addressing
+                    rel_path = label_path.relative_to(label_dir)
+                    
+                    # Create a combined ID that includes all parent directories
+                    file_id = str(rel_path.with_suffix(''))  # Remove .lab extension
+                    
+                    if file_id.endswith('_spec'):
+                        file_id = file_id[:-5]
+                    
+                    # Debug first few files
+                    if maestro_label_count < 3 and self.verbose:
+                        print(f"  Maestro label: {label_path}, ID: {file_id}")
+                        
+                    label_files_dict[file_id] = label_path
+                    maestro_label_count += 1
+                else:  # FMA label file handling - unchanged
                     numeric_match = self.numeric_id_pattern.search(str(label_path.stem))
                     if numeric_match:
                         numeric_id = numeric_match.group(1)
                         label_files_dict[numeric_id] = label_path
-        
+                        fma_label_count += 1
+                    
         if self.verbose:
             print(f"Found {len(label_files_dict)} label files with valid IDs across all directories")
+            print(f"  FMA: {fma_label_count} label files")
+            print(f"  Maestro: {maestro_label_count} label files")
         
         # Find all spectrogram files from all spectrogram directories
         valid_spec_files = []
+        maestro_spec_count = 0
+        fma_spec_count = 0
         
         for spec_dir in self.spec_dirs:
-            if self.dataset_type == 'maestro':
+            # Determine search logic based on directory path
+            use_maestro_logic = "maestro" in str(spec_dir).lower()
+            
+            if use_maestro_logic:
+                # Maestro-specific search logic
+                if self.verbose:
+                    print(f"Using Maestro logic for {spec_dir}")
+                    
+                # Look recursively through all subdirectories for Maestro files
                 for spec_path in spec_dir.glob("**/*.npy"):
-                    file_match = self.file_pattern.search(str(spec_path.name))
-                    if file_match:
-                        file_id = file_match.group(1)
+                    if "_spec.npy" in str(spec_path):
+                        # Get the full path relative to spec_dir for consistent addressing
+                        rel_path = spec_path.relative_to(spec_dir)
+                        
+                        # Create file ID from the relative path (without extension) to match label file pattern
+                        file_id = str(rel_path.with_suffix(''))
                         if file_id.endswith('_spec'):
                             file_id = file_id[:-5]
-                        parent_dir = spec_path.parent.name
-                        combined_id = f"{parent_dir}/{file_id}"
                         
-                        if combined_id in label_files_dict:
-                            valid_spec_files.append((spec_path, combined_id))
+                        # Debug first few files
+                        if maestro_spec_count < 10 and self.verbose:
+                            print(f"  Maestro spec: {spec_path}")
+                            print(f"  ID: {file_id}")
+                            print(f"  In dict: {file_id in label_files_dict}")
+                            
+                        if file_id in label_files_dict:
+                            valid_spec_files.append((spec_path, file_id))
+                            maestro_spec_count += 1
             else:
+                # FMA-specific search logic - unchanged
                 for prefix_dir in spec_dir.glob("**/"):
                     if prefix_dir.is_dir() and len(prefix_dir.name) == 3 and prefix_dir.name.isdigit():
                         dir_prefix = prefix_dir.name
@@ -403,6 +443,7 @@ class SynthDataset(Dataset):
                                 numeric_id = numeric_match.group(1)
                                 if numeric_id in label_files_dict:
                                     valid_spec_files.append((spec_path, numeric_id))
+                                    fma_spec_count += 1
         
         if not valid_spec_files:
             warnings.warn(f"No valid spectrogram files found for dataset type '{self.dataset_type}'. Check your data paths.")
@@ -410,32 +451,84 @@ class SynthDataset(Dataset):
             
         if self.verbose:
             print(f"Found {len(valid_spec_files)} valid spectrogram files")
+            print(f"  FMA: {fma_spec_count} spectrogram files")
+            print(f"  Maestro: {maestro_spec_count} spectrogram files")
+            
             if valid_spec_files:
                 print("Sample spectrogram paths:")
                 for i, (path, _) in enumerate(valid_spec_files[:3]):
                     print(f"  {i+1}. {path}")
         
-        # Handle small dataset percentage option
+        # Handle small dataset percentage option with special handling for combined mode
         if self.small_dataset_percentage is not None:
             # Ensure consistent sampling by using a fixed seed
             np.random.seed(42)
             
-            # Get file count based on percentage
-            sample_size = max(1, int(len(valid_spec_files) * self.small_dataset_percentage))
-            
-            # Sample files - prefer deterministic subset
-            if sample_size < len(valid_spec_files):
-                # Sort files for deterministic behavior
-                valid_spec_files.sort(key=lambda x: str(x[0]))
+            # Special handling for combined dataset to ensure both datasets are represented
+            if self.is_combined_mode and self.dataset_type == 'combined' and len(self.spec_dirs) > 1:
+                # Group files by which dataset they belong to
+                dataset_files = {}
+                for spec_path, file_id in valid_spec_files:
+                    # Determine which dataset this file belongs to based on path
+                    dataset_key = None
+                    for i, dir_path in enumerate(self.spec_dirs):
+                        if str(spec_path).startswith(str(dir_path)):
+                            dataset_key = i
+                            break
+                    
+                    if dataset_key is not None:
+                        if dataset_key not in dataset_files:
+                            dataset_files[dataset_key] = []
+                        dataset_files[dataset_key].append((spec_path, file_id))
                 
-                # Take the first portion based on percentage
-                valid_spec_files = valid_spec_files[:sample_size]
-                
+                # Add debugging to verify dataset detection
                 if self.verbose:
-                    print(f"Using {sample_size} files ({self.small_dataset_percentage*100:.2f}% of dataset) for quick testing")
-                    print(f"First file: {valid_spec_files[0][0]}")
-                    if len(valid_spec_files) > 1:
-                        print(f"Last file: {valid_spec_files[-1][0]}")
+                    print(f"Dataset distribution before sampling:")
+                    for i, dir_path in enumerate(self.spec_dirs):
+                        dataset_name = "Maestro" if "maestro" in str(dir_path) else "FMA"
+                        file_count = len(dataset_files.get(i, []))
+                        print(f"  {dataset_name}: {file_count} files detected from {dir_path}")
+                
+                # Apply percentage to each dataset individually
+                sampled_files = []
+                for dataset_key, files in dataset_files.items():
+                    # Sort files for deterministic behavior within each dataset
+                    files.sort(key=lambda x: str(x[0]))
+                    
+                    # Calculate sample size for this dataset
+                    dataset_sample_size = max(1, int(len(files) * self.small_dataset_percentage))
+                    
+                    # Take the first portion based on percentage
+                    sampled_dataset_files = files[:dataset_sample_size]
+                    sampled_files.extend(sampled_dataset_files)
+                    
+                    # Always show this information since it's critical for understanding dataset mixture
+                    dataset_name = "Maestro" if "maestro" in str(self.spec_dirs[dataset_key]) else "FMA"
+                    print(f"Using {len(sampled_dataset_files)} {dataset_name} files ({self.small_dataset_percentage*100:.2f}% of {len(files)})")
+                    if sampled_dataset_files:
+                        print(f"First {dataset_name} file: {sampled_dataset_files[0][0]}")
+                        if len(sampled_dataset_files) > 1:
+                            print(f"Last {dataset_name} file: {sampled_dataset_files[-1][0]}")
+                
+                # Update valid_spec_files with the combined sampled files
+                valid_spec_files = sampled_files
+            else:
+                # Original behavior for single datasets
+                sample_size = max(1, int(len(valid_spec_files) * self.small_dataset_percentage))
+                
+                # Sample files - prefer deterministic subset
+                if sample_size < len(valid_spec_files):
+                    # Sort files for deterministic behavior
+                    valid_spec_files.sort(key=lambda x: str(x[0]))
+                    
+                    # Take the first portion based on percentage
+                    valid_spec_files = valid_spec_files[:sample_size]
+                    
+                    if self.verbose:
+                        print(f"Using {sample_size} files ({self.small_dataset_percentage*100:.2f}% of dataset) for quick testing")
+                        print(f"First file: {valid_spec_files[0][0]}")
+                        if len(valid_spec_files) > 1:
+                            print(f"Last file: {valid_spec_files[-1][0]}")
         
         self.samples = []
         self.total_processed = 0
@@ -588,6 +681,35 @@ class SynthDataset(Dataset):
                 
                 end_time = time.time()
                 print(f"Dataset loading completed in {end_time - start_time:.2f} seconds")
+                
+                # Add additional metrics at the end of loading
+                if self.samples and hasattr(self, 'is_combined_mode') and self.is_combined_mode:
+                    # Create a breakdown of samples by dataset (based on file path)
+                    dataset_sample_counts = {}
+                    for sample in self.samples:
+                        if 'spec_path' in sample:
+                            path = sample['spec_path']
+                        elif hasattr(sample, 'get') and sample.get('spectro') is not None:
+                            path = str(sample.get('song_id', ''))
+                        else:
+                            continue
+                            
+                        # Determine which dataset this sample belongs to
+                        dataset_name = "unknown"
+                        for i, dir_path in enumerate(self.spec_dirs):
+                            if str(path).startswith(str(dir_path)) or str(dir_path) in str(path):
+                                dataset_name = "Maestro" if "maestro" in str(dir_path) else "FMA"
+                                break
+                        
+                        if dataset_name not in dataset_sample_counts:
+                            dataset_sample_counts[dataset_name] = 0
+                        dataset_sample_counts[dataset_name] += 1
+                    
+                    if self.verbose:
+                        print(f"\nSample distribution after processing:")
+                        for dataset_name, count in dataset_sample_counts.items():
+                            percentage = (count / len(self.samples)) * 100
+                            print(f"  {dataset_name}: {count} samples ({percentage:.2f}%)")
         else:
             warnings.warn("No samples loaded. Check your data paths and structure.")
     def _process_file(self, spec_file, file_id, label_files_dict, return_skip_reason=False):
@@ -612,8 +734,13 @@ class SynthDataset(Dataset):
             
             logit_file = None
             if self.logits_dirs is not None:
+                # Detect if this is a Maestro file by checking the file_id pattern
+                is_maestro_file = 'maestro' in str(spec_file).lower() or (
+                    '/' in file_id and 'maestro' in file_id.lower())
+                
                 for logits_dir in self.logits_dirs:
-                    if self.dataset_type == 'maestro':
+                    if is_maestro_file:
+                        # Use Maestro-specific logic for Maestro files
                         if '/' in file_id:
                             parent_dir, base_name = file_id.split('/', 1)
                             temp_logit_file = logits_dir / parent_dir / f"{base_name}_logits.npy"
@@ -626,6 +753,7 @@ class SynthDataset(Dataset):
                                 logit_file = temp_logit_file
                                 break
                     else:
+                        # Use FMA logic for FMA files
                         temp_logit_file = logits_dir / dir_prefix / f"{file_id}_logits.npy"
                         if os.path.exists(temp_logit_file):
                             logit_file = temp_logit_file
@@ -933,9 +1061,11 @@ class SynthDataset(Dataset):
                     logits_tensor = torch.from_numpy(sample_i['teacher_logits']).to(dtype=torch.float, device=self.device)
                 else:
                     logits_tensor = sample_i['teacher_logits'].clone().detach().to(self.device)
-                    
+                
+                # Just store the original logits - we'll process them all at once later
                 teacher_logits_seq.append(logits_tensor)
                 has_teacher_logits = True
+                
             elif 'logit_path' in sample_i:
                 # Load teacher logits from disk
                 try:
@@ -946,25 +1076,30 @@ class SynthDataset(Dataset):
                     if 'frame_idx' in sample_i and len(logits.shape) > 1:
                         frame_idx = sample_i['frame_idx']
                         if frame_idx < logits.shape[0]:
-                            logits_vec = torch.from_numpy(logits[frame_idx]).to(dtype=torch.float, device=self.device)
+                            logits_vec = logits[frame_idx]
                         else:
-                            # Use zero tensor for out-of-bounds frame
-                            if teacher_logits_seq:
-                                logits_vec = torch.zeros_like(teacher_logits_seq[0], device=self.device)
-                            else:
-                                # Default size if we don't know the shape yet
-                                logits_vec = torch.zeros(25, dtype=torch.float, device=self.device)
+                            logits_vec = np.zeros(logits.shape[1] if len(logits.shape) > 1 else logits.shape[0])
                     else:
-                        # Single-frame logits
-                        logits_vec = torch.from_numpy(logits).to(dtype=torch.float, device=self.device)
-                        
-                    teacher_logits_seq.append(logits_vec)
+                        # Use the logits directly, handling different shapes later
+                        logits_vec = logits
+                    
+                    # Convert to tensor without reshaping yet
+                    logits_tensor = torch.from_numpy(logits_vec).to(dtype=torch.float, device=self.device)
+                    teacher_logits_seq.append(logits_tensor)
                     has_teacher_logits = True
+                    
                 except Exception as e:
-                    if not teacher_logits_seq and has_teacher_logits:
-                        # Default size if loading fails but we've seen teacher logits before
-                        logits_vec = torch.zeros(25, dtype=torch.float, device=self.device)
+                    if teacher_logits_seq:
+                        # Use zero tensor with matching shape if loading fails
+                        logits_vec = torch.zeros_like(teacher_logits_seq[0], device=self.device)
                         teacher_logits_seq.append(logits_vec)
+                    elif self.verbose and not hasattr(self, '_logits_load_error'):
+                        print(f"Warning: Error loading logits, will use zeros: {e}")
+                        self._logits_load_error = True
+                        # Create dummy tensor
+                        teacher_logits_seq.append(torch.zeros(170, dtype=torch.float, device=self.device))
+                        has_teacher_logits = True
+                        
             elif has_teacher_logits:
                 # No teacher logits for this sample but we have them for others
                 # Create zero tensor with matching shape for consistency
@@ -991,46 +1126,63 @@ class SynthDataset(Dataset):
             'chord_idx': torch.stack(label_seq, dim=0)
         }
         
-        # Add teacher logits if available
+        # Add teacher logits if available - ensures consistent shape
         if has_teacher_logits and teacher_logits_seq:
             try:
-                sample_out['teacher_logits'] = torch.stack(teacher_logits_seq, dim=0)
-            except Exception as e:
-                # Handle dimension mismatch by converting to same shape
-                if self.verbose and not hasattr(self, '_logits_stack_warning'):
-                    print(f"Warning: Teacher logits have inconsistent shapes. Fixing dimensions.")
-                    self._logits_stack_warning = True
+                # Use a fixed number of classes to ensure consistent shape
+                fixed_num_classes = 170  # Common for chord recognition: ~170 chord classes
                 
-                # Find the most common shape
-                shapes = [t.shape for t in teacher_logits_seq]
-                if shapes:
-                    # Use the first shape as reference
-                    target_shape = shapes[0]
-                    # Reshape tensors if needed
-                    fixed_tensors = []
-                    for tensor in teacher_logits_seq:
-                        if tensor.shape != target_shape:
-                            # Create new tensor with correct shape and copy data where possible
-                            fixed = torch.zeros(target_shape, dtype=torch.float, device=self.device)
-                            # For 1D tensors, copy as much as we can
-                            if tensor.dim() == 1 and tensor.shape[0] <= target_shape[0]:
-                                fixed[:tensor.shape[0]] = tensor
-                            fixed_tensors.append(fixed)
-                        else:
-                            fixed_tensors.append(tensor)
+                # Convert and resize all tensors to this fixed size
+                normalized_logits = []
+                for logits_tensor in teacher_logits_seq:
+                    # Handle different input dimensions
+                    if logits_tensor.dim() == 0:  # Scalar tensor
+                        normalized = torch.zeros(fixed_num_classes, dtype=torch.float, device=self.device)
+                        normalized[0] = logits_tensor.item() if logits_tensor.numel() > 0 else 0.0
+                        
+                    elif logits_tensor.dim() == 1:  # Already a vector
+                        normalized = torch.zeros(fixed_num_classes, dtype=torch.float, device=self.device)
+                        # Copy as much data as possible
+                        copy_len = min(logits_tensor.shape[0], fixed_num_classes)
+                        normalized[:copy_len] = logits_tensor[:copy_len]
+                        
+                    else:  # Multi-dimensional tensor
+                        # Flatten and then normalize
+                        flattened = logits_tensor.reshape(-1)
+                        normalized = torch.zeros(fixed_num_classes, dtype=torch.float, device=self.device)
+                        copy_len = min(flattened.shape[0], fixed_num_classes)
+                        normalized[:copy_len] = flattened[:copy_len]
                     
-                    sample_out['teacher_logits'] = torch.stack(fixed_tensors, dim=0)
+                    normalized_logits.append(normalized)
+                
+                # Stack the uniformly shaped logits
+                teacher_logits_stacked = torch.stack(normalized_logits, dim=0)
+                
+                # Add to the output dictionary
+                sample_out['teacher_logits'] = teacher_logits_stacked
+                
+                if self.verbose and not hasattr(self, '_logit_shape_info'):
+                    print(f"Teacher logits shape: {teacher_logits_stacked.shape}")
+                    self._logit_shape_info = True
+                    
+            except Exception as e:
+                if self.verbose and not hasattr(self, '_logits_error'):
+                    print(f"Error processing teacher logits: {e}")
+                    print(f"Will use dummy tensor instead")
+                    self._logits_error = True
+                
+                # Create dummy tensor with fixed shape
+                dummy_logits = torch.zeros((self.seq_len, fixed_num_classes), dtype=torch.float, device=self.device)
+                sample_out['teacher_logits'] = dummy_logits
         
         # Apply GPU batch caching if enabled
         if self.batch_gpu_cache and self.device.type == 'cuda':
             try:
-                # Use a subset of the first frame as the cache key
-                key = idx  # Use the index as the key for simplicity and reliability
+                key = idx  # Use the index as the key
                 self.gpu_batch_cache[key] = sample_out
                 
                 # Limit cache size to avoid memory issues
-                if len(self.gpu_batch_cache) > 2000:  # Larger threshold for strided data
-                    # Remove oldest entry (arbitrary key)
+                if len(self.gpu_batch_cache) > 256:
                     oldest_key = next(iter(self.gpu_batch_cache))
                     del self.gpu_batch_cache[oldest_key]
             except Exception as e:
@@ -1038,14 +1190,27 @@ class SynthDataset(Dataset):
                     print(f"Warning: Error in GPU batch caching: {e}")
                     self._cache_error_warning = True
                 
-                # Clear cache if an error occurs to prevent cascading failures
+                # Clear cache if an error occurs
                 self.gpu_batch_cache = {}
         
         return sample_out
 
-    def get_train_iterator(self, batch_size=128, shuffle=True, num_workers=None, pin_memory=None):
-        if not self.train_indices:
-            warnings.warn("No training segments available")
+    def _get_data_iterator(self, indices, name, batch_size=128, shuffle=False, num_workers=None, pin_memory=None):
+        """Helper method to get a data iterator for a specific subset of indices
+        
+        Args:
+            indices: List of indices to use
+            name: Name of the subset for warning message
+            batch_size: Batch size for DataLoader
+            shuffle: Whether to shuffle the data
+            num_workers: Number of worker processes for DataLoader
+            pin_memory: Whether to use pinned memory for DataLoader
+            
+        Returns:
+            DataLoader object
+        """
+        if not indices:
+            warnings.warn(f"No {name} segments available")
             return DataLoader(
                 SynthSegmentSubset(self, []),
                 batch_size=batch_size,
@@ -1055,26 +1220,29 @@ class SynthDataset(Dataset):
             )
         
         return DataLoader(
-            SynthSegmentSubset(self, self.train_indices),
+            SynthSegmentSubset(self, indices),
             batch_size=batch_size,
             shuffle=shuffle,
             pin_memory=pin_memory,
             num_workers=num_workers
         )
+
+    def get_train_iterator(self, batch_size=128, shuffle=True, num_workers=None, pin_memory=None):
+        """Get data iterator for training set"""
+        return self._get_data_iterator(
+            self.train_indices, 
+            "training", 
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory
+        )
     
     def get_eval_iterator(self, batch_size=128, shuffle=False, num_workers=None, pin_memory=None):
-        if not self.eval_indices:
-            warnings.warn("No evaluation segments available")
-            return DataLoader(
-                SynthSegmentSubset(self, []),
-                batch_size=batch_size,
-                shuffle=shuffle,
-                pin_memory=pin_memory,
-                num_workers=num_workers
-            )
-            
-        return DataLoader(
-            SynthSegmentSubset(self, self.eval_indices),
+        """Get data iterator for evaluation set"""
+        return self._get_data_iterator(
+            self.eval_indices, 
+            "evaluation", 
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
@@ -1082,18 +1250,10 @@ class SynthDataset(Dataset):
         )
     
     def get_test_iterator(self, batch_size=128, shuffle=False, num_workers=None, pin_memory=None):
-        if not self.test_indices:
-            warnings.warn("No test segments available")
-            return DataLoader(
-                SynthSegmentSubset(self, []),
-                batch_size=batch_size,
-                shuffle=shuffle,
-                pin_memory=pin_memory,
-                num_workers=num_workers
-            )
-            
-        return DataLoader(
-            SynthSegmentSubset(self, self.test_indices),
+        """Get data iterator for test set"""
+        return self._get_data_iterator(
+            self.test_indices, 
+            "test", 
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,

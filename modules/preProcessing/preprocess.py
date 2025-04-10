@@ -1,571 +1,538 @@
-import numpy as np
-import librosa
 import os
-from scipy import linalg
-from scipy.optimize import nnls  # Add this import for the NNLS function
+import librosa
+from modules.utils.chords import Chords
+import re
+from enum import Enum
+import pyrubberband as pyrb
+import torch
+import math
+import glob
+from pathlib import Path
 
-# Constants similar to the C++ implementation
-nBPS = 3  # bins per semitone
-nNote = 84 * nBPS  # number of notes
-MIDI_basenote = 21  # MIDI number for lowest note (A0)
+class FeatureTypes(Enum):
+    cqt = 'cqt'
 
-# Windows for weighting treble and bass ranges
-treblewindow = np.concatenate((np.zeros(12), 
-                              np.ones(24) * 0.5, 
-                              np.ones(24), 
-                              np.ones(24) * 0.5))
-treblewindow = treblewindow[:84]
+class Preprocess():
+    def __init__(self, config, feature_to_use, dataset_names, root_dir):
+        self.config = config
+        self.dataset_names = dataset_names
+        self.root_path = root_dir + '/'
 
-def cospuls(x, centre, width):
-    """
-    Cosine pulse function centered at 'centre' with given width
-    """
-    recipwidth = 1.0 / width
-    abs_diff = abs(x - centre)
-    if abs_diff <= 0.5 * width:
-        return np.cos((x - centre) * 2 * np.pi * recipwidth) * 0.5 + 0.5
-    return 0.0
+        self.time_interval = config.feature["hop_length"]/config.mp3["song_hz"]
+        self.no_of_chord_datapoints_per_sequence = math.ceil(config.mp3['inst_len'] / self.time_interval)
+        self.Chord_class = Chords()
 
-def pitchCospuls(x, centre, binsperoctave):
-    """
-    Pitch-scaled cosine pulse function
-    """
-    warpedf = -binsperoctave * (np.log2(centre) - np.log2(x))
-    out = cospuls(warpedf, 0.0, 2.0)
-    # Scale to correct for note density
-    c = np.log(2.0) / binsperoctave
-    return out / (c * x) if x > 0 else 0.0
+        # isophonic
+        self.isophonic_directory = self.root_path + 'isophonic/'
 
-def specialConvolution(convolvee, kernel):
-    """
-    Special convolution as defined in the C++ code
-    """
-    len_convolvee = len(convolvee)
-    len_kernel = len(kernel)
-    
-    Z = np.zeros(len_convolvee)
-    
-    # Main convolution part
-    for n in range(len_kernel - 1, len_convolvee):
-        s = 0.0
-        for m in range(len_kernel):
-            s += convolvee[n-m] * kernel[m]
-        Z[n - len_kernel//2] = s
-    
-    # Fill upper and lower pads
-    for n in range(len_kernel//2):
-        Z[n] = Z[len_kernel//2]
-    
-    for n in range(len_convolvee, len_convolvee + len_kernel//2):
-        Z[n - len_kernel//2] = Z[len_convolvee - len_kernel//2 - 1]
-    
-    return Z
+        # uspop
+        self.uspop_directory = self.root_path + 'uspop/'
+        self.uspop_audio_path = 'audio/'
+        self.uspop_lab_path = 'annotations/uspopLabels/'
+        self.uspop_index_path = 'annotations/uspopLabels.txt'
 
-def logFreqMatrix(sample_rate, blocksize):
-    """
-    Calculate matrix that maps from magnitude spectrum to pitch-scale spectrum
-    """
-    binspersemitone = nBPS
-    minoctave = 0
-    maxoctave = 7
-    oversampling = 80
-    
-    # Linear frequency vector
-    fft_f = np.array([i * (sample_rate / blocksize) for i in range(blocksize//2)])
-    fft_width = sample_rate * 2.0 / blocksize
-    
-    # Linear oversampled frequency vector
-    oversampled_f = np.array([i * ((sample_rate / blocksize) / oversampling) for i in range(oversampling * blocksize//2)])
-    
-    # Pitch-spaced frequency vector
-    minMIDI = 21 + minoctave * 12
-    maxMIDI = 21 + maxoctave * 12
-    oob = 1.0 / binspersemitone
-    
-    cq_f = []
-    for i in range(minMIDI, maxMIDI):
-        for k in range(binspersemitone):
-            cq_f.append(440 * (2.0 ** (0.083333333333 * (i + oob * k - 69))))
-    cq_f.append(440 * (2.0 ** (0.083333 * (maxMIDI - 69))))
-    
-    cq_f = np.array(cq_f)
-    nFFT = len(fft_f)
-    
-    # FFT activation
-    fft_activation = []
-    for iOS in range(2 * oversampling):
-        cosp = cospuls(oversampled_f[iOS], fft_f[1], fft_width)
-        fft_activation.append(cosp)
-    
-    # Create the log frequency matrix
-    outmatrix = np.zeros((nFFT, len(cq_f)))
-    
-    for iFFT in range(1, nFFT):
-        curr_start = oversampling * iFFT - oversampling
-        curr_end = oversampling * iFFT + oversampling
+        # robbie williams
+        self.robbie_williams_directory = self.root_path + 'robbiewilliams/'
+        self.robbie_williams_audio_path = 'audio/'
+        self.robbie_williams_lab_path = 'chords/'
+
+        # custom audio and label directories
+        self.custom_audio_dirs = []
+        self.custom_label_dirs = []
         
-        for iCQ in range(len(cq_f)):
-            if (cq_f[iCQ] * (2.0 ** 0.084) + fft_width > fft_f[iFFT] and 
-                cq_f[iCQ] * (2.0 ** (-0.084 * 2)) - fft_width < fft_f[iFFT]):
-                
-                for iOS in range(curr_start, curr_end):
-                    if iOS < len(oversampled_f):
-                        cq_activation = pitchCospuls(oversampled_f[iOS], cq_f[iCQ], binspersemitone * 12)
-                        outmatrix[iFFT, iCQ] += cq_activation * fft_activation[iOS - curr_start]
-    
-    # Convert to sparse format
-    kernel_value = []
-    kernel_fft_index = []
-    kernel_note_index = []
-    
-    for iNote in range(len(cq_f)):
-        for iFFT in range(nFFT):
-            if outmatrix[iFFT, iNote] > 0:
-                # Only include indices that are within the valid range for nNote
-                if iNote < nNote:
-                    kernel_value.append(outmatrix[iFFT, iNote])
-                    kernel_fft_index.append(iFFT)
-                    kernel_note_index.append(iNote)
-    
-    return kernel_value, kernel_fft_index, kernel_note_index
+        # Check if audio_dirs and label_dirs are in dataset_names (they're paths in that case)
+        for path in dataset_names:
+            if os.path.exists(path) and (os.path.isdir(path) or path.startswith('./') or path.startswith('/')):
+                if 'Audio' in path or 'audio' in path:
+                    self.custom_audio_dirs.append(path)
+                elif 'Label' in path or 'label' in path:
+                    self.custom_label_dirs.append(path)
 
-def dictionaryMatrix(s_param=0.7):
-    """
-    Create a dictionary matrix for note mapping
-    """
-    binspersemitone = nBPS
-    minoctave = 0
-    maxoctave = 7
-    
-    # Pitch-spaced frequency vector
-    minMIDI = 21 + minoctave * 12 - 1
-    maxMIDI = 21 + maxoctave * 12
-    oob = 1.0 / binspersemitone
-    
-    cq_f = []
-    for i in range(minMIDI, maxMIDI):
-        for k in range(binspersemitone):
-            cq_f.append(440 * (2.0 ** (0.083333333333 * (i + oob * k - 69))))
-    cq_f.append(440 * (2.0 ** (0.083333 * (maxMIDI - 69))))
-    
-    dm = np.zeros((nNote, 12 * (maxoctave - minoctave)))
-    
-    for iOut in range(12 * (maxoctave - minoctave)):
-        for iHarm in range(1, 21):
-            floatbin = ((iOut + 1) * binspersemitone + 1) + binspersemitone * 12 * np.log2(iHarm)
-            curr_amp = s_param ** (iHarm - 1)
-            
-            for iNote in range(nNote):
-                if abs(iNote + 1.0 - floatbin) < 2:
-                    dm[iNote, iOut] += cospuls(iNote + 1.0, floatbin, binspersemitone + 0.0) * curr_amp
-    
-    return dm
+        self.feature_name = feature_to_use
+        self.is_cut_last_chord = False
 
-class NNLSChroma:
-    def __init__(self, sample_rate=44100, blocksize=16384, stepsize=2048):
+    def find_mp3_path(self, dirpath, word):
+        for filename in os.listdir(dirpath):
+            last_dir = dirpath.split("/")[-2]
+            if ".mp3" in filename:
+                tmp = filename.replace(".mp3", "")
+                tmp = tmp.replace(last_dir, "")
+                filename_lower = tmp.lower()
+                filename_lower = " ".join(re.findall("[a-zA-Z]+", filename_lower))
+                if word.lower().replace(" ", "") in filename_lower.replace(" ", ""):
+                    return filename
+
+    def find_mp3_path_robbiewilliams(self, dirpath, word):
+        for filename in os.listdir(dirpath):
+            if ".mp3" in filename:
+                tmp = filename.replace(".mp3", "")
+                filename_lower = tmp.lower()
+                filename_lower = filename_lower.replace("robbie williams", "")
+                filename_lower = " ".join(re.findall("[a-zA-Z]+", filename_lower))
+                filename_lower = self.song_pre(filename_lower)
+                if self.song_pre(word.lower()).replace(" ", "") in filename_lower.replace(" ", ""):
+                    return filename
+
+    def get_all_files(self):
+        res_list = []
+
+        # First check for custom audio/label directories
+        if self.custom_audio_dirs and self.custom_label_dirs:
+            res_list.extend(self._get_custom_files())
+        
+        # isophonic
+        if "isophonic" in self.dataset_names:
+            for dirpath, dirnames, filenames in os.walk(self.isophonic_directory):
+                if not dirnames:
+                    for filename in filenames:
+                        if ".lab" in filename:
+                            tmp = filename.replace(".lab", "")
+                            song_name = " ".join(re.findall("[a-zA-Z]+", tmp)).replace("CD", "")
+                            mp3_path = self.find_mp3_path(dirpath, song_name)
+                            res_list.append([song_name, os.path.join(dirpath, filename), os.path.join(dirpath, mp3_path),
+                                             os.path.join(self.root_path, "result", "isophonic")])
+
+        # uspop
+        if "uspop" in self.dataset_names:
+            with open(os.path.join(self.uspop_directory, self.uspop_index_path)) as f:
+                uspop_lab_list = f.readlines()
+            uspop_lab_list = [x.strip() for x in uspop_lab_list]
+
+            for lab_path in uspop_lab_list:
+                spl = lab_path.split('/')
+                lab_artist = self.uspop_pre(spl[2])
+                lab_title = self.uspop_pre(spl[4][3:-4])
+                lab_path = lab_path.replace('./uspopLabels/', '')
+                lab_path = os.path.join(self.uspop_directory, self.uspop_lab_path, lab_path)
+
+                for filename in os.listdir(os.path.join(self.uspop_directory, self.uspop_audio_path)):
+                    if not '.csv' in filename:
+                        spl = filename.split('-')
+                        mp3_artist = self.uspop_pre(spl[0])
+                        mp3_title = self.uspop_pre(spl[1][:-4])
+
+                        if lab_artist == mp3_artist and lab_title == mp3_title:
+                            res_list.append([mp3_artist + mp3_title, lab_path,
+                                             os.path.join(self.uspop_directory, self.uspop_audio_path, filename),
+                                             os.path.join(self.root_path, "result", "uspop")])
+                            break
+
+        # robbie williams
+        if "robbiewilliams" in self.dataset_names:
+            for dirpath, dirnames, filenames in os.walk(self.robbie_williams_directory):
+                if not dirnames:
+                    for filename in filenames:
+                        if ".txt" in filename and (not 'README' in filename):
+                            tmp = filename.replace(".txt", "")
+                            song_name = " ".join(re.findall("[a-zA-Z]+", tmp)).replace("GTChords", "")
+                            mp3_dir = dirpath.replace("chords", "audio")
+                            mp3_path = self.find_mp3_path_robbiewilliams(mp3_dir, song_name)
+                            res_list.append([song_name, os.path.join(dirpath, filename), os.path.join(mp3_dir, mp3_path),
+                                             os.path.join(self.root_path, "result", "robbiewilliams")])
+        return res_list
+
+    def _get_custom_files(self):
         """
-        Initialize the NNLS Chroma extractor
+        Find matching audio and label files in custom directories.
         
-        Parameters:
-        -----------
-        sample_rate : int
-            Sample rate of the audio signal (default: 44100)
-        blocksize : int
-            Frame length for FFT (default: 16384)
-        stepsize : int
-            Hop size between frames (default: 2048)
-        """
-        self.sample_rate = sample_rate
-        self.blocksize = blocksize
-        self.stepsize = stepsize
-        
-        # Parameters
-        self.whitening = 1.0
-        self.s = 0.7  # Spectral shape parameter (0.6 to 0.9 in the paper)
-        self.doNormalizeChroma = 3  # L2 norm
-        self.tuneLocal = 0.0  # global tuning
-        self.boostN = 0.1
-        self.useNNLS = 1.0
-        self.rollon = 0.0
-        
-        # Pre-processing method as described in the paper:
-        # 0: original - no pre-processing
-        # 1: subtraction - subtract the background spectrum 
-        # 2: standardization - subtract background and divide by running std dev
-        self.preprocessing_method = 0
-        
-        # Create the dictionary matrix and log freq matrix
-        self.dict = dictionaryMatrix(self.s)
-        self.kernel_value, self.kernel_fft_index, self.kernel_note_index = logFreqMatrix(
-            self.sample_rate, self.blocksize)
-        
-        # For tuning estimation
-        self.sinvalues = np.sin(2 * np.pi * (np.arange(nBPS) / nBPS))
-        self.cosvalues = np.cos(2 * np.pi * (np.arange(nBPS) / nBPS))
-        
-        # Make hamming window of length 1/2 octave
-        hamwinlength = nBPS * 6 + 1
-        hamwinsum = 0
-        hw = []
-        for i in range(hamwinlength):
-            hw_val = 0.54 - 0.46 * np.cos((2 * np.pi * i) / (hamwinlength - 1))
-            hw.append(hw_val)
-            hamwinsum += hw_val
-        self.hw = np.array(hw) / hamwinsum
-        
-        # Initialize tuning
-        self.mean_tunings = np.zeros(nBPS)
-        self.local_tunings = np.zeros(nBPS)
-        self.local_tuning = []
-        self.frame_count = 0
-        self.log_spectrum = []
-    
-    def process_frame(self, fft_data):
-        """
-        Process a single FFT frame
-        """
-        self.frame_count += 1
-        
-        # Extract magnitude from FFT data
-        magnitude = np.sqrt(fft_data[0:self.blocksize//2, 0]**2 + fft_data[0:self.blocksize//2, 1]**2)
-        
-        # Apply rollon if needed
-        if self.rollon > 0:
-            energysum = np.sum(magnitude**2)
-            cumenergy = 0
-            for i in range(2, self.blocksize//2):
-                cumenergy += magnitude[i]**2
-                if cumenergy < energysum * self.rollon / 100:
-                    magnitude[i-2] = 0
-                else:
-                    break
-        
-        # Note magnitude mapping using pre-calculated matrix
-        nm = np.zeros(nNote)
-        
-        for i, k_val in enumerate(self.kernel_value):
-            # Add safety check to prevent index out of bounds
-            if self.kernel_note_index[i] < nNote and self.kernel_fft_index[i] < len(magnitude):
-                nm[self.kernel_note_index[i]] += magnitude[self.kernel_fft_index[i]] * k_val
-        
-        one_over_N = 1.0 / self.frame_count
-        
-        # Update means of complex tuning variables
-        self.mean_tunings *= float(self.frame_count - 1) * one_over_N
-        
-        for iTone in range(0, round(nNote * 0.62 / nBPS) * nBPS + 1, nBPS):
-            self.mean_tunings += nm[iTone:iTone+nBPS] * one_over_N
-            
-            ratioOld = 0.997
-            self.local_tunings *= ratioOld
-            self.local_tunings += nm[iTone:iTone+nBPS] * (1 - ratioOld)
-        
-        # Local tuning
-        localTuningImag = np.sum(self.local_tunings * self.sinvalues)
-        localTuningReal = np.sum(self.local_tunings * self.cosvalues)
-        
-        normalisedtuning = np.arctan2(localTuningImag, localTuningReal) / (2 * np.pi)
-        self.local_tuning.append(normalisedtuning)
-        
-        # Store log spectrum
-        self.log_spectrum.append(nm)
-        
-        return nm
-    
-    def extract_chroma(self):
-        """
-        Extract chromagram features from processed frames
-        """
-        if len(self.log_spectrum) == 0:
-            return None
-        
-        # Calculate tuning
-        meanTuningImag = np.sum(self.mean_tunings * self.sinvalues)
-        meanTuningReal = np.sum(self.mean_tunings * self.cosvalues)
-        
-        normalisedtuning = np.arctan2(meanTuningImag, meanTuningReal) / (2 * np.pi)
-        intShift = int(np.floor(normalisedtuning * 3))
-        floatShift = normalisedtuning * 3 - intShift
-        
-        # Process each frame
-        tuned_log_spectrum = []
-        
-        for frame_idx, log_frame in enumerate(self.log_spectrum):
-            # Apply tuning
-            if self.tuneLocal:
-                intShift = int(np.floor(self.local_tuning[frame_idx] * 3))
-                floatShift = self.local_tuning[frame_idx] * 3 - intShift
-            
-            # Create tuned log frame
-            tuned_frame = np.zeros_like(log_frame)
-            tuned_frame[:2] = 0  # set lower edge to zero
-            
-            # Interpolate inner bins
-            for k in range(2, len(log_frame) - 3):
-                if k + intShift < len(log_frame) and k + intShift + 1 < len(log_frame):
-                    tuned_frame[k] = log_frame[k + intShift] * (1 - floatShift) + log_frame[k + intShift + 1] * floatShift
-            
-            tuned_frame[-3:] = 0  # upper edge
-            
-            # Apply pre-processing as described in the paper
-            if self.preprocessing_method > 0:
-                # Calculate the running mean (background spectrum)
-                # Using octave-wide Hamming-windowed neighborhood (+-18 bins = 6 semitones)
-                running_mean = specialConvolution(tuned_frame, self.hw)
-                
-                # For standardization (method 2), calculate running standard deviation
-                if self.preprocessing_method == 2:
-                    running_std = np.zeros_like(tuned_frame)
-                    for i in range(nNote):
-                        running_std[i] = (tuned_frame[i] - running_mean[i]) ** 2
-                    running_std = specialConvolution(running_std, self.hw)
-                    running_std = np.sqrt(running_std)
-                
-                # Apply the pre-processing as per equation (2) in the paper
-                for i in range(nNote):
-                    if tuned_frame[i] - running_mean[i] > 0:
-                        if self.preprocessing_method == 1:  # subtraction
-                            tuned_frame[i] = tuned_frame[i] - running_mean[i]
-                        elif self.preprocessing_method == 2:  # standardization
-                            if running_std[i] > 0:
-                                tuned_frame[i] = (tuned_frame[i] - running_mean[i]) / running_std[i]
-                            else:
-                                tuned_frame[i] = 0
-                    else:
-                        tuned_frame[i] = 0
-                    
-            tuned_log_spectrum.append(tuned_frame)
-        
-        # Extract semitone spectrum and chromagram
-        chromagrams = []
-        
-        for tuned_frame in tuned_log_spectrum:
-            chroma = np.zeros(12)
-            
-            if self.useNNLS == 0:
-                # Simple mapping approach - just copy the centre bin of every semitone
-                for iNote in range(nBPS//2 + 2, nNote - nBPS//2, nBPS):
-                    semitone_idx = (iNote - (nBPS//2 + 2)) // nBPS
-                    chroma[semitone_idx % 12] += tuned_frame[iNote]
-            else:
-                # Use NNLS approach as described in the paper
-                # Create semitone spectrum with indices that have energy
-                semitone_spectrum = np.zeros(84)
-                signif_index = []
-                
-                for index, iNote in enumerate(range(nBPS//2 + 2, nNote - nBPS//2, nBPS)):
-                    curr_val = 0
-                    for iBPS in range(-nBPS//2, nBPS//2 + 1):
-                        if iNote + iBPS < len(tuned_frame):
-                            curr_val += tuned_frame[iNote + iBPS]
-                    
-                    if curr_val > 0:
-                        signif_index.append(index)
-                
-                if signif_index:
-                    try:
-                        # Create dictionary for NNLS
-                        curr_dict = np.zeros((nNote, len(signif_index)))
-                        
-                        for i, note_idx in enumerate(signif_index):
-                            curr_dict[:, i] = self.dict[:, note_idx % 12]
-                        
-                        # Add a small regularization term to prevent singular matrix
-                        reg_lambda = 1e-10
-                        
-                        # Solve NNLS with robust error handling
-                        try:
-                            x, _ = nnls(curr_dict, tuned_frame)
-                        except np.linalg.LinAlgError:
-                            # If we get a singular matrix, try with more regularization
-                            try:
-                                # Add a small identity component to make the matrix better conditioned
-                                curr_dict = curr_dict + np.random.normal(0, reg_lambda, curr_dict.shape)
-                                x, _ = nnls(curr_dict, tuned_frame)
-                            except:
-                                # If still failing, fall back to simple method
-                                x = np.zeros(len(signif_index))
-                                for i, note_idx in enumerate(signif_index):
-                                    x[i] = tuned_frame[nBPS//2 + 2 + note_idx * nBPS]
-                        
-                        # Map back to semitone spectrum
-                        for i, note_idx in enumerate(signif_index):
-                            if note_idx < len(semitone_spectrum):
-                                semitone_spectrum[note_idx] = x[i]
-                                if note_idx % 12 < len(chroma) and note_idx < len(treblewindow):
-                                    chroma[note_idx % 12] += x[i] * treblewindow[note_idx]
-                    except Exception as e:
-                        print(f"Error in NNLS processing: {e}")
-                        # Fall back to simple method if anything goes wrong
-                        for index, iNote in enumerate(range(nBPS//2 + 2, nNote - nBPS//2, nBPS)):
-                            if iNote < len(tuned_frame):
-                                semitone_idx = (iNote - (nBPS//2 + 2)) // nBPS
-                                if semitone_idx % 12 < len(chroma) and semitone_idx < len(treblewindow):
-                                    chroma[semitone_idx % 12] += tuned_frame[iNote] * treblewindow[semitone_idx]
-            
-            # Normalize chroma if needed
-            if self.doNormalizeChroma > 0:
-                if self.doNormalizeChroma == 1:  # max norm
-                    max_val = np.max(chroma)
-                    if max_val > 0:
-                        chroma /= max_val
-                elif self.doNormalizeChroma == 2:  # L1 norm
-                    sum_val = np.sum(chroma)
-                    if sum_val > 0:
-                        chroma /= sum_val
-                elif self.doNormalizeChroma == 3:  # L2 norm
-                    sum_squared = np.sum(chroma**2)
-                    if sum_squared > 0:
-                        chroma /= np.sqrt(sum_squared)
-            
-            chromagrams.append(chroma)
-        
-        return np.array(chromagrams)
-    
-    def extract_features(self, audio_data, sr=None):
-        """
-        Extract NNLS chroma features from audio data
-        
-        Parameters:
-        -----------
-        audio_data : numpy array
-            Audio signal (mono)
-        sr : int, optional
-            Sample rate of the audio data. If not provided, uses the class's sample_rate.
-            
         Returns:
-        --------
-        chromagram : numpy array
-            Matrix of chroma features (n_frames x 12)
+            List of [song_name, label_path, audio_path, result_path] entries
         """
-        # Use provided sample rate if given
-        if sr is not None:
-            self.sample_rate = sr
-            
-        # Reset state
-        self.log_spectrum = []
-        self.local_tuning = []
-        self.mean_tunings = np.zeros(nBPS)
-        self.local_tunings = np.zeros(nBPS)
-        self.frame_count = 0
+        result = []
         
-        # Compute STFT
-        stft = librosa.stft(
-            audio_data,
-            n_fft=self.blocksize,
-            hop_length=self.stepsize,
-            window='hamming',  # Use Hamming window as specified in the paper
-            center=True
-        )
+        # Get all audio files with supported extensions
+        audio_files = {}
+        for audio_dir in self.custom_audio_dirs:
+            if not os.path.exists(audio_dir):
+                continue
+                
+            # Find MP3 files in this directory and its subdirectories
+            for ext in ['.mp3', '.wav', '.flac', '.ogg', '.m4a']:
+                for audio_path in glob.glob(os.path.join(audio_dir, f"**/*{ext}"), recursive=True):
+                    basename = Path(audio_path).stem
+                    audio_files[basename] = audio_path
         
-        # Convert to complex array
-        complex_stft = stft.T
-        real_part = np.real(complex_stft)
-        imag_part = np.imag(complex_stft)
+        # Get all label files
+        label_files = {}
+        for label_dir in self.custom_label_dirs:
+            if not os.path.exists(label_dir):
+                continue
+                
+            # Find label files in this directory and its subdirectories
+            for ext in ['.lab', '.txt']:
+                for label_path in glob.glob(os.path.join(label_dir, f"**/*{ext}"), recursive=True):
+                    basename = Path(label_path).stem
+                    label_files[basename] = label_path
         
-        # Format as needed for our algorithm
-        fft_data = np.zeros((len(complex_stft), self.blocksize//2, 2))
-        fft_data[:, :, 0] = real_part[:, :self.blocksize//2]
-        fft_data[:, :, 1] = imag_part[:, :self.blocksize//2]
+        # Find matches between audio and label files
+        for basename, audio_path in audio_files.items():
+            if basename in label_files:
+                # Determine dataset name from directory structure
+                audio_dir_name = Path(audio_path).parent.name
+                label_dir_name = Path(label_files[basename]).parent.name
+                dataset_name = audio_dir_name or label_dir_name
+                
+                # Create result path
+                result_path = os.path.join(self.root_path, "result", "custom", dataset_name)
+                
+                # Create entry
+                result.append([
+                    basename,  # song_name
+                    label_files[basename],  # label_path
+                    audio_path,  # audio_path
+                    result_path  # result_path
+                ])
         
-        # Process each frame
-        for i in range(len(fft_data)):
-            self.process_frame(fft_data[i])
-        
-        # Extract chroma features
-        return self.extract_chroma()
+        return result
 
-def extract_chroma(audio_path, hop_size=2048, output_csv=None, preprocessing_method=1):
-    """
-    Extract chromagram from audio file using librosa's built-in functions
-    
-    Parameters:
-    -----------
-    audio_path : str
-        Path to the audio file
-    hop_size : int, optional
-        Hop size in samples (default: 2048)
-    output_csv : str, optional
-        Path to save the CSV output file. If None, will not save to CSV.
-    preprocessing_method : int, optional
-        Pre-processing method: 0=none, 1=subtraction (default), 2=standardization
-        
-    Returns:
-    --------
-    timestamps : numpy array
-        Array of timestamps for each frame
-    chromagram : numpy array
-        Matrix of chroma features (n_frames x 12)
-    """
-    # Load the audio file
-    print(f"Loading audio file: {audio_path}")
-    y, sr = librosa.load(audio_path, sr=22050)  # Standard sample rate
-    
-    # Set parameters for feature extraction
-    n_fft = 4096  # FFT window size
-    
-    # Extract chromagram using librosa
-    print(f"Extracting chromagram...")
-    
-    # Choose extraction method based on preprocessing_method
-    if preprocessing_method == 0:
-        # Basic chromagram with no preprocessing
-        chromagram = librosa.feature.chroma_stft(
-            y=y, sr=sr, n_fft=n_fft, hop_length=hop_size, norm=None
-        )
-    else:
-        # With harmonic separation for better chord detection
-        y_harmonic = librosa.effects.harmonic(y=y, margin=4.0)
-        
-        if preprocessing_method == 1:  # Subtraction method
-            # Use CQT-based chromagram for better pitch detection
-            chromagram = librosa.feature.chroma_cqt(
-                y=y_harmonic, sr=sr, hop_length=hop_size
-            )
-            
-            # Apply log transformation and subtract median
-            chromagram = np.log1p(chromagram)
-            chromagram = chromagram - np.median(chromagram, axis=1, keepdims=True)
-            chromagram = np.maximum(chromagram, 0.0)  # Keep only positive values
-            
-        elif preprocessing_method == 2:  # Standardization
-            # NNLS chromagram for improved chord extraction
-            chromagram = librosa.feature.chroma_cens(
-                y=y_harmonic, sr=sr, hop_length=hop_size
-            )
-            
-            # Standardize features
-            chromagram = (chromagram - np.mean(chromagram, axis=1, keepdims=True)) / (
-                np.std(chromagram, axis=1, keepdims=True) + 1e-8
-            )
-            chromagram = np.maximum(chromagram, 0.0)  # Keep only positive values
-    
-    # Rotate the chromagram to shift from C-based to A-based (rotate by 3 positions)
-    # This changes C->C#->D->D#->E->F->F#->G->G#->A->A#->B to A->A#->B->C->C#->D->D#->E->F->F#->G->G#
-    chromagram = np.roll(chromagram, 3, axis=0)
-    
-    # Transpose to get [n_frames, 12] shape
-    chromagram = chromagram.T
-    
-    # Calculate timestamps
-    timestamps = librosa.times_like(chromagram, sr=sr, hop_length=hop_size)
-    
-    # Save to CSV if output_csv is provided
-    if output_csv is not None:
-        # Get the filename for the CSV header
-        filename = os.path.basename(audio_path)
-        
-        print(f"Writing CSV to: {output_csv}")
-        with open(output_csv, 'w') as f:
-            # Write header row with filename in first column
-            f.write(f'"{filename}",Time,A,A#,B,C,C#,D,D#,E,F,F#,G,G#\n')
-            
-            # Write each row with timestamp and chroma values
-            for i, (time, chroma) in enumerate(zip(timestamps, chromagram)):
-                # Format with precision but without scientific notation
-                chroma_str = [f"{c:.7f}" if c >= 0.0001 else "0" for c in chroma]
-                f.write(f',{time:.7f},{",".join(chroma_str)}\n')
-        
-        print(f"Completed! CSV saved to {output_csv}")
-    
-    return timestamps, chromagram
+    def uspop_pre(self, text):
+        text = text.lower()
+        text = text.replace('_', '')
+        text = text.replace(' ', '')
+        text = " ".join(re.findall("[a-zA-Z]+", text))
+        return text
+
+    def song_pre(self, text):
+        to_remove = ["'", '`', '(', ')', ' ', '&', 'and', 'And']
+
+        for remove in to_remove:
+            text = text.replace(remove, '')
+
+        return text
+
+    def config_to_folder(self):
+        mp3_config = self.config.mp3
+        feature_config = self.config.feature
+        mp3_string = "%d_%.1f_%.1f" % \
+                     (mp3_config['song_hz'], mp3_config['inst_len'],
+                      mp3_config['skip_interval'])
+        feature_string = "%s_%d_%d_%d" % \
+                         (self.feature_name.value, feature_config['n_bins'], feature_config['bins_per_octave'], feature_config['hop_length'])
+
+        return mp3_config, feature_config, mp3_string, feature_string
+
+    def generate_labels_features_new(self, all_list):
+        pid = os.getpid()
+        mp3_config, feature_config, mp3_str, feature_str = self.config_to_folder()
+
+        i = 0  # number of songs
+        j = 0  # number of impossible songs
+        k = 0  # number of tried songs
+        total = 0  # number of generated instances
+
+        stretch_factors = [1.0]
+        shift_factors = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6]
+
+        loop_broken = False
+        for song_name, lab_path, mp3_path, save_path in all_list:
+
+            # different song initialization
+            if loop_broken:
+                loop_broken = False
+
+            i += 1
+            print(pid, "generating features from ...", os.path.join(mp3_path))
+            if i % 10 == 0:
+                print(i, ' th song')
+
+            original_wav, sr = librosa.load(os.path.join(mp3_path), sr=mp3_config['song_hz'])
+
+            # make result path if not exists
+            # save_path, mp3_string, feature_string, song_name, aug.pt
+            result_path = os.path.join(save_path, mp3_str, feature_str, song_name.strip())
+            if not os.path.exists(result_path):
+                os.makedirs(result_path)
+
+            # calculate result
+            for stretch_factor in stretch_factors:
+                if loop_broken:
+                    loop_broken = False
+                    break
+
+                for shift_factor in shift_factors:
+                    # for filename
+                    idx = 0
+
+                    chord_info = self.Chord_class.get_converted_chord(os.path.join(lab_path))
+
+                    k += 1
+                    # stretch original sound and chord info
+                    x = pyrb.time_stretch(original_wav, sr, stretch_factor)
+                    x = pyrb.pitch_shift(x, sr, shift_factor)
+                    audio_length = x.shape[0]
+                    chord_info['start'] = chord_info['start'] * 1/stretch_factor
+                    chord_info['end'] = chord_info['end'] * 1/stretch_factor
+
+                    last_sec = chord_info.iloc[-1]['end']
+                    last_sec_hz = int(last_sec * mp3_config['song_hz'])
+
+                    if audio_length + mp3_config['skip_interval'] < last_sec_hz:
+                        print('loaded song is too short :', song_name)
+                        loop_broken = True
+                        j += 1
+                        break
+                    elif audio_length > last_sec_hz:
+                        x = x[:last_sec_hz]
+
+                    origin_length = last_sec_hz
+                    origin_length_in_sec = origin_length / mp3_config['song_hz']
+
+                    current_start_second = 0
+
+                    # get chord list between current_start_second and current+song_length
+                    while current_start_second + mp3_config['inst_len'] < origin_length_in_sec:
+                        inst_start_sec = current_start_second
+                        curSec = current_start_second
+
+                        chord_list = []
+                        # extract chord per 1/self.time_interval
+                        while curSec < inst_start_sec + mp3_config['inst_len']:
+                            try:
+                                available_chords = chord_info.loc[(chord_info['start'] <= curSec) & (
+                                        chord_info['end'] > curSec + self.time_interval)].copy()
+                                if len(available_chords) == 0:
+                                    available_chords = chord_info.loc[((chord_info['start'] >= curSec) & (
+                                            chord_info['start'] <= curSec + self.time_interval)) | (
+                                                                              (chord_info['end'] >= curSec) & (
+                                                                              chord_info['end'] <= curSec + self.time_interval))].copy()
+                                if len(available_chords) == 1:
+                                    chord = available_chords['chord_id'].iloc[0]
+                                elif len(available_chords) > 1:
+                                    max_starts = available_chords.apply(lambda row: max(row['start'], curSec),
+                                                                        axis=1)
+                                    available_chords['max_start'] = max_starts
+                                    min_ends = available_chords.apply(
+                                        lambda row: min(row.end, curSec + self.time_interval), axis=1)
+                                    available_chords['min_end'] = min_ends
+                                    chords_lengths = available_chords['min_end'] - available_chords['max_start']
+                                    available_chords['chord_length'] = chords_lengths
+                                    chord = available_chords.ix[available_chords['chord_length'].idxmax()]['chord_id']
+                                else:
+                                    chord = 24
+                            except Exception as e:
+                                chord = 24
+                                print(e)
+                                print(pid, "no chord")
+                                raise RuntimeError()
+                            finally:
+                                # convert chord by shift factor
+                                if chord != 24:
+                                    chord += shift_factor * 2
+                                    chord = chord % 24
+
+                                chord_list.append(chord)
+                                curSec += self.time_interval
+
+                        if len(chord_list) == self.no_of_chord_datapoints_per_sequence:
+                            try:
+                                sequence_start_time = current_start_second
+                                sequence_end_time = current_start_second + mp3_config['inst_len']
+
+                                start_index = int(sequence_start_time * mp3_config['song_hz'])
+                                end_index = int(sequence_end_time * mp3_config['song_hz'])
+
+                                song_seq = x[start_index:end_index]
+
+                                etc = '%.1f_%.1f' % (
+                                    current_start_second, current_start_second + mp3_config['inst_len'])
+                                aug = '%.2f_%i' % (stretch_factor, shift_factor)
+
+                                if self.feature_name == FeatureTypes.cqt:
+                                    # print(pid, "make feature")
+                                    feature = librosa.cqt(song_seq, sr=sr, n_bins=feature_config['n_bins'],
+                                                          bins_per_octave=feature_config['bins_per_octave'],
+                                                          hop_length=feature_config['hop_length'])
+                                else:
+                                    raise NotImplementedError
+
+                                if feature.shape[1] > self.no_of_chord_datapoints_per_sequence:
+                                    feature = feature[:, :self.no_of_chord_datapoints_per_sequence]
+
+                                if feature.shape[1] != self.no_of_chord_datapoints_per_sequence:
+                                    print('loaded features length is too short :', song_name)
+                                    loop_broken = True
+                                    j += 1
+                                    break
+
+                                result = {
+                                    'feature': feature,
+                                    'chord': chord_list,
+                                    'etc': etc
+                                }
+
+                                # save_path, mp3_string, feature_string, song_name, aug.pt
+                                filename = aug + "_" + str(idx) + ".pt"
+                                torch.save(result, os.path.join(result_path, filename))
+                                idx += 1
+                                total += 1
+                            except Exception as e:
+                                print(e)
+                                print(pid, "feature error")
+                                raise RuntimeError()
+                        else:
+                            print("invalid number of chord datapoints in sequence :", len(chord_list))
+                        current_start_second += mp3_config['skip_interval']
+        print(pid, "total instances: %d" % total)
+
+    def generate_labels_features_voca(self, all_list):
+        pid = os.getpid()
+        mp3_config, feature_config, mp3_str, feature_str = self.config_to_folder()
+
+        i = 0  # number of songs
+        j = 0  # number of impossible songs
+        k = 0  # number of tried songs
+        total = 0  # number of generated instances
+        stretch_factors = [1.0]
+        shift_factors = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6]
+
+        loop_broken = False
+        for song_name, lab_path, mp3_path, save_path in all_list:
+            save_path = save_path + '_voca'
+
+            # different song initialization
+            if loop_broken:
+                loop_broken = False
+
+            i += 1
+            print(pid, "generating features from ...", os.path.join(mp3_path))
+            if i % 10 == 0:
+                print(i, ' th song')
+
+            original_wav, sr = librosa.load(os.path.join(mp3_path), sr=mp3_config['song_hz'])
+
+            # save_path, mp3_string, feature_string, song_name, aug.pt
+            result_path = os.path.join(save_path, mp3_str, feature_str, song_name.strip())
+            if not os.path.exists(result_path):
+                os.makedirs(result_path)
+
+            # calculate result
+            for stretch_factor in stretch_factors:
+                if loop_broken:
+                    loop_broken = False
+                    break
+
+                for shift_factor in shift_factors:
+                    # for filename
+                    idx = 0
+
+                    try:
+                        chord_info = self.Chord_class.get_converted_chord_voca(os.path.join(lab_path))
+                    except Exception as e:
+                        print(e)
+                        print(pid, " chord lab file error : %s" % song_name)
+                        loop_broken = True
+                        j += 1
+                        break
+
+                    k += 1
+                    # stretch original sound and chord info
+                    x = pyrb.time_stretch(original_wav, sr, stretch_factor)
+                    x = pyrb.pitch_shift(x, sr, shift_factor)
+                    audio_length = x.shape[0]
+                    chord_info['start'] = chord_info['start'] * 1/stretch_factor
+                    chord_info['end'] = chord_info['end'] * 1/stretch_factor
+
+                    last_sec = chord_info.iloc[-1]['end']
+                    last_sec_hz = int(last_sec * mp3_config['song_hz'])
+
+                    if audio_length + mp3_config['skip_interval'] < last_sec_hz:
+                        print('loaded song is too short :', song_name)
+                        loop_broken = True
+                        j += 1
+                        break
+                    elif audio_length > last_sec_hz:
+                        x = x[:last_sec_hz]
+
+                    origin_length = last_sec_hz
+                    origin_length_in_sec = origin_length / mp3_config['song_hz']
+
+                    current_start_second = 0
+
+                    # get chord list between current_start_second and current+song_length
+                    while current_start_second + mp3_config['inst_len'] < origin_length_in_sec:
+                        inst_start_sec = current_start_second
+                        curSec = current_start_second
+
+                        chord_list = []
+                        # extract chord per 1/self.time_interval
+                        while curSec < inst_start_sec + mp3_config['inst_len']:
+                            try:
+                                available_chords = chord_info.loc[(chord_info['start'] <= curSec) & (chord_info['end'] > curSec + self.time_interval)].copy()
+                                if len(available_chords) == 0:
+                                    available_chords = chord_info.loc[((chord_info['start'] >= curSec) & (chord_info['start'] <= curSec + self.time_interval)) | ((chord_info['end'] >= curSec) & (chord_info['end'] <= curSec + self.time_interval))].copy()
+
+                                if len(available_chords) == 1:
+                                    chord = available_chords['chord_id'].iloc[0]
+                                elif len(available_chords) > 1:
+                                    max_starts = available_chords.apply(lambda row: max(row['start'], curSec),axis=1)
+                                    available_chords['max_start'] = max_starts
+                                    min_ends = available_chords.apply(lambda row: min(row.end, curSec + self.time_interval), axis=1)
+                                    available_chords['min_end'] = min_ends
+                                    chords_lengths = available_chords['min_end'] - available_chords['max_start']
+                                    available_chords['chord_length'] = chords_lengths
+                                    chord = available_chords.ix[available_chords['chord_length'].idxmax()]['chord_id']
+                                else:
+                                    chord = 169
+                            except Exception as e:
+                                chord = 169
+                                print(e)
+                                print(pid, "no chord")
+                                raise RuntimeError()
+                            finally:
+                                # convert chord by shift factor
+                                if chord != 169 and chord != 168:
+                                    chord += shift_factor * 14
+                                    chord = chord % 168
+
+                                chord_list.append(chord)
+                                curSec += self.time_interval
+
+                        if len(chord_list) == self.no_of_chord_datapoints_per_sequence:
+                            try:
+                                sequence_start_time = current_start_second
+                                sequence_end_time = current_start_second + mp3_config['inst_len']
+
+                                start_index = int(sequence_start_time * mp3_config['song_hz'])
+                                end_index = int(sequence_end_time * mp3_config['song_hz'])
+
+                                song_seq = x[start_index:end_index]
+
+                                etc = '%.1f_%.1f' % (
+                                    current_start_second, current_start_second + mp3_config['inst_len'])
+                                aug = '%.2f_%i' % (stretch_factor, shift_factor)
+
+                                if self.feature_name == FeatureTypes.cqt:
+                                    feature = librosa.cqt(song_seq, sr=sr, n_bins=feature_config['n_bins'],
+                                                          bins_per_octave=feature_config['bins_per_octave'],
+                                                          hop_length=feature_config['hop_length'])
+                                else:
+                                    raise NotImplementedError
+
+                                if feature.shape[1] > self.no_of_chord_datapoints_per_sequence:
+                                    feature = feature[:, :self.no_of_chord_datapoints_per_sequence]
+
+                                if feature.shape[1] != self.no_of_chord_datapoints_per_sequence:
+                                    print('loaded features length is too short :', song_name)
+                                    loop_broken = True
+                                    j += 1
+                                    break
+
+                                result = {
+                                    'feature': feature,
+                                    'chord': chord_list,
+                                    'etc': etc
+                                }
+
+                                # save_path, mp3_string, feature_string, song_name, aug.pt
+                                filename = aug + "_" + str(idx) + ".pt"
+                                torch.save(result, os.path.join(result_path, filename))
+                                idx += 1
+                                total += 1
+                            except Exception as e:
+                                print(e)
+                                print(pid, "feature error")
+                                raise RuntimeError()
+                        else:
+                            print("invalid number of chord datapoints in sequence :", len(chord_list))
+                        current_start_second += mp3_config['skip_interval']
+        print(pid, "total instances: %d" % total)

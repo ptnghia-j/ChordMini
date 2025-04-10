@@ -507,26 +507,28 @@ def main():
     
     # Initialize SynthDataset with optimized settings
     logger.info("\n=== Creating dataset ===")
+
+
     dataset_args.update({
         'spec_dir': spec_dir,
         'label_dir': label_dir,
+        'logits_dir': logits_dir,
         'chord_mapping': chord_mapping,
-        'seq_len': config.feature.get('seq_len', 10),
-        'stride': config.feature.get('stride', 5),
-        'frame_duration': config.feature.get('frame_duration', 0.1),
-        'num_workers': 0,  # Force single worker for GPU optimization
-        'cache_file': os.path.join(project_root, 'dataset_cache.pkl') if not args.disable_cache else None,
+        'seq_len': config.training.get('seq_len', 10),
+        'stride': config.training.get('seq_stride', 5),
+        'frame_duration': config.feature.get('hop_duration', 0.1),
         'verbose': True,
-        'use_cache': not args.disable_cache,
-        'metadata_only': args.metadata_cache,
-        'cache_fraction': args.cache_fraction,
-        'logits_dir': logits_dir,  # Add teacher logits directory for KD
-        'lazy_init': args.lazy_init,
-        'require_teacher_logits': use_kd,  # Only require teacher logits if KD is enabled
         'device': device,
         'pin_memory': False,
-        'prefetch_factor': args.prefetch_factor,
-        'batch_gpu_cache': args.batch_gpu_cache
+        'prefetch_factor': float(args.prefetch_factor) if args.prefetch_factor else 1,
+        'num_workers': 10,
+        # debug area
+        'require_teacher_logits': use_kd,
+        'use_cache': not config.data.get('disable_cache', False),
+        'metadata_only': str(args.metadata_cache).lower() == "true",
+        'cache_fraction': config.data.get('cache_fraction', 0.1),
+        'lazy_init': str(args.lazy_init).lower() == "true",
+        'batch_gpu_cache': str(args.batch_gpu_cache).lower() == "true",
     })
     
     # Create the dataset
@@ -809,6 +811,53 @@ def main():
                 logger.info(f"Test metrics saved to {metrics_path}")
             except Exception as e:
                 logger.error(f"Error saving test metrics: {e}")
+            
+            # NEW: Generate chord quality distribution and accuracy visualization
+            logger.info("\n=== Generating Chord Quality Distribution and Accuracy Graph ===")
+            try:
+                from modules.utils.visualize import plot_chord_quality_distribution_accuracy
+                
+                # Collect all predictions and targets from test set
+                all_preds = []
+                all_targets = []
+                model.eval()
+                with torch.no_grad():
+                    for batch in test_loader:
+                        inputs, targets = batch['spectro'], batch['chord_idx']
+                        inputs = inputs.to(device)
+                        targets = targets.to(device)
+                        if normalization:
+                            inputs = (inputs - normalization['mean']) / normalization['std']
+                        outputs = model(inputs)
+                        if isinstance(outputs, tuple):
+                            logits = outputs[0]
+                        else:
+                            logits = outputs
+                            
+                        # Handle 3D logits (sequence data)
+                        if logits.ndim == 3 and targets.ndim <= 2:
+                            logits = logits.mean(dim=1)  # Average over time dimension
+                            
+                        preds = logits.argmax(dim=1)
+                        all_preds.extend(preds.cpu().numpy())
+                        all_targets.extend(targets.cpu().numpy())
+                
+                # Define focus qualities
+                focus_qualities = ["maj", "min", "dim", "aug", "min6", "maj6", "min7", 
+                                  "min-maj7", "maj7", "7", "dim7", "hdim7", "sus2", "sus4"]
+                
+                # Create distribution and accuracy visualization
+                quality_dist_path = os.path.join(checkpoints_dir, "chord_quality_distribution_accuracy.png")
+                plot_chord_quality_distribution_accuracy(
+                    all_preds, all_targets, master_mapping,
+                    save_path=quality_dist_path,
+                    title="Chord Quality Distribution and Accuracy",
+                    focus_qualities=focus_qualities
+                )
+                logger.info(f"Chord quality distribution and accuracy graph saved to {quality_dist_path}")
+            except Exception as e:
+                logger.error(f"Error creating chord quality distribution graph: {e}")
+                logger.error(traceback.format_exc())
             
             # Advanced testing with mir_eval module
             logger.info("\n=== MIR evaluation ===")
