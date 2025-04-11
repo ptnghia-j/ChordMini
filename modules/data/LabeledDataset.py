@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from pathlib import Path
-from torch.utils.data import Dataset, DataLoader, Subset, sampler
+from torch.utils.data import Dataset, DataLoader, Subset
 import traceback
 from types import SimpleNamespace
 
@@ -202,7 +202,7 @@ class LabeledDataset(Dataset):
 
     def _parse_label_file(self, label_path):
         """
-        Parse chord labels from a label file using the Chords class.
+        Parse chord labels from a label file using direct file reading.
         
         Args:
             label_path: Path to label file
@@ -216,347 +216,47 @@ class LabeledDataset(Dataset):
         timestamps = []
         
         try:
-            # First try to use the Chords class functionality
-            use_large_voca = hasattr(self.feature_config, 'feature') and self.feature_config.feature.get('large_voca', False)
-            
-            try:
-                if use_large_voca:
-                    # Get converted chord with large vocabulary
-                    df = self.chord_processor.get_converted_chord_voca(label_path)
-                else:
-                    # Get converted chord with standard vocabulary
-                    df = self.chord_processor.get_converted_chord(label_path)
-                
-                # Extract chord labels and timestamps from dataframe
-                for _, row in df.iterrows():
-                    start_time = row['start']
-                    end_time = row['end']
-                    chord_id = row['chord_id']
-                    
-                    # Convert chord ID back to name using idx2voca_chord or chord mapping
-                    if self.chord_mapping:
-                        # Find the chord name from the mapping
-                        for name, idx in self.chord_mapping.items():
-                            if idx == chord_id:
-                                chord_name = name
-                                break
-                        else:
-                            # If chord ID not found in mapping, use N for no chord
-                            chord_name = "N"
-                    else:
-                        # If no mapping provided, use the chord ID as string
-                        chord_name = str(chord_id)
-                    
-                    chord_labels.append(chord_name)
-                    timestamps.append((start_time, end_time))
-                
-                logger.debug(f"Parsed {len(chord_labels)} chord labels using Chords class from {label_path}")
-                return chord_labels, timestamps
-            
-            except Exception as e:
-                logger.warning(f"Failed to use Chords class for parsing {label_path}: {e}")
-                logger.warning("Falling back to manual parsing")
-                
-            # Fall back to manual parsing if Chords class fails
-            with open(label_path, 'r', encoding='utf-8') as f:
+            # Read the file directly for greater control over parsing
+            with open(label_path, 'r', encoding='utf-8', errors='replace') as f:
                 for line in f:
                     parts = line.strip().split()
                     if len(parts) >= 3:
                         start_time = float(parts[0])
                         end_time = float(parts[1])
-                        chord = parts[2]
+                        chord_name = parts[2]
                         
-                        chord_labels.append(chord)
+                        # Store the original chord name, not a processed version
+                        chord_labels.append(chord_name)
                         timestamps.append((start_time, end_time))
+                        
+            logger.debug(f"Parsed {len(chord_labels)} chord labels directly from {label_path}")
+            return chord_labels, timestamps
+            
         except UnicodeDecodeError:
             # Try with different encoding
-            with open(label_path, 'r', encoding='latin-1') as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) >= 3:
-                        start_time = float(parts[0])
-                        end_time = float(parts[1])
-                        chord = parts[2]
-                        
-                        chord_labels.append(chord)
-                        timestamps.append((start_time, end_time))
-        
-        return chord_labels, timestamps
-    
-    def _chord_names_to_indices(self, chord_names):
-        """
-        Convert chord names to indices using the Chords class.
-        
-        Args:
-            chord_names: List of chord names
-            
-        Returns:
-            List of chord indices
-        """
-        if self.chord_mapping is None:
-            # If no mapping is provided, return raw chord names
-            return chord_names
-        
-        indices = []
-        unknown_chords = set()
-        
-        # Check if large vocabulary is enabled
-        use_large_voca = hasattr(self.feature_config, 'feature') and self.feature_config.feature.get('large_voca', False)
-        
-        for chord in chord_names:
-            if chord in self.chord_mapping:
-                indices.append(self.chord_mapping[chord])
-            else:
-                try:
-                    # Try to use the Chords class to convert
-                    # First, preprocess the chord name with lab_file_error_modify
-                    modified_chord = chord
-                    if hasattr(self.chord_processor, 'lab_file_error_modify'):
-                        modified_chord = self.chord_processor.lab_file_error_modify([chord])[0]
-                    
-                    # Parse the chord and get its root and properties
-                    root, bass, intervals, is_major = self.chord_processor.chord(modified_chord)
-                    
-                    # Convert to index based on vocabulary size
-                    if use_large_voca:
-                        # For large vocabulary, use convert_to_id_voca
-                        quality = None
-                        # Extract quality from chord name if it contains a colon
-                        if ':' in modified_chord:
-                            _, quality = modified_chord.split(':', 1)
-                            if '/' in quality:
-                                quality, _ = quality.split('/', 1)
-                        
-                        idx = self.chord_processor.convert_to_id_voca(root=root, quality=quality)
-                    else:
-                        # For standard vocabulary, use convert_to_id
-                        idx = self.chord_processor.convert_to_id(root=root, is_major=is_major)
-                    
-                    indices.append(idx)
-                    
-                except Exception as e:
-                    # If conversion fails, use fallback
-                    if "X" in self.chord_mapping:
-                        indices.append(self.chord_mapping["X"])  # Use 'X' (unknown) for unknown chords
-                    elif "N" in self.chord_mapping:
-                        indices.append(self.chord_mapping["N"])  # Fallback to 'N' if 'X' not available
-                    else:
-                        # If neither 'X' nor 'N' in mapping, use the first index
-                        indices.append(0)
-                    unknown_chords.add(chord)
-        
-        # Log unknown chords (at debug level)
-        if 0 < len(unknown_chords) < 20:
-            logger.debug(f"Unknown chords (mapped to X): {unknown_chords}")
-        elif len(unknown_chords) >= 20:
-            logger.debug(f"Many unknown chords ({len(unknown_chords)}) found, showing first 10: {list(unknown_chords)[:10]}")
-        
-        return indices
-
-    def _extract_samples(self):
-        """
-        Extract samples from audio-label pairs.
-        
-        Returns:
-            List of sample dictionaries
-        """
-        samples = []
-        errors = {'feature': 0, 'label': 0, 'segment': 0, 'other': 0}
-        
-        for audio_path, label_path in tqdm(self.audio_label_pairs, desc="Processing audio files"):
             try:
-                # Extract features from audio file
-                if self.cache_features and self.cache_dir:
-                    # Generate cache filename based on audio path
-                    cache_filename = f"{Path(audio_path).stem}.npy"
-                    cache_path = os.path.join(self.cache_dir, cache_filename)
-                    
-                    if os.path.exists(cache_path):
-                        # Load from cache
-                        try:
-                            data = np.load(cache_path, allow_pickle=True).item()
-                            feature = data['feature']
-                            feature_per_second = data['feature_per_second']
-                            song_length_second = data['song_length_second']
-                        except Exception as e:
-                            logger.warning(f"Error loading cached features for {audio_path}: {e}")
-                            # Extract features with better error handling
-                            feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, self.feature_config)
-                            np.save(cache_path, {
-                                'feature': feature,
-                                'feature_per_second': feature_per_second,
-                                'song_length_second': song_length_second
-                            })
-                    else:
-                        # Extract features with better error handling
-                        feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, self.feature_config)
-                        np.save(cache_path, {
-                            'feature': feature,
-                            'feature_per_second': feature_per_second,
-                            'song_length_second': song_length_second
-                        })
-                else:
-                    # Extract features with better error handling
-                    feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, self.feature_config)
-                
-                # Transpose to get (time, frequency) format
-                feature = feature.T
-                
-                # Change to debug level for per-file details
-                logger.debug(f"Feature shape for {os.path.basename(audio_path)}: {feature.shape}")
-                
-                # Parse chord labels from label file
-                chord_labels, timestamps = self._parse_label_file(label_path)
-                
-                # Change to debug level for detailed label info
-                logger.debug(f"Found {len(chord_labels)} chord labels in {os.path.basename(label_path)}")
-                if chord_labels:
-                    logger.debug(f"First few labels: {chord_labels[:5]}")
-                    logger.debug(f"First few timestamps: {timestamps[:5]}")
-                
-                # Convert chord labels to frame-level representation
-                num_frames = feature.shape[0]
-                frame_level_chords = self._chord_labels_to_frames(
-                    chord_labels, timestamps, num_frames, feature_per_second)
-                
-                # Convert chord names to indices
-                chord_indices = self._chord_names_to_indices(frame_level_chords)
-                
-                # Verify we have enough frames for at least one segment
-                if num_frames < self.seq_len:
-                    logger.warning(f"Audio file {os.path.basename(audio_path)} has {num_frames} frames, which is less than seq_len={self.seq_len}. Skipping.")
-                    errors['segment'] += 1
-                    continue
-                
-                # Create segments with sequence length and stride
-                segments_created = 0
-                for i in range(0, num_frames - self.seq_len + 1, self.stride):
-                    # Extract segment
-                    feature_segment = feature[i:i+self.seq_len]
-                    chord_indices_segment = chord_indices[i:i+self.seq_len]
-                    
-                    # Create sample dictionary
-                    sample = {
-                        'song_id': Path(audio_path).stem,
-                        'spectro': feature_segment,
-                        'chord_idx': chord_indices_segment,
-                        'start_frame': i,
-                        'audio_path': audio_path,
-                        'label_path': label_path,
-                        'feature_per_second': feature_per_second
-                    }
-                    
-                    samples.append(sample)
-                    segments_created += 1
-                
-                # Change to debug level for per-file segment creation info
-                logger.debug(f"Created {segments_created} segments from {os.path.basename(audio_path)}")
-                    
+                with open(label_path, 'r', encoding='latin-1') as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) >= 3:
+                            start_time = float(parts[0])
+                            end_time = float(parts[1])
+                            chord_name = parts[2]
+                            
+                            # Store the original chord name, not a processed version
+                            chord_labels.append(chord_name)
+                            timestamps.append((start_time, end_time))
+                            
+                logger.debug(f"Parsed {len(chord_labels)} chord labels with latin-1 encoding from {label_path}")
+                return chord_labels, timestamps
             except Exception as e:
-                # Determine error type for statistics
-                error_msg = str(e).lower()
-                if 'feature' in error_msg:
-                    errors['feature'] += 1
-                elif 'label' in error_msg or 'parse' in error_msg:
-                    errors['label'] += 1
-                else:
-                    errors['other'] += 1
+                logger.error(f"Error parsing label file with latin-1 encoding: {e}")
+                return [], []
                 
-                logger.error(f"Error processing {audio_path}: {e}")
-                logger.error(traceback.format_exc())
-        
-        # Log error statistics
-        total_errors = sum(errors.values())
-        if total_errors > 0:
-            logger.warning(f"Encountered errors during processing: {errors}")
-            logger.warning(f"Total error rate: {total_errors/len(self.audio_label_pairs):.2%}")
-        
-        return samples
-    
-    def _create_dummy_samples(self, count=10):
-        """Create dummy samples to avoid DataLoader errors when no real samples exist"""
-        # Use the first chord_mapping index as a default if mapping exists
-        default_idx = 0 if not self.chord_mapping else list(self.chord_mapping.values())[0]
-        
-        # Create dummy samples
-        for i in range(count):
-            # Create a dummy spectrogram of shape (seq_len, 144) - typical spectrogram shape
-            dummy_spectro = np.zeros((self.seq_len, 144), dtype=np.float32)
-            # Create dummy chord indices of shape (seq_len,)
-            dummy_chords = np.full(self.seq_len, default_idx, dtype=np.int64)
-            
-            # Add to samples
-            self.samples.append({
-                'song_id': f"dummy_{i}",
-                'spectro': dummy_spectro,
-                'chord_idx': dummy_chords,
-                'start_frame': 0,
-                'audio_path': "dummy_path.wav",
-                'label_path': "dummy_path.lab",
-                'feature_per_second': 10.0
-            })
-    
-    def _find_matching_pairs(self):
-        """
-        Find all matching audio and label files across all directories.
-        
-        Returns:
-            List of tuples (audio_path, label_path)
-        """
-        audio_label_pairs = []
-        audio_extensions = ['.mp3', '.wav', '.flac', '.ogg', '.m4a']
-        label_extensions = ['.lab', '.txt']
-        
-        for audio_dir, label_dir in zip(self.audio_dirs, self.label_dirs):
-            # Check if directories exist
-            if not os.path.exists(audio_dir):
-                logger.warning(f"Audio directory not found: {audio_dir}")
-                continue
-            
-            if not os.path.exists(label_dir):
-                logger.warning(f"Label directory not found: {label_dir}")
-                continue
-            
-            # Find audio files
-            audio_files = {}
-            for ext in audio_extensions:
-                for path in glob.glob(os.path.join(audio_dir, f"*{ext}")):
-                    # Use filename without extension as key
-                    basename = os.path.splitext(os.path.basename(path))[0]
-                    audio_files[basename] = path
-                    
-                # Also check subdirectories
-                for path in glob.glob(os.path.join(audio_dir, f"**/*{ext}"), recursive=True):
-                    basename = os.path.splitext(os.path.basename(path))[0]
-                    audio_files[basename] = path
-            
-            # Find label files
-            label_files = {}
-            for ext in label_extensions:
-                for path in glob.glob(os.path.join(label_dir, f"*{ext}")):
-                    basename = os.path.splitext(os.path.basename(path))[0]
-                    label_files[basename] = path
-                    
-                # Also check subdirectories
-                for path in glob.glob(os.path.join(label_dir, f"**/*{ext}"), recursive=True):
-                    basename = os.path.splitext(os.path.basename(path))[0]
-                    label_files[basename] = path
-            
-            # Log counts for debugging
-            logger.info(f"Found {len(audio_files)} audio files in {audio_dir}")
-            logger.info(f"Found {len(label_files)} label files in {label_dir}")
-            
-            # Match audio files with label files
-            pairs_found = 0
-            for basename, audio_path in audio_files.items():
-                if basename in label_files:
-                    audio_label_pairs.append((audio_path, label_files[basename]))
-                    pairs_found += 1
-            
-            logger.info(f"Matched {pairs_found} pairs between {audio_dir} and {label_dir}")
-        
-        return audio_label_pairs
-    
+        except Exception as e:
+            logger.error(f"Error parsing label file: {e}")
+            return [], []
+
     def _chord_labels_to_frames(self, chord_labels, timestamps, num_frames, feature_per_second):
         """
         Convert chord labels to frame-level representation.
@@ -598,43 +298,7 @@ class LabeledDataset(Dataset):
             if not found_chord:
                 n_chord_frames += 1
         
-        # SECOND PASS: If there are still many N chords, use proximity matching with tolerance
-        if n_chord_frames > 0.5 * num_frames:  # If more than 50% are N chords, try with tolerance
-            tolerance = frame_duration * 0.5  # Half a frame tolerance
-            
-            for i in range(num_frames):
-                if frame_level_chords[i] != "N":
-                    continue  # Skip already assigned frames
-                    
-                # Calculate time for this frame center
-                frame_time = (i + 0.5) * frame_duration
-                
-                # Find nearest chord within tolerance
-                min_distance = float('inf')
-                nearest_chord = None
-                
-                for chord, (start, end) in zip(chord_labels, timestamps):
-                    # If frame is before chord starts
-                    if frame_time < start:
-                        distance = start - frame_time
-                    # If frame is after chord ends
-                    elif frame_time >= end:
-                        distance = frame_time - end
-                    # Should not get here if first pass worked correctly
-                    else:
-                        distance = 0
-                        
-                    if distance < min_distance:
-                        min_distance = distance
-                        nearest_chord = chord
-                
-                # Assign nearest chord if within tolerance
-                if nearest_chord is not None and min_distance <= tolerance:
-                    frame_level_chords[i] = nearest_chord
-                    assigned_frames += 1
-                    n_chord_frames -= 1
-        
-        # Log statistics - only if significant number of frames are unassigned
+        # Log statistics if many frames are unassigned
         if n_chord_frames > 0.1 * num_frames:  # If more than 10% are still N chords
             n_percent = (n_chord_frames / num_frames) * 100
             logger.debug(f"Chord assignment: {assigned_frames}/{num_frames} frames assigned ({assigned_frames/num_frames:.1%})")
@@ -650,96 +314,77 @@ class LabeledDataset(Dataset):
                     logger.debug(f"Song length in frames: {num_frames}, feature_per_second: {feature_per_second}")
         
         return frame_level_chords
-        
-    def _split_dataset(self, train_ratio, val_ratio, test_ratio):
+
+    def _chord_names_to_indices(self, chord_names):
         """
-        Split dataset into train, validation, and test sets.
-        Splitting is done by song to prevent data leakage.
+        Convert chord names to indices using the Chords class's proven conversion method.
         
         Args:
-            train_ratio: Ratio of data for training
-            val_ratio: Ratio of data for validation
-            test_ratio: Ratio of data for testing
+            chord_names: List of chord names
+            
+        Returns:
+            List of chord indices
         """
-        # Get unique song IDs
-        song_ids = list(set(sample['song_id'] for sample in self.samples))
+        if self.chord_mapping is None:
+            # If no mapping is provided, return raw chord names
+            return chord_names
         
-        # Shuffle song IDs
-        random.shuffle(song_ids)
+        # Directly use the built-in chord mapping from chord_mapping dictionary first
+        indices = []
+        unknown_chords = set()
+        use_large_voca = hasattr(self.feature_config, 'feature') and self.feature_config.feature.get('large_voca', False)
         
-        # Calculate split indices
-        train_split = int(len(song_ids) * train_ratio)
-        val_split = int(len(song_ids) * (train_ratio + val_ratio))
-            
-        # Split song IDs
-        train_song_ids = set(song_ids[:train_split])
-        val_song_ids = set(song_ids[train_split:val_split])
-        test_song_ids = set(song_ids[val_split:])
+        # First try direct mapping using the chord_mapping dictionary - fastest approach
+        for chord in chord_names:
+            if chord in self.chord_mapping:
+                indices.append(self.chord_mapping[chord])
+            elif chord == "N":
+                indices.append(self.chord_mapping.get("N", 169 if use_large_voca else 24))
+            elif chord == "X":
+                indices.append(self.chord_mapping.get("X", 168 if use_large_voca else 25))
+            else:
+                # For more complex chords, use the Chords processor
+                try:
+                    # First preprocess the chord using lab_file_error_modify if available
+                    if hasattr(self.chord_processor, 'lab_file_error_modify'):
+                        modified_chord = self.chord_processor.lab_file_error_modify([chord])[0]
+                    else:
+                        modified_chord = chord
+                    
+                    # Parse the chord components
+                    root, bass, intervals, is_major = self.chord_processor.chord(modified_chord)
+                    
+                    # Convert to index based on vocabulary size
+                    if use_large_voca:
+                        # Extract quality from chord name if it contains a colon
+                        quality = None
+                        if ':' in modified_chord:
+                            _, quality = modified_chord.split(':', 1)
+                            if '/' in quality:
+                                quality = quality.split('/', 1)[0]  # Remove bass note
+                        else:
+                            quality = 'maj'  # Default to major if no quality specified
+                        
+                        idx = self.chord_processor.convert_to_id_voca(root=root, quality=quality)
+                    else:
+                        # For standard vocabulary, use root and is_major
+                        idx = self.chord_processor.convert_to_id(root=root, is_major=is_major)
+                    
+                    indices.append(idx)
+                    
+                except Exception as e:
+                    # If conversion fails, use N as fallback
+                    unknown_chords.add(chord)
+                    indices.append(self.chord_mapping.get("N", 169 if use_large_voca else 24))
         
-        # Split samples based on song IDs
-        self.train_indices = [i for i, sample in enumerate(self.samples) if sample['song_id'] in train_song_ids]
-        self.val_indices = [i for i, sample in enumerate(self.samples) if sample['song_id'] in val_song_ids]
-        self.test_indices = [i for i, sample in enumerate(self.samples) if sample['song_id'] in test_song_ids]
+        # Log unknown chords
+        if unknown_chords:
+            if len(unknown_chords) < 20:
+                logger.warning(f"Unknown chords (mapped to N): {unknown_chords}")
+            else:
+                logger.warning(f"Many unknown chords ({len(unknown_chords)}) found, showing first 10: {list(unknown_chords)[:10]}")
         
-        logger.info(f"Dataset split - Train: {len(self.train_indices)}, Val: {len(self.val_indices)}, Test: {len(self.test_indices)}")
-
-    def analyze_label_file(self, label_path):
-        """Analyze a single label file to diagnose potential issues"""
-        logger.info(f"Analyzing label file: {os.path.basename(label_path)}")
-        
-        try:
-            # Attempt to parse the file - first few lines raw
-            with open(label_path, 'r', encoding='utf-8', errors='replace') as f:
-                lines = f.readlines()[:10]  # First 10 lines
-            
-            logger.info(f"First few lines of file: {lines}")
-            
-            # Now parse with our normal method
-            chord_labels, timestamps = self._parse_label_file(label_path)
-            
-            if len(chord_labels) == 0:
-                logger.error(f"No chords parsed from file - possible format issue")
-                return
-                
-            logger.info(f"Parsed {len(chord_labels)} chords")
-            logger.info(f"First 5 chords: {chord_labels[:5]}")
-            logger.info(f"First 5 timestamps: {timestamps[:5]}")
-            
-            # Calculate song duration
-            if timestamps:
-                duration = timestamps[-1][1]
-                logger.info(f"Song duration from labels: {duration:.2f} seconds")
-                
-                # Calculate frame rate and expected frame count
-                feature_per_second = 1.0 / self.feature_config.feature.get('hop_duration', 0.1)
-                expected_frames = int(duration * feature_per_second)
-                logger.info(f"Expected frames at {feature_per_second:.2f} frames/sec: {expected_frames}")
-                
-                # Check for gaps in chord coverage
-                total_chord_time = 0
-                for _, (start, end) in enumerate(timestamps):
-                    total_chord_time += (end - start)
-                
-                coverage = (total_chord_time / duration) * 100
-                logger.info(f"Chord time coverage: {coverage:.2f}% of song duration")
-                
-                if coverage < 90:
-                    logger.warning(f"Low chord coverage ({coverage:.2f}%) may result in many N labels")
-            
-            # Check for chord mapping issues
-            mapped = self._chord_names_to_indices(chord_labels)
-            n_chord_id = 169 if self.feature_config.feature.get('large_voca', False) else 24
-            n_count = sum(1 for idx in mapped if idx == n_chord_id)
-            
-            if n_count > 0:
-                logger.info(f"N chords in file: {n_count}/{len(mapped)} ({n_count/len(mapped):.2%})")
-                if n_count > 0.5 * len(mapped):
-                    logger.warning(f"HIGH NUMBER OF N CHORDS: Check mapping and chord format")
-            
-        except Exception as e:
-            logger.error(f"Error analyzing label file: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+        return indices
 
     def __len__(self):
         """Return the number of samples in the dataset"""
@@ -761,7 +406,7 @@ class LabeledDataset(Dataset):
             'audio_path': sample['audio_path'],
             'label_path': sample['label_path']
         }
-    
+
     def get_train_iterator(self, batch_size=32, shuffle=True, num_workers=2, pin_memory=True):
         """Get data loader for training set"""
         return DataLoader(
@@ -771,7 +416,7 @@ class LabeledDataset(Dataset):
             num_workers=num_workers,
             pin_memory=pin_memory
         )
-    
+
     def get_val_iterator(self, batch_size=32, shuffle=False, num_workers=2, pin_memory=True):
         """Get data loader for validation set"""
         return DataLoader(

@@ -333,7 +333,7 @@ class SynthDataset(Dataset):
                     self.chord_to_idx = cache_data['chord_to_idx']
                     
                     if self.verbose:
-                        print(f"Loaded {len(self.samples)} samples from cache in {time.time() - start_time:.2f}s")
+                        print(f"Loaded {len(self.samples)} samples from cache file {self.cache_file}")
                     
                     return
                 else:
@@ -656,12 +656,10 @@ class SynthDataset(Dataset):
                 try:
                     first_spec = np.load(first_sample['spec_path'])
                     if 'frame_idx' in first_sample and len(first_spec.shape) > 1:
-                        frame_idx = first_sample['frame_idx']
-                        if frame_idx < first_spec.shape[0]:
-                            first_spec = first_spec[frame_idx]
+                        first_spec = first_spec[first_sample['frame_idx']]
                 except Exception as e:
                     if self.verbose:
-                        print(f"Error loading first spectrogram for dimension check: {e}")
+                        print(f"Error loading first spectrogram: {e}")
                     first_spec = np.zeros((144,))
             else:
                 first_spec = np.zeros((144,))
@@ -679,6 +677,37 @@ class SynthDataset(Dataset):
                 chord_counter = Counter(sample['chord_label'] for sample in self.samples)
                 print(f"Found {len(chord_counter)} unique chord classes")
                 
+                # Add detailed chord distribution analysis
+                from modules.utils.chords import get_chord_quality
+                
+                # Count samples by chord quality
+                quality_counter = Counter()
+                for sample in self.samples:
+                    chord_label = sample['chord_label']
+                    quality = get_chord_quality(chord_label)
+                    quality_counter[quality] += 1
+                
+                # Sort qualities by count for better reporting
+                total_samples = len(self.samples)
+                print(f"Dataset loading completed in {time.time() - start_time:.2f} seconds")
+                print(f"Chord quality distribution:")
+                for quality, count in quality_counter.most_common():
+                    percentage = (count / total_samples) * 100
+                    print(f"  {quality}: {count} samples ({percentage:.2f}%)")
+                
+                # Print the most common chord types to see what we have
+                print("\nMost common chord types:")
+                for chord, count in chord_counter.most_common(20):
+                    percentage = (count / total_samples) * 100
+                    print(f"  {chord}: {count} samples ({percentage:.2f}%)")
+                    
+                # List some less common chord types to see what unusual chords exist
+                print("\nSome less common chord types:")
+                less_common = [item for item in chord_counter.most_common()[100:120]]
+                for chord, count in less_common:
+                    percentage = (count / total_samples) * 100
+                    print(f"  {chord}: {count} samples ({percentage:.2f}%)")
+                
                 end_time = time.time()
                 print(f"Dataset loading completed in {end_time - start_time:.2f} seconds")
                 
@@ -689,27 +718,21 @@ class SynthDataset(Dataset):
                     for sample in self.samples:
                         if 'spec_path' in sample:
                             path = sample['spec_path']
-                        elif hasattr(sample, 'get') and sample.get('spectro') is not None:
-                            path = str(sample.get('song_id', ''))
-                        else:
-                            continue
+                            dataset_key = "unknown"
+                            if "maestro" in str(path).lower():
+                                dataset_key = "maestro"
+                            else:
+                                dataset_key = "fma"
                             
-                        # Determine which dataset this sample belongs to
-                        dataset_name = "unknown"
-                        for i, dir_path in enumerate(self.spec_dirs):
-                            if str(path).startswith(str(dir_path)) or str(dir_path) in str(path):
-                                dataset_name = "Maestro" if "maestro" in str(dir_path) else "FMA"
-                                break
-                        
-                        if dataset_name not in dataset_sample_counts:
-                            dataset_sample_counts[dataset_name] = 0
-                        dataset_sample_counts[dataset_name] += 1
+                            if dataset_key not in dataset_sample_counts:
+                                dataset_sample_counts[dataset_key] = 0
+                            dataset_sample_counts[dataset_key] += 1
                     
                     if self.verbose:
-                        print(f"\nSample distribution after processing:")
-                        for dataset_name, count in dataset_sample_counts.items():
-                            percentage = (count / len(self.samples)) * 100
-                            print(f"  {dataset_name}: {count} samples ({percentage:.2f}%)")
+                        print("\nSample distribution by dataset source:")
+                        for dataset_key, count in dataset_sample_counts.items():
+                            percentage = (count / total_samples) * 100
+                            print(f"  {dataset_key}: {count} samples ({percentage:.2f}%)")
         else:
             warnings.warn("No samples loaded. Check your data paths and structure.")
     def _process_file(self, spec_file, file_id, label_files_dict, return_skip_reason=False):

@@ -62,6 +62,92 @@ def idx_to_chord(idx):
 
     return PITCH_CLASS[root] + ("M" if minmaj == 0 else "m")
 
+def get_chord_quality(chord_label):
+    """
+    Extract the quality from a chord label and map it to a standard category.
+    
+    Args:
+        chord_label (str): Chord label like "C:maj", "G:7", etc.
+        
+    Returns:
+        str: Standardized chord quality category
+    """
+    # Handle special non-chord labels
+    if chord_label in ["N", "X"]:
+        return "No Chord"
+        
+    # Use chord parsing utilities from this module
+    try:
+        # Handle any error correction and standardization
+        chord_label = Chords().label_error_modify(chord_label)
+        
+        # Extract chord parts (internally handles format variations)
+        if ':' in chord_label:
+            root, quality = chord_label.split(':', 1)
+            if '/' in quality:
+                quality = quality.split('/', 1)[0]  # Remove bass note
+        else:
+            # Handle no-separator format like "Cmaj7" or "Dm"
+            for root_note in PITCH_CLASS:
+                if chord_label.startswith(root_note):
+                    if len(chord_label) == len(root_note):
+                        # Just a root note like "C" - implied major
+                        return "Major"
+                    quality = chord_label[len(root_note):]
+                    break
+            else:
+                return "Other"  # Couldn't identify root note
+                
+        # Map quality to standard categories
+        quality_map = {
+            # Major family
+            "maj": "Major", "": "Major", "M": "Major", 
+            
+            # Minor family
+            "min": "Minor", "m": "Minor",
+            
+            # Dominant seventh
+            "7": "Dom7",
+            
+            # Major seventh
+            "maj7": "Maj7", "M7": "Maj7",
+            
+            # Minor seventh
+            "min7": "Min7", "m7": "Min7",
+            
+            # Diminished
+            "dim": "Dim", "°": "Dim", "o": "Dim",
+            
+            # Diminished seventh
+            "dim7": "Dim7", "°7": "Dim7", "o7": "Dim7",
+            
+            # Half-diminished seventh
+            "hdim7": "Half-Dim", "m7b5": "Half-Dim", "ø": "Half-Dim",
+            
+            # Augmented
+            "aug": "Aug", "+": "Aug",
+            
+            # Suspended
+            "sus2": "Sus", "sus4": "Sus", "sus": "Sus",
+            
+            # Extended chords
+            "9": "Extended", "11": "Extended", "13": "Extended",
+            "maj9": "Extended", "min9": "Extended",
+            
+            # Minor/Major sixth
+            "min6": "Min6", "m6": "Min6",
+            "maj6": "Maj6", "6": "Maj6",
+            
+            # Minor/Major seventh
+            "minmaj7": "Min-Maj7", "mmaj7": "Min-Maj7"
+        }
+        
+        return quality_map.get(quality, "Other")
+        
+    except Exception as e:
+        logger.warning(f"Error determining chord quality for '{chord_label}': {e}")
+        return "Other"
+
 class Chords:
 
     def __init__(self):

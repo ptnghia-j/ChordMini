@@ -234,42 +234,100 @@ def map_chord_to_quality(chord_name):
         if chord_name in ["N", "X", "None", "Unknown"]:
             return "No Chord"
             
-        # Standardize notation if it uses : separator
-        chord_name = chord_name.replace(":", "")
+        # Extract quality using extract_chord_quality function
+        quality = extract_chord_quality(chord_name)
+        
+        # Map extracted quality to broader categories
+        quality_groups = {
+            # Major family
+            "maj": "Major", "": "Major", "M": "Major", "major": "Major",
             
-        # Define quality mappings with regex patterns
-        quality_mappings = [
-            # Major quality group
-            (r'^[A-G]$|maj$|^[A-G]maj$', 'Major'),
-            # Minor quality group
-            (r'min$|m$|^[A-G]m$', 'Minor'),
-            # Dominant 7th quality group
-            (r'7$|^[A-G]7$|dom7$', 'Dom7'),
-            # Major 7th quality group
-            (r'maj7$|^[A-G]maj7$', 'Maj7'),
-            # Minor 7th quality group
-            (r'min7$|m7$|^[A-G]m7$', 'Min7'),
-            # Diminished quality group
-            (r'dim$|°|^[A-G]dim$|^[A-G]o$', 'Dim'),
-            # Diminished 7th quality group
-            (r'dim7$|°7|^[A-G]dim7$|^[A-G]o7$', 'Dim7'),
-            # Half-diminished quality group
-            (r'hdim$|ø|m7b5$|^[A-G]ø$', 'Half-Dim'),
-            # Augmented quality group
-            (r'aug$|\+$|^[A-G]\+$|^[A-G]aug$', 'Aug'),
-            # Suspended quality group
-            (r'sus$|sus2$|sus4$', 'Sus'),
-            # Extended chords 9th, 11th, 13th
-            (r'9$|11$|13$', 'Extended')
-        ]
+            # Minor family  
+            "min": "Minor", "m": "Minor", "minor": "Minor",
             
-        # Check each pattern
-        for pattern, quality in quality_mappings:
-            if re.search(pattern, chord_name):
-                return quality
-                
-        # Default quality for any other chord
-        return "Other"
+            # Dominant seventh family
+            "7": "Dom7", "dom7": "Dom7", "dominant": "Dom7",
+            
+            # Major seventh family
+            "maj7": "Maj7", "M7": "Maj7", "major7": "Maj7",
+            
+            # Minor seventh family
+            "min7": "Min7", "m7": "Min7", "minor7": "Min7",
+            
+            # Diminished family
+            "dim": "Dim", "°": "Dim", "o": "Dim", "diminished": "Dim",
+            
+            # Diminished seventh family
+            "dim7": "Dim7", "°7": "Dim7", "o7": "Dim7", "diminished7": "Dim7",
+            
+            # Half-diminished family
+            "hdim7": "Half-Dim", "m7b5": "Half-Dim", "ø": "Half-Dim", "half-diminished": "Half-Dim",
+            
+            # Augmented family
+            "aug": "Aug", "+": "Aug", "augmented": "Aug",
+            
+            # Suspended family
+            "sus2": "Sus", "sus4": "Sus", "sus": "Sus", "suspended": "Sus",
+            
+            # Extended chords
+            "9": "Extended", "11": "Extended", "13": "Extended",
+            "maj9": "Extended", "maj11": "Extended", "maj13": "Extended",
+            "min9": "Extended", "min11": "Extended", "min13": "Extended",
+            
+            # Additional common chord qualities
+            "min6": "Min6", "m6": "Min6",
+            "maj6": "Maj6", "6": "Maj6",
+            "minmaj7": "Min-Maj7", "mmaj7": "Min-Maj7", "min-maj7": "Min-Maj7",
+        }
+        
+        # Return mapped quality or "Other" if not found
+        return quality_groups.get(quality, "Other")
+
+def extract_chord_quality(chord_name):
+    """
+    Extract the quality from a chord name.
+    
+    Args:
+        chord_name: Chord name string (e.g., 'C:maj', 'A:min7')
+        
+    Returns:
+        Chord quality string
+    """
+    # Handle special cases
+    if chord_name in ["N", "X", "None", "Unknown"]:
+        return "N"
+        
+    # Remove root note and colon if present
+    if ":" in chord_name:
+        quality = chord_name.split(":", 1)[1]
+        # Handle possible bass note
+        if "/" in quality:
+            quality = quality.split("/", 1)[0]
+        return quality.strip()
+    else:
+        # Try to extract quality without colon
+        root_notes = ["A", "B", "C", "D", "E", "F", "G"]
+        root_found = False
+        
+        for note in root_notes:
+            if chord_name.startswith(note):
+                # Check if there's a flat or sharp
+                if len(chord_name) > 1 and chord_name[1] in ['b', '#']:
+                    quality = chord_name[2:]  # Skip root with accidental
+                else:
+                    quality = chord_name[1:]  # Skip root without accidental
+                root_found = True
+                break
+        
+        if not root_found:
+            # If no root note is found, return the full name
+            return chord_name
+            
+        # Handle possible bass note
+        if "/" in quality:
+            quality = quality.split("/", 1)[0]
+            
+        return quality.strip()
 
 def get_chord_quality_groups():
     """
@@ -281,6 +339,93 @@ def get_chord_quality_groups():
         return CHORD_QUALITIES
     except (ImportError, AttributeError):
         return DEFAULT_CHORD_QUALITIES
+
+def group_chords_by_focus_qualities(predictions, targets, idx_to_chord, focus_qualities=None):
+    """
+    Group chords by specific focus qualities.
+    
+    Args:
+        predictions: List of predicted chord indices
+        targets: List of target chord indices
+        idx_to_chord: Dictionary mapping indices to chord names
+        focus_qualities: List of qualities to focus on
+        
+    Returns:
+        tuple: (pred_qualities_idx, target_qualities_idx, qualities_list, quality_to_idx, idx_to_quality)
+    """
+    if focus_qualities is None:
+        focus_qualities = ["maj", "min", "dim", "aug", "min6", "maj6", "min7", 
+                          "min-maj7", "maj7", "7", "dim7", "hdim7", "sus2", "sus4"]
+                          
+    # Add "N" and "other" to cover all cases
+    if "N" not in focus_qualities:
+        focus_qualities.append("N")
+    if "other" not in focus_qualities:
+        focus_qualities.append("other")
+        
+    # Create mapping dictionaries
+    quality_to_idx = {q: i for i, q in enumerate(focus_qualities)}
+    idx_to_quality = {}
+    
+    # Add logging to see what's in idx_to_chord for debugging
+    info(f"First 5 idx_to_chord mappings for debugging:")
+    for idx, chord_name in list(idx_to_chord.items())[:5]:
+        info(f"  {idx}: {chord_name}")
+    
+    # Map chord indices to qualities
+    for idx, chord in idx_to_chord.items():
+        # Get the raw quality first
+        raw_quality = extract_chord_quality(chord)
+        info(f"Extracted quality '{raw_quality}' from chord '{chord}'")
+        
+        # Simple mapping for common qualities
+        if raw_quality in quality_to_idx:
+            idx_to_quality[idx] = raw_quality
+        # Handle variations that should map to standard qualities
+        elif raw_quality in ["major", "M"]:
+            idx_to_quality[idx] = "maj"
+        elif raw_quality in ["minor", "m"]:
+            idx_to_quality[idx] = "min"
+        elif raw_quality in ["M7", "major7"]:
+            idx_to_quality[idx] = "maj7"
+        elif raw_quality in ["m7", "minor7"]:
+            idx_to_quality[idx] = "min7"
+        elif raw_quality in ["°", "o", "diminished"]:
+            idx_to_quality[idx] = "dim"
+        elif raw_quality in ["°7", "o7", "diminished7"]:
+            idx_to_quality[idx] = "dim7"
+        elif raw_quality in ["m7b5", "ø", "half-diminished"]:
+            idx_to_quality[idx] = "hdim7"
+        elif raw_quality in ["m6", "minor6"]:
+            idx_to_quality[idx] = "min6"
+        elif raw_quality in ["6", "maj6"]:
+            idx_to_quality[idx] = "maj6"
+        elif raw_quality in ["mmaj7", "mM7"]:
+            idx_to_quality[idx] = "min-maj7"
+        else:
+            idx_to_quality[idx] = "other"
+            
+    # Log quality mapping statistics
+    quality_counts = {}
+    for quality in idx_to_quality.values():
+        quality_counts[quality] = quality_counts.get(quality, 0) + 1
+    
+    info(f"Quality mapping statistics:")
+    for quality, count in sorted(quality_counts.items(), key=lambda x: x[1], reverse=True):
+        info(f"  {quality}: {count} chords")
+    
+    # Map predictions and targets to quality indices
+    pred_qualities_idx = []
+    target_qualities_idx = []
+    
+    for pred, target in zip(predictions, targets):
+        pred_quality = idx_to_quality.get(pred, "other")
+        target_quality = idx_to_quality.get(target, "other")
+        
+        pred_qualities_idx.append(quality_to_idx[pred_quality])
+        target_qualities_idx.append(quality_to_idx[target_quality])
+        
+    return np.array(pred_qualities_idx), np.array(target_qualities_idx), focus_qualities, quality_to_idx, idx_to_quality
 
 def group_chords_by_quality(predictions, targets, idx_to_chord):
     """
@@ -362,7 +507,6 @@ def calculate_quality_confusion_matrix(predictions, targets, idx_to_chord):
             quality_accuracy[quality] = 0.0
             
     return quality_cm, quality_counts, quality_accuracy, quality_groups
-
 
 def calculate_confusion_matrix(predictions, targets, idx_to_chord, checkpoint_dir, current_epoch=None):
     """
@@ -616,214 +760,6 @@ def plot_chord_quality_confusion_matrix(predictions, targets, idx_to_chord,
     
     return fig, quality_accuracy, quality_cm, quality_groups, quality_counts
 
-def plot_learning_curve(train_loss, val_loss=None, title='Learning Curve', figsize=(10, 6), 
-                       save_path=None, dpi=300):
-    """
-    Plot training and validation learning curves.
-    
-    Args:
-        train_loss: List of training loss values
-        val_loss: List of validation loss values (optional)
-        title: Plot title
-        figsize: Figure size (width, height) in inches
-        save_path: Path to save the figure (if None, just returns the figure)
-        dpi: DPI for saved figure
-        
-    Returns:
-        matplotlib figure
-    """
-    fig, ax = plt.subplots(figsize=figsize)
-    
-    # Plot training loss
-    epochs = range(1, len(train_loss) + 1)
-    ax.plot(epochs, train_loss, 'b-', label='Training Loss')
-    
-    # Plot validation loss if provided
-    if val_loss:
-        ax.plot(epochs, val_loss, 'r-', label='Validation Loss')
-    
-    ax.set_title(title)
-    ax.set_xlabel('Epochs')
-    ax.set_ylabel('Loss')
-    ax.legend()
-    ax.grid(True, linestyle='--', alpha=0.7)
-    
-    # Save the figure if requested
-    if save_path is not None:
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
-    
-    return fig
-
-def visualize_transitions(hmm_model, idx_to_chord, top_k=10, save_path='transitions.png',
-                          figsize=(12, 6), cmap='viridis', title=None, dpi=300):
-    """
-    Visualize chord transition probabilities from an HMM model.
-    
-    Args:
-        hmm_model: HMM model with transitions attribute (PyTorch tensor)
-        idx_to_chord: Dictionary mapping indices to chord names
-        top_k: Number of top transitions to display
-        save_path: Path to save the visualization
-        figsize: Figure size (width, height) in inches
-        cmap: Color map for the bars
-        title: Custom title (if None, a default title is used)
-        dpi: DPI for saved figure
-        
-    Returns:
-        matplotlib figure
-    """
-    # Get transition probabilities
-    transitions = hmm_model.transitions.detach().cpu().numpy()
-    
-    # Convert from log space
-    transitions = np.exp(transitions)
-    
-    # Find top k transitions
-    top_pairs = []
-    for i in range(transitions.shape[0]):
-        for j in range(transitions.shape[1]):
-            top_pairs.append((i, j, transitions[i, j]))
-    
-    top_pairs.sort(key=lambda x: x[2], reverse=True)
-    top_pairs = top_pairs[:top_k]
-    
-    # Create labels
-    labels = []
-    values = []
-    for i, j, v in top_pairs:
-        # Handle cases where indices aren't in the chord mapping
-        chord_i = idx_to_chord.get(i, f"Chord-{i}")
-        chord_j = idx_to_chord.get(j, f"Chord-{j}")
-        labels.append(f"{chord_i}→{chord_j}")
-        values.append(v)
-    
-    # Plot
-    fig, ax = plt.subplots(figsize=figsize)
-    sns.barplot(x=labels, y=values, ax=ax, palette=cmap)
-    plt.xticks(rotation=45, ha='right')
-    plt.title(title or f"Top {top_k} Chord Transitions")
-    plt.tight_layout()
-    
-    # Save the figure if requested
-    if save_path:
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
-    
-    return fig
-
-def extract_chord_quality(chord_name):
-    """
-    Extract the quality from a chord name.
-    
-    Args:
-        chord_name: Chord name string (e.g., 'C:maj', 'A:min7')
-        
-    Returns:
-        Chord quality string
-    """
-    # Handle special cases
-    if chord_name in ["N", "X", "None", "Unknown"]:
-        return "N"
-        
-    # Remove root note and colon if present
-    if ":" in chord_name:
-        quality = chord_name.split(":", 1)[1]
-    else:
-        # Try to extract quality without colon
-        root_notes = ["A", "B", "C", "D", "E", "F", "G"]
-        for note in root_notes:
-            if chord_name.startswith(note):
-                # Check if there's a flat or sharp
-                if len(chord_name) > 1 and chord_name[1] in ['b', '#']:
-                    quality = chord_name[2:]  # Skip root with accidental
-                else:
-                    quality = chord_name[1:]  # Skip root without accidental
-                break
-        else:
-            # If no root note is found, return the full name
-            quality = chord_name
-            
-    # Map common quality names to standardized ones
-    quality_mapping = {
-        "major": "maj", "maj": "maj", "": "maj",
-        "minor": "min", "min": "min", "m": "min",
-        "dim": "dim", "°": "dim", "o": "dim",
-        "aug": "aug", "+": "aug",
-        "min6": "min6", "m6": "min6",
-        "maj6": "maj6", "6": "maj6",
-        "min7": "min7", "m7": "min7",
-        "minmaj7": "min-maj7", "mmaj7": "min-maj7", "m(maj7)": "min-maj7",
-        "maj7": "maj7", "M7": "maj7",
-        "7": "7", "dom7": "7",
-        "dim7": "dim7", "°7": "dim7", "o7": "dim7",
-        "hdim7": "hdim7", "m7b5": "hdim7", "ø": "hdim7",
-        "sus2": "sus2",
-        "sus4": "sus4", "sus": "sus4"
-    }
-    
-    # Try direct mapping
-    if quality in quality_mapping:
-        return quality_mapping[quality]
-    
-    # Handle compound qualities
-    for q_name, q_standard in quality_mapping.items():
-        if quality.startswith(q_name):
-            return q_standard
-            
-    # If no match is found, return as is
-    return quality
-
-def group_chords_by_focus_qualities(predictions, targets, idx_to_chord, focus_qualities=None):
-    """
-    Group chords by specific focus qualities.
-    
-    Args:
-        predictions: List of predicted chord indices
-        targets: List of target chord indices
-        idx_to_chord: Dictionary mapping indices to chord names
-        focus_qualities: List of qualities to focus on
-        
-    Returns:
-        tuple: (pred_qualities_idx, target_qualities_idx, qualities_list, quality_to_idx, idx_to_quality)
-    """
-    if focus_qualities is None:
-        focus_qualities = ["maj", "min", "dim", "aug", "min6", "maj6", "min7", 
-                          "min-maj7", "maj7", "7", "dim7", "hdim7", "sus2", "sus4"]
-                          
-    # Add "N" and "other" to cover all cases
-    if "N" not in focus_qualities:
-        focus_qualities.append("N")
-    if "other" not in focus_qualities:
-        focus_qualities.append("other")
-        
-    # Create mapping dictionaries
-    quality_to_idx = {q: i for i, q in enumerate(focus_qualities)}
-    idx_to_quality = {}
-    
-    # Map chord indices to qualities
-    for idx, chord in idx_to_chord.items():
-        quality = extract_chord_quality(chord)
-        if quality in quality_to_idx:
-            idx_to_quality[idx] = quality
-        else:
-            idx_to_quality[idx] = "other"
-            
-    # Map predictions and targets to quality indices
-    pred_qualities_idx = []
-    target_qualities_idx = []
-    
-    for pred, target in zip(predictions, targets):
-        pred_quality = idx_to_quality.get(pred, "other")
-        target_quality = idx_to_quality.get(target, "other")
-        
-        pred_qualities_idx.append(quality_to_idx[pred_quality])
-        target_qualities_idx.append(quality_to_idx[target_quality])
-        
-    return np.array(pred_qualities_idx), np.array(target_qualities_idx), focus_qualities, quality_to_idx, idx_to_quality
-
 def plot_chord_quality_distribution_accuracy(predictions, targets, idx_to_chord, save_path=None, 
                                             figsize=(14, 8), title=None, dpi=300,
                                             focus_qualities=None):
@@ -936,4 +872,102 @@ def plot_chord_quality_distribution_accuracy(predictions, targets, idx_to_chord,
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
 
+    return fig
+
+def plot_learning_curve(train_loss, val_loss=None, title='Learning Curve', figsize=(10, 6), 
+                       save_path=None, dpi=300):
+    """
+    Plot training and validation learning curves.
+    
+    Args:
+        train_loss: List of training loss values
+        val_loss: List of validation loss values (optional)
+        title: Plot title
+        figsize: Figure size (width, height) in inches
+        save_path: Path to save the figure (if None, just returns the figure)
+        dpi: DPI for saved figure
+        
+    Returns:
+        matplotlib figure
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Plot training loss
+    epochs = range(1, len(train_loss) + 1)
+    ax.plot(epochs, train_loss, 'b-', label='Training Loss')
+    
+    # Plot validation loss if provided
+    if val_loss:
+        ax.plot(epochs, val_loss, 'r-', label='Validation Loss')
+    
+    ax.set_title(title)
+    ax.set_xlabel('Epochs')
+    ax.set_ylabel('Loss')
+    ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.7)
+    
+    # Save the figure if requested
+    if save_path is not None:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+    
+    return fig
+
+def visualize_transitions(hmm_model, idx_to_chord, top_k=10, save_path='transitions.png',
+                          figsize=(12, 6), cmap='viridis', title=None, dpi=300):
+    """
+    Visualize chord transition probabilities from an HMM model.
+    
+    Args:
+        hmm_model: HMM model with transitions attribute (PyTorch tensor)
+        idx_to_chord: Dictionary mapping indices to chord names
+        top_k: Number of top transitions to display
+        save_path: Path to save the visualization
+        figsize: Figure size (width, height) in inches
+        cmap: Color map for the bars
+        title: Custom title (if None, a default title is used)
+        dpi: DPI for saved figure
+        
+    Returns:
+        matplotlib figure
+    """
+    # Get transition probabilities
+    transitions = hmm_model.transitions.detach().cpu().numpy()
+    
+    # Convert from log space
+    transitions = np.exp(transitions)
+    
+    # Find top k transitions
+    top_pairs = []
+    for i in range(transitions.shape[0]):
+        for j in range(transitions.shape[1]):
+            top_pairs.append((i, j, transitions[i, j]))
+    
+    top_pairs.sort(key=lambda x: x[2], reverse=True)
+    top_pairs = top_pairs[:top_k]
+    
+    # Create labels
+    labels = []
+    values = []
+    for i, j, v in top_pairs:
+        # Handle cases where indices aren't in the chord mapping
+        chord_i = idx_to_chord.get(i, f"Chord-{i}")
+        chord_j = idx_to_chord.get(j, f"Chord-{j}")
+        labels.append(f"{chord_i}→{chord_j}")
+        values.append(v)
+    
+    # Plot
+    fig, ax = plt.subplots(figsize=figsize)
+    sns.barplot(x=labels, y=values, ax=ax, palette=cmap)
+    plt.xticks(rotation=45, ha='right')
+    plt.title(title or f"Top {top_k} Chord Transitions")
+    plt.tight_layout()
+    
+    # Save the figure if requested
+    if save_path:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+    
     return fig

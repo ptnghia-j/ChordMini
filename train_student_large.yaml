@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-mini-large-02
+  name: chord-mini-large-03
   namespace: csuf-titans
   labels:
     app: chord-student-training
@@ -20,7 +20,7 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-GeForce-RTX-4090
+                - NVIDIA-GeForce-RTX-3090
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -239,7 +239,7 @@ spec:
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: "null"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: "0.05"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
           command:
@@ -371,10 +371,9 @@ spec:
               if [ "${USE_FOCAL_LOSS}" = "true" ]; then
                 echo "Using focal loss with gamma=${FOCAL_GAMMA}"
                 FOCAL_LOSS_ARG="--use_focal_loss --focal_gamma ${FOCAL_GAMMA}"
-                # Add focal_alpha if specified
                 if [ "${FOCAL_ALPHA}" != "" ]; then
+                  echo "Using alpha=${FOCAL_ALPHA} for focal loss weighting"
                   FOCAL_LOSS_ARG="${FOCAL_LOSS_ARG} --focal_alpha ${FOCAL_ALPHA}"
-                  echo "Using focal loss alpha=${FOCAL_ALPHA}"
                 fi
               else
                 echo "Using standard cross-entropy loss (focal loss disabled)"
@@ -561,12 +560,16 @@ spec:
               python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
             requests:
-              cpu: "3"             
-              memory: "72Gi"    
+              # cpu: "3"             
+              # memory: "72Gi"    
+              cpu: "3"
+              memory: "12Gi"
               nvidia.com/gpu: "1"
             limits:
-              cpu: "12"             
-              memory: "132Gi" 
+              # cpu: "12"             
+              # memory: "132Gi" 
+              cpu: "12"
+              memory: "48Gi"
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage
