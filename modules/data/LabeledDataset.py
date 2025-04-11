@@ -259,7 +259,7 @@ class LabeledDataset(Dataset):
 
     def _chord_labels_to_frames(self, chord_labels, timestamps, num_frames, feature_per_second):
         """
-        Convert chord labels to frame-level representation.
+        Convert chord labels to frame-level representation with improved assignment.
         
         Args:
             chord_labels: List of chord labels
@@ -270,17 +270,67 @@ class LabeledDataset(Dataset):
         Returns:
             List of chord labels for each frame
         """
+        # Log input data for debugging
+        logger.debug(f"Converting {len(chord_labels)} chord labels to {num_frames} frames at {feature_per_second} fps")
+        
+        # Calculate frame duration in seconds from parameters
+        # Using the configured parameters:
+        # hop_duration = hop_length / song_hz = 2048 / 22050 ≈ 0.09288 seconds per frame
+        # feature_per_second = 1 / hop_duration ≈ 10.77 frames per second
+        frame_duration = 1.0 / feature_per_second
+        
+        # Verify frame rate matches configuration
+        expected_feature_per_second = 1.0 / self.feature_config.feature.get('hop_duration', 0.09288)
+        if abs(feature_per_second - expected_feature_per_second) > 0.01:  # Allow small rounding differences
+            logger.warning(f"Frame rate mismatch: Got {feature_per_second:.2f} fps but expected {expected_feature_per_second:.2f} fps")
+            logger.warning(f"This could cause chord alignment issues. Check feature extraction parameters.")
+        
+        # Calculate audio duration in seconds based on frames and hop duration
+        audio_duration = num_frames * frame_duration
+        logger.debug(f"Audio duration: {audio_duration:.2f}s ({num_frames} frames at {frame_duration:.5f}s per frame)")
+        
+        if len(chord_labels) > 0:
+            label_duration = timestamps[-1][1]
+            logger.debug(f"Label duration: {label_duration:.2f}s from chord file")
+            logger.debug(f"First 3 chord labels: {chord_labels[:3]}")
+            logger.debug(f"First 3 timestamps: {timestamps[:3]}")
+            
+            # Check for duration mismatch
+            if abs(audio_duration - label_duration) / max(audio_duration, label_duration) > 0.2:  # >20% difference
+                logger.warning(f"Duration mismatch: audio={audio_duration:.2f}s vs labels={label_duration:.2f}s")
+                
+                # Check if timestamps appear to be in milliseconds
+                if label_duration > audio_duration * 10:
+                    logger.warning(f"Labels appear to be in milliseconds while audio is in seconds!")
+        
         # Initialize with "N" (no chord)
         frame_level_chords = ["N"] * num_frames
         
-        # Calculate frame duration in seconds
-        frame_duration = 1.0 / feature_per_second
+        # Check if timestamps are potentially in the wrong format (milliseconds instead of seconds)
+        time_scale_factor = 1.0
+        if timestamps and timestamps[-1][1] > num_frames * frame_duration * 10:
+            # If the last timestamp ends way after the audio ends, assume milliseconds
+            time_scale_factor = 0.001
+            logger.warning(f"Timestamps appear to be in milliseconds, converting to seconds (scale factor: {time_scale_factor})")
+            # Convert timestamps to seconds
+            timestamps = [(start * time_scale_factor, end * time_scale_factor) for start, end in timestamps]
+            
+            # Recalculate label duration for more accurate logs
+            label_duration = timestamps[-1][1]
+            logger.info(f"After scaling: Label duration = {label_duration:.2f}s")
+            
+            # Check if scaling fixed the mismatch
+            if abs(audio_duration - label_duration) / max(audio_duration, label_duration) <= 0.2:
+                logger.info(f"Duration mismatch resolved by ms->s conversion!")
         
-        # Keep track of statistics for debugging
+        # IMPROVED APPROACH: Use two passes with larger tolerance
+        
+        # Keep track of assigned and unassigned frames
         assigned_frames = 0
-        n_chord_frames = 0
         
-        # FIRST PASS: Exact matching - assign chords where frame is fully within chord boundaries
+        # FIRST PASS: Match frames to chords with reasonable tolerance
+        tolerance = frame_duration * 0.5  # Half a frame tolerance
+        
         for i in range(num_frames):
             # Calculate time for this frame center
             frame_time = (i + 0.5) * frame_duration
@@ -288,30 +338,66 @@ class LabeledDataset(Dataset):
             # Find chord that contains this time point
             found_chord = False
             for chord, (start, end) in zip(chord_labels, timestamps):
-                # Use a small tolerance to account for floating point errors
-                if start <= frame_time < end:
+                # Use tolerance to account for rounding errors and misalignments
+                if (start - tolerance) <= frame_time < (end + tolerance):
                     frame_level_chords[i] = chord
                     found_chord = True
                     assigned_frames += 1
                     break
-            
-            if not found_chord:
-                n_chord_frames += 1
         
-        # Log statistics if many frames are unassigned
-        if n_chord_frames > 0.1 * num_frames:  # If more than 10% are still N chords
-            n_percent = (n_chord_frames / num_frames) * 100
-            logger.debug(f"Chord assignment: {assigned_frames}/{num_frames} frames assigned ({assigned_frames/num_frames:.1%})")
-            logger.debug(f"N chord frames: {n_chord_frames}/{num_frames} ({n_percent:.1f}%)")
+        # SECOND PASS: For remaining unassigned frames, find the nearest chord
+        if assigned_frames < num_frames * 0.5:  # If less than 50% frames assigned
+            logger.warning(f"Only {assigned_frames}/{num_frames} frames ({assigned_frames/num_frames:.1%}) assigned in first pass. Using nearest chord assignment.")
             
-            # If almost all frames are N, this is likely a file format or parsing issue
-            if n_chord_frames > 0.9 * num_frames:
-                logger.warning(f"WARNING: {n_percent:.1f}% of frames labeled as N. Possible parsing issue with chord file.")
+            # Use much larger tolerance for nearest chord finding
+            large_tolerance = frame_duration * 10  # 10 frames tolerance
+            
+            for i in range(num_frames):
+                if frame_level_chords[i] == "N":  # Only process unassigned frames
+                    frame_time = (i + 0.5) * frame_duration
+                    
+                    # Find nearest chord
+                    min_distance = float('inf')
+                    nearest_chord = None
+                    
+                    for chord, (start, end) in zip(chord_labels, timestamps):
+                        # Calculate distance to this chord segment
+                        if frame_time < start:
+                            distance = start - frame_time
+                        elif frame_time >= end:
+                            distance = frame_time - end
+                        else:
+                            distance = 0  # Frame is actually inside chord
+                        
+                        if distance < min_distance:
+                            min_distance = distance
+                            nearest_chord = chord
+                    
+                    # Assign nearest chord if within large tolerance
+                    if nearest_chord is not None and min_distance <= large_tolerance:
+                        frame_level_chords[i] = nearest_chord
+                        assigned_frames += 1
+        
+        # Calculate statistics for logging
+        n_chord_frames = num_frames - assigned_frames
+        n_percent = (n_chord_frames / num_frames) * 100
+        
+        # Log detailed statistics
+        logger.info(f"Chord assignment: {assigned_frames}/{num_frames} frames assigned ({assigned_frames/num_frames:.1%})")
+        
+        # If still high percentage of N chords, investigate further
+        if n_chord_frames > 0.9 * num_frames:
+            logger.warning(f"WARNING: {n_percent:.1f}% of frames labeled as N. Possible parsing issue with chord file.")
+            
+            # Check if timestamps are extremely short and might need adjustment
+            if timestamps:
+                total_chord_time = sum(end - start for start, end in timestamps)
+                logger.warning(f"Total chord time: {total_chord_time:.2f}s vs audio duration: {audio_duration:.2f}s")
                 
-                # Show first few timestamps to aid debugging
-                if timestamps:
-                    logger.debug(f"First 3 timestamps: {timestamps[:3]}")
-                    logger.debug(f"Song length in frames: {num_frames}, feature_per_second: {feature_per_second}")
+                # If chord duration is less than 10% of audio duration, timestamps might be wrong
+                if total_chord_time < audio_duration * 0.1:
+                    logger.error(f"CRITICAL: Total chord time ({total_chord_time:.2f}s) is much shorter than audio duration ({audio_duration:.2f}s)")
+                    logger.error("Check if label file uses correct time format and matches the audio length.")
         
         return frame_level_chords
 
@@ -385,6 +471,329 @@ class LabeledDataset(Dataset):
                 logger.warning(f"Many unknown chords ({len(unknown_chords)}) found, showing first 10: {list(unknown_chords)[:10]}")
         
         return indices
+
+    def _find_matching_pairs(self):
+        """
+        Find all matching audio and label files across all directories.
+        
+        Returns:
+            List of tuples (audio_path, label_path)
+        """
+        audio_label_pairs = []
+        audio_extensions = ['.mp3', '.wav', '.flac', '.ogg', '.m4a']
+        label_extensions = ['.lab', '.txt']
+        
+        for audio_dir, label_dir in zip(self.audio_dirs, self.label_dirs):
+            # Check if directories exist
+            if not os.path.exists(audio_dir):
+                logger.warning(f"Audio directory not found: {audio_dir}")
+                continue
+            
+            if not os.path.exists(label_dir):
+                logger.warning(f"Label directory not found: {label_dir}")
+                continue
+            
+            # Find audio files
+            audio_files = {}
+            for ext in audio_extensions:
+                for path in glob.glob(os.path.join(audio_dir, f"*{ext}")):
+                    # Use filename without extension as key
+                    basename = os.path.splitext(os.path.basename(path))[0]
+                    audio_files[basename] = path
+                    
+                # Also check subdirectories
+                for path in glob.glob(os.path.join(audio_dir, f"**/*{ext}"), recursive=True):
+                    basename = os.path.splitext(os.path.basename(path))[0]
+                    audio_files[basename] = path
+            
+            # Find label files
+            label_files = {}
+            for ext in label_extensions:
+                for path in glob.glob(os.path.join(label_dir, f"*{ext}")):
+                    basename = os.path.splitext(os.path.basename(path))[0]
+                    label_files[basename] = path
+                    
+                # Also check subdirectories
+                for path in glob.glob(os.path.join(label_dir, f"**/*{ext}"), recursive=True):
+                    basename = os.path.splitext(os.path.basename(path))[0]
+                    label_files[basename] = path
+            
+            # Log counts for debugging
+            logger.info(f"Found {len(audio_files)} audio files in {audio_dir}")
+            logger.info(f"Found {len(label_files)} label files in {label_dir}")
+            
+            # Match audio files with label files
+            pairs_found = 0
+            for basename, audio_path in audio_files.items():
+                if basename in label_files:
+                    audio_label_pairs.append((audio_path, label_files[basename]))
+                    pairs_found += 1
+            
+            logger.info(f"Matched {pairs_found} pairs between {audio_dir} and {label_dir}")
+        
+        return audio_label_pairs
+
+    def _extract_samples(self):
+        """
+        Extract samples from audio-label pairs.
+        
+        Returns:
+            List of sample dictionaries
+        """
+        samples = []
+        errors = {'feature': 0, 'label': 0, 'segment': 0, 'other': 0}
+        
+        for audio_path, label_path in tqdm(self.audio_label_pairs, desc="Processing audio files"):
+            try:
+                # Extract features from audio file
+                if self.cache_features and self.cache_dir:
+                    # Generate cache filename based on audio path
+                    cache_filename = f"{Path(audio_path).stem}.npy"
+                    cache_path = os.path.join(self.cache_dir, cache_filename)
+                    
+                    if os.path.exists(cache_path):
+                        # Load from cache
+                        try:
+                            data = np.load(cache_path, allow_pickle=True).item()
+                            feature = data['feature']
+                            feature_per_second = data['feature_per_second']
+                            song_length_second = data['song_length_second']
+                        except Exception as e:
+                            logger.warning(f"Error loading cached features for {audio_path}: {e}")
+                            # Extract features with better error handling
+                            feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, self.feature_config)
+                            np.save(cache_path, {
+                                'feature': feature,
+                                'feature_per_second': feature_per_second,
+                                'song_length_second': song_length_second
+                            })
+                    else:
+                        # Extract features with better error handling
+                        feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, self.feature_config)
+                        np.save(cache_path, {
+                            'feature': feature,
+                            'feature_per_second': feature_per_second,
+                            'song_length_second': song_length_second
+                        })
+                else:
+                    # Extract features with better error handling
+                    feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, self.feature_config)
+                
+                # Transpose to get (time, frequency) format
+                feature = feature.T
+                
+                # Change to debug level for per-file details
+                logger.debug(f"Feature shape for {os.path.basename(audio_path)}: {feature.shape}")
+                
+                # Parse chord labels from label file
+                chord_labels, timestamps = self._parse_label_file(label_path)
+                
+                # Add diagnostic info for each file
+                logger.info(f"Processing {os.path.basename(audio_path)} - Found {len(chord_labels)} chord labels")
+                
+                # Validate that we have chord labels
+                if len(chord_labels) == 0:
+                    logger.error(f"No chord labels found in {label_path}! Skipping file.")
+                    errors['label'] += 1
+                    continue
+                    
+                # Analyze timestamps to detect potential issues
+                if timestamps:
+                    total_duration = timestamps[-1][1]
+                    expected_frames = int(total_duration * feature_per_second)
+                    logger.info(f"Label duration: {total_duration:.2f}s, Audio frames: {feature.shape[0]}, Expected frames: {expected_frames}")
+                    
+                    # Detect significant mismatch
+                    if abs(feature.shape[0] - expected_frames) > feature.shape[0] * 0.5:
+                        logger.warning(f"Label vs audio duration mismatch: {total_duration:.2f}s vs {feature.shape[0]/feature_per_second:.2f}s")
+                
+                # Check for time discontinuities in chord labels
+                if len(timestamps) > 1:
+                    discontinuities = []
+                    for i in range(1, len(timestamps)):
+                        prev_end = timestamps[i-1][1]
+                        curr_start = timestamps[i][0]
+                        gap = curr_start - prev_end
+                        if abs(gap) > 0.01:  # 10ms gap/overlap threshold
+                            discontinuities.append((i-1, i, gap))
+                    
+                    if discontinuities:
+                        logger.warning(f"Found {len(discontinuities)} time discontinuities in {label_path}")
+                        if len(discontinuities) < 5:  # Show first few if not too many
+                            for prev_idx, curr_idx, gap in discontinuities[:5]:
+                                logger.warning(f"Gap of {gap:.3f}s between {chord_labels[prev_idx]} and {chord_labels[curr_idx]}")
+                
+                # Convert chord labels to frame-level representation
+                num_frames = feature.shape[0]
+                frame_level_chords = self._chord_labels_to_frames(
+                    chord_labels, timestamps, num_frames, feature_per_second)
+                
+                # Convert chord names to indices
+                chord_indices = self._chord_names_to_indices(frame_level_chords)
+                
+                # Verify we have enough frames for at least one segment
+                if num_frames < self.seq_len:
+                    logger.warning(f"Audio file {os.path.basename(audio_path)} has {num_frames} frames, which is less than seq_len={self.seq_len}. Skipping.")
+                    errors['segment'] += 1
+                    continue
+                
+                # Create segments with sequence length and stride
+                segments_created = 0
+                for i in range(0, num_frames - self.seq_len + 1, self.stride):
+                    # Extract segment
+                    feature_segment = feature[i:i+self.seq_len]
+                    chord_indices_segment = chord_indices[i:i+self.seq_len]
+                    
+                    # Create sample dictionary
+                    sample = {
+                        'song_id': Path(audio_path).stem,
+                        'spectro': feature_segment,
+                        'chord_idx': chord_indices_segment,
+                        'start_frame': i,
+                        'audio_path': audio_path,
+                        'label_path': label_path,
+                        'feature_per_second': feature_per_second
+                    }
+                    
+                    samples.append(sample)
+                    segments_created += 1
+                
+                # Change to debug level for per-file segment creation info
+                logger.debug(f"Created {segments_created} segments from {os.path.basename(audio_path)}")
+                    
+            except Exception as e:
+                # Determine error type for statistics
+                error_msg = str(e).lower()
+                if 'feature' in error_msg:
+                    errors['feature'] += 1
+                elif 'label' in error_msg or 'parse' in error_msg:
+                    errors['label'] += 1
+                else:
+                    errors['other'] += 1
+                
+                logger.error(f"Error processing {audio_path}: {e}")
+                logger.error(traceback.format_exc())
+        
+        # Log error statistics
+        total_errors = sum(errors.values())
+        if total_errors > 0:
+            logger.warning(f"Encountered errors during processing: {errors}")
+            logger.warning(f"Total error rate: {total_errors/len(self.audio_label_pairs):.2%}")
+        
+        return samples
+    
+    def _create_dummy_samples(self, count=10):
+        """Create dummy samples to avoid DataLoader errors when no real samples exist"""
+        # Use the first chord_mapping index as a default if mapping exists
+        default_idx = 0 if not self.chord_mapping else list(self.chord_mapping.values())[0]
+        
+        # Create dummy samples
+        for i in range(count):
+            # Create a dummy spectrogram of shape (seq_len, 144) - typical spectrogram shape
+            dummy_spectro = np.zeros((self.seq_len, 144), dtype=np.float32)
+            # Create dummy chord indices of shape (seq_len,)
+            dummy_chords = np.full(self.seq_len, default_idx, dtype=np.int64)
+            
+            # Add to samples
+            self.samples.append({
+                'song_id': f"dummy_{i}",
+                'spectro': dummy_spectro,
+                'chord_idx': dummy_chords,
+                'start_frame': 0,
+                'audio_path': "dummy_path.wav",
+                'label_path': "dummy_path.lab",
+                'feature_per_second': 10.0
+            })
+    
+    def _split_dataset(self, train_ratio, val_ratio, test_ratio):
+        """
+        Split dataset into train, validation, and test sets.
+        Splitting is done by song to prevent data leakage.
+        
+        Args:
+            train_ratio: Ratio of data for training
+            val_ratio: Ratio of data for validation
+            test_ratio: Ratio of data for testing
+        """
+        # Get unique song IDs
+        song_ids = list(set(sample['song_id'] for sample in self.samples))
+        
+        # Shuffle song IDs
+        random.shuffle(song_ids)
+        
+        # Calculate split indices
+        train_split = int(len(song_ids) * train_ratio)
+        val_split = int(len(song_ids) * (train_ratio + val_ratio))
+            
+        # Split song IDs
+        train_song_ids = set(song_ids[:train_split])
+        val_song_ids = set(song_ids[train_split:val_split])
+        test_song_ids = set(song_ids[val_split:])
+        
+        # Split samples based on song IDs
+        self.train_indices = [i for i, sample in enumerate(self.samples) if sample['song_id'] in train_song_ids]
+        self.val_indices = [i for i, sample in enumerate(self.samples) if sample['song_id'] in val_song_ids]
+        self.test_indices = [i for i, sample in enumerate(self.samples) if sample['song_id'] in test_song_ids]
+        
+        logger.info(f"Dataset split - Train: {len(self.train_indices)}, Val: {len(self.val_indices)}, Test: {len(self.test_indices)}")
+    
+    def analyze_label_file(self, label_path):
+        """Analyze a single label file to diagnose potential issues"""
+        logger.info(f"Analyzing label file: {os.path.basename(label_path)}")
+        
+        try:
+            # Attempt to parse the file - first few lines raw
+            with open(label_path, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()[:10]  # First 10 lines
+            
+            logger.info(f"First few lines of file: {lines}")
+            
+            # Now parse with our normal method
+            chord_labels, timestamps = self._parse_label_file(label_path)
+            
+            if len(chord_labels) == 0:
+                logger.error(f"No chords parsed from file - possible format issue")
+                return
+                
+            logger.info(f"Parsed {len(chord_labels)} chords")
+            logger.info(f"First 5 chords: {chord_labels[:5]}")
+            logger.info(f"First 5 timestamps: {timestamps[:5]}")
+            
+            # Calculate song duration
+            if timestamps:
+                duration = timestamps[-1][1]
+                logger.info(f"Song duration from labels: {duration:.2f} seconds")
+                
+                # Calculate frame rate and expected frame count
+                feature_per_second = 1.0 / self.feature_config.feature.get('hop_duration', 0.1)
+                expected_frames = int(duration * feature_per_second)
+                logger.info(f"Expected frames at {feature_per_second:.2f} frames/sec: {expected_frames}")
+                
+                # Check for gaps in chord coverage
+                total_chord_time = 0
+                for _, (start, end) in enumerate(timestamps):
+                    total_chord_time += (end - start)
+                
+                coverage = (total_chord_time / duration) * 100
+                logger.info(f"Chord time coverage: {coverage:.2f}% of song duration")
+                
+                if coverage < 90:
+                    logger.warning(f"Low chord coverage ({coverage:.2f}%) may result in many N labels")
+            
+            # Check for chord mapping issues
+            mapped = self._chord_names_to_indices(chord_labels)
+            n_chord_id = 169 if self.feature_config.feature.get('large_voca', False) else 24
+            n_count = sum(1 for idx in mapped if idx == n_chord_id)
+            
+            if n_count > 0:
+                logger.info(f"N chords in file: {n_count}/{len(mapped)} ({n_count/len(mapped):.2%})")
+                if n_count > 0.5 * len(mapped):
+                    logger.warning(f"HIGH NUMBER OF N CHORDS: Check mapping and chord format")
+            
+        except Exception as e:
+            logger.error(f"Error analyzing label file: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     def __len__(self):
         """Return the number of samples in the dataset"""
