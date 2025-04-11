@@ -842,7 +842,119 @@ class Chords:
         chord_mapping : dict
             Dictionary mapping chord names to indices
         """
+        if not chord_mapping:
+            logger.warning("Empty chord mapping provided. This may cause issues with chord recognition.")
+            self.chord_mapping = {}
+            return
+            
         self.chord_mapping = chord_mapping
+        logger.info(f"Chord mapping set with {len(chord_mapping)} entries")
+        
+        # Log some example mappings for debugging purposes
+        debug_sample = {
+            'Major chords': {k: chord_mapping.get(k) for k in ['C', 'F', 'G'] if k in chord_mapping},
+            'Minor chords': {k: chord_mapping.get(k) for k in ['C:min', 'A:min', 'D:min'] if k in chord_mapping},
+            'Special chords': {k: chord_mapping.get(k) for k in ['N', 'X'] if k in chord_mapping}
+        }
+        logger.debug(f"Chord mapping examples: {debug_sample}")
+        
+        # Check for expected chord mappings
+        if 'N' not in chord_mapping:
+            logger.warning("No mapping for 'N' (no chord) found. Will default to 24 or 169 depending on vocabulary size.")
+            
+        # Check if we're using large vocabulary (170 chords) by examining the mapping
+        max_index = max(chord_mapping.values()) if chord_mapping else 0
+        if max_index > 25:
+            logger.info(f"Large vocabulary detected (max index: {max_index})")
+        else:
+            logger.info(f"Standard vocabulary detected (max index: {max_index})")
+        
+        # Initialize the enharmonic mapping for consistent chord lookup
+        self._initialize_enharmonic_mapping()
+
+    def _initialize_enharmonic_mapping(self):
+        """Initialize mappings between flat and sharp notes for consistent chord lookup"""
+        # Create bidirectional mapping for enharmonic equivalents
+        self.enharmonic_map = {
+            'Bb': 'A#', 'A#': 'Bb',
+            'Db': 'C#', 'C#': 'Db',
+            'Eb': 'D#', 'D#': 'Eb',
+            'Gb': 'F#', 'F#': 'Gb',
+            'Ab': 'G#', 'G#': 'Ab',
+        }
+        
+        # Add chord mappings for enharmonic equivalents if one exists but the other doesn't
+        if hasattr(self, 'chord_mapping') and self.chord_mapping:
+            # Check each root note with both flat and sharp variants
+            for flat, sharp in [('Bb', 'A#'), ('Db', 'C#'), ('Eb', 'D#'), ('Gb', 'F#'), ('Ab', 'G#')]:
+                # For major chords (root only)
+                if flat in self.chord_mapping and sharp not in self.chord_mapping:
+                    self.chord_mapping[sharp] = self.chord_mapping[flat]
+                elif sharp in self.chord_mapping and flat not in self.chord_mapping:
+                    self.chord_mapping[flat] = self.chord_mapping[sharp]
+                
+                # For common qualities
+                for quality in ['min', 'maj', 'dim', 'aug', '7', 'maj7', 'min7']:
+                    flat_chord = f"{flat}:{quality}"
+                    sharp_chord = f"{sharp}:{quality}"
+                    
+                    if flat_chord in self.chord_mapping and sharp_chord not in self.chord_mapping:
+                        self.chord_mapping[sharp_chord] = self.chord_mapping[flat_chord]
+                    elif sharp_chord in self.chord_mapping and flat_chord not in self.chord_mapping:
+                        self.chord_mapping[flat_chord] = self.chord_mapping[sharp_chord]
+
+    def get_chord_idx(self, chord_name, use_large_voca=False):
+        """
+        Get chord index for a given chord name, with fallbacks for error cases.
+        
+        Parameters
+        ----------
+        chord_name : str
+            The chord name to look up
+        use_large_voca : bool
+            Whether to use the large vocabulary (170 chords)
+            
+        Returns
+        -------
+        int
+            The chord index
+        """
+        # Direct lookup first (most efficient)
+        if hasattr(self, 'chord_mapping') and self.chord_mapping and chord_name in self.chord_mapping:
+            return self.chord_mapping[chord_name]
+            
+        # Handle special cases
+        if chord_name == "N":
+            return 169 if use_large_voca else 24
+        if chord_name == "X":
+            return 168 if use_large_voca else 25
+            
+        # Try parsing the chord
+        try:
+            # Process the chord label with error correction
+            modified_chord = self.label_error_modify(chord_name)
+            
+            # Parse the chord
+            root, bass, intervals, is_major = self.chord(modified_chord)
+            
+            # For large vocabulary, extract quality
+            if use_large_voca:
+                quality = None
+                if ':' in modified_chord:
+                    _, quality = modified_chord.split(':', 1)
+                    if '/' in quality:
+                        quality = quality.split('/', 1)[0]
+                else:
+                    quality = 'maj'  # Default
+                
+                return self.convert_to_id_voca(root=root, quality=quality)
+            else:
+                # For standard vocabulary
+                return self.convert_to_id(root=root, is_major=is_major)
+                
+        except Exception as e:
+            logger.warning(f"Error parsing chord '{chord_name}': {e}")
+            return 169 if use_large_voca else 24  # Default to N
 
     def initialize_chord_mapping(self, chord_mapping=None):
         """

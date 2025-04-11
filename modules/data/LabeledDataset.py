@@ -257,6 +257,58 @@ class LabeledDataset(Dataset):
             logger.error(f"Error parsing label file: {e}")
             return [], []
 
+    def _fix_time_scale(self, feature_shape, feature_per_second, song_length_second, timestamps):
+        """
+        Fix time scale issues between audio features and chord labels.
+        
+        Args:
+            feature_shape: Shape of the extracted feature (frames, freq_bins)
+            feature_per_second: Calculated frames per second
+            song_length_second: Calculated song length in seconds
+            timestamps: List of (start_time, end_time) tuples from chord labels
+            
+        Returns:
+            Tuple of (corrected_feature_per_second, time_scale_factor)
+        """
+        if not timestamps:
+            return feature_per_second, 1.0
+            
+        # Calculate expected number of frames based on label duration and feature rate
+        label_duration = timestamps[-1][1]
+        expected_frames = feature_shape[0]
+        
+        # Check for massive mismatch in calculated duration
+        if song_length_second > 1000:  # If calculated duration is >1000 seconds
+            logger.warning(f"Calculated song duration of {song_length_second:.2f}s is suspiciously long")
+            
+            # Recalculate based on more reasonable assumptions
+            # Most songs are 2-10 minutes, so calculate fps from frames and label duration
+            corrected_fps = expected_frames / label_duration
+            
+            if 8.0 <= corrected_fps <= 12.0:  # Reasonable frame rate range for music
+                logger.info(f"Corrected frame rate: {corrected_fps:.2f} fps (was {feature_per_second:.2f})")
+                return corrected_fps, 1.0
+        
+        # Check if timestamps might be in milliseconds
+        if label_duration * 10 < song_length_second:
+            logger.warning("Labels appear to be in seconds but audio duration is much longer")
+            
+            # Try to correct the frame rate instead of scaling timestamps
+            corrected_fps = expected_frames / label_duration
+            
+            if 8.0 <= corrected_fps <= 12.0:  # Reasonable range
+                logger.info(f"Using corrected frame rate: {corrected_fps:.2f} fps")
+                return corrected_fps, 1.0
+            else:
+                logger.warning(f"Corrected fps of {corrected_fps:.2f} seems outside reasonable range")
+        
+        # If labels appear to be in milliseconds but audio is in seconds
+        if label_duration > song_length_second * 10:
+            logger.warning("Labels appear to be in milliseconds but audio is in seconds")
+            return feature_per_second, 0.001  # Convert ms to seconds
+            
+        return feature_per_second, 1.0
+
     def _chord_labels_to_frames(self, chord_labels, timestamps, num_frames, feature_per_second):
         """
         Convert chord labels to frame-level representation with improved assignment.
@@ -270,134 +322,83 @@ class LabeledDataset(Dataset):
         Returns:
             List of chord labels for each frame
         """
+        # Fix the massive time scale issues we're seeing in the logs
+        corrected_fps, time_scale_factor = self._fix_time_scale(
+            feature_shape=(num_frames, self.feature_config.feature.get('n_bins', 144)),
+            feature_per_second=feature_per_second,
+            song_length_second=num_frames / feature_per_second if feature_per_second > 0 else 0,
+            timestamps=timestamps
+        )
+        
+        # Use the corrected frame rate instead
+        feature_per_second = corrected_fps
+        
         # Log input data for debugging
         logger.debug(f"Converting {len(chord_labels)} chord labels to {num_frames} frames at {feature_per_second} fps")
         
-        # Calculate frame duration in seconds from parameters
-        # Using the configured parameters:
-        # hop_duration = hop_length / song_hz = 2048 / 22050 ≈ 0.09288 seconds per frame
-        # feature_per_second = 1 / hop_duration ≈ 10.77 frames per second
+        # Calculate frame duration in seconds
         frame_duration = 1.0 / feature_per_second
         
-        # Verify frame rate matches configuration
-        expected_feature_per_second = 1.0 / self.feature_config.feature.get('hop_duration', 0.09288)
-        if abs(feature_per_second - expected_feature_per_second) > 0.01:  # Allow small rounding differences
-            logger.warning(f"Frame rate mismatch: Got {feature_per_second:.2f} fps but expected {expected_feature_per_second:.2f} fps")
-            logger.warning(f"This could cause chord alignment issues. Check feature extraction parameters.")
-        
-        # Calculate audio duration in seconds based on frames and hop duration
+        # Calculate audio duration in seconds based on frames and frame duration
         audio_duration = num_frames * frame_duration
         logger.debug(f"Audio duration: {audio_duration:.2f}s ({num_frames} frames at {frame_duration:.5f}s per frame)")
         
-        if len(chord_labels) > 0:
-            label_duration = timestamps[-1][1]
-            logger.debug(f"Label duration: {label_duration:.2f}s from chord file")
-            logger.debug(f"First 3 chord labels: {chord_labels[:3]}")
-            logger.debug(f"First 3 timestamps: {timestamps[:3]}")
-            
-            # Check for duration mismatch
-            if abs(audio_duration - label_duration) / max(audio_duration, label_duration) > 0.2:  # >20% difference
-                logger.warning(f"Duration mismatch: audio={audio_duration:.2f}s vs labels={label_duration:.2f}s")
-                
-                # Check if timestamps appear to be in milliseconds
-                if label_duration > audio_duration * 10:
-                    logger.warning(f"Labels appear to be in milliseconds while audio is in seconds!")
-        
-        # Initialize with "N" (no chord)
-        frame_level_chords = ["N"] * num_frames
-        
-        # Check if timestamps are potentially in the wrong format (milliseconds instead of seconds)
-        time_scale_factor = 1.0
-        if timestamps and timestamps[-1][1] > num_frames * frame_duration * 10:
-            # If the last timestamp ends way after the audio ends, assume milliseconds
-            time_scale_factor = 0.001
-            logger.warning(f"Timestamps appear to be in milliseconds, converting to seconds (scale factor: {time_scale_factor})")
-            # Convert timestamps to seconds
+        # Apply time scale factor to timestamps if needed
+        if time_scale_factor != 1.0:
             timestamps = [(start * time_scale_factor, end * time_scale_factor) for start, end in timestamps]
+            logger.info(f"Applied time scale factor {time_scale_factor} to timestamps")
             
             # Recalculate label duration for more accurate logs
             label_duration = timestamps[-1][1]
             logger.info(f"After scaling: Label duration = {label_duration:.2f}s")
+        elif timestamps:
+            label_duration = timestamps[-1][1]
+            logger.debug(f"Label duration: {label_duration:.2f}s from chord file")
             
-            # Check if scaling fixed the mismatch
-            if abs(audio_duration - label_duration) / max(audio_duration, label_duration) <= 0.2:
-                logger.info(f"Duration mismatch resolved by ms->s conversion!")
-        
-        # IMPROVED APPROACH: Use two passes with larger tolerance
+        # Initialize with "N" (no chord)
+        frame_level_chords = ["N"] * num_frames
         
         # Keep track of assigned and unassigned frames
         assigned_frames = 0
         
-        # FIRST PASS: Match frames to chords with reasonable tolerance
+        # Set a reasonable tolerance based on frame duration
         tolerance = frame_duration * 0.5  # Half a frame tolerance
         
+        # First pass: Direct assignment with tolerance
         for i in range(num_frames):
             # Calculate time for this frame center
-            frame_time = (i + 0.5) * frame_duration
+            frame_time = i * frame_duration + (frame_duration / 2)
             
             # Find chord that contains this time point
-            found_chord = False
             for chord, (start, end) in zip(chord_labels, timestamps):
-                # Use tolerance to account for rounding errors and misalignments
                 if (start - tolerance) <= frame_time < (end + tolerance):
                     frame_level_chords[i] = chord
-                    found_chord = True
                     assigned_frames += 1
                     break
         
-        # SECOND PASS: For remaining unassigned frames, find the nearest chord
-        if assigned_frames < num_frames * 0.5:  # If less than 50% frames assigned
-            logger.warning(f"Only {assigned_frames}/{num_frames} frames ({assigned_frames/num_frames:.1%}) assigned in first pass. Using nearest chord assignment.")
-            
-            # Use much larger tolerance for nearest chord finding
-            large_tolerance = frame_duration * 10  # 10 frames tolerance
-            
-            for i in range(num_frames):
-                if frame_level_chords[i] == "N":  # Only process unassigned frames
-                    frame_time = (i + 0.5) * frame_duration
-                    
-                    # Find nearest chord
-                    min_distance = float('inf')
-                    nearest_chord = None
-                    
-                    for chord, (start, end) in zip(chord_labels, timestamps):
-                        # Calculate distance to this chord segment
-                        if frame_time < start:
-                            distance = start - frame_time
-                        elif frame_time >= end:
-                            distance = frame_time - end
-                        else:
-                            distance = 0  # Frame is actually inside chord
-                        
-                        if distance < min_distance:
-                            min_distance = distance
-                            nearest_chord = chord
-                    
-                    # Assign nearest chord if within large tolerance
-                    if nearest_chord is not None and min_distance <= large_tolerance:
-                        frame_level_chords[i] = nearest_chord
-                        assigned_frames += 1
-        
-        # Calculate statistics for logging
-        n_chord_frames = num_frames - assigned_frames
-        n_percent = (n_chord_frames / num_frames) * 100
-        
-        # Log detailed statistics
+        # Log assignment statistics
         logger.info(f"Chord assignment: {assigned_frames}/{num_frames} frames assigned ({assigned_frames/num_frames:.1%})")
         
-        # If still high percentage of N chords, investigate further
-        if n_chord_frames > 0.9 * num_frames:
-            logger.warning(f"WARNING: {n_percent:.1f}% of frames labeled as N. Possible parsing issue with chord file.")
+        # If terrible assignment, try with much larger tolerance
+        if assigned_frames < num_frames * 0.3:  # Less than 30% assigned
+            logger.warning(f"Poor chord assignment rate ({assigned_frames/num_frames:.1%}). Trying larger tolerance.")
             
-            # Check if timestamps are extremely short and might need adjustment
-            if timestamps:
-                total_chord_time = sum(end - start for start, end in timestamps)
-                logger.warning(f"Total chord time: {total_chord_time:.2f}s vs audio duration: {audio_duration:.2f}s")
+            # Reset and try again with much larger tolerance
+            frame_level_chords = ["N"] * num_frames
+            assigned_frames = 0
+            large_tolerance = frame_duration * 5  # 5x frame duration
+            
+            for i in range(num_frames):
+                frame_time = i * frame_duration + (frame_duration / 2)
                 
-                # If chord duration is less than 10% of audio duration, timestamps might be wrong
-                if total_chord_time < audio_duration * 0.1:
-                    logger.error(f"CRITICAL: Total chord time ({total_chord_time:.2f}s) is much shorter than audio duration ({audio_duration:.2f}s)")
-                    logger.error("Check if label file uses correct time format and matches the audio length.")
+                for chord, (start, end) in zip(chord_labels, timestamps):
+                    # Use larger tolerance for better coverage
+                    if (start - large_tolerance) <= frame_time < (end + large_tolerance):
+                        frame_level_chords[i] = chord
+                        assigned_frames += 1
+                        break
+            
+            logger.info(f"After larger tolerance: {assigned_frames}/{num_frames} frames assigned ({assigned_frames/num_frames:.1%})")
         
         return frame_level_chords
 

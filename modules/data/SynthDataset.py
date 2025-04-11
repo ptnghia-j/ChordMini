@@ -296,27 +296,27 @@ class SynthDataset(Dataset):
             # Use provided normalization parameters
             return (spec - mean) / (std if std != 0 else 1.0)
     
-    def apply_gpu_cache(self, batch):
-        """Apply GPU batch caching for repeated access patterns"""
-        if not self.gpu_batch_cache:
-            return batch
+    # def apply_gpu_cache(self, batch):
+    #     """Apply GPU batch caching for repeated access patterns"""
+    #     if not self.gpu_batch_cache:
+    #         return batch
             
-        # Generate a cache key from the batch
-        key_tensor = batch['spectro'][:, 0, 0] if isinstance(batch['spectro'], torch.Tensor) and len(batch['spectro'].shape) > 2 else None
+    #     # Generate a cache key from the batch
+    #     key_tensor = batch['spectro'][:, 0, 0] if isinstance(batch['spectro'], torch.Tensor) and len(batch['spectro'].shape) > 2 else None
         
-        if key_tensor is not None:
-            # Create a tuple key from the first values
-            key = tuple(key_tensor.cpu().numpy().tolist())
+    #     if key_tensor is not None:
+    #         # Create a tuple key from the first values
+    #         key = tuple(key_tensor.cpu().numpy().tolist())
             
-            # Check if batch is already cached
-            if key in self.gpu_batch_cache:
-                return self.gpu_batch_cache[key]
+    #         # Check if batch is already cached
+    #         if key in self.gpu_batch_cache:
+    #             return self.gpu_batch_cache[key]
             
-            # Cache the new batch (only if it's small enough)
-            if len(self.gpu_batch_cache) < 1000:  # Limit cache size
-                self.gpu_batch_cache[key] = batch
+    #         # Cache the new batch (only if it's small enough)
+    #         if len(self.gpu_batch_cache) < 1000:  # Limit cache size
+    #             self.gpu_batch_cache[key] = batch
                 
-        return batch
+    #     return batch
 
     def _load_data(self):
         """Load data from files or cache with optimized memory usage and error handling"""
