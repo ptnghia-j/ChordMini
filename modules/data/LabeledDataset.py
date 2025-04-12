@@ -261,7 +261,8 @@ class LabeledDataset(Dataset):
     def analyze_label_file(self, label_path):
         """Analyze a label file for diagnostic purposes."""
         from modules.utils import logger
-        
+        from collections import Counter # Ensure Counter is imported
+
         try:
             with open(label_path, 'r') as f:
                 lines = f.readlines()
@@ -298,37 +299,44 @@ class LabeledDataset(Dataset):
                 coverage = total_time / duration * 100
                 logger.info(f"Chord time coverage: {coverage:.2f}% of song duration")
             
-            # Check chord index mapping
+            # Check chord index mapping using the processor's method
             unknown_count = 0
-            unmapped_chords = []
-            
+            unmapped_chords_counter = Counter() # Use Counter for efficiency
+            use_large_voca = hasattr(self.feature_config, 'feature') and self.feature_config.feature.get('large_voca', False)
+            x_chord_idx = 168 if use_large_voca else 25 # Unknown chord index
+
             for chord in chord_labels:
-                if chord not in self.chord_mapping:
+                # Use the same method as in _chord_names_to_indices
+                idx = self.chord_processor.get_chord_idx(chord, use_large_voca)
+                if idx == x_chord_idx and chord != "X": # Check if it mapped to unknown
                     unknown_count += 1
-                    if chord not in unmapped_chords:
-                        unmapped_chords.append(chord)
-            
+                    unmapped_chords_counter[chord] += 1
+
             if unknown_count > 0:
-                logger.error(f"Unknown chords: {unknown_count}/{len(chord_labels)} ({unknown_count/len(chord_labels)*100:.1f}%)")
-                logger.error(f"Most common unknown chords: {Counter([c for c in chord_labels if c not in self.chord_mapping]).most_common(10)}")
-                
+                logger.error(f"Unknown chords (using get_chord_idx): {unknown_count}/{len(chord_labels)} ({unknown_count/len(chord_labels)*100:.1f}%)")
+                logger.error(f"Most common unknown chords: {unmapped_chords_counter.most_common(10)}")
+
                 unique_chords = set(chord_labels)
-                unmapped_unique = [c for c in unique_chords if c not in self.chord_mapping]
-                logger.error(f"{len(unmapped_unique)}/{len(unique_chords)} unique chords could not be directly mapped")
+                # Re-check unique unmapped using the processor method
+                unmapped_unique = [c for c in unique_chords if self.chord_processor.get_chord_idx(c, use_large_voca) == x_chord_idx and c != "X"]
+                logger.error(f"{len(unmapped_unique)}/{len(unique_chords)} unique chords could not be mapped by get_chord_idx")
                 logger.error(f"Examples of unmapped chords: {unmapped_unique[:10]}")
-            
-            # Validate chord mapping on first few chords
-            logger.info("Chord mapping validation (first 5 chords):")
+            else:
+                 logger.info("All chords successfully mapped by get_chord_idx.")
+
+            # Validate chord mapping on first few chords using the processor's method
+            logger.info("Chord mapping validation (first 5 chords using get_chord_idx):")
             for i, chord in enumerate(chord_labels[:5]):
-                idx = self.chord_mapping.get(chord, 169)  # Default to no-chord (169) if not found
+                idx = self.chord_processor.get_chord_idx(chord, use_large_voca) # Use processor method
                 logger.info(f"  '{chord}' -> {idx}")
-                
-            # Check specifically for G:maj mapping
+
+            # Check specifically for G:maj mapping using the processor's method
             if "G:maj" in chord_labels:
-                logger.info(f"G:maj mapping: {self.chord_mapping.get('G:maj', 'Not mapped')}")
-            
+                g_maj_idx = self.chord_processor.get_chord_idx("G:maj", use_large_voca)
+                logger.info(f"G:maj mapping (using get_chord_idx): {g_maj_idx}")
+
             return True
-            
+
         except Exception as e:
             logger.error(f"Error analyzing label file {label_path}: {e}")
             return False

@@ -8,10 +8,11 @@ import librosa  # Add librosa import
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 from sortedcontainers import SortedList
+from collections import defaultdict  # Import defaultdict
 
 from modules.utils import logger
 from modules.utils.mir_eval_modules import audio_file_to_features
-from modules.utils.chords import Chords
+from modules.utils.chords import Chords, idx2voca_chord  # Import idx2voca_chord
 from modules.preProcessing.preprocess import Preprocess, FeatureTypes
 
 class CrossValidationDataset(Dataset):
@@ -246,338 +247,137 @@ class CrossValidationDataset(Dataset):
         # Log information
         logger.info(f"Fold {self.kfold}/{self.total_folds}: {'Training' if self.train else 'Validation'} set has {len(self.song_names)} songs and {len(self.paths)} instances")
 
-    def _process_audio_file(self, audio_path, label_path, cache_path, stretch_factor=1.0, shift_factor=0):
-        """Process an audio file to extract features and labels"""
-        # Generate features and chord labels
-        try:
-            # Get preprocessor
-            preprocessor = self._get_preprocessor()
-            
-            # Create chord class instance for parsing
-            chord_class = Chords()
-            
-            # Check if large vocabulary is enabled
-            large_voca = self.config.feature.get('large_voca', False)
-            
-            # Get chord info
-            if large_voca:
-                chord_info = chord_class.get_converted_chord_voca(label_path)
-            else:
-                chord_info = chord_class.get_converted_chord(label_path)
-            
-            # Load audio file
-            song_hz = self.config.mp3.get('song_hz', 22050)
-            original_wav, sr = librosa.load(audio_path, sr=song_hz)
-            
-            # Apply time stretching and pitch shifting
-            if stretch_factor != 1.0 or shift_factor != 0:
-                import pyrubberband as pyrb
-                x = pyrb.time_stretch(original_wav, sr, stretch_factor)
-                x = pyrb.pitch_shift(x, sr, shift_factor)
-            else:
-                x = original_wav
-            
-            # Adjust chord timestamps for time stretching
-            if stretch_factor != 1.0:
-                chord_info['start'] = chord_info['start'] * (1/stretch_factor)
-                chord_info['end'] = chord_info['end'] * (1/stretch_factor)
-            
-            # Get sequence parameters
-            inst_len = self.config.mp3.get('inst_len', 10.0)
-            hop_length = self.config.feature.get('hop_length', 2048)
-            time_interval = hop_length / song_hz
-            no_of_chord_datapoints_per_sequence = math.ceil(inst_len / time_interval)
-            
-            # Log info about time granularity
-            logger.debug(f"Audio file: {os.path.basename(audio_path)}")
-            logger.debug(f"Time interval between frames: {time_interval:.6f} seconds")
-            logger.debug(f"Number of frames per sequence: {no_of_chord_datapoints_per_sequence}")
-            
-            # Get audio information
-            last_sec = chord_info.iloc[-1]['end']
-            last_sec_hz = int(last_sec * song_hz)
-            
-            # Ensure audio is long enough
-            if len(x) < last_sec_hz:
-                logger.warning(f"Audio file {audio_path} is too short")
-                return None
-            
-            # Trim audio if needed
-            if len(x) > last_sec_hz:
-                x = x[:last_sec_hz]
-            
-            # Process audio in segments
-            origin_length_in_sec = last_sec_hz / song_hz
-            skip_interval = self.config.mp3.get('skip_interval', 5.0)
-            
-            results = []
-            current_start_second = 0
-            
-            # Added: Track stats for debugging
-            chord_stats = {"total_frames": 0, "n_chords": 0, "valid_chords": 0}
-            
-            while current_start_second + inst_len < origin_length_in_sec:
-                # Extract chord sequence for this segment
-                chord_list = []
-                curSec = current_start_second
-                
-                while curSec < current_start_second + inst_len:
-                    try:
-                        # FIXED: Better chord boundary handling - ensure every frame gets the correct chord
-                        
-                        # Step 1: First look for chords that strictly contain the current time point
-                        # A chord contains a time point if: start <= time < end
-                        exact_matches = chord_info.loc[(chord_info['start'] <= curSec) & 
-                                                     (chord_info['end'] > curSec)]
-                        
-                        if len(exact_matches) > 0:
-                            # Found exact match - use the first one if multiple
-                            chord = exact_matches['chord_id'].iloc[0]
-                            chord_stats["valid_chords"] += 1
-                        else:
-                            # Step 2: If no exact match, handle boundary cases
-                            
-                            # Get chords that end exactly at this time point (curSec == end)
-                            end_boundary_matches = chord_info.loc[chord_info['end'] == curSec]
-                            
-                            # Get chords that start exactly at this time point (curSec == start)
-                            start_boundary_matches = chord_info.loc[chord_info['start'] == curSec]
-                            
-                            if len(end_boundary_matches) > 0:
-                                # There's a chord ending exactly at this time - use it
-                                # (Preference given to the chord that just ended)
-                                chord = end_boundary_matches['chord_id'].iloc[0]
-                                chord_stats["valid_chords"] += 1
-                            elif len(start_boundary_matches) > 0:
-                                # There's a chord starting exactly at this time - use it
-                                chord = start_boundary_matches['chord_id'].iloc[0]
-                                chord_stats["valid_chords"] += 1
-                            else:
-                                # Step 3: If still no match, find the closest chord by distance
-                                # IMPROVED: Add a reasonable maximum distance threshold
-                                closest_chord = None
-                                min_distance = float('inf')
-                                max_distance_threshold = time_interval * 10  # 10 frames max distance
-                                
-                                for _, row in chord_info.iterrows():
-                                    # If curSec is before chord starts, distance is to start time
-                                    if curSec < row['start']:
-                                        distance = row['start'] - curSec
-                                    # If curSec is after chord ends, distance is to end time
-                                    elif curSec > row['end']:
-                                        distance = curSec - row['end']
-                                    else:
-                                        # Should be covered by exact match case, but just in case
-                                        distance = 0
-                                    
-                                    # Update closest chord if this one is closer
-                                    if distance < min_distance:
-                                        min_distance = distance
-                                        closest_chord = row
-                                
-                                # Only use closest chord if within reasonable distance
-                                if closest_chord is not None and min_distance <= max_distance_threshold:
-                                    chord = closest_chord['chord_id']
-                                    chord_stats["valid_chords"] += 1
-                                    
-                                    # Log if this chord is somewhat far away
-                                    if min_distance > time_interval and len(chord_list) % 100 == 0:
-                                        logger.debug(f"Using distant chord at {curSec}s, distance={min_distance:.3f}s")
-                                else:
-                                    # No chord found within reasonable distance, use no-chord class
-                                    chord = self.n_chord_id  # Use instance variable instead of hardcoded value
-                                    chord_stats["n_chords"] += 1
-                                    
-                                    if min_distance > max_distance_threshold and closest_chord is not None:
-                                        logger.debug(f"Distant chord rejected at {curSec}s, distance={min_distance:.3f}s > threshold {max_distance_threshold:.3f}s")
-                    
-                    except Exception as e:
-                        # Error handling for chord extraction
-                        chord = self.n_chord_id  # Use instance variable instead of hardcoded value
-                        chord_stats["n_chords"] += 1
-                        logger.warning(f"Error extracting chord at {curSec}s: {e}")
-                    
-                    # Handle pitch shifting for chord IDs
-                    if shift_factor != 0:
-                        if chord != self.n_chord_id and chord != self.x_chord_id and large_voca:
-                            chord += shift_factor * 14
-                            chord = chord % 168
-                        elif chord != self.n_chord_id and not large_voca:
-                            chord += shift_factor * 2
-                            chord = chord % 24
-                    
-                    chord_list.append(chord)
-                    chord_stats["total_frames"] += 1
-                    curSec += time_interval
-                
-                # Log chord stats for this segment
-                if len(results) == 0:  # Only log for first segment
-                    n_percent = (chord_stats["n_chords"] / chord_stats["total_frames"]) * 100 if chord_stats["total_frames"] > 0 else 0
-                    logger.debug(f"Chord stats for first segment: {chord_stats['valid_chords']} valid chords, "
-                               f"{chord_stats['n_chords']} N chords ({n_percent:.1f}%) out of {chord_stats['total_frames']} frames")
-                
-                # Check if we have the right number of chords
-                if len(chord_list) == no_of_chord_datapoints_per_sequence:
-                    # Extract audio segment
-                    sequence_start_time = current_start_second
-                    sequence_end_time = current_start_second + inst_len
-                    start_index = int(sequence_start_time * song_hz)
-                    end_index = int(sequence_end_time * song_hz)
-                    song_seq = x[start_index:end_index]
-                    
-                    # Extract CQT feature
-                    n_bins = self.config.feature.get('n_bins', 144)
-                    bins_per_octave = self.config.feature.get('bins_per_octave', 24)
-                    feature = librosa.cqt(
-                        song_seq, 
-                        sr=song_hz,
-                        n_bins=n_bins,
-                        bins_per_octave=bins_per_octave,
-                        hop_length=hop_length
-                    )
-                    
-                    # Ensure feature length matches chord sequence length
-                    if feature.shape[1] > no_of_chord_datapoints_per_sequence:
-                        feature = feature[:, :no_of_chord_datapoints_per_sequence]
-                    
-                    if feature.shape[1] != no_of_chord_datapoints_per_sequence:
-                        logger.warning(f"Feature length mismatch: {feature.shape[1]} != {no_of_chord_datapoints_per_sequence}")
-                        break
-                    
-                    # Create result dictionary
-                    etc = f"{current_start_second:.1f}_{current_start_second + inst_len:.1f}"
-                    aug = f"{stretch_factor:.2f}_{shift_factor}"
-                    result = {
-                        'feature': feature,
-                        'chord': chord_list,
-                        'etc': etc,
-                        'song_name': os.path.basename(audio_path)
-                    }
-                    
-                    # Save to cache
-                    cache_filename = f"{aug}_{len(results)}.pt"
-                    cache_filepath = os.path.join(cache_path, cache_filename)
-                    torch.save(result, cache_filepath)
-                    results.append(cache_filepath)
-                
-                # Move to next segment
-                current_start_second += skip_interval
-            
-            return results
-                    
-        except Exception as e:
-            logger.error(f"Error processing {audio_path}: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return None
+    def __len__(self):
+        """Return the total number of samples in the dataset."""
+        return len(self.paths)
 
-    def analyze_label_files(self, num_files=5):
+    def __getitem__(self, idx):
         """
-        Analyze the first few label files to understand their structure and content.
-        This helps identify issues with chord parsing.
+        Retrieve a sample by index. Loads pre-cached data or handles on-the-fly processing placeholder.
         """
-        logger.info(f"Analyzing the first {num_files} label files...")
-        
-        for idx, (audio_path, label_path) in enumerate(self.audio_label_pairs[:num_files]):
+        path_info = self.paths[idx]
+
+        if isinstance(path_info, str): # It's a path to a cached .pt file
+            file_path = path_info
             try:
-                logger.info(f"File {idx+1}: {os.path.basename(label_path)}")
-                
-                # Read raw content of label file
-                with open(label_path, 'r', encoding='utf-8', errors='replace') as f:
-                    content = f.read()
-                
-                # Count lines and show first few lines
-                lines = content.strip().split('\n')
-                logger.info(f"  Total lines: {len(lines)}")
-                logger.info(f"  First 3 lines: {lines[:3]}")
-                
-                # Parse with Chords class
-                large_voca = self.config.feature.get('large_voca', False)
-                chord_class = Chords()
-                
-                try:
-                    if large_voca:
-                        chord_info = chord_class.get_converted_chord_voca(label_path)
-                    else:
-                        chord_info = chord_class.get_converted_chord(label_path)
-                    
-                    logger.info(f"  Successfully parsed {len(chord_info)} chords")
-                    logger.info(f"  First few chords: {chord_info.iloc[:3]['chord_id'].tolist()}")
-                    logger.info(f"  Time range: {chord_info['start'].min():.2f} to {chord_info['end'].max():.2f} seconds")
-                    
-                    # Check for N chord frequency
-                    n_chord_id = 169 if large_voca else 24
-                    n_count = (chord_info['chord_id'] == n_chord_id).sum()
-                    logger.info(f"  'N' chords in file: {n_count}/{len(chord_info)} ({n_count/len(chord_info):.2%})")
-                    
-                except Exception as e:
-                    logger.error(f"  Error parsing with Chords class: {e}")
-            
+                # Load pre-cached data
+                data = torch.load(file_path, map_location='cpu') # Load to CPU first
+
+                # Ensure data has expected keys and convert to tensors
+                spectro = torch.tensor(data['feature'], dtype=torch.float32)
+                chord_idx = torch.tensor(data['chord'], dtype=torch.long)
+
+                # Return in the expected dictionary format
+                return {
+                    'spectro': spectro,
+                    'chord_idx': chord_idx,
+                    'song_id': data.get('song_name', Path(file_path).stem), # Extract song_id if available
+                    'start_frame': data.get('start_frame', 0) # Placeholder if not saved
+                }
+            except FileNotFoundError:
+                logger.error(f"Cached file not found: {file_path}")
+                # Return a dummy sample or raise error
+                return self._get_dummy_sample()
             except Exception as e:
-                logger.error(f"Error analyzing {label_path}: {e}")
-        
-        logger.info("Label file analysis complete")
+                logger.error(f"Error loading cached file {file_path}: {e}")
+                # Return a dummy sample or raise error
+                return self._get_dummy_sample()
+
+        elif isinstance(path_info, dict) and path_info.get('needs_processing'):
+            # Placeholder for on-the-fly processing
+            # This part needs implementation similar to LabeledDataset._extract_samples
+            # For now, log a warning and return a dummy sample
+            logger.warning(f"On-the-fly processing requested for {path_info.get('song_name')} but not fully implemented. Returning dummy sample.")
+            # TODO: Implement on-the-fly feature extraction and label processing here
+            # feature, feature_per_second, song_length_second = audio_file_to_features(...)
+            # chord_labels, timestamps = self._parse_label_file(...)
+            # frame_level_chords = self._chord_labels_to_frames(...)
+            # chord_indices = self._chord_names_to_indices(...)
+            # Create segments...
+            return self._get_dummy_sample(song_id=path_info.get('song_name', 'unknown_otf'))
+        else:
+            logger.error(f"Invalid path info at index {idx}: {path_info}")
+            return self._get_dummy_sample()
+
+    def _get_dummy_sample(self, song_id="dummy"):
+        """Returns a dummy sample to prevent crashes when loading fails."""
+        seq_len = self.config.training.get('seq_len', 10)
+        n_bins = self.config.feature.get('n_bins', 144)
+        dummy_spectro = torch.zeros((seq_len, n_bins), dtype=torch.float32)
+        dummy_chords = torch.full((seq_len,), self.n_chord_id, dtype=torch.long) # Use N chord index
+        return {
+            'spectro': dummy_spectro,
+            'chord_idx': dummy_chords,
+            'song_id': song_id,
+            'start_frame': 0
+        }
 
     def analyze_chord_distribution(self):
-        """
-        Analyze the distribution of chords in the dataset to identify potential imbalance issues.
-        This helps diagnose issues like excessive 'N' chord labeling.
-        """
-        logger.info("Analyzing chord distribution in the dataset...")
-        
-        # Initialize counters
-        chord_counts = {}
-        total_frames = 0
-        n_chord_frames = 0
-        large_voca = self.config.feature.get('large_voca', False)
-        
-        # Sample up to 100 files for analysis
-        sample_paths = self.paths[:min(100, len(self.paths))]
-        
-        # Process each file
-        for path in sample_paths:
+        """Analyze the distribution of chord qualities in the dataset."""
+        logger.info("Analyzing chord quality distribution...")
+        quality_counts = defaultdict(int)
+        total_chords = 0
+
+        # Get the index for 'N' chord
+        use_large_voca = self.config.feature.get('large_voca', False)
+        n_chord_idx = self.chord_mapping.get("N", 169 if use_large_voca else 24)
+        x_chord_idx = self.chord_mapping.get("X", 168 if use_large_voca else 25)  # Also get X index
+
+        # Create reverse mapping for quality lookup if needed
+        idx_to_chord_name = {v: k for k, v in self.chord_mapping.items()}
+        # Fallback using idx2voca_chord if direct mapping is sparse
+        if len(idx_to_chord_name) < (170 if use_large_voca else 25):
+            idx_to_chord_name = idx2voca_chord()
+
+        # Iterate through all chord indices in all samples
+        for path in self.paths:
             try:
                 # Skip if it's a dictionary (on-the-fly processing)
                 if isinstance(path, dict):
                     continue
-                    
+
                 # Load data from file
                 data = torch.load(path)
-                
+
                 # Count chord occurrences
-                for chord_id in data['chord']:
-                    chord_id = int(chord_id)  # Convert to int for consistent key type
-                    if chord_id not in chord_counts:
-                        chord_counts[chord_id] = 0
-                    chord_counts[chord_id] += 1
-                    total_frames += 1
-                    
-                    # Check if it's not an 'N' chord
-                    if chord_id != self.n_chord_id:
-                        n_chord_frames += 1
-                        
+                for idx in data['chord']:
+                    total_chords += 1
+                    # Explicitly check for N chord index
+                    if idx == n_chord_idx:
+                        quality_counts['No Chord'] += 1
+                    # Explicitly check for X chord index (often treated as 'Other' or ignored)
+                    elif idx == x_chord_idx:
+                        quality_counts['Other'] += 1  # Or handle as needed
+                    else:
+                        # Try to get chord name from index
+                        chord_name = idx_to_chord_name.get(idx)
+                        if chord_name:
+                            try:
+                                # Use chord_processor to get quality
+                                quality = Chords().get_quality(chord_name)
+                                quality_counts[quality or 'Other'] += 1
+                            except Exception:
+                                quality_counts['Other'] += 1  # Fallback if parsing fails
+                        else:
+                            # If index not in mapping (shouldn't happen often with initialized mapping)
+                            quality_counts['Other'] += 1
+
             except Exception as e:
                 logger.error(f"Error analyzing file {path}: {e}")
-        
-        # Calculate statistics
-        n_chord_percent = (n_chord_frames / total_frames * 100) if total_frames > 0 else 0
-        n_percent = ((total_frames - n_chord_frames) / total_frames * 100) if total_frames > 0 else 0
-        
-        logger.info(f"Analyzed {total_frames} frames from {len(sample_paths)} files")
-        logger.info(f"  Chord frames (non-N): {n_chord_frames} ({n_chord_percent:.2f}%)")
-        logger.info(f"  No-chord frames (N): {total_frames - n_chord_frames} ({n_percent:.2f}%)")
-        
-        # Sort and display chord distribution
-        if chord_counts:
-            sorted_counts = sorted(chord_counts.items(), key=lambda x: x[1], reverse=True)
-            logger.info("Top 10 chord IDs by frequency:")
-            for chord_id, count in sorted_counts[:10]:
-                percentage = (count / total_frames * 100) if total_frames > 0 else 0
-                logger.info(f"  Chord ID {chord_id}: {count} frames ({percentage:.2f}%)")
-        
+
+        if total_chords == 0:
+            logger.warning("No chords found in samples for distribution analysis.")
+            return
+
+        logger.info("Chord quality distribution:")
+        # Sort qualities for consistent output order (optional)
+        sorted_qualities = sorted(quality_counts.keys())
+        for quality in sorted_qualities:
+            count = quality_counts[quality]
+            percentage = (count / total_chords) * 100
+            logger.info(f"  {quality}: {count} samples ({percentage:.2f}%)")
+
         return {
-            'total_frames': total_frames,
-            'chord_frames': n_chord_frames,
-            'no_chord_frames': total_frames - n_chord_frames,
-            'chord_counts': chord_counts
+            'total_chords': total_chords,
+            'quality_counts': quality_counts
         }
