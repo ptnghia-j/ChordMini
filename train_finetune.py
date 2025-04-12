@@ -242,6 +242,12 @@ def main():
     parser.add_argument('--reset_scheduler', action='store_true',
                       help='Reset learning rate scheduler when loading pretrained model')
     
+    # Add parameters to handle model loading/saving
+    parser.add_argument('--force_num_classes', type=int, default=None,
+                        help='Force the model to use this number of output classes (e.g., 170 or 205)')
+    parser.add_argument('--partial_loading', action='store_true',
+                        help='Allow partial loading of output layer when model sizes differ')
+    
     args = parser.parse_args()
 
     # Load configuration from YAML first
@@ -506,14 +512,23 @@ def main():
         logger.error("Cannot proceed with training due to data loading issue.")
         return
     
+    # Determine the correct number of output classes
+    if args.force_num_classes is not None:
+        n_classes = args.force_num_classes
+        logger.info(f"Forcing model to use {n_classes} output classes as specified by --force_num_classes")
+    elif config.training.get('use_voca', False):
+        n_classes = 170  # Standard number for large vocabulary
+        logger.info(f"Using large vocabulary with {n_classes} output classes")
+    else:
+        n_classes = 25   # Standard number for small vocabulary (major/minor only)
+        logger.info(f"Using small vocabulary with {n_classes} output classes")
+    
     # Load pretrained model
     logger.info(f"\n=== Loading pretrained model from {args.pretrained} ===")
     try:
-        # Get frequency dimension and class count
+        # Get frequency dimension
         n_freq = getattr(config.feature, 'freq_bins', 144)
-        n_classes = len(chord_mapping)
         logger.info(f"Using frequency dimension: {n_freq}")
-        logger.info(f"Output classes: {n_classes}")
         
         # Apply model scale factor
         if model_scale != 1.0:
@@ -529,7 +544,7 @@ def main():
         # Create fresh model instance
         model = ChordNet(
             n_freq=n_freq,
-            n_classes=n_classes,
+            n_classes=n_classes,  # Use determined number of classes
             n_group=n_group,
             f_layer=config.model.get('base_config', {}).get('f_layer', 3),
             f_head=config.model.get('base_config', {}).get('f_head', 6),
@@ -547,16 +562,29 @@ def main():
         # Load pretrained weights
         checkpoint = torch.load(args.pretrained, map_location=device)
         
-        # Handle different checkpoint formats
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        elif 'model' in checkpoint:
-            model.load_state_dict(checkpoint['model'])
-        else:
-            # Try to load the state dict directly
-            model.load_state_dict(checkpoint)
+        # Check if the checkpoint contains model dimensions info
+        if 'n_classes' in checkpoint:
+            pretrained_classes = checkpoint['n_classes']
+            logger.info(f"Pretrained model has {pretrained_classes} output classes")
+            
+            # Warn if there's a mismatch
+            if pretrained_classes != n_classes:
+                logger.warning(f"Mismatch in class count: pretrained={pretrained_classes}, current={n_classes}")
+                
+                if not args.partial_loading:
+                    logger.warning("Loading may fail. Use --partial_loading to attempt partial weights loading.")
         
-        logger.info("Pretrained model loaded successfully")
+        # Extract the state dict
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        elif 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        else:
+            state_dict = checkpoint
+        
+        # Load weights with partial loading option
+        model.load_state_dict(state_dict, strict=not args.partial_loading)
+        logger.info("Successfully loaded pretrained weights")
         
         # Freeze feature extraction layers if requested
         if args.freeze_feature_extractor:

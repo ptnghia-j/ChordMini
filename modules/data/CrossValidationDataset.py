@@ -65,7 +65,21 @@ class CrossValidationDataset(Dataset):
             self.label_dirs = audio_dirs
         else:
             self.label_dirs = label_dirs
-            
+        
+        # Define audio_label_pairs list for analyze_label_files
+        self.audio_label_pairs = []
+        
+        # Get N and X chord IDs from chord_mapping if available (avoid hardcoding)
+        use_large_voca = self.config.feature.get('large_voca', False)
+        if self.chord_mapping:
+            self.n_chord_id = self.chord_mapping.get("N", 169 if use_large_voca else 24)
+            self.x_chord_id = self.chord_mapping.get("X", 168 if use_large_voca else 25)
+        else:
+            self.n_chord_id = 169 if use_large_voca else 24
+            self.x_chord_id = 168 if use_large_voca else 25
+        
+        logger.info(f"Using large_voca={use_large_voca}, N chord ID={self.n_chord_id}, X chord ID={self.x_chord_id}")
+        
         # Setup cache directory
         self.cache_dir = cache_dir
         if self.cache_dir:
@@ -136,6 +150,10 @@ class CrossValidationDataset(Dataset):
             # Use the preprocessor to find all matching audio/label files
             preprocessor = self._get_preprocessor()
             file_list = preprocessor.get_all_files()
+            
+            # Populate audio_label_pairs list for analyze_label_files
+            for song_name, lab_path, mp3_path, _ in file_list:
+                self.audio_label_pairs.append((mp3_path, lab_path))
             
             # Create a dictionary of paths for each song
             for song_name, lab_path, mp3_path, _ in file_list:
@@ -336,9 +354,10 @@ class CrossValidationDataset(Dataset):
                                 chord_stats["valid_chords"] += 1
                             else:
                                 # Step 3: If still no match, find the closest chord by distance
-                                # But without any minimum distance threshold
+                                # IMPROVED: Add a reasonable maximum distance threshold
                                 closest_chord = None
                                 min_distance = float('inf')
+                                max_distance_threshold = time_interval * 10  # 10 frames max distance
                                 
                                 for _, row in chord_info.iterrows():
                                     # If curSec is before chord starts, distance is to start time
@@ -356,32 +375,34 @@ class CrossValidationDataset(Dataset):
                                         min_distance = distance
                                         closest_chord = row
                                 
-                                # Always use the closest chord regardless of distance
-                                # Only fall back to "N" if no chords exist at all
-                                if closest_chord is not None:
+                                # Only use closest chord if within reasonable distance
+                                if closest_chord is not None and min_distance <= max_distance_threshold:
                                     chord = closest_chord['chord_id']
                                     chord_stats["valid_chords"] += 1
                                     
-                                    # Log if this chord is far away
+                                    # Log if this chord is somewhat far away
                                     if min_distance > time_interval and len(chord_list) % 100 == 0:
                                         logger.debug(f"Using distant chord at {curSec}s, distance={min_distance:.3f}s")
                                 else:
-                                    # No chord found at all, use no-chord class
-                                    chord = 169 if large_voca else 24
+                                    # No chord found within reasonable distance, use no-chord class
+                                    chord = self.n_chord_id  # Use instance variable instead of hardcoded value
                                     chord_stats["n_chords"] += 1
+                                    
+                                    if min_distance > max_distance_threshold and closest_chord is not None:
+                                        logger.debug(f"Distant chord rejected at {curSec}s, distance={min_distance:.3f}s > threshold {max_distance_threshold:.3f}s")
                     
                     except Exception as e:
                         # Error handling for chord extraction
-                        chord = 169 if large_voca else 24
+                        chord = self.n_chord_id  # Use instance variable instead of hardcoded value
                         chord_stats["n_chords"] += 1
                         logger.warning(f"Error extracting chord at {curSec}s: {e}")
                     
                     # Handle pitch shifting for chord IDs
                     if shift_factor != 0:
-                        if chord != 169 and chord != 168 and large_voca:
+                        if chord != self.n_chord_id and chord != self.x_chord_id and large_voca:
                             chord += shift_factor * 14
                             chord = chord % 168
-                        elif chord != 24 and not large_voca:
+                        elif chord != self.n_chord_id and not large_voca:
                             chord += shift_factor * 2
                             chord = chord % 24
                     
@@ -509,7 +530,6 @@ class CrossValidationDataset(Dataset):
         total_frames = 0
         n_chord_frames = 0
         large_voca = self.config.feature.get('large_voca', False)
-        n_chord_id = 169 if large_voca else 24
         
         # Sample up to 100 files for analysis
         sample_paths = self.paths[:min(100, len(self.paths))]
@@ -533,7 +553,7 @@ class CrossValidationDataset(Dataset):
                     total_frames += 1
                     
                     # Check if it's not an 'N' chord
-                    if chord_id != n_chord_id:
+                    if chord_id != self.n_chord_id:
                         n_chord_frames += 1
                         
             except Exception as e:

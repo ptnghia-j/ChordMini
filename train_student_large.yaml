@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-mini-large-03
+  name: chord-mini-large
   namespace: csuf-titans
   labels:
     app: chord-student-training
@@ -195,16 +195,16 @@ spec:
             - name: FOCAL_GAMMA
               value: "2.0"   # Focusing parameter for focal loss
             - name: FOCAL_ALPHA
-              value: "0.3"  # Class weight parameter for focal loss
+              value: "0.25"  # Class weight parameter for focal loss
             # Warmup settings
             - name: USE_WARMUP
               value: "true"  # Set to "true" to enable learning rate warm-up
             - name: WARMUP_START_LR
               value: "0.0001"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.0004"  # Final learning rate after warm-up
+              value: "0.001"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "4"  # Number of epochs for warm-up
+              value: "20"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
               value: "0.3"  # Set dropout probability (0-1)
@@ -239,7 +239,7 @@ spec:
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: "0.02"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: "0.05"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
           command:

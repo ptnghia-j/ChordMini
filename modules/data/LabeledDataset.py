@@ -277,6 +277,15 @@ class LabeledDataset(Dataset):
         label_duration = timestamps[-1][1]
         expected_frames = feature_shape[0]
         
+        # Verify if feature_per_second is actually a frame duration (common mistake)
+        if feature_per_second < 1.0:
+            # It's likely the frame duration was passed instead of frame rate
+            logger.warning(f"Detected frame duration ({feature_per_second:.5f}s) passed as frame rate")
+            # Convert from duration to rate
+            true_feature_per_second = 1.0 / feature_per_second
+            logger.info(f"Corrected frame rate: {true_feature_per_second:.2f} fps (was {feature_per_second:.2f})")
+            return true_feature_per_second, 1.0
+        
         # Check for massive mismatch in calculated duration
         if song_length_second > 1000:  # If calculated duration is >1000 seconds
             logger.warning(f"Calculated song duration of {song_length_second:.2f}s is suspiciously long")
@@ -358,6 +367,26 @@ class LabeledDataset(Dataset):
         # Initialize with "N" (no chord)
         frame_level_chords = ["N"] * num_frames
         
+        # NEW: Find reasonable label bounds to detect issues with timestamps
+        if timestamps:
+            min_time = min(start for start, _ in timestamps)
+            max_time = max(end for _, end in timestamps)
+            
+            # Check for negative start times or excessive end times
+            if min_time < 0:
+                logger.warning(f"Found negative start time ({min_time:.2f}s) in chord labels")
+                # Shift all timestamps to non-negative
+                if min_time < -0.01:  # Only fix if it's substantially negative
+                    shift = -min_time
+                    timestamps = [(start + shift, end + shift) for start, end in timestamps]
+                    logger.info(f"Shifted all timestamps by +{shift:.2f}s")
+            
+            # Check for extreme duration mismatch
+            expected_duration = audio_duration
+            if max_time > expected_duration * 2:
+                logger.warning(f"Label end time ({max_time:.2f}s) far exceeds audio duration ({expected_duration:.2f}s)")
+                # Do not auto-fix this case as it requires more careful handling
+        
         # Keep track of assigned and unassigned frames
         assigned_frames = 0
         
@@ -366,7 +395,8 @@ class LabeledDataset(Dataset):
         
         # First pass: Direct assignment with tolerance
         for i in range(num_frames):
-            # Calculate time for this frame center
+            # Calculate time for this frame center (THIS IS THE KEY CHANGE)
+            # Using the proper formula: frame_index * frame_duration + half_frame_duration
             frame_time = i * frame_duration + (frame_duration / 2)
             
             # Find chord that contains this time point
@@ -375,7 +405,7 @@ class LabeledDataset(Dataset):
                     frame_level_chords[i] = chord
                     assigned_frames += 1
                     break
-        
+
         # Log assignment statistics
         logger.info(f"Chord assignment: {assigned_frames}/{num_frames} frames assigned ({assigned_frames/num_frames:.1%})")
         
@@ -389,6 +419,7 @@ class LabeledDataset(Dataset):
             large_tolerance = frame_duration * 5  # 5x frame duration
             
             for i in range(num_frames):
+                # Ensure proper frame time calculation here too
                 frame_time = i * frame_duration + (frame_duration / 2)
                 
                 for chord, (start, end) in zip(chord_labels, timestamps):
@@ -404,7 +435,7 @@ class LabeledDataset(Dataset):
 
     def _chord_names_to_indices(self, chord_names):
         """
-        Convert chord names to indices using the Chords class's proven conversion method.
+        Convert chord names to indices using a more direct approach similar to SynthDataset.
         
         Args:
             chord_names: List of chord names
@@ -416,60 +447,100 @@ class LabeledDataset(Dataset):
             # If no mapping is provided, return raw chord names
             return chord_names
         
-        # Directly use the built-in chord mapping from chord_mapping dictionary first
+        # Create a simplified, direct mapping approach similar to SynthDataset
         indices = []
-        unknown_chords = set()
+        unknown_chords = {}  # Store chord -> count for better diagnostics
         use_large_voca = hasattr(self.feature_config, 'feature') and self.feature_config.feature.get('large_voca', False)
         
-        # First try direct mapping using the chord_mapping dictionary - fastest approach
+        # Get default values for N and X based on vocabulary size
+        n_chord_idx = self.chord_mapping.get("N", 169 if use_large_voca else 24)
+        x_chord_idx = self.chord_mapping.get("X", 168 if use_large_voca else 25)
+        
+        # Print diagnostic info for reference points
+        if not hasattr(self, '_chord_mapping_logged') and chord_names:
+            logger.info(f"Chord mapping info - total chords in mapping: {len(self.chord_mapping)}")
+            logger.info(f"N chord index: {n_chord_idx}, X chord index: {x_chord_idx}")
+            
+            # Print a sample of the mapping
+            sample_keys = list(self.chord_mapping.keys())[:10]  # First 10 keys
+            logger.info(f"Sample chord mapping: {[(k, self.chord_mapping[k]) for k in sample_keys]}")
+            self._chord_mapping_logged = True
+        
+        # First pass - direct mapping only
         for chord in chord_names:
             if chord in self.chord_mapping:
+                # Direct hit - use the mapping directly
                 indices.append(self.chord_mapping[chord])
-            elif chord == "N":
-                indices.append(self.chord_mapping.get("N", 169 if use_large_voca else 24))
-            elif chord == "X":
-                indices.append(self.chord_mapping.get("X", 168 if use_large_voca else 25))
+            elif chord == "N" or chord.lower() == "n":
+                # No chord - use N mapping
+                indices.append(n_chord_idx)
+            elif chord == "X" or chord.lower() == "x":
+                # Unknown chord - use X mapping
+                indices.append(x_chord_idx)
             else:
-                # For more complex chords, use the Chords processor
-                try:
-                    # First preprocess the chord using lab_file_error_modify if available
-                    if hasattr(self.chord_processor, 'lab_file_error_modify'):
-                        modified_chord = self.chord_processor.lab_file_error_modify([chord])[0]
-                    else:
-                        modified_chord = chord
-                    
-                    # Parse the chord components
-                    root, bass, intervals, is_major = self.chord_processor.chord(modified_chord)
-                    
-                    # Convert to index based on vocabulary size
-                    if use_large_voca:
-                        # Extract quality from chord name if it contains a colon
-                        quality = None
-                        if ':' in modified_chord:
-                            _, quality = modified_chord.split(':', 1)
-                            if '/' in quality:
-                                quality = quality.split('/', 1)[0]  # Remove bass note
-                        else:
-                            quality = 'maj'  # Default to major if no quality specified
-                        
-                        idx = self.chord_processor.convert_to_id_voca(root=root, quality=quality)
-                    else:
-                        # For standard vocabulary, use root and is_major
-                        idx = self.chord_processor.convert_to_id(root=root, is_major=is_major)
-                    
-                    indices.append(idx)
-                    
-                except Exception as e:
-                    # If conversion fails, use N as fallback
-                    unknown_chords.add(chord)
-                    indices.append(self.chord_mapping.get("N", 169 if use_large_voca else 24))
+                # Handle more complex chord names - first try normalizing
+                # 1. Try without any modification
+                indices.append(n_chord_idx)  # Default to N
+                
+                # Track unknown chords for diagnostics
+                if chord not in unknown_chords:
+                    unknown_chords[chord] = 0
+                unknown_chords[chord] += 1
         
-        # Log unknown chords
+        # Simplified second pass only if needed
         if unknown_chords:
-            if len(unknown_chords) < 20:
-                logger.warning(f"Unknown chords (mapped to N): {unknown_chords}")
-            else:
-                logger.warning(f"Many unknown chords ({len(unknown_chords)}) found, showing first 10: {list(unknown_chords)[:10]}")
+            # Only attempt more complex parsing if we have the Chords processor properly initialized
+            has_processor = hasattr(self, 'chord_processor') and hasattr(self.chord_processor, 'chord')
+            
+            if has_processor:
+                # Create a local cache for chord parsing to avoid repeated work
+                chord_cache = {}
+                
+                # Try to fix indices for unknown chords using a simpler approach
+                for i, chord in enumerate(chord_names):
+                    if chord in self.chord_mapping or chord in ["N", "X", "n", "x"]:
+                        continue  # Skip already mapped chords
+                    
+                    # Only process this chord if we haven't already cached a result
+                    if chord not in chord_cache:
+                        try:
+                            # Skip complex parsing and just normalize the chord name
+                            normalized_chord = chord
+                            
+                            # Simple normalization: remove any text in parentheses
+                            if "(" in normalized_chord:
+                                normalized_chord = normalized_chord.split("(")[0].strip()
+                            
+                            # Try direct mapping with normalized chord
+                            if normalized_chord in self.chord_mapping:
+                                chord_cache[chord] = self.chord_mapping[normalized_chord]
+                            else:
+                                # No direct mapping, leave as N
+                                chord_cache[chord] = n_chord_idx
+                        except Exception:
+                            # Any error, use N as fallback
+                            chord_cache[chord] = n_chord_idx
+                    
+                    # Apply the cached result
+                    if chord in chord_cache:
+                        indices[i] = chord_cache[chord]
+            
+            # Log unknown chord statistics - but not too verbose
+            total_unknown = sum(unknown_chords.values())
+            total_chords = len(chord_names)
+            
+            if total_unknown > 0:
+                unknown_percent = (total_unknown / total_chords) * 100
+                logger.warning(f"Unknown chords: {total_unknown}/{total_chords} ({unknown_percent:.1f}%)")
+                
+                # Only show details if there aren't too many unique unknown chords
+                if len(unknown_chords) <= 10:
+                    top_unknowns = sorted(unknown_chords.items(), key=lambda x: x[1], reverse=True)
+                    logger.warning(f"Most common unknown chords: {top_unknowns}")
+                else:
+                    # Show just the top few
+                    top_unknowns = sorted(unknown_chords.items(), key=lambda x: x[1], reverse=True)[:10]
+                    logger.warning(f"Top 10 unknown chords (of {len(unknown_chords)} total): {top_unknowns}")
         
         return indices
 
@@ -781,16 +852,32 @@ class LabeledDataset(Dataset):
                 if coverage < 90:
                     logger.warning(f"Low chord coverage ({coverage:.2f}%) may result in many N labels")
             
-            # Check for chord mapping issues
+            # Check chord mapping functionality
             mapped = self._chord_names_to_indices(chord_labels)
-            n_chord_id = 169 if self.feature_config.feature.get('large_voca', False) else 24
-            n_count = sum(1 for idx in mapped if idx == n_chord_id)
             
-            if n_count > 0:
-                logger.info(f"N chords in file: {n_count}/{len(mapped)} ({n_count/len(mapped):.2%})")
-                if n_count > 0.5 * len(mapped):
-                    logger.warning(f"HIGH NUMBER OF N CHORDS: Check mapping and chord format")
+            # Print mapping results with more detail
+            unique_chords = set(chord_labels)
+            unmapped = 0
+            unmapped_examples = []
             
+            for chord in unique_chords:
+                if not chord in self.chord_mapping and chord not in ["N", "X"]:
+                    unmapped += 1
+                    if len(unmapped_examples) < 10:
+                        unmapped_examples.append(chord)
+            
+            if unmapped > 0:
+                logger.warning(f"{unmapped}/{len(unique_chords)} unique chords could not be directly mapped")
+                logger.warning(f"Examples of unmapped chords: {unmapped_examples}")
+            else:
+                logger.info(f"All {len(unique_chords)} unique chords in this file map correctly")
+            
+            # NEW: Add detailed mapping validation for the first few chords
+            if chord_labels and mapped and len(chord_labels) == len(mapped):
+                logger.info("Chord mapping validation (first 5 chords):")
+                for i in range(min(5, len(chord_labels))):
+                    logger.info(f"  '{chord_labels[i]}' -> {mapped[i]}")
+                
         except Exception as e:
             logger.error(f"Error analyzing label file: {e}")
             import traceback

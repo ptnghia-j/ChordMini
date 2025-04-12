@@ -188,6 +188,9 @@ spec:
             # Data paths
             - name: DATA_ROOT
               value: "/mnt/storage/data"
+            # Model vocabulary size - crucial for matching pretrained model
+            - name: NUM_CHORDS
+              value: "170"  # Must match pretrained model's 170 chord classes
             # Fine-tuning specific settings
             - name: PRETRAINED_MODEL
               value: "/mnt/storage/checkpoints/student/student_model_best.pth"  # Path to pretrained model

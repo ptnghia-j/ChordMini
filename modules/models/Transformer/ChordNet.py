@@ -120,8 +120,12 @@ class ChordNet(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
         # Use the correct feature dimension for the output linear layer
+        self.n_classes = n_classes  # Store the number of classes for debugging and loading
         self.fc = nn.Linear(actual_feature_dim, n_classes)
         self.ignore_index = ignore_index
+        
+        # Dictionary to map indices to chord names - useful for evaluation
+        self.idx_to_chord = kwargs.get('idx_to_chord', None)
 
     def forward(self, x, targets=None, weight=None):
         # For SynthDataset, input is [batch_size, time_steps, freq_bins]
@@ -252,6 +256,67 @@ class ChordNet(nn.Module):
     def predict_frames(self, x):
         """Alias for predict(x, per_frame=True)"""
         return self.predict(x, per_frame=True)
+
+    def load_state_dict(self, state_dict, strict=True, partial_output_layer=False):
+        """
+        Custom state_dict loader that can handle output layer size mismatches
+        
+        Args:
+            state_dict: The state dictionary to load
+            strict: Whether to enforce exact matches (default: True)
+            partial_output_layer: Whether to allow partial loading of output layer (default: False)
+                                 when model sizes differ
+        """
+        # Check if output layer dimensions match
+        if 'fc.weight' in state_dict and hasattr(self, 'fc'):
+            pretrained_classes = state_dict['fc.weight'].size(0)
+            current_classes = self.fc.weight.size(0)
+            
+            if pretrained_classes != current_classes:
+                warnings.warn(f"Output layer mismatch: pretrained={pretrained_classes} classes, "
+                              f"current={current_classes} classes")
+                
+                if partial_output_layer:
+                    warnings.warn("Attempting partial loading of output layer...")
+                    # Common case: larger model loading smaller pretrained weights
+                    if current_classes > pretrained_classes:
+                        # Create a new weight tensor with correct dimensions
+                        new_weight = torch.zeros_like(self.fc.weight)
+                        new_bias = torch.zeros_like(self.fc.bias)
+                        
+                        # Copy the available weights
+                        new_weight[:pretrained_classes, :] = state_dict['fc.weight']
+                        new_bias[:pretrained_classes] = state_dict['fc.bias']
+                        
+                        # Update the state dict
+                        state_dict['fc.weight'] = new_weight
+                        state_dict['fc.bias'] = new_bias
+                        
+                        warnings.warn(f"Loaded first {pretrained_classes} classes, "
+                                     f"initialized remaining {current_classes-pretrained_classes} classes to zero")
+                    
+                    # Less common: smaller model loading larger pretrained weights
+                    elif current_classes < pretrained_classes:
+                        # Truncate the weights
+                        state_dict['fc.weight'] = state_dict['fc.weight'][:current_classes, :]
+                        state_dict['fc.bias'] = state_dict['fc.bias'][:current_classes]
+                        
+                        warnings.warn(f"Truncated pretrained weights from {pretrained_classes} to {current_classes} classes")
+        
+        # Call the parent implementation
+        return super().load_state_dict(state_dict, strict)
+    
+    def set_chord_mapping(self, chord_mapping):
+        """Set chord mapping for evaluation purposes"""
+        from modules.utils.chords import idx2voca_chord
+        
+        if chord_mapping:
+            self.chord_mapping = chord_mapping
+            # Create reverse mapping for evaluation
+            self.idx_to_chord = {v: k for k, v in chord_mapping.items()}
+        else:
+            # Fall back to default mapping
+            self.idx_to_chord = idx2voca_chord()
 
 
 if __name__ == '__main__':
