@@ -22,6 +22,7 @@ from modules.utils import logger
 from modules.utils.hparams import HParams
 from modules.utils.chords import idx2voca_chord, Chords
 from modules.training.Tester import Tester
+from modules.utils.teacher_utils import load_btc_model, extract_logits_from_teacher
 
 def count_files_in_subdirectories(directory, file_pattern):
     """Count files in a directory and all its subdirectories matching a pattern."""
@@ -614,6 +615,38 @@ def main():
         logger.error(traceback.format_exc())
         return
     
+    # Load teacher model if provided
+    teacher_model = None
+    teacher_mean = None
+    teacher_std = None
+    
+    if args.teacher_model:
+        logger.info(f"\n=== Loading teacher model from {args.teacher_model} ===")
+        try:
+            # Determine vocabulary size based on args and config
+            use_voca = args.use_voca or config.feature.get('large_voca', False)
+            
+            # Load the teacher model
+            teacher_model, teacher_mean, teacher_std = load_btc_model(
+                args.teacher_model, 
+                device, 
+                use_voca=use_voca
+            )
+            logger.info("Teacher model loaded successfully for knowledge distillation")
+            
+            # If we don't have explicit KD loss but loaded a teacher, enable it
+            if not use_kd:
+                use_kd = True
+                logger.info("Automatically enabling knowledge distillation with loaded teacher model")
+                kd_alpha = args.kd_alpha or config.training.get('kd_alpha', 0.5)
+                temperature = args.temperature or config.training.get('temperature', 1.0)
+                logger.info(f"Using KD alpha: {kd_alpha}, temperature: {temperature}")
+            
+        except Exception as e:
+            logger.error(f"Error loading teacher model: {e}")
+            logger.error(traceback.format_exc())
+            teacher_model = None
+    
     # Create optimizer - only optimize unfrozen parameters
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -698,6 +731,8 @@ def main():
         use_kd_loss=use_kd,
         kd_alpha=kd_alpha,
         temperature=temperature,
+        teacher_model=teacher_model,
+        teacher_normalization={'mean': teacher_mean, 'std': teacher_std}
     )
     
     # Attach chord processor to trainer
@@ -707,6 +742,27 @@ def main():
     logger.info(f"\n=== Starting fine-tuning ===")
     try:
         logger.info("Preparing data (this may take a while for large datasets)...")
+        
+        # If using teacher model but not within trainer, pre-compute logits
+        if teacher_model is not None and use_kd and not trainer.teacher_model:
+            logger.info("Pre-computing teacher logits for knowledge distillation...")
+            logits_dir = os.path.join(checkpoints_dir, "teacher_logits")
+            os.makedirs(logits_dir, exist_ok=True)
+            
+            from modules.utils.teacher_utils import generate_teacher_predictions
+            teacher_preds = generate_teacher_predictions(
+                teacher_model, 
+                train_loader, 
+                teacher_mean, 
+                teacher_std,
+                device,
+                save_dir=logits_dir
+            )
+            logger.info(f"Generated teacher predictions for {len(teacher_preds)} samples")
+            
+            # Set the predictions in the trainer
+            trainer.teacher_predictions = teacher_preds
+        
         trainer.train(train_loader, val_loader)
         logger.info("Fine-tuning completed successfully!")
     except KeyboardInterrupt:
@@ -755,7 +811,7 @@ def main():
     
     # Save the final model
     try:
-        save_path = os.path.join(checkpoints_dir, "finetune_model_final.pth")
+        save_path = os.path.join(checkpoints_dir, "student_model_final.pth")
         torch.save({
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -767,6 +823,80 @@ def main():
         logger.info(f"Final model saved to {save_path}")
     except Exception as e:
         logger.error(f"Error saving final model: {e}")
+    
+    # Advanced MIR Evaluation on validation set
+    logger.info("\n=== Advanced MIR Evaluation ===")
+    try:
+        # Make sure we're using the best model
+        if trainer.load_best_model():
+            score_metrics = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
+            
+            # Get validation dataset
+            val_dataset = val_loader.dataset
+            dataset_length = len(val_dataset)
+            
+            if dataset_length < 3:
+                logger.info("Not enough validation samples to compute chord metrics.")
+            else:
+                # Create balanced splits
+                split = dataset_length // 3
+                valid_dataset1 = val_dataset[:split]
+                valid_dataset2 = val_dataset[split:2*split]
+                valid_dataset3 = val_dataset[2*split:]
+                
+                # Evaluate each split
+                logger.info(f"Evaluating model on {len(valid_dataset1)} samples in split 1...")
+                score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
+                    valid_dataset=valid_dataset1, config=config, model=model, model_type='ChordNet', 
+                    mean=mean, std=std, device=device)
+                
+                logger.info(f"Evaluating model on {len(valid_dataset2)} samples in split 2...")
+                score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
+                    valid_dataset=valid_dataset2, config=config, model=model, model_type='ChordNet', 
+                    mean=mean, std=std, device=device)
+                
+                logger.info(f"Evaluating model on {len(valid_dataset3)} samples in split 3...")
+                score_list_dict3, song_length_list3, average_score_dict3 = large_voca_score_calculation(
+                    valid_dataset=valid_dataset3, config=config, model=model, model_type='ChordNet', 
+                    mean=mean, std=std, device=device)
+                
+                # Calculate weighted averages
+                mir_eval_results = {}
+                for m in score_metrics:
+                    if song_length_list1 and song_length_list2 and song_length_list3:
+                        # Calculate weighted average based on song lengths
+                        avg = (np.sum(song_length_list1) * average_score_dict1[m] +
+                               np.sum(song_length_list2) * average_score_dict2[m] +
+                               np.sum(song_length_list3) * average_score_dict3[m]) / (
+                               np.sum(song_length_list1) + np.sum(song_length_list2) + np.sum(song_length_list3))
+                        
+                        # Log individual split scores
+                        logger.info(f"==== {m} score 1: {average_score_dict1[m]:.4f}")
+                        logger.info(f"==== {m} score 2: {average_score_dict2[m]:.4f}")
+                        logger.info(f"==== {m} score 3: {average_score_dict3[m]:.4f}")
+                        logger.info(f"==== {m} weighted average: {avg:.4f}")
+                        
+                        # Store in results dictionary
+                        mir_eval_results[m] = {
+                            'split1': float(average_score_dict1[m]),
+                            'split2': float(average_score_dict2[m]),
+                            'split3': float(average_score_dict3[m]),
+                            'weighted_avg': float(avg)
+                        }
+                    else:
+                        logger.info(f"==== {m} scores couldn't be calculated properly")
+                        mir_eval_results[m] = {'error': 'Calculation failed'}
+                
+                # Save MIR-eval metrics
+                mir_eval_path = os.path.join(checkpoints_dir, "mir_eval_metrics.json")
+                with open(mir_eval_path, 'w') as f:
+                    json.dump(mir_eval_results, f, indent=2)
+                logger.info(f"MIR evaluation metrics saved to {mir_eval_path}")
+        else:
+            logger.warning("Could not load best model for MIR evaluation")
+    except Exception as e:
+        logger.error(f"Error during MIR evaluation: {e}")
+        logger.error(traceback.format_exc())
     
     logger.info("Fine-tuning and evaluation complete!")
 

@@ -336,7 +336,7 @@ spec:
                 echo "Starting fine-tuning with all options..."
                 python train_finetune.py --config ./config/student_config.yaml \
                   --pretrained ${PRETRAINED_MODEL} \
-                  --use_voca
+                  --use_voca \
                   --save_dir ${SAVE_DIR} \
                   --audio_dirs ${AUDIO_DIRS} \
                   --label_dirs ${LABEL_DIRS} \

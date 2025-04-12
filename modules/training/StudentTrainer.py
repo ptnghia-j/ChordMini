@@ -216,7 +216,8 @@ class StudentTrainer(BaseTrainer):
                  lr_decay_factor=0.95, min_lr=5e-6, 
                  use_warmup=False, warmup_epochs=5, warmup_start_lr=None, warmup_end_lr=None,
                  lr_schedule_type=None, use_focal_loss=False, focal_gamma=2.0, focal_alpha=None,
-                 use_kd_loss=False, kd_alpha=0.5, temperature=1.0):
+                 use_kd_loss=False, kd_alpha=0.5, temperature=1.0,
+                 teacher_model=None, teacher_normalization=None, teacher_predictions=None):
         
         # First call the parent's __init__ to set up the logger and other attributes
         super().__init__(model, optimizer, scheduler, device, num_epochs,
@@ -328,6 +329,154 @@ class StudentTrainer(BaseTrainer):
         
         # Add flag to track and debug scheduler stepping
         self._scheduler_step_count = 0
+        
+        # Teacher model support for knowledge distillation
+        self.teacher_model = teacher_model
+        self.teacher_normalization = teacher_normalization or {'mean': 0.0, 'std': 1.0}
+        self.teacher_predictions = teacher_predictions or {}
+
+    def train_batch(self, batch):
+        """Train on a single batch."""
+        self.model.train()
+        self.optimizer.zero_grad()
+        
+        # Get input and target
+        spectro = batch['spectro'].to(self.device)
+        targets = batch['chord_idx'].to(self.device)
+        
+        # Normalize input
+        if self.normalization:
+            spectro = (spectro - self.normalization['mean']) / self.normalization['std']
+        
+        # Forward pass
+        outputs = self.model(spectro)
+        
+        # Handle case where outputs is a tuple (logits, encoder_output)
+        if isinstance(outputs, tuple):
+            logits = outputs[0]
+        else:
+            logits = outputs
+            
+        # Calculate standard loss (cross-entropy or focal)
+        if self.use_focal_loss:
+            standard_loss = self.focal_loss(logits, targets)
+        else:
+            standard_loss = self.loss_fn(logits, targets)
+        
+        # Calculate knowledge distillation loss if enabled
+        kd_loss = torch.tensor(0.0, device=self.device)
+        if self.use_kd_loss:
+            # Check if teacher_model is available for on-the-fly logits
+            if self.teacher_model is not None:
+                with torch.no_grad():
+                    # Extract logits from teacher model
+                    teacher_logits = extract_logits_from_teacher(
+                        self.teacher_model,
+                        spectro,
+                        self.teacher_normalization['mean'],
+                        self.teacher_normalization['std'],
+                        self.device
+                    )
+            else:
+                # Look for pre-computed logits in teacher_predictions
+                teacher_logits = None
+                if 'song_id' in batch and self.teacher_predictions:
+                    # Create a batch of teacher logits
+                    batch_teacher_logits = []
+                    for sample_idx, song_id in enumerate(batch['song_id']):
+                        # Create a unique key that includes song_id and possibly start_frame
+                        key = song_id
+                        if 'start_frame' in batch:
+                            key = f"{song_id}_{batch['start_frame'][sample_idx].item()}"
+                        
+                        if key in self.teacher_predictions:
+                            batch_teacher_logits.append(self.teacher_predictions[key])
+                        else:
+                            # If no predictions available, use a placeholder (zeros)
+                            batch_teacher_logits.append(torch.zeros_like(logits[sample_idx]))
+                    
+                    if batch_teacher_logits:
+                        teacher_logits = torch.stack(batch_teacher_logits, dim=0).to(self.device)
+                        
+                # If we still don't have teacher logits, check if they're in the batch
+                if teacher_logits is None and 'teacher_logits' in batch:
+                    teacher_logits = batch['teacher_logits'].to(self.device)
+            
+            # If we have teacher logits, compute KD loss
+            if teacher_logits is not None:
+                # Handle dimensionality issues
+                if teacher_logits.shape != logits.shape:
+                    warning(f"Teacher logits shape {teacher_logits.shape} doesn't match student logits shape {logits.shape}")
+                    
+                    # Try basic reshaping if dimensionality is close
+                    if teacher_logits.dim() == logits.dim():
+                        # Just take the first part of the larger tensor
+                        if teacher_logits.shape[1] > logits.shape[1]:
+                            teacher_logits = teacher_logits[:, :logits.shape[1], :]
+                        elif teacher_logits.shape[1] < logits.shape[1]:
+                            # Pad with zeros
+                            pad_size = logits.shape[1] - teacher_logits.shape[1]
+                            padding = torch.zeros(teacher_logits.shape[0], pad_size, teacher_logits.shape[2], 
+                                                 device=self.device)
+                            teacher_logits = torch.cat([teacher_logits, padding], dim=1)
+                
+                # Compute KD loss
+                kd_loss = self.knowledge_distillation_loss(
+                    logits, teacher_logits, self.temperature
+                )
+        
+        # Combine losses
+        if self.use_kd_loss and kd_loss.item() != 0.0:
+            # Use combination of KD and standard loss
+            loss = self.kd_alpha * kd_loss + (1 - self.kd_alpha) * standard_loss
+        else:
+            # Use only standard loss
+            loss = standard_loss
+        
+        # Backward pass and optimizer step
+        loss.backward()
+        self.optimizer.step()
+        
+        # Get predicted classes
+        _, predicted = torch.max(logits, 1)
+        
+        # Calculate accuracy
+        correct = (predicted == targets).sum().item()
+        total = targets.size(0)
+        
+        return {
+            'loss': loss.item(),
+            'standard_loss': standard_loss.item(),
+            'kd_loss': kd_loss.item() if self.use_kd_loss else 0.0,
+            'accuracy': correct / total
+        }
+
+    def knowledge_distillation_loss(self, student_logits, teacher_logits, temperature):
+        """
+        Calculate knowledge distillation loss.
+        
+        Args:
+            student_logits: Logits from student model
+            teacher_logits: Logits from teacher model
+            temperature: Temperature for softening distributions
+            
+        Returns:
+            KD loss
+        """
+        # Ensure teacher and student logits have the same shape
+        if student_logits.shape != teacher_logits.shape:
+            warning(f"Shape mismatch in KD loss: student {student_logits.shape}, teacher {teacher_logits.shape}")
+            return torch.tensor(0.0, device=self.device)
+        
+        # Apply temperature scaling
+        soft_targets = torch.nn.functional.softmax(teacher_logits / temperature, dim=-1)
+        log_probs = torch.nn.functional.log_softmax(student_logits / temperature, dim=-1)
+        
+        # Calculate KL divergence loss
+        loss = -(soft_targets * log_probs).sum(dim=-1).mean()
+        
+        # Apply temperature^2 scaling to match the gradient scale
+        return loss * (temperature ** 2)
 
     def _create_smooth_scheduler(self):
         """Create a smooth learning rate scheduler that works with warmup."""
@@ -1446,7 +1595,6 @@ class StudentTrainer(BaseTrainer):
         else:
             info("No best model found to load.")
             return False
-
 
     def _plot_loss_history(self):
         """Plot and save the loss history."""
