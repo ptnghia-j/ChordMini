@@ -51,6 +51,10 @@ class CrossValidationDataset(Dataset):
         
         # Initialize preprocessor to None here, before it's first accessed
         self._preprocessor = None
+
+        # Determine and store use_large_voca consistently
+        self.use_large_voca = self.config.feature.get('large_voca', False)
+        logger.info(f"Dataset initialized with use_large_voca = {self.use_large_voca}")
         
         # Setup audio and label directories
         if audio_dirs is None:
@@ -70,16 +74,15 @@ class CrossValidationDataset(Dataset):
         # Define audio_label_pairs list for analyze_label_files
         self.audio_label_pairs = []
         
-        # Get N and X chord IDs from chord_mapping if available (avoid hardcoding)
-        use_large_voca = self.config.feature.get('large_voca', False)
+        # Get N and X chord IDs based on the stored use_large_voca flag
         if self.chord_mapping:
-            self.n_chord_id = self.chord_mapping.get("N", 169 if use_large_voca else 24)
-            self.x_chord_id = self.chord_mapping.get("X", 168 if use_large_voca else 25)
+            self.n_chord_id = self.chord_mapping.get("N", 169 if self.use_large_voca else 24)
+            self.x_chord_id = self.chord_mapping.get("X", 168 if self.use_large_voca else 25)
         else:
-            self.n_chord_id = 169 if use_large_voca else 24
-            self.x_chord_id = 168 if use_large_voca else 25
+            self.n_chord_id = 169 if self.use_large_voca else 24
+            self.x_chord_id = 168 if self.use_large_voca else 25
         
-        logger.info(f"Using large_voca={use_large_voca}, N chord ID={self.n_chord_id}, X chord ID={self.x_chord_id}")
+        logger.info(f"Using N chord ID={self.n_chord_id}, X chord ID={self.x_chord_id}")
         
         # Setup cache directory
         self.cache_dir = cache_dir
@@ -318,48 +321,41 @@ class CrossValidationDataset(Dataset):
         quality_counts = defaultdict(int)
         total_chords = 0
 
-        # Get the index for 'N' chord
-        use_large_voca = self.config.feature.get('large_voca', False)
-        n_chord_idx = self.chord_mapping.get("N", 169 if use_large_voca else 24)
-        x_chord_idx = self.chord_mapping.get("X", 168 if use_large_voca else 25)  # Also get X index
+        # Use the stored N and X chord indices
+        n_chord_idx = self.n_chord_id
+        x_chord_idx = self.x_chord_id
 
         # Create reverse mapping for quality lookup if needed
-        idx_to_chord_name = {v: k for k, v in self.chord_mapping.items()}
-        # Fallback using idx2voca_chord if direct mapping is sparse
-        if len(idx_to_chord_name) < (170 if use_large_voca else 25):
-            idx_to_chord_name = idx2voca_chord()
+        idx_to_chord_name = idx2voca_chord()
+        expected_size = 170 if self.use_large_voca else 26
+        if len(idx_to_chord_name) < expected_size - 5:
+            logger.warning(f"idx_to_chord_name map size ({len(idx_to_chord_name)}) seems small for use_large_voca={self.use_large_voca}. Quality analysis might be inaccurate.")
+            if self.chord_mapping:
+                idx_to_chord_name = {v: k for k, v in self.chord_mapping.items()}
 
         # Iterate through all chord indices in all samples
         for path in self.paths:
             try:
-                # Skip if it's a dictionary (on-the-fly processing)
                 if isinstance(path, dict):
                     continue
 
-                # Load data from file
                 data = torch.load(path)
 
-                # Count chord occurrences
                 for idx in data['chord']:
                     total_chords += 1
-                    # Explicitly check for N chord index
                     if idx == n_chord_idx:
                         quality_counts['No Chord'] += 1
-                    # Explicitly check for X chord index (often treated as 'Other' or ignored)
                     elif idx == x_chord_idx:
-                        quality_counts['Other'] += 1  # Or handle as needed
+                        quality_counts['Other'] += 1
                     else:
-                        # Try to get chord name from index
                         chord_name = idx_to_chord_name.get(idx)
                         if chord_name:
                             try:
-                                # Use chord_processor to get quality
                                 quality = Chords().get_quality(chord_name)
                                 quality_counts[quality or 'Other'] += 1
                             except Exception:
-                                quality_counts['Other'] += 1  # Fallback if parsing fails
+                                quality_counts['Other'] += 1
                         else:
-                            # If index not in mapping (shouldn't happen often with initialized mapping)
                             quality_counts['Other'] += 1
 
             except Exception as e:
@@ -370,7 +366,6 @@ class CrossValidationDataset(Dataset):
             return
 
         logger.info("Chord quality distribution:")
-        # Sort qualities for consistent output order (optional)
         sorted_qualities = sorted(quality_counts.keys())
         for quality in sorted_qualities:
             count = quality_counts[quality]

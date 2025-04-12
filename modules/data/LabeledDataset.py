@@ -159,6 +159,10 @@ class LabeledDataset(Dataset):
         # Convert to ConfigDict for dual access patterns
         self.feature_config = ConfigDict(raw_config)
         
+        # Determine and store use_large_voca consistently
+        self.use_large_voca = self.feature_config.feature.get('large_voca', False)
+        logger.info(f"Dataset initialized with use_large_voca = {self.use_large_voca}")
+
         self.device = device
         
         # Create cache directory if needed
@@ -174,7 +178,9 @@ class LabeledDataset(Dataset):
         self.chord_processor = Chords()
         if chord_mapping:
             self.chord_processor.set_chord_mapping(chord_mapping)
-        self.chord_mapping = chord_mapping
+            # Initialize mapping considering the vocabulary size
+            self.chord_processor.initialize_chord_mapping()
+        self.chord_mapping = self.chord_processor.chord_mapping  # Use the potentially extended mapping
         
         # Find all matched audio and label files
         logger.info("Finding audio and label files...")
@@ -302,12 +308,12 @@ class LabeledDataset(Dataset):
             # Check chord index mapping using the processor's method
             unknown_count = 0
             unmapped_chords_counter = Counter() # Use Counter for efficiency
-            use_large_voca = hasattr(self.feature_config, 'feature') and self.feature_config.feature.get('large_voca', False)
-            x_chord_idx = 168 if use_large_voca else 25 # Unknown chord index
+            # Use the stored instance attribute for consistency
+            x_chord_idx = 168 if self.use_large_voca else 25 # Unknown chord index
 
             for chord in chord_labels:
-                # Use the same method as in _chord_names_to_indices
-                idx = self.chord_processor.get_chord_idx(chord, use_large_voca)
+                # Use the same method as in _chord_names_to_indices, passing the instance attribute
+                idx = self.chord_processor.get_chord_idx(chord, self.use_large_voca)
                 if idx == x_chord_idx and chord != "X": # Check if it mapped to unknown
                     unknown_count += 1
                     unmapped_chords_counter[chord] += 1
@@ -317,22 +323,22 @@ class LabeledDataset(Dataset):
                 logger.error(f"Most common unknown chords: {unmapped_chords_counter.most_common(10)}")
 
                 unique_chords = set(chord_labels)
-                # Re-check unique unmapped using the processor method
-                unmapped_unique = [c for c in unique_chords if self.chord_processor.get_chord_idx(c, use_large_voca) == x_chord_idx and c != "X"]
+                # Re-check unique unmapped using the processor method and instance attribute
+                unmapped_unique = [c for c in unique_chords if self.chord_processor.get_chord_idx(c, self.use_large_voca) == x_chord_idx and c != "X"]
                 logger.error(f"{len(unmapped_unique)}/{len(unique_chords)} unique chords could not be mapped by get_chord_idx")
                 logger.error(f"Examples of unmapped chords: {unmapped_unique[:10]}")
             else:
                  logger.info("All chords successfully mapped by get_chord_idx.")
 
-            # Validate chord mapping on first few chords using the processor's method
+            # Validate chord mapping on first few chords using the processor's method and instance attribute
             logger.info("Chord mapping validation (first 5 chords using get_chord_idx):")
             for i, chord in enumerate(chord_labels[:5]):
-                idx = self.chord_processor.get_chord_idx(chord, use_large_voca) # Use processor method
+                idx = self.chord_processor.get_chord_idx(chord, self.use_large_voca) # Use instance attribute
                 logger.info(f"  '{chord}' -> {idx}")
 
-            # Check specifically for G:maj mapping using the processor's method
+            # Check specifically for G:maj mapping using the processor's method and instance attribute
             if "G:maj" in chord_labels:
-                g_maj_idx = self.chord_processor.get_chord_idx("G:maj", use_large_voca)
+                g_maj_idx = self.chord_processor.get_chord_idx("G:maj", self.use_large_voca) # Use instance attribute
                 logger.info(f"G:maj mapping (using get_chord_idx): {g_maj_idx}")
 
             return True
@@ -453,7 +459,7 @@ class LabeledDataset(Dataset):
         
         # NEW: Find reasonable label bounds to detect issues with timestamps
         if timestamps:
-            min_time = min(start for start, _ in timestamps)
+            min_time = min(start for start in timestamps)
             max_time = max(end for _, end in timestamps)
             
             # Check for negative start times or excessive end times
@@ -533,25 +539,24 @@ class LabeledDataset(Dataset):
 
         indices = []
         unknown_chords = Counter() # Use Counter for efficient counting
-        use_large_voca = hasattr(self.feature_config, 'feature') and self.feature_config.feature.get('large_voca', False)
 
-        # Get N and X indices once
-        n_chord_idx = self.chord_mapping.get("N", 169 if use_large_voca else 24)
-        x_chord_idx = self.chord_mapping.get("X", 168 if use_large_voca else 25)
+        # Get N and X indices once using the instance attribute
+        n_chord_idx = self.chord_mapping.get("N", 169 if self.use_large_voca else 24)
+        x_chord_idx = self.chord_mapping.get("X", 168 if self.use_large_voca else 25)
 
         # Log mapping info once for diagnostics
         if not hasattr(self, '_chord_mapping_logged') and chord_names:
             logger.info(f"Chord mapping info - total chords in mapping: {len(self.chord_mapping)}")
-            logger.info(f"N chord index: {n_chord_idx}, X chord index: {x_chord_idx}")
+            logger.info(f"N chord index: {n_chord_idx}, X chord index: {x_chord_idx} (use_large_voca={self.use_large_voca})") # Log flag value
             # Print a sample of the mapping
             sample_keys = list(self.chord_mapping.keys())[:10]
             logger.info(f"Sample chord mapping: {[(k, self.chord_mapping[k]) for k in sample_keys]}")
             self._chord_mapping_logged = True
 
-        # Process each chord using the processor's lookup method
+        # Process each chord using the processor's lookup method and instance attribute
         for chord in chord_names:
             # Use the get_chord_idx method which handles N, X, normalization, simplification, and enharmonics
-            idx = self.chord_processor.get_chord_idx(chord, use_large_voca)
+            idx = self.chord_processor.get_chord_idx(chord, self.use_large_voca) # Use instance attribute
             indices.append(idx)
 
             # Track if the result was the unknown index
