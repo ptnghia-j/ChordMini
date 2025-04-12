@@ -8,6 +8,7 @@ from pathlib import Path
 from torch.utils.data import Dataset, DataLoader, Subset
 import traceback
 from types import SimpleNamespace
+from collections import Counter
 
 from modules.utils import logger
 from modules.utils.mir_eval_modules import audio_file_to_features
@@ -510,113 +511,56 @@ class LabeledDataset(Dataset):
 
     def _chord_names_to_indices(self, chord_names):
         """
-        Convert chord names to indices using a more direct approach similar to SynthDataset.
-        
+        Convert chord names to indices using the chord_processor's get_chord_idx method.
+
         Args:
             chord_names: List of chord names
-            
+
         Returns:
             List of chord indices
         """
         if self.chord_mapping is None:
-            # If no mapping is provided, return raw chord names
+            logger.warning("Chord mapping not set in LabeledDataset. Returning raw names.")
             return chord_names
-        
-        # Create a simplified, direct mapping approach similar to SynthDataset
+
         indices = []
-        unknown_chords = {}  # Store chord -> count for better diagnostics
+        unknown_chords = Counter() # Use Counter for efficient counting
         use_large_voca = hasattr(self.feature_config, 'feature') and self.feature_config.feature.get('large_voca', False)
-        
-        # Get default values for N and X based on vocabulary size
+
+        # Get N and X indices once
         n_chord_idx = self.chord_mapping.get("N", 169 if use_large_voca else 24)
         x_chord_idx = self.chord_mapping.get("X", 168 if use_large_voca else 25)
-        
-        # Print diagnostic info for reference points
+
+        # Log mapping info once for diagnostics
         if not hasattr(self, '_chord_mapping_logged') and chord_names:
             logger.info(f"Chord mapping info - total chords in mapping: {len(self.chord_mapping)}")
             logger.info(f"N chord index: {n_chord_idx}, X chord index: {x_chord_idx}")
-            
             # Print a sample of the mapping
-            sample_keys = list(self.chord_mapping.keys())[:10]  # First 10 keys
+            sample_keys = list(self.chord_mapping.keys())[:10]
             logger.info(f"Sample chord mapping: {[(k, self.chord_mapping[k]) for k in sample_keys]}")
             self._chord_mapping_logged = True
-        
-        # First pass - direct mapping only
+
+        # Process each chord using the processor's lookup method
         for chord in chord_names:
-            if chord in self.chord_mapping:
-                # Direct hit - use the mapping directly
-                indices.append(self.chord_mapping[chord])
-            elif chord == "N" or chord.lower() == "n":
-                # No chord - use N mapping
-                indices.append(n_chord_idx)
-            elif chord == "X" or chord.lower() == "x":
-                # Unknown chord - use X mapping
-                indices.append(x_chord_idx)
-            else:
-                # Handle more complex chord names - first try normalizing
-                # 1. Try without any modification
-                indices.append(n_chord_idx)  # Default to N
-                
-                # Track unknown chords for diagnostics
-                if chord not in unknown_chords:
-                    unknown_chords[chord] = 0
+            # Use the get_chord_idx method which handles N, X, normalization, simplification, and enharmonics
+            idx = self.chord_processor.get_chord_idx(chord, use_large_voca)
+            indices.append(idx)
+
+            # Track if the result was the unknown index
+            if idx == x_chord_idx and chord != "X": # Don't count explicit 'X' as unknown
                 unknown_chords[chord] += 1
-        
-        # Simplified second pass only if needed
-        if unknown_chords:
-            # Only attempt more complex parsing if we have the Chords processor properly initialized
-            has_processor = hasattr(self, 'chord_processor') and hasattr(self.chord_processor, 'chord')
-            
-            if has_processor:
-                # Create a local cache for chord parsing to avoid repeated work
-                chord_cache = {}
-                
-                # Try to fix indices for unknown chords using a simpler approach
-                for i, chord in enumerate(chord_names):
-                    if chord in self.chord_mapping or chord in ["N", "X", "n", "x"]:
-                        continue  # Skip already mapped chords
-                    
-                    # Only process this chord if we haven't already cached a result
-                    if chord not in chord_cache:
-                        try:
-                            # Skip complex parsing and just normalize the chord name
-                            normalized_chord = chord
-                            
-                            # Simple normalization: remove any text in parentheses
-                            if "(" in normalized_chord:
-                                normalized_chord = normalized_chord.split("(")[0].strip()
-                            
-                            # Try direct mapping with normalized chord
-                            if normalized_chord in self.chord_mapping:
-                                chord_cache[chord] = self.chord_mapping[normalized_chord]
-                            else:
-                                # No direct mapping, leave as N
-                                chord_cache[chord] = n_chord_idx
-                        except Exception:
-                            # Any error, use N as fallback
-                            chord_cache[chord] = n_chord_idx
-                    
-                    # Apply the cached result
-                    if chord in chord_cache:
-                        indices[i] = chord_cache[chord]
-            
-            # Log unknown chord statistics - but not too verbose
-            total_unknown = sum(unknown_chords.values())
+
+        # Log unknown chord statistics if any were found
+        total_unknown = sum(unknown_chords.values())
+        if total_unknown > 0:
             total_chords = len(chord_names)
-            
-            if total_unknown > 0:
-                unknown_percent = (total_unknown / total_chords) * 100
-                logger.warning(f"Unknown chords: {total_unknown}/{total_chords} ({unknown_percent:.1f}%)")
-                
-                # Only show details if there aren't too many unique unknown chords
-                if len(unknown_chords) <= 10:
-                    top_unknowns = sorted(unknown_chords.items(), key=lambda x: x[1], reverse=True)
-                    logger.warning(f"Most common unknown chords: {top_unknowns}")
-                else:
-                    # Show just the top few
-                    top_unknowns = sorted(unknown_chords.items(), key=lambda x: x[1], reverse=True)[:10]
-                    logger.warning(f"Top 10 unknown chords (of {len(unknown_chords)} total): {top_unknowns}")
-        
+            unknown_percent = (total_unknown / total_chords) * 100
+            # Limit logging verbosity - maybe only log if > 1% unknown or periodically
+            if unknown_percent > 1.0 or random.random() < 0.01: # Log if >1% or 1% of the time
+                 logger.warning(f"Unknown chords: {total_unknown}/{total_chords} ({unknown_percent:.1f}%)")
+                 # Show most common unknowns for debugging
+                 logger.warning(f"Most common unknown chords: {unknown_chords.most_common(10)}")
+
         return indices
 
     def _find_matching_pairs(self):

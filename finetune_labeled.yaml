@@ -187,7 +187,7 @@ spec:
               value: "4"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
-              value: "0.2"  # Set dropout probability (0-1)
+              value: "0.4"  # Set dropout probability (0-1)
             # Data paths
             - name: DATA_ROOT
               value: "/mnt/storage/data"
