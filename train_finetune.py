@@ -260,7 +260,60 @@ def main():
 
     # Load configuration from YAML first
     config = HParams.load(args.config)
-    
+
+    # --- NEW: Override config with environment variables ---
+    logger.info("Checking environment variables for config overrides...")
+    env_overrides = {
+        'MODEL_SCALE': ('model', 'scale', float),
+        'LEARNING_RATE': ('training', 'learning_rate', float),
+        'MIN_LEARNING_RATE': ('training', 'min_learning_rate', float),
+        'USE_KD_LOSS': ('training', 'use_kd_loss', lambda v: v.lower() == 'true'),
+        'KD_ALPHA': ('training', 'kd_alpha', float),
+        'TEMPERATURE': ('training', 'temperature', float),
+        'USE_FOCAL_LOSS': ('training', 'use_focal_loss', lambda v: v.lower() == 'true'),
+        'FOCAL_GAMMA': ('training', 'focal_gamma', float),
+        'FOCAL_ALPHA': ('training', 'focal_alpha', float, True), # Allow None
+        'USE_WARMUP': ('training', 'use_warmup', lambda v: v.lower() == 'true'),
+        'WARMUP_START_LR': ('training', 'warmup_start_lr', float),
+        'WARMUP_END_LR': ('training', 'warmup_end_lr', float),
+        'WARMUP_EPOCHS': ('training', 'warmup_epochs', int),
+        'DROPOUT': ('model', 'dropout', float),
+        'DATA_ROOT': ('paths', 'storage_root', str),
+        'NUM_CHORDS': ('model', 'num_chords', int),
+        'PRETRAINED_MODEL': ('paths', 'pretrained_model', str), # Env var for pretrained path
+        'FREEZE_FEATURE_EXTRACTOR': ('training', 'freeze_feature_extractor', lambda v: v.lower() == 'true'),
+        'EPOCHS': ('training', 'num_epochs', int),
+        'BATCH_SIZE': ('training', 'batch_size', int),
+        'LR_SCHEDULE': ('training', 'lr_schedule', str),
+        'DISABLE_CACHE': ('data', 'disable_cache', lambda v: v.lower() == 'true'),
+        'METADATA_CACHE': ('data', 'metadata_cache', lambda v: v.lower() == 'true'),
+        'SAVE_DIR': ('paths', 'checkpoints_dir', str),
+        'USE_CROSS_VALIDATION': ('data', 'use_cross_validation', lambda v: v.lower() == 'true'),
+        'KFOLD': ('data', 'kfold', int),
+        'TOTAL_FOLDS': ('data', 'total_folds', int),
+        'USE_VOCA': ('feature', 'large_voca', lambda v: v.lower() == 'true') # Env var for large voca
+    }
+
+    for env_var, (section, key, type_converter, *optional) in env_overrides.items():
+        value = os.environ.get(env_var)
+        if value is not None:
+            try:
+                # Ensure section exists
+                if section not in config:
+                    config[section] = {}
+
+                allow_none = len(optional) > 0 and optional[0] is True
+                if allow_none and value.lower() in ['none', 'null', '']:
+                    converted_value = None
+                else:
+                    converted_value = type_converter(value)
+
+                config[section][key] = converted_value
+                logger.info(f"  Overriding config.{section}.{key} with ENV VAR {env_var}={converted_value}")
+            except Exception as e:
+                logger.warning(f"  Failed to apply ENV VAR {env_var}={value}: {e}")
+    # --- End of environment variable overrides ---
+
     # Then check device availability
     if config.misc.get('use_cuda') and is_cuda_available():
         device = get_device()
@@ -793,7 +846,7 @@ def main():
         teacher_normalization={'mean': teacher_mean, 'std': teacher_std} if teacher_mean is not None else None,
     )
     
-    # Attach chord processor to trainer
+    # Attach chord mapping to trainer
     trainer.set_chord_mapping(chord_mapping)
     
     # Run training

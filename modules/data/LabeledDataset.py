@@ -459,7 +459,8 @@ class LabeledDataset(Dataset):
         
         # NEW: Find reasonable label bounds to detect issues with timestamps
         if timestamps:
-            min_time = min(start for start in timestamps)
+            # Correctly extract only the start time for min() comparison
+            min_time = min(start for start, _ in timestamps)
             max_time = max(end for _, end in timestamps)
             
             # Check for negative start times or excessive end times

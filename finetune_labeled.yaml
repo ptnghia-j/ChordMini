@@ -194,6 +194,8 @@ spec:
             # Model vocabulary size - crucial for matching pretrained model
             - name: NUM_CHORDS
               value: "170"  # Must match pretrained model's 170 chord classes
+            - name: USE_VOCA
+              value: "true"  # Use large vocabulary (170 chords)
             # Fine-tuning specific settings
             - name: PRETRAINED_MODEL
               value: "/mnt/storage/checkpoints/student/student_model_best.pth"  # Path to pretrained model
@@ -226,139 +228,13 @@ spec:
               value: "0"      # Which fold to use for validation (0-4)
             - name: TOTAL_FOLDS
               value: "5"      # Total number of folds
-            - name: PREPROCESS
-              value: "false"  # Set to "true" to preprocess and generate features
           command:
-            - sh
-            - -c
-            - |
-              set -ex
-              echo "=== Fine-tuning model on labeled data ==="
-              
-              # Install necessary system packages
-              apt-get update && apt-get install -y libsndfile1 || { echo "ERROR: Failed to install system dependencies"; exit 1; }
-              
-              # Create a minimal requirements.txt if missing
-              if [ ! -f requirements.txt ]; then
-                echo "Creating minimal requirements.txt"
-                echo "numpy==1.22.0" > requirements.txt
-                echo "librosa>=0.8.0" >> requirements.txt
-                echo "torch>=1.9.0" >> requirements.txt
-                echo "tqdm>=4.62.0" >> requirements.txt
-                echo "scikit-learn>=1.0.0" >> requirements.txt
-                echo "pyyaml>=6.0.0" >> requirements.txt  # Added for config loading
-                echo "soundfile>=0.10.0" >> requirements.txt  # For audio file loading
-              fi
-              
-              pip install --no-cache-dir -r requirements.txt || { echo "WARNING: Some requirements may have failed"; }
-              pip install --no-cache-dir matplotlib tqdm pyyaml librosa scikit-learn soundfile || { echo "ERROR: Failed to install additional Python packages"; exit 1; }
-              
-              # Verify the data paths
-              echo "Checking LabeledDataset paths..."
-              
-              # Create checkpoints directory
-              mkdir -p ${SAVE_DIR}
-              
-              # Check for audio/label files
-              echo "Checking for audio files..."
-              find ${DATA_ROOT}/LabeledDataset/Audio -type f | grep -E '\.(mp3|wav)$' | wc -l
-              
-              echo "Checking for label files..."
-              find ${DATA_ROOT}/LabeledDataset/Labels -type f | grep -E '\.(lab|txt)$' | wc -l
-              
-              # Prepare command line arguments
-              KD_ARGS=""
-              if [ "${USE_KD_LOSS}" = "true" ]; then
-                KD_ARGS="--use_kd_loss --kd_alpha ${KD_ALPHA} --temperature ${TEMPERATURE}"
-              fi
-              
-              FOCAL_ARGS=""
-              if [ "${USE_FOCAL_LOSS}" = "true" ]; then
-                FOCAL_ARGS="--use_focal_loss --focal_gamma ${FOCAL_GAMMA}"
-                if [ "${FOCAL_ALPHA}" != "" ]; then
-                  FOCAL_ARGS="${FOCAL_ARGS} --focal_alpha ${FOCAL_ALPHA}"
-                fi
-              fi
-              
-              WARMUP_ARGS=""
-              if [ "${USE_WARMUP}" = "true" ]; then
-                WARMUP_ARGS="--use_warmup --warmup_epochs ${WARMUP_EPOCHS} --warmup_start_lr ${WARMUP_START_LR} --warmup_end_lr ${WARMUP_END_LR}"
-              fi
-              
-              FREEZE_ARGS=""
-              if [ "${FREEZE_FEATURE_EXTRACTOR}" = "true" ]; then
-                FREEZE_ARGS="--freeze_feature_extractor"
-              fi
-              
-              CACHE_ARGS=""
-              if [ "${DISABLE_CACHE}" = "true" ]; then
-                CACHE_ARGS="--disable_cache"
-              fi
-              
-              if [ "${METADATA_CACHE}" = "true" ]; then
-                CACHE_ARGS="${CACHE_ARGS} --metadata_cache"
-              fi
-              
-              # Define directories
-              AUDIO_DIRS="${DATA_ROOT}/LabeledDataset/Audio/billboard ${DATA_ROOT}/LabeledDataset/Audio/caroleKing ${DATA_ROOT}/LabeledDataset/Audio/queen ${DATA_ROOT}/LabeledDataset/Audio/theBeatles"
-              LABEL_DIRS="${DATA_ROOT}/LabeledDataset/Labels/billboardLabels ${DATA_ROOT}/LabeledDataset/Labels/caroleKingLabels ${DATA_ROOT}/LabeledDataset/Labels/queenLabels ${DATA_ROOT}/LabeledDataset/Labels/theBeatlesLabels"
-              CACHE_DIR="${DATA_ROOT}/LabeledDataset/cache"
-              
-              # Cross-validation arguments
-              CV_ARGS=""
-              if [ "${USE_CROSS_VALIDATION}" = "true" ]; then
-                echo "Using cross-validation with fold ${KFOLD} of ${TOTAL_FOLDS}"
-                if [ "${PREPROCESS}" = "true" ]; then
-                  # Run preprocessing first if requested
-                  echo "Running preprocessing step to generate features..."
-                  python train_cv_kd.py --config ./config/student_config.yaml \
-                    --kfold ${KFOLD} \
-                    --total_folds ${TOTAL_FOLDS} \
-                    --audio_dirs ${AUDIO_DIRS} \
-                    --label_dirs ${LABEL_DIRS} \
-                    --cache_dir ${CACHE_DIR} \
-                    --preprocess
-                  
-                  echo "Preprocessing completed."
-                fi
-                
-                # Use cross-validation training script instead of standard fine-tuning
-                echo "Starting cross-validation training with fold ${KFOLD}..."
-                python train_cv_kd.py --config ./config/student_config.yaml \
-                  --kfold ${KFOLD} \
-                  --total_folds ${TOTAL_FOLDS} \
-                  --save_dir ${SAVE_DIR}/cv_fold${KFOLD} \
-                  --audio_dirs ${AUDIO_DIRS} \
-                  --label_dirs ${LABEL_DIRS} \
-                  --cache_dir ${CACHE_DIR} \
-                  --learning_rate ${LEARNING_RATE} \
-                  --batch_size ${BATCH_SIZE} \
-                  ${KD_ARGS}
-              else
-                # Run the standard fine-tuning script with all options
-                echo "Starting fine-tuning with all options..."
-                python train_finetune.py --config ./config/student_config.yaml \
-                  --pretrained ${PRETRAINED_MODEL} \
-                  --use_voca \
-                  --save_dir ${SAVE_DIR} \
-                  --audio_dirs ${AUDIO_DIRS} \
-                  --label_dirs ${LABEL_DIRS} \
-                  --cache_dir ${CACHE_DIR} \
-                  --learning_rate ${LEARNING_RATE} \
-                  --min_learning_rate ${MIN_LEARNING_RATE} \
-                  --model_scale ${MODEL_SCALE} \
-                  --dropout ${DROPOUT} \
-                  --epochs ${EPOCHS} \
-                  --batch_size ${BATCH_SIZE} \
-                  --lr_schedule ${LR_SCHEDULE} \
-                  --gpu_memory_fraction ${GPU_MEMORY_FRACTION} \
-                  ${WARMUP_ARGS} ${KD_ARGS} ${FOCAL_ARGS} ${FREEZE_ARGS} ${CACHE_ARGS}
-              fi
-              
-              echo "=== Training complete ==="
-              
-              # Clear GPU cache to release memory before exiting
-              python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
+            - python
+            - train_finetune.py
+            - --config
+            - ./config/student_config.yaml
+            - --pretrained
+            - /mnt/storage/checkpoints/student/student_model_best.pth
           resources:
             requests:
               cpu: "2"             
