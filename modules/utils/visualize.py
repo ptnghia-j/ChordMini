@@ -223,6 +223,10 @@ def map_chord_to_quality(chord_name):
     Returns:
         str: The chord quality group name
     """
+    # Handle non-string input
+    if not isinstance(chord_name, str):
+        return "Other"
+        
     # Try to import chord functions from chords.py
     try:
         from modules.utils.chords import get_chord_quality
@@ -278,6 +282,11 @@ def map_chord_to_quality(chord_name):
             "min6": "Min6", "m6": "Min6",
             "maj6": "Maj6", "6": "Maj6",
             "minmaj7": "Min-Maj7", "mmaj7": "Min-Maj7", "min-maj7": "Min-Maj7",
+            
+            # Add additional chord qualities that appear in your dataset
+            "min(9)": "Minor", "min/5": "Minor",  # Minor with extensions or inversions
+            "maj/3": "Major", "maj/5": "Major",   # Major with inversions
+            "7/3": "Dom7",                        # Dominant seventh with inversion
         }
         
         # Return mapped quality or "Other" if not found
@@ -297,9 +306,14 @@ def extract_chord_quality(chord_name):
     if chord_name in ["N", "X", "None", "Unknown"]:
         return "N"
         
+    # Handle common case where chord_name might be a numeric index instead of a string
+    if not isinstance(chord_name, str):
+        return str(chord_name)
+        
     # Remove root note and colon if present
     if ":" in chord_name:
-        quality = chord_name.split(":", 1)[1]
+        parts = chord_name.split(":", 1)
+        quality = parts[1]
         # Handle possible bass note
         if "/" in quality:
             quality = quality.split("/", 1)[0]
@@ -374,36 +388,52 @@ def group_chords_by_focus_qualities(predictions, targets, idx_to_chord, focus_qu
     
     # Map chord indices to qualities
     for idx, chord in idx_to_chord.items():
-        # Get the raw quality first
-        raw_quality = extract_chord_quality(chord)
-        info(f"Extracted quality '{raw_quality}' from chord '{chord}'")
-        
-        # Simple mapping for common qualities
-        if raw_quality in quality_to_idx:
-            idx_to_quality[idx] = raw_quality
-        # Handle variations that should map to standard qualities
-        elif raw_quality in ["major", "M"]:
-            idx_to_quality[idx] = "maj"
-        elif raw_quality in ["minor", "m"]:
-            idx_to_quality[idx] = "min"
-        elif raw_quality in ["M7", "major7"]:
-            idx_to_quality[idx] = "maj7"
-        elif raw_quality in ["m7", "minor7"]:
-            idx_to_quality[idx] = "min7"
-        elif raw_quality in ["°", "o", "diminished"]:
-            idx_to_quality[idx] = "dim"
-        elif raw_quality in ["°7", "o7", "diminished7"]:
-            idx_to_quality[idx] = "dim7"
-        elif raw_quality in ["m7b5", "ø", "half-diminished"]:
-            idx_to_quality[idx] = "hdim7"
-        elif raw_quality in ["m6", "minor6"]:
-            idx_to_quality[idx] = "min6"
-        elif raw_quality in ["6", "maj6"]:
-            idx_to_quality[idx] = "maj6"
-        elif raw_quality in ["mmaj7", "mM7"]:
-            idx_to_quality[idx] = "min-maj7"
-        else:
+        try:
+            # Get the raw quality first
+            raw_quality = extract_chord_quality(chord)
+            debug_level = "info" if idx < 5 else "debug"  # Only log first few extensively
+            
+            if debug_level == "info":
+                info(f"Extracted quality '{raw_quality}' from chord '{chord}'")
+            
+            # Simple mapping for common qualities
+            if raw_quality in quality_to_idx:
+                idx_to_quality[idx] = raw_quality
+            # Handle variations that should map to standard qualities
+            elif raw_quality in ["major", "M"]:
+                idx_to_quality[idx] = "maj"
+            elif raw_quality in ["minor", "m"]:
+                idx_to_quality[idx] = "min"
+            elif raw_quality in ["M7", "major7"]:
+                idx_to_quality[idx] = "maj7"
+            elif raw_quality in ["m7", "minor7"]:
+                idx_to_quality[idx] = "min7"
+            elif raw_quality in ["°", "o", "diminished"]:
+                idx_to_quality[idx] = "dim"
+            elif raw_quality in ["°7", "o7", "diminished7"]:
+                idx_to_quality[idx] = "dim7"
+            elif raw_quality in ["m7b5", "ø", "half-diminished"]:
+                idx_to_quality[idx] = "hdim7"
+            elif raw_quality in ["m6", "minor6"]:
+                idx_to_quality[idx] = "min6"
+            elif raw_quality in ["6", "maj6"]:
+                idx_to_quality[idx] = "maj6"
+            elif raw_quality in ["mmaj7", "mM7"]:
+                idx_to_quality[idx] = "min-maj7"
+            # Add more mappings for commonly encountered variations
+            elif raw_quality.startswith("min"):
+                idx_to_quality[idx] = "min"
+            elif raw_quality.startswith("maj"):
+                idx_to_quality[idx] = "maj"
+            elif raw_quality.startswith("7"):
+                idx_to_quality[idx] = "7"
+            else:
+                idx_to_quality[idx] = "other"
+        except Exception as e:
+            # Handle any errors and default to "other"
             idx_to_quality[idx] = "other"
+            if idx < 10:  # Only log errors for first few chord indices to avoid spam
+                info(f"Error processing chord {chord} at index {idx}: {e}")
             
     # Log quality mapping statistics
     quality_counts = {}
@@ -419,6 +449,12 @@ def group_chords_by_focus_qualities(predictions, targets, idx_to_chord, focus_qu
     target_qualities_idx = []
     
     for pred, target in zip(predictions, targets):
+        # Convert numpy arrays to Python integers if needed
+        if isinstance(pred, np.ndarray):
+            pred = pred.item()
+        if isinstance(target, np.ndarray):
+            target = target.item()
+            
         pred_quality = idx_to_quality.get(pred, "other")
         target_quality = idx_to_quality.get(target, "other")
         

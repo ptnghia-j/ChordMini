@@ -87,6 +87,12 @@ def main():
     if args.use_voca:
         config.feature['large_voca'] = True
         config.model['num_chords'] = 170  # 170 chord types (12 roots × 14 qualities + 2 special chords)
+        logger.info("Using large vocabulary with 170 chord classes")
+    else:
+        # Set to small vocabulary explicitly if not using large vocabulary
+        config.feature['large_voca'] = False
+        config.model['num_chords'] = 25  # Only major/minor chords + no-chord
+        logger.info("Using small vocabulary with 25 chord classes")
     
     # Set random seed for reproducibility
     seed = config.misc['seed']
@@ -101,7 +107,7 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
     
     # Set up chord mapping
-    if args.use_voca:
+    if args.use_voca or config.feature.get('large_voca', False):
         # Use the full 170-chord vocabulary mapping
         logger.info("Using large vocabulary chord mapping (170 chords)")
         chord_mapping = {idx2voca_chord()[i]: i for i in range(170)}
@@ -148,7 +154,10 @@ def main():
     if args.use_kd_loss and args.teacher_model:
         logger.info(f"Loading teacher model from {args.teacher_model}")
         try:
-            n_classes = 170 if args.use_voca else 25
+            # Determine the correct number of output classes
+            n_classes = 170 if args.use_voca or config.feature.get('large_voca', False) else 25
+            logger.info(f"Creating teacher model with {n_classes} output classes")
+            
             teacher_model = ChordNet(
                 n_freq=config.feature.get('n_bins', 144),
                 n_classes=n_classes,
@@ -176,6 +185,7 @@ def main():
             logger.info("Teacher model loaded successfully")
         except Exception as e:
             logger.error(f"Error loading teacher model: {e}")
+            logger.error(traceback.format_exc())
             teacher_model = None
     
     # Run preprocessing if specified
@@ -287,8 +297,16 @@ def main():
         logger.info(f"Calculated normalization: mean={mean}, std={std}")
     
     # Create model
-    n_classes = 170 if args.use_voca else 25
+    n_classes = 170 if args.use_voca or config.feature.get('large_voca', False) else 25
     logger.info(f"Creating model with {n_classes} output classes")
+    
+    # Log additional information about feature dimensions
+    n_freq = config.feature.get('n_bins', 144)
+    n_group = config.model.get('n_group', 32)
+    feature_dim = n_freq // n_group if n_group > 0 else n_freq
+    heads = config.model.get('f_head', 6)
+    logger.info(f"Using feature dimensions: n_freq={n_freq}, n_group={n_group}, feature_dim={feature_dim}, heads={heads}")
+    
     model = ChordNet(
         n_freq=config.feature.get('n_bins', 144),
         n_classes=n_classes,

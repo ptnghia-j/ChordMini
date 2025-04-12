@@ -248,6 +248,10 @@ def main():
     parser.add_argument('--partial_loading', action='store_true',
                         help='Allow partial loading of output layer when model sizes differ')
     
+    # Add option for large vocabulary
+    parser.add_argument('--use_voca', action='store_true',
+                        help='Use large vocabulary (170 chord types instead of standard 25)')
+    
     args = parser.parse_args()
 
     # Load configuration from YAML first
@@ -265,6 +269,12 @@ def main():
     config.misc['seed'] = args.seed or config.misc.get('seed', 42)
     config.paths['checkpoints_dir'] = args.save_dir or config.paths.get('checkpoints_dir', 'checkpoints/finetune')
     config.paths['storage_root'] = args.storage_root or config.paths.get('storage_root', None)
+    
+    # Set large vocabulary config if specified
+    if args.use_voca:
+        config.feature['large_voca'] = True
+        config.model['num_chords'] = 170  # 170 chord types (12 roots × 14 qualities + 2 special chords)
+        logger.info("Using large vocabulary with 170 chord classes")
     
     # Handle learning rate and warmup parameters
     config.training['learning_rate'] = args.learning_rate or config.training.get('learning_rate', 0.0001)
@@ -516,7 +526,7 @@ def main():
     if args.force_num_classes is not None:
         n_classes = args.force_num_classes
         logger.info(f"Forcing model to use {n_classes} output classes as specified by --force_num_classes")
-    elif config.training.get('use_voca', False):
+    elif args.use_voca or config.training.get('use_voca', False) or config.feature.get('large_voca', False):
         n_classes = 170  # Standard number for large vocabulary
         logger.info(f"Using large vocabulary with {n_classes} output classes")
     else:
