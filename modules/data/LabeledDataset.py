@@ -257,6 +257,81 @@ class LabeledDataset(Dataset):
             logger.error(f"Error parsing label file: {e}")
             return [], []
 
+    def analyze_label_file(self, label_path):
+        """Analyze a label file for diagnostic purposes."""
+        from modules.utils import logger
+        
+        try:
+            with open(label_path, 'r') as f:
+                lines = f.readlines()
+                
+            logger.info(f"Analyzing label file: {os.path.basename(label_path)}")
+            logger.info(f"First few lines of file: {lines[:10]}")
+            
+            # Parse the chord labels and timestamps
+            timestamps = []
+            chord_labels = []
+            
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) >= 3:
+                    start_time = float(parts[0])
+                    end_time = float(parts[1])
+                    chord = parts[2]
+                    
+                    timestamps.append((start_time, end_time))
+                    chord_labels.append(chord)
+            
+            logger.info(f"Parsed {len(chord_labels)} chords")
+            logger.info(f"First 5 chords: {chord_labels[:5]}")
+            logger.info(f"First 5 timestamps: {timestamps[:5]}")
+            
+            # Calculate song duration
+            if timestamps:
+                duration = timestamps[-1][1]
+                logger.info(f"Song duration from labels: {duration:.2f} seconds")
+                logger.info(f"Expected frames at 10.77 frames/sec: {int(duration * 10.77)}")
+                
+                # Check for time coverage (gaps in the labels)
+                total_time = sum(end - start for start, end in timestamps)
+                coverage = total_time / duration * 100
+                logger.info(f"Chord time coverage: {coverage:.2f}% of song duration")
+            
+            # Check chord index mapping
+            unknown_count = 0
+            unmapped_chords = []
+            
+            for chord in chord_labels:
+                if chord not in self.chord_mapping:
+                    unknown_count += 1
+                    if chord not in unmapped_chords:
+                        unmapped_chords.append(chord)
+            
+            if unknown_count > 0:
+                logger.error(f"Unknown chords: {unknown_count}/{len(chord_labels)} ({unknown_count/len(chord_labels)*100:.1f}%)")
+                logger.error(f"Most common unknown chords: {Counter([c for c in chord_labels if c not in self.chord_mapping]).most_common(10)}")
+                
+                unique_chords = set(chord_labels)
+                unmapped_unique = [c for c in unique_chords if c not in self.chord_mapping]
+                logger.error(f"{len(unmapped_unique)}/{len(unique_chords)} unique chords could not be directly mapped")
+                logger.error(f"Examples of unmapped chords: {unmapped_unique[:10]}")
+            
+            # Validate chord mapping on first few chords
+            logger.info("Chord mapping validation (first 5 chords):")
+            for i, chord in enumerate(chord_labels[:5]):
+                idx = self.chord_mapping.get(chord, 169)  # Default to no-chord (169) if not found
+                logger.info(f"  '{chord}' -> {idx}")
+                
+            # Check specifically for G:maj mapping
+            if "G:maj" in chord_labels:
+                logger.info(f"G:maj mapping: {self.chord_mapping.get('G:maj', 'Not mapped')}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error analyzing label file {label_path}: {e}")
+            return False
+
     def _fix_time_scale(self, feature_shape, feature_per_second, song_length_second, timestamps):
         """
         Fix time scale issues between audio features and chord labels.
@@ -809,80 +884,6 @@ class LabeledDataset(Dataset):
         
         logger.info(f"Dataset split - Train: {len(self.train_indices)}, Val: {len(self.val_indices)}, Test: {len(self.test_indices)}")
     
-    def analyze_label_file(self, label_path):
-        """Analyze a single label file to diagnose potential issues"""
-        logger.info(f"Analyzing label file: {os.path.basename(label_path)}")
-        
-        try:
-            # Attempt to parse the file - first few lines raw
-            with open(label_path, 'r', encoding='utf-8', errors='replace') as f:
-                lines = f.readlines()[:10]  # First 10 lines
-            
-            logger.info(f"First few lines of file: {lines}")
-            
-            # Now parse with our normal method
-            chord_labels, timestamps = self._parse_label_file(label_path)
-            
-            if len(chord_labels) == 0:
-                logger.error(f"No chords parsed from file - possible format issue")
-                return
-                
-            logger.info(f"Parsed {len(chord_labels)} chords")
-            logger.info(f"First 5 chords: {chord_labels[:5]}")
-            logger.info(f"First 5 timestamps: {timestamps[:5]}")
-            
-            # Calculate song duration
-            if timestamps:
-                duration = timestamps[-1][1]
-                logger.info(f"Song duration from labels: {duration:.2f} seconds")
-                
-                # Calculate frame rate and expected frame count
-                feature_per_second = 1.0 / self.feature_config.feature.get('hop_duration', 0.1)
-                expected_frames = int(duration * feature_per_second)
-                logger.info(f"Expected frames at {feature_per_second:.2f} frames/sec: {expected_frames}")
-                
-                # Check for gaps in chord coverage
-                total_chord_time = 0
-                for _, (start, end) in enumerate(timestamps):
-                    total_chord_time += (end - start)
-                
-                coverage = (total_chord_time / duration) * 100
-                logger.info(f"Chord time coverage: {coverage:.2f}% of song duration")
-                
-                if coverage < 90:
-                    logger.warning(f"Low chord coverage ({coverage:.2f}%) may result in many N labels")
-            
-            # Check chord mapping functionality
-            mapped = self._chord_names_to_indices(chord_labels)
-            
-            # Print mapping results with more detail
-            unique_chords = set(chord_labels)
-            unmapped = 0
-            unmapped_examples = []
-            
-            for chord in unique_chords:
-                if not chord in self.chord_mapping and chord not in ["N", "X"]:
-                    unmapped += 1
-                    if len(unmapped_examples) < 10:
-                        unmapped_examples.append(chord)
-            
-            if unmapped > 0:
-                logger.warning(f"{unmapped}/{len(unique_chords)} unique chords could not be directly mapped")
-                logger.warning(f"Examples of unmapped chords: {unmapped_examples}")
-            else:
-                logger.info(f"All {len(unique_chords)} unique chords in this file map correctly")
-            
-            # NEW: Add detailed mapping validation for the first few chords
-            if chord_labels and mapped and len(chord_labels) == len(mapped):
-                logger.info("Chord mapping validation (first 5 chords):")
-                for i in range(min(5, len(chord_labels))):
-                    logger.info(f"  '{chord_labels[i]}' -> {mapped[i]}")
-                
-        except Exception as e:
-            logger.error(f"Error analyzing label file: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-
     def __len__(self):
         """Return the number of samples in the dataset"""
         return len(self.samples)

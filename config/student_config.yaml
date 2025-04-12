@@ -4,7 +4,7 @@
 
 # Training hyperparameters
 training:
-  batch_size: 128
+  batch_size: 256
   max_epochs: 100
   learning_rate: 1.0e-3  # Base learning rate
   min_learning_rate: 5.0e-6  # Minimum learning rate for schedulers
@@ -13,7 +13,7 @@ training:
   epsilon: 1.0e-9
   early_stopping_patience: 10
   seq_len: 108
-  seq_stride: 36
+  seq_stride: 27
   save_checkpoint_interval: 10
   lr_decay_factor: 0.95
   # Warm-up parameters with expanded options

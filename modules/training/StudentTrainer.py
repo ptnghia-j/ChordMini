@@ -1258,7 +1258,15 @@ class StudentTrainer(BaseTrainer):
                     if 'teacher_logits' not in first_batch:
                         info("WARNING: KD is enabled but teacher_logits are missing from the first batch!")
                         info("This will cause training to fall back to standard CE loss and may lead to poor results.")
-                        info("Please ensure your dataset properly includes teacher logits for all samples.")
+                        
+                        # NEW: Disable KD if no teacher logits available at start
+                        info("AUTOMATICALLY DISABLING KD since no teacher logits found.")
+                        self.use_kd_loss = False
+                        
+                        if self.use_focal_loss:
+                            info("Continuing with focal loss only.")
+                        else:
+                            info("Continuing with standard cross-entropy loss only.")
                     else:
                         teacher_shape = first_batch['teacher_logits'].shape
                         info(f"Teacher logits verified with shape: {teacher_shape}")
@@ -1267,8 +1275,14 @@ class StudentTrainer(BaseTrainer):
                             info("WARNING: Teacher logits contain all zeros! Check your logits loading process.")
                 except Exception as e:
                     info(f"Error checking first batch for teacher logits: {e}")
+                    # NEW: Disable KD on error
+                    info("AUTOMATICALLY DISABLING KD due to error checking teacher logits.")
+                    self.use_kd_loss = False
             else:
-                info("Knowledge Distillation disabled, using standard loss")
+                if self.use_focal_loss:
+                    info("Knowledge Distillation disabled, using focal loss")
+                else:
+                    info("Knowledge Distillation disabled, using standard cross entropy loss")
             
             # Handle initial learning rate explicitly (before first epoch)
             if self.use_warmup and start_epoch == 1:

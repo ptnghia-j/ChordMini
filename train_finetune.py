@@ -12,6 +12,9 @@ import random
 from pathlib import Path
 from collections import Counter
 
+# Define the standard pitch classes for chord notation
+PITCH_CLASS = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
 # Project imports
 from modules.utils.mir_eval_modules import large_voca_score_calculation
 from modules.utils.device import get_device, is_cuda_available, is_gpu_available, clear_gpu_cache
@@ -259,7 +262,7 @@ def main():
     config = HParams.load(args.config)
     
     # Then check device availability
-    if config.misc['use_cuda'] and is_cuda_available():
+    if config.misc.get('use_cuda') and is_cuda_available():
         device = get_device()
         logger.info(f"Using CUDA for training on device: {torch.cuda.get_device_name(0)}")
     else:
@@ -267,40 +270,71 @@ def main():
         logger.info("Using CPU for training")
     
     # Override config values with command line arguments if provided
-    config.misc['seed'] = args.seed or config.misc.get('seed', 42)
-    config.paths['checkpoints_dir'] = args.save_dir or config.paths.get('checkpoints_dir', 'checkpoints/finetune')
-    config.paths['storage_root'] = args.storage_root or config.paths.get('storage_root', None)
+    config.misc['seed'] = args.seed if args.seed is not None else config.misc.get('seed', 42)
+    config.paths['checkpoints_dir'] = args.save_dir if args.save_dir else config.paths.get('checkpoints_dir', 'checkpoints/finetune')
+    config.paths['storage_root'] = args.storage_root if args.storage_root else config.paths.get('storage_root', None)
     
-    # Set large vocabulary config if specified
+    # Handle KD loss setting with proper type conversion
+    use_kd_loss = args.use_kd_loss
+    
+    # Be more explicit about logging KD settings
+    if use_kd_loss:
+        logger.info("Knowledge Distillation Loss ENABLED via command line argument")
+    else:
+        # Check if any config value might be enabling KD
+        config_kd = config.training.get('use_kd_loss', False)
+        if isinstance(config_kd, str):
+            config_kd = config_kd.lower() == "true"
+        else:
+            config_kd = bool(config_kd)
+            
+        if config_kd:
+            logger.info("Knowledge Distillation Loss ENABLED via config file")
+            use_kd_loss = True
+        else:
+            logger.info("Knowledge Distillation Loss DISABLED - will use standard loss")
+            use_kd_loss = False
+    
+    # Set large vocabulary config if specified - with proper boolean handling
     if args.use_voca:
         config.feature['large_voca'] = True
-        config.model['num_chords'] = 170  # 170 chord types (12 roots × 14 qualities + 2 special chords)
+        config.model['num_chords'] = 170  # 170 chord types
         logger.info("Using large vocabulary with 170 chord classes")
+    elif hasattr(config.feature, 'large_voca'):
+        # Handle string "true"/"false" in config
+        if isinstance(config.feature.large_voca, str):
+            config.feature['large_voca'] = config.feature.large_voca.lower() == "true"
+        if config.feature.get('large_voca', False):
+            config.model['num_chords'] = 170
+            logger.info("Using large vocabulary with 170 chord classes (from config)")
     
     # Handle learning rate and warmup parameters
-    config.training['learning_rate'] = args.learning_rate or config.training.get('learning_rate', 0.0001)
-    config.training['min_learning_rate'] = args.min_learning_rate or config.training.get('min_learning_rate', 5e-6)
+    config.training['learning_rate'] = float(args.learning_rate) if args.learning_rate is not None else float(config.training.get('learning_rate', 0.0001))
+    config.training['min_learning_rate'] = float(args.min_learning_rate) if args.min_learning_rate is not None else float(config.training.get('min_learning_rate', 5e-6))
     
+    # Only set warmup_epochs if explicitly provided
     if args.warmup_epochs is not None:
-        config.training['warmup_epochs'] = args.warmup_epochs
+        config.training['warmup_epochs'] = int(args.warmup_epochs)
     
+    # Handle warmup_start_lr properly
     if args.warmup_start_lr is not None:
-        config.training['warmup_start_lr'] = args.warmup_start_lr
+        config.training['warmup_start_lr'] = float(args.warmup_start_lr)
     elif 'warmup_start_lr' not in config.training:
         config.training['warmup_start_lr'] = config.training['learning_rate']/10
     
+    # Handle warmup_end_lr properly
     if args.warmup_end_lr is not None:
-        config.training['warmup_end_lr'] = args.warmup_end_lr
+        config.training['warmup_end_lr'] = float(args.warmup_end_lr)
     elif 'warmup_end_lr' not in config.training:
         config.training['warmup_end_lr'] = config.training['learning_rate']
 
     # Override number of epochs if specified
     if args.epochs is not None:
-        config.training['num_epochs'] = args.epochs
+        config.training['num_epochs'] = int(args.epochs)
 
     # Override batch size if specified
     if args.batch_size is not None:
-        config.training['batch_size'] = args.batch_size
+        config.training['batch_size'] = int(args.batch_size)
 
     # Log parameters that have been overridden
     logger.info(f"Using learning rate: {config.training['learning_rate']}")
@@ -312,22 +346,19 @@ def main():
     logger.info(f"Using {config.training.get('num_epochs')} epochs for fine-tuning")
     logger.info(f"Using batch size: {config.training.get('batch_size', 16)}")
     
-    # Log training configuration
+    # Log training configuration with proper type conversions
     logger.info("\n=== Fine-tuning Configuration ===")
-    model_scale = args.model_scale or config.model.get('scale', 1.0)
+    model_scale = float(args.model_scale) if args.model_scale is not None else float(config.model.get('scale', 1.0))
     logger.info(f"Model scale: {model_scale}")
     logger.info(f"Pretrained model: {args.pretrained}")
     if args.freeze_feature_extractor:
         logger.info("Feature extraction layers will be frozen during fine-tuning")
     
-    # Log knowledge distillation settings
-    use_kd = args.use_kd_loss if args.use_kd_loss else config.training.get('use_kd_loss', False)
-    use_kd = str(use_kd).lower() == "true"
+    # Log knowledge distillation settings with proper type handling
+    kd_alpha = float(args.kd_alpha) if args.kd_alpha is not None else float(config.training.get('kd_alpha', 0.5))
+    temperature = float(args.temperature) if args.temperature is not None else float(config.training.get('temperature', 1.0))
     
-    kd_alpha = args.kd_alpha or config.training.get('kd_alpha', 0.5)
-    temperature = args.temperature or config.training.get('temperature', 1.0)
-    
-    if use_kd:
+    if use_kd_loss:
         logger.info("\n=== Knowledge Distillation Enabled ===")
         logger.info(f"KD alpha: {kd_alpha} (weighting between KD and CE loss)")
         logger.info(f"Temperature: {temperature} (for softening distributions)")
@@ -338,42 +369,69 @@ def main():
     else:
         logger.info("Knowledge distillation is disabled, using standard loss")
     
-    # Log focal loss settings
-    if args.use_focal_loss or config.training.get('use_focal_loss', False):
+    # Handle focal loss settings with proper type conversion
+    use_focal_loss = args.use_focal_loss
+    if not use_focal_loss:
+        config_focal = config.training.get('use_focal_loss', False)
+        if isinstance(config_focal, str):
+            use_focal_loss = config_focal.lower() == "true"
+        else:
+            use_focal_loss = bool(config_focal)
+            
+    focal_gamma = float(args.focal_gamma) if args.focal_gamma is not None else float(config.training.get('focal_gamma', 2.0))
+    
+    if args.focal_alpha is not None:
+        focal_alpha = float(args.focal_alpha)
+    elif config.training.get('focal_alpha') is not None:
+        focal_alpha = float(config.training.get('focal_alpha'))
+    else:
+        focal_alpha = None
+    
+    if use_focal_loss:
         logger.info("\n=== Focal Loss Enabled ===")
-        logger.info(f"Gamma: {args.focal_gamma or config.training.get('focal_gamma', 2.0)}")
-        if args.focal_alpha or config.training.get('focal_alpha'):
-            logger.info(f"Alpha: {args.focal_alpha or config.training.get('focal_alpha')}")
+        logger.info(f"Gamma: {focal_gamma}")
+        if focal_alpha is not None:
+            logger.info(f"Alpha: {focal_alpha}")
     else:
         logger.info("Using standard cross-entropy loss")
 
     # Clear summary of loss function configuration
-    if use_kd and (args.use_focal_loss or config.training.get('use_focal_loss', False)):
+    if use_kd_loss and use_focal_loss:
         logger.info("\n=== Final Loss Configuration ===")
-        logger.info(f"Using Focal Loss (gamma={args.focal_gamma or config.training.get('focal_gamma', 2.0)}, alpha={args.focal_alpha or config.training.get('focal_alpha')}) combined with KD Loss")
+        logger.info(f"Using Focal Loss (gamma={focal_gamma}, alpha={focal_alpha}) combined with KD Loss")
         logger.info(f"KD formula: final_loss = {kd_alpha} * KL_div_loss + {1-kd_alpha} * focal_loss")
-    elif use_kd:
+    elif use_kd_loss:
         logger.info("\n=== Final Loss Configuration ===")
         logger.info(f"Using standard Cross Entropy combined with KD Loss")
         logger.info(f"KD formula: final_loss = {kd_alpha} * KL_div_loss + {1-kd_alpha} * cross_entropy")
-    elif args.use_focal_loss or config.training.get('use_focal_loss', False):
+    elif use_focal_loss:
         logger.info("\n=== Final Loss Configuration ===")
-        logger.info(f"Using only Focal Loss with gamma={args.focal_gamma or config.training.get('focal_gamma', 2.0)}, alpha={args.focal_alpha or config.training.get('focal_alpha')}")
+        logger.info(f"Using only Focal Loss with gamma={focal_gamma}, alpha={focal_alpha}")
     else:
         logger.info("\n=== Final Loss Configuration ===")
         logger.info("Using only standard Cross Entropy Loss")
     
     # Set random seed for reproducibility
-    seed = config.misc['seed']
+    seed = int(config.misc['seed'])
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
     logger.info(f"Random seed set to {seed}")
+    
+    # Initialize dataset_args dictionary
+    dataset_args = {}
+
+    # Set dataset type - use small dataset for quick testing if specified
+    dataset_args['small_dataset_percentage'] = args.small_dataset
+    if dataset_args['small_dataset_percentage'] is None:
+        logger.info("Using full dataset")
+    else:
+        logger.info(f"Using {dataset_args['small_dataset_percentage']*100:.1f}% of dataset")
 
     # Set up logging
-    logger.logging_verbosity(config.misc['logging_level'])
+    logger.logging_verbosity(config.misc.get('logging_level', 'INFO'))
 
     # Get project root and storage root
     project_root = os.path.dirname(os.path.abspath(__file__))
@@ -635,11 +693,11 @@ def main():
             logger.info("Teacher model loaded successfully for knowledge distillation")
             
             # If we don't have explicit KD loss but loaded a teacher, enable it
-            if not use_kd:
-                use_kd = True
+            if not use_kd_loss:
+                use_kd_loss = True
                 logger.info("Automatically enabling knowledge distillation with loaded teacher model")
-                kd_alpha = args.kd_alpha or config.training.get('kd_alpha', 0.5)
-                temperature = args.temperature or config.training.get('temperature', 1.0)
+                kd_alpha = args.kd_alpha if args.kd_alpha is not None else float(config.training.get('kd_alpha', 0.5))
+                temperature = args.temperature if args.temperature is not None else float(config.training.get('temperature', 1.0))
                 logger.info(f"Using KD alpha: {kd_alpha}, temperature: {temperature}")
             
         except Exception as e:
@@ -669,7 +727,7 @@ def main():
         logger.info("Calculating global mean and std for normalization...")
         
         # Create stats loader
-        stats_batch_size = min(16, config.training['batch_size'])
+        stats_batch_size = min(16, int(config.training.get('batch_size', 16)))
         stats_loader = torch.utils.data.DataLoader(
             labeled_dataset,
             batch_size=stats_batch_size,
@@ -711,28 +769,28 @@ def main():
         model=model,
         optimizer=optimizer, 
         device=device,
-        num_epochs=config.training.get('num_epochs', 50),
+        num_epochs=int(config.training.get('num_epochs', 50)),
         logger=logger,
         checkpoint_dir=checkpoints_dir,
         class_weights=None,
         idx_to_chord=master_mapping,
         normalization=normalization,
-        early_stopping_patience=config.training.get('early_stopping_patience', 5),
-        lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
-        min_lr=config.training.get('min_learning_rate', 5e-6),
-        use_warmup=args.use_warmup or config.training.get('use_warmup', False),
-        warmup_epochs=config.training.get('warmup_epochs'),
-        warmup_start_lr=config.training.get('warmup_start_lr'),
-        warmup_end_lr=config.training.get('warmup_end_lr'),
+        early_stopping_patience=int(config.training.get('early_stopping_patience', 5)),
+        lr_decay_factor=float(config.training.get('lr_decay_factor', 0.95)),
+        min_lr=float(config.training.get('min_learning_rate', 5e-6)),
+        use_warmup=args.use_warmup or bool(config.training.get('use_warmup', False)),
+        warmup_epochs=int(config.training.get('warmup_epochs')) if config.training.get('warmup_epochs') is not None else None,
+        warmup_start_lr=float(config.training.get('warmup_start_lr')) if config.training.get('warmup_start_lr') is not None else None,
+        warmup_end_lr=float(config.training.get('warmup_end_lr')) if config.training.get('warmup_end_lr') is not None else None,
         lr_schedule_type=lr_schedule_type,
-        use_focal_loss=args.use_focal_loss or config.training.get('use_focal_loss', False),
-        focal_gamma=args.focal_gamma or config.training.get('focal_gamma', 2.0),
-        focal_alpha=args.focal_alpha or config.training.get('focal_alpha', None),
-        use_kd_loss=use_kd,
+        use_focal_loss=use_focal_loss,
+        focal_gamma=focal_gamma,
+        focal_alpha=focal_alpha,
+        use_kd_loss=use_kd_loss,
         kd_alpha=kd_alpha,
         temperature=temperature,
         teacher_model=teacher_model,
-        teacher_normalization={'mean': teacher_mean, 'std': teacher_std}
+        teacher_normalization={'mean': teacher_mean, 'std': teacher_std} if teacher_mean is not None else None,
     )
     
     # Attach chord processor to trainer
@@ -744,7 +802,7 @@ def main():
         logger.info("Preparing data (this may take a while for large datasets)...")
         
         # If using teacher model but not within trainer, pre-compute logits
-        if teacher_model is not None and use_kd and not trainer.teacher_model:
+        if teacher_model is not None and use_kd_loss and not trainer.teacher_model:
             logger.info("Pre-computing teacher logits for knowledge distillation...")
             logits_dir = os.path.join(checkpoints_dir, "teacher_logits")
             os.makedirs(logits_dir, exist_ok=True)
@@ -776,7 +834,7 @@ def main():
     try:
         if trainer.load_best_model():
             test_loader = labeled_dataset.get_test_iterator(
-                batch_size=config.training['batch_size'],
+                batch_size=config.training.get('batch_size', 16),
                 shuffle=False,
                 num_workers=0,
                 pin_memory=False
@@ -832,17 +890,17 @@ def main():
             score_metrics = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
             
             # Get validation dataset
-            val_dataset = val_loader.dataset
-            dataset_length = len(val_dataset)
+            val_dataset = labeled_dataset
+            dataset_length = len(val_dataset.val_indices)
             
             if dataset_length < 3:
                 logger.info("Not enough validation samples to compute chord metrics.")
             else:
                 # Create balanced splits
                 split = dataset_length // 3
-                valid_dataset1 = val_dataset[:split]
-                valid_dataset2 = val_dataset[split:2*split]
-                valid_dataset3 = val_dataset[2*split:]
+                valid_dataset1 = [val_dataset[val_dataset.val_indices[i]] for i in range(split)]
+                valid_dataset2 = [val_dataset[val_dataset.val_indices[split + i]] for i in range(min(split, dataset_length - split))]
+                valid_dataset3 = [val_dataset[val_dataset.val_indices[2*split + i]] for i in range(min(split, dataset_length - 2*split))]
                 
                 # Evaluate each split
                 logger.info(f"Evaluating model on {len(valid_dataset1)} samples in split 1...")

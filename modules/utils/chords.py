@@ -4,29 +4,6 @@ This module contains chord evaluation functionality.
 
 It provides the evaluation measures used for the MIREX ACE task, and
 tries to follow [1]_ and [2]_ as closely as possible.
-
-Notes
------
-This implementation tries to follow the references and their implementation
-(e.g., https://github.com/jpauwels/MusOOEvaluator for [2]_). However, there
-are some known (and possibly some unknown) differences. If you find one not
-listed in the following, please file an issue:
-
- - Detected chord segments are adjusted to fit the length of the annotations.
-   In particular, this means that, if necessary, filler segments of 'no chord'
-   are added at beginnings and ends. This can result in different segmentation
-   scores compared to the original implementation.
-
-References
-----------
-.. [1] Christopher Harte, "Towards Automatic Extraction of Harmony Information
-       from Music Signals." Dissertation,
-       Department for Electronic Engineering, Queen Mary University of London,
-       2010.
-.. [2] Johan Pauwels and Geoffroy Peeters.
-       "Evaluating Automatically Estimated Chord Sequences."
-       In Proceedings of ICASSP 2013, Vancouver, Canada, 2013.
-
 """
 
 import numpy as np
@@ -61,6 +38,7 @@ def idx_to_chord(idx):
     root = idx // 2
 
     return PITCH_CLASS[root] + ("M" if minmaj == 0 else "m")
+
 
 def get_chord_quality(chord_label):
     """
@@ -148,8 +126,8 @@ def get_chord_quality(chord_label):
         logger.warning(f"Error determining chord quality for '{chord_label}': {e}")
         return "Other"
 
-class Chords:
 
+class Chords:
     def __init__(self):
         self._shorthands = {
             'maj': self.interval_list('(1,3,5)'),
@@ -159,9 +137,9 @@ class Chords:
             'maj7': self.interval_list('(1,3,5,7)'),
             'min7': self.interval_list('(1,b3,5,b7)'),
             '7': self.interval_list('(1,3,5,b7)'),
-            '6': self.interval_list('(1,6)'),  # custom
+            '6': self.interval_list('(1,6)'),
             '5': self.interval_list('(1,5)'),
-            '4': self.interval_list('(1,4)'),  # custom
+            '4': self.interval_list('(1,4)'),
             '1': self.interval_list('(1)'),
             'dim7': self.interval_list('(1,b3,b5,bb7)'),
             'hdim7': self.interval_list('(1,b3,b5,b7)'),
@@ -180,172 +158,60 @@ class Chords:
             'min13': self.interval_list('(1,b3,5,b7,13)')
         }
 
-        # Add enharmonic mappings for flat to sharp conversions
+        # Common mapping tables - consolidated from multiple places
         self.enharmonic_map = {
-            'Bb': 'A#',
-            'Db': 'C#',
-            'Eb': 'D#',
-            'Gb': 'F#',
-            'Ab': 'G#',
+            'Bb': 'A#', 'A#': 'Bb',
+            'Db': 'C#', 'C#': 'Db',
+            'Eb': 'D#', 'D#': 'Eb',
+            'Gb': 'F#', 'F#': 'Gb',
+            'Ab': 'G#', 'G#': 'Ab',
         }
 
-        # Add quality name normalization mappings to match teacher model's vocabulary
         self.quality_map = {
-            '': 'maj',   # Empty string means major chord
-            'M': 'maj',  # Alternative notation for major
-            'm': 'min',  # Alternative notation for minor
-            'major': 'maj',
-            'minor': 'min',
-            'maj7+5': 'maj7',  # Simplify some extended chords
+            '': 'maj',          # Empty string means major chord
+            'M': 'maj',         # Alternative notation for major
+            'm': 'min',         # Alternative notation for minor
+            'major': 'maj',     # Full word notation
+            'minor': 'min',     # Full word notation
+            'maj7+5': 'maj7',   # Simplify extended chords
             'maj7-5': 'maj7',
             'min7+5': 'min7',
             'min7-5': 'min7',
         }
-
-    def chords(self, labels):
-
-        """
-        Transform a list of chord labels into an array of internal numeric
-        representations.
-
-        Parameters
-        ----------
-        labels : list
-            List of chord labels (str).
-
-        Returns
-        -------
-        chords : numpy.array
-            Structured array with columns 'root', 'bass', and 'intervals',
-            containing a numeric representation of chords.
-
-        """
-        crds = np.zeros(len(labels), dtype=CHORD_DTYPE)
-        cache = {}
-        for i, lbl in enumerate(labels):
-            cv = cache.get(lbl, None)
-            if cv is None:
-                cv = self.chord(lbl)
-                cache[lbl] = cv
-            crds[i] = cv
-
-        return crds
-
-    def label_error_modify(self, label):
-        if label == 'Emin/4': label = 'E:min/4'
-        elif label == 'A7/3': label = 'A:7/3'
-        elif label == 'Bb7/3': label = 'Bb:7/3'
-        elif label == 'Bb7/5': label = 'Bb:7/5'
-        elif label.find(':') == -1:
-            if label.find('min') != -1:
-                label = label[:label.find('min')] + ':' + label[label.find('min'):]
-        return label
-
-    def chord(self, label):
-        """
-        Transform a chord label into the internal numeric represenation of
-        (root, bass, intervals array).
-
-        Parameters
-        ----------
-        label : str
-            Chord label.
-
-        Returns
-        -------
-        chord : tuple
-            Numeric representation of the chord: (root, bass, intervals array).
-
-        """
-
-        try:
-            is_major = False
-
-            if label == 'N':
-                return NO_CHORD
-            if label == 'X':
-                return UNKNOWN_CHORD
-
-            label = self.label_error_modify(label)
-
-            c_idx = label.find(':')
-            s_idx = label.find('/')
-
-            if c_idx == -1:
-                quality_str = 'maj'  # Default to major if no quality specified
-                if s_idx == -1:
-                    root_str = label
-                    bass_str = ''
-                else:
-                    root_str = label[:s_idx]
-                    bass_str = label[s_idx + 1:]
-            else:
-                root_str = label[:c_idx]
-                if s_idx == -1:
-                    quality_str = label[c_idx + 1:]
-                    bass_str = ''
-                else:
-                    quality_str = label[c_idx + 1:s_idx]
-                    bass_str = label[s_idx + 1:]
-
-            # Normalize root string for enharmonic equivalents
-            root_str = self.normalize_root(root_str)
-            
-            # Normalize quality string
-            quality_str = self.normalize_quality(quality_str)
-            
-            root = self.pitch(root_str)
-            bass = self.interval(bass_str) if bass_str else 0
-            ivs = self.chord_intervals(quality_str)
-            ivs[bass] = 1
-
-            if 'min' in quality_str:
-                is_major = False
-            else:
-                is_major = True
-
-        except Exception as e:
-            print(e, label)
-
-        return root, bass, ivs, is_major
-
-    def normalize_root(self, root_str):
-        """
-        Normalize a root note by converting flat notes to their enharmonic sharp equivalents.
-        This helps with consistent chord vocabulary lookups.
         
-        Parameters
-        ----------
-        root_str : str
-            Root note string (e.g. 'Bb', 'Ab', 'F#')
+        # Simplification rules for extended qualities and special notations
+        self.simplification_map = {
+            # Extensions to base qualities
+            'maj9': 'maj7',      # Cmaj9 -> Cmaj7
+            'maj11': 'maj7',     # Cmaj11 -> Cmaj7
+            'maj13': 'maj7',     # Cmaj13 -> Cmaj7
+            '9': '7',            # C9 -> C7
+            '11': '7',           # C11 -> C7
+            '13': '7',           # C13 -> C7
+            'min9': 'min7',      # Cmin9 -> Cmin7
+            'min11': 'min7',     # Cmin11 -> Cmin7
+            'min13': 'min7',     # Cmin13 -> Cmin7
             
-        Returns
-        -------
-        normalized_root : str
-            Normalized root note, preferring sharps over flats
-        """
-        return self.enharmonic_map.get(root_str, root_str)
-        
-    def normalize_quality(self, quality_str):
-        """
-        Normalize quality string to match vocabulary standards.
-        
-        Parameters
-        ----------
-        quality_str : str
-            Quality string (e.g., '', 'm', 'maj7')
+            # Suspended and special chords
+            'sus4(2)': 'sus4',   # Csus4(2) -> Csus4
+            'maj(9)': 'maj7',    # Cmaj(9) -> Cmaj7
+            'sus4(9)': 'sus4',   # Csus4(9) -> Csus4
+            'sus2(b7)': 'sus2',  # Csus2(b7) -> Csus2
+            '7(#9)': '7',        # C7(#9) -> C7
+            'maj(b9)': 'maj7',   # Cmaj(b9) -> Cmaj7
             
-        Returns
-        -------
-        normalized_quality : str
-            Normalized quality string matching vocabulary
-        """
-        # Handle parentheses and additional indicators
-        # Strip away scale degree indicators like (*3,*5)
-        base_quality = quality_str.split('(')[0].strip()
+            # Special notation patterns
+            '(1)': 'maj',        # C(1) -> C
+            '(1,5)': 'maj',      # C(1,5) -> C
+            '(1,b7)': '7',       # C(1,b7) -> C7
+            '(1,b3)': 'min',     # C(1,b3) -> Cmin
+            'maj(*5)': 'maj',    # Cmaj(*5) -> C
+            'min(*b3)': 'min',   # Cmin(*b3) -> Cmin
+            'min(*b3,*5)': 'min' # Cmin(*b3,*5) -> Cmin
+        }
         
-        # Apply quality mapping
-        return self.quality_map.get(base_quality, base_quality)
+        # Initialize chord mapping dictionary
+        self.chord_mapping = {}
 
     _l = [0, 1, 1, 0, 1, 1, 1]
     _chroma_id = (np.arange(len(_l) * 2) + 1) + np.array(_l + _l).cumsum() - 1
@@ -450,8 +316,6 @@ class Chords:
                 given_pitch_classes[self.interval(int_def)] = 1
         return given_pitch_classes
 
-    # mapping of shorthand interval notations to the actual interval representation
-
     def chord_intervals(self, quality_str):
         """
         Convert a chord quality string to a pitch class representation. For
@@ -475,7 +339,6 @@ class Chords:
             ivs = self._shorthands[quality_str[:list_idx]].copy()
         else:
             ivs = np.zeros(12, dtype=np.int32)
-
 
         return self.interval_list(quality_str[list_idx:], ivs)
 
@@ -593,289 +456,545 @@ class Chords:
 
         return reduced_chords
 
-    def convert_to_id(self, root, is_major):
-        if root == -1:
-            return 24
-        else:
-            if is_major:
-                return root * 2
-            else:
-                return root * 2 + 1
-
-    def get_converted_chord(self, filename):
-        loaded_chord = self.load_chords(filename)
-        triads = self.reduce_to_triads(loaded_chord['chord'])
-
-        df = self.assign_chord_id(triads)
-        df['start'] = loaded_chord['start']
-        df['end'] = loaded_chord['end']
-
-        return df
-
-    def assign_chord_id(self, entry):
-        # maj, min chord only
-        # if you want to add other chord, change this part and get_converted_chord(reduce_to_triads)
-        df = pd.DataFrame(data=entry[['root', 'is_major']])
-        df['chord_id'] = df.apply(lambda row: self.convert_to_id(row['root'], row['is_major']), axis=1)
-        return df
-
-    def convert_to_id_voca(self, root, quality):
-        if root == -1:
-            return 169  # "N" (no chord) is mapped to 169
-        else:
-            # First normalize the quality for better matching
-            quality = self.normalize_quality(quality)
-            
-            # Handle extended chord qualities by reducing them to their base quality
-            base_quality = self._reduce_extended_quality(quality)
-            
-            # Special case for major chord: teacher model expects empty string
-            if base_quality == 'maj':
-                chord_key = PITCH_CLASS[root]
-                if chord_key in self.chord_mapping:
-                    return self.chord_mapping[chord_key]
-                    
-            # Try to construct the canonical chord name using the pattern from teacher model
-            chord_key = f"{PITCH_CLASS[root]}:{base_quality}"
-            if chord_key in self.chord_mapping:
-                return self.chord_mapping[chord_key]
-                
-            # If still not found, use the original algorithm
-            if base_quality == 'min':
-                return root * 14
-            elif base_quality == 'maj':
-                return root * 14 + 1
-            elif base_quality == 'dim':
-                return root * 14 + 2
-            elif base_quality == 'aug':
-                return root * 14 + 3
-            elif base_quality == 'min6':
-                return root * 14 + 4
-            elif base_quality == 'maj6':
-                return root * 14 + 5
-            elif base_quality == 'min7':
-                return root * 14 + 6
-            elif base_quality == 'minmaj7':
-                return root * 14 + 7
-            elif base_quality == 'maj7':
-                return root * 14 + 8
-            elif base_quality == '7':
-                return root * 14 + 9
-            elif base_quality == 'dim7':
-                return root * 14 + 10
-            elif base_quality == 'hdim7':
-                return root * 14 + 11
-            elif base_quality == 'sus2':
-                return root * 14 + 12
-            elif base_quality == 'sus4':
-                return root * 14 + 13
-            else:
-                return 168  # Unknown chord mapped to 168
-
-    def _reduce_extended_quality(self, quality):
+    def normalize_chord(self, chord_name):
         """
-        Reduce extended chord qualities to their base quality for better mapping.
-        For example, min9 -> min7, maj13 -> maj7, etc.
+        Normalize a chord name to a canonical form for consistent lookup.
+        Handles various notations, enharmonic equivalents, and format issues.
+        
+        Args:
+            chord_name (str): Input chord name in any supported format
+            
+        Returns:
+            tuple: (normalized_chord, root, quality, bass)
         """
-        # Map extended chords to their base qualities
-        if quality in ['min9', 'min11', 'min13']:
-            return 'min7'  # Reduce to min7
-        elif quality in ['maj9', 'maj11', 'maj13']:
-            return 'maj7'  # Reduce to maj7
-        elif quality in ['9', '11', '13']:
-            return '7'     # Reduce to dominant 7
-        elif quality in ['add9', 'add2']:
-            return 'maj'   # Reduce to major
-        elif quality in ['minAdd9', 'min(add9)']:
-            return 'min'   # Reduce to minor
-        # Handle special cases: (*3,*5) notation for omitted notes
-        elif '(*' in quality:
-            # Extract base quality before the parenthesis
-            base = quality.split('(')[0]
-            return base if base else 'maj'
+        # Handle special chords
+        if chord_name in ['N', 'NC', 'X']:
+            return chord_name, None, None, None
         
-        return quality     # Return unchanged if not an extended chord
-
-    def get_converted_chord_voca(self, filename):
-        loaded_chord = self.load_chords(filename)
-        triads = self.reduce_to_triads(loaded_chord['chord'])
-        df = pd.DataFrame(data=triads[['root', 'is_major']])
-
-        (ref_intervals, ref_labels) = mir_eval.io.load_labeled_intervals(filename)
-        ref_labels = self.lab_file_error_modify(ref_labels)
-        idxs = list()
+        # Apply basic error correction
+        chord_name = self.label_error_modify(chord_name)
         
-        # Add debugging for chord mapping
-        if not hasattr(self, 'chord_mapping'):
-            logger.info("Warning: chord_mapping attribute not set. Using formula-based mapping.")
-            self.chord_mapping = {}
+        # Split into components
+        root, quality, bass = None, None, None
+        
+        # Handle format with separator (:)
+        if ':' in chord_name:
+            parts = chord_name.split(':')
+            root = parts[0]
+            quality_with_bass = parts[1]
             
-        # DEBUG: Add logging to show what's in the chord mapping
-        logger.debug(f"Chord mapping contains {len(self.chord_mapping)} entries")
+            # Handle bass note
+            if '/' in quality_with_bass:
+                quality, bass = quality_with_bass.split('/')
+            else:
+                quality = quality_with_bass
+        else:
+            # Handle format without separator
+            # First check for bass note
+            if '/' in chord_name:
+                main_chord, bass = chord_name.split('/')
+            else:
+                main_chord = chord_name
+                bass = None
+                
+            # Then extract root and quality
+            # Find where the root note ends and quality starts
+            for i, c in enumerate(main_chord):
+                if i > 0 and c.islower():  # Start of a quality like 'min', 'maj', etc.
+                    root = main_chord[:i]
+                    quality = main_chord[i:]
+                    break
+                elif i > 0 and c.isdigit():  # Start of a quality like '7', '9', etc.
+                    root = main_chord[:i]
+                    quality = main_chord[i:]
+                    break
+            else:
+                # If no quality found, it's just a root (major chord)
+                root = main_chord
+                quality = ''
         
-        for i in ref_labels:
-            try:
-                # This split returns the root and quality separately
-                chord_root, quality, scale_degrees, bass = mir_eval.chord.split(i, reduce_extended_chords=True)
-                
-                # Apply enharmonic mapping for flat notes
-                orig_root = chord_root  # Save original root for debugging
-                if chord_root in self.enharmonic_map:
-                    # Convert flats to sharps
-                    sharp_root = self.enharmonic_map[chord_root]
-                    chord_root = sharp_root
-                    
-                    # Reconstruct i with the sharp notation for use in chord function
-                    if quality:
-                        i_normalized = f"{sharp_root}:{quality}"
-                        if bass:
-                            i_normalized += f"/{bass}"
-                    else:
-                        i_normalized = sharp_root
-                        if bass:
-                            i_normalized += f"/{bass}"
-                    
-                    logger.debug(f"Converted {i} to {i_normalized}")
-                else:
-                    i_normalized = i
-                
-                # Get the root index and other data from the transformed chord
-                root, bass, ivs, is_major = self.chord(i_normalized)
-                
-                # CRITICAL FIX: Major chords in the teacher model are represented without :maj suffix
-                # Try lookup in the following order:
-                
-                # 1. For major chords, first try without quality (e.g., "C" instead of "C:maj")
-                if quality == 'maj' or not quality:
-                    lookup_key = PITCH_CLASS[root]
-                    if lookup_key in self.chord_mapping:
-                        logger.debug(f"Found major chord {i} as {lookup_key} -> {self.chord_mapping[lookup_key]}")
-                        idxs.append(self.chord_mapping[lookup_key])
-                        continue
-                
-                # 2. Try with explicit quality
-                lookup_key = f"{PITCH_CLASS[root]}:{quality}" if quality else PITCH_CLASS[root]
-                if lookup_key in self.chord_mapping:
-                    logger.debug(f"Found chord {i} as {lookup_key} -> {self.chord_mapping[lookup_key]}")
-                    idxs.append(self.chord_mapping[lookup_key])
-                    continue
-                    
-                # 3. For extended chords, try the reduced base quality
-                base_quality = self._reduce_extended_quality(quality)
-                base_lookup_key = f"{PITCH_CLASS[root]}:{base_quality}" if base_quality and base_quality != 'maj' else PITCH_CLASS[root]
-                if base_lookup_key in self.chord_mapping:
-                    logger.debug(f"Found extended chord {i} reduced to {base_lookup_key} -> {self.chord_mapping[base_lookup_key]}")
-                    idxs.append(self.chord_mapping[base_lookup_key])
-                    continue
-                
-                # 4. If all else fails, use the numeric formula
-                formula_result = self.convert_to_id_voca(root=root, quality=quality)
-                logger.debug(f"Using formula for chord {i}: root={root}, quality={quality} -> {formula_result}")
-                idxs.append(formula_result)
-                
-            except Exception as e:
-                logger.warning(f"Error processing chord {i}: {e}")
-                idxs.append(168)  # Unknown chord
+        # Normalize root (prefer sharps)
+        if root in self.enharmonic_map:
+            root = self.enharmonic_map.get(root, root)
         
-        df['chord_id'] = idxs
-        df['start'] = loaded_chord['start']
-        df['end'] = loaded_chord['end']
+        # Normalize quality
+        if quality in self.quality_map:
+            quality = self.quality_map[quality]
         
-        return df
-
-    def lab_file_error_modify(self, ref_labels):
-        for i in range(len(ref_labels)):
-            # Handle various notation formats
-            if ref_labels[i][-2:] == ':4':
-                ref_labels[i] = ref_labels[i].replace(':4', ':sus4')
-            elif ref_labels[i][-2:] == ':6':
-                ref_labels[i] = ref_labels[i].replace(':6', ':maj6')
-            elif ref_labels[i][-4:] == ':6/2':
-                ref_labels[i] = ref_labels[i].replace(':6/2', ':maj6/2')
-            # Keep extended chords as-is but remove extensions for lookup
-            elif ref_labels[i][-2:] == ':9':
-                # Keep the label but will be processed in get_converted_chord_voca
-                pass
-            elif ref_labels[i][-4:] == ':11':
-                # Keep the label but will be processed in get_converted_chord_voca
-                pass
-            elif ref_labels[i][-4:] == ':13':
-                # Keep the label but will be processed in get_converted_chord_voca
-                pass
-            # Handle specific error cases
-            elif ref_labels[i] == 'Emin/4':
-                ref_labels[i] = 'E:min/4'
-            elif ref_labels[i] == 'A7/3':
-                ref_labels[i] = 'A:7/3'
-            elif ref_labels[i] == 'Bb7/3':
-                ref_labels[i] = 'A#:7/3'  # Convert directly to sharp notation
-            elif ref_labels[i] == 'Bb7/5':
-                ref_labels[i] = 'A#:7/5'  # Convert directly to sharp notation
-            # Handle format without colon separator
-            elif ref_labels[i].find(':') == -1:
-                if ref_labels[i].find('min') != -1:
-                    ref_labels[i] = ref_labels[i][:ref_labels[i].find('min')] + ':' + ref_labels[i][ref_labels[i].find('min'):]
-                elif ref_labels[i].find('maj') != -1:
-                    ref_labels[i] = ref_labels[i][:ref_labels[i].find('maj')] + ':' + ref_labels[i][ref_labels[i].find('maj'):]
-                elif ref_labels[i].find('dim') != -1:
-                    ref_labels[i] = ref_labels[i][:ref_labels[i].find('dim')] + ':' + ref_labels[i][ref_labels[i].find('dim'):]
-                elif ref_labels[i].find('aug') != -1:
-                    ref_labels[i] = ref_labels[i][:ref_labels[i].find('aug')] + ':' + ref_labels[i][ref_labels[i].find('aug'):]
-                elif ref_labels[i].find('sus') != -1:
-                    ref_labels[i] = ref_labels[i][:ref_labels[i].find('sus')] + ':' + ref_labels[i][ref_labels[i].find('sus'):]
-                elif ref_labels[i].find('7') != -1:
-                    ref_labels[i] = ref_labels[i][:ref_labels[i].find('7')] + ':' + ref_labels[i][ref_labels[i].find('7'):]
+        # Construct normalized chord name
+        if not quality or quality == 'maj':
+            normalized = root  # Just root for major
+        else:
+            normalized = f"{root}:{quality}"
+        
+        # Add bass if present
+        if bass:
+            normalized += f"/{bass}"
             
-            # Handle enharmonic equivalents at the label level
-            parts = ref_labels[i].split(':')
-            if len(parts) > 1 and parts[0] in self.enharmonic_map:
-                ref_labels[i] = self.enharmonic_map[parts[0]] + ':' + parts[1]
+        return normalized, root, quality, bass
 
-        return ref_labels
+    def simplify_chord(self, chord_name):
+        """
+        Simplify a chord to its basic form by reducing extensions and removing inversions.
+        This is helpful for mapping complex chords to a smaller vocabulary.
+        
+        Args:
+            chord_name (str): The chord name to simplify
+            
+        Returns:
+            str: Simplified chord name
+        """
+        # Special cases
+        if chord_name in ['N', 'NC', 'X']:
+            return chord_name
+            
+        # First normalize the chord
+        normalized, root, quality, bass = self.normalize_chord(chord_name)
+        if root is None:  # Special chord
+            return normalized
+            
+        # Remove inversion (bass note)
+        simplified = f"{root}:{quality}" if quality else root
+        
+        # Apply simplification for extended qualities
+        if quality in self.simplification_map:
+            simple_quality = self.simplification_map[quality]
+            simplified = f"{root}:{simple_quality}" if simple_quality != 'maj' else root
+        
+        # Handle special cases with parentheses
+        elif '(' in quality and quality not in self._shorthands:
+            # Extract base quality if present
+            base_quality = quality.split('(')[0]
+            if base_quality in self._shorthands:
+                simplified = f"{root}:{base_quality}" if base_quality != 'maj' else root
+            elif any(pattern in quality for pattern in ['(1)', '(*']):
+                # Patterns like (1) or (*3) indicate root position major or altered chords
+                simplified = root
+        
+        return simplified
+
+    def label_error_modify(self, label):
+        """
+        Correct common errors and inconsistencies in chord label format
+        """
+        if not label or label in ['N', 'X', 'NC']:
+            return label
+            
+        # Common format fixes
+        if label == 'Emin/4': 
+            return 'E:min/4'
+        elif label == 'A7/3': 
+            return 'A:7/3'
+        elif label == 'Bb7/3': 
+            return 'Bb:7/3'
+        elif label == 'Bb7/5': 
+            return 'Bb:7/5'
+            
+        # Handle format without colon separator
+        if ':' not in label:
+            # Check for common quality strings and insert separator
+            for quality in ['min', 'maj', 'dim', 'aug', 'sus']:
+                if quality in label:
+                    idx = label.find(quality)
+                    return label[:idx] + ':' + label[idx:]
+            
+            # Check for numeric qualities like 7, 9, etc.
+            for i, c in enumerate(label):
+                if i > 0 and c.isdigit():
+                    return label[:i] + ':' + label[i:]
+                    
+        return label
 
     def set_chord_mapping(self, chord_mapping):
         """
-        Set the chord mapping to be used when looking up chord indices.
+        Set the chord mapping to be used for chord index lookup.
+        Also initializes extended mappings for variants.
         
-        Parameters
-        ----------
-        chord_mapping : dict
-            Dictionary mapping chord names to indices
+        Args:
+            chord_mapping (dict): Dictionary mapping chord names to indices
         """
         if not chord_mapping:
-            logger.warning("Empty chord mapping provided. This may cause issues with chord recognition.")
+            logger.warning("Empty chord mapping provided. Using formula-based approach.")
             self.chord_mapping = {}
             return
             
-        self.chord_mapping = chord_mapping
+        # Store a copy of the original mapping
+        self.chord_mapping = chord_mapping.copy()
         logger.info(f"Chord mapping set with {len(chord_mapping)} entries")
         
-        # Log some example mappings for debugging purposes
-        debug_sample = {
-            'Major chords': {k: chord_mapping.get(k) for k in ['C', 'F', 'G'] if k in chord_mapping},
-            'Minor chords': {k: chord_mapping.get(k) for k in ['C:min', 'A:min', 'D:min'] if k in chord_mapping},
-            'Special chords': {k: chord_mapping.get(k) for k in ['N', 'X'] if k in chord_mapping}
-        }
-        logger.debug(f"Chord mapping examples: {debug_sample}")
-        
-        # Check for expected chord mappings
-        if 'N' not in chord_mapping:
-            logger.warning("No mapping for 'N' (no chord) found. Will default to 24 or 169 depending on vocabulary size.")
-            
-        # Check if we're using large vocabulary (170 chords) by examining the mapping
-        max_index = max(chord_mapping.values()) if chord_mapping else 0
-        if max_index > 25:
-            logger.info(f"Large vocabulary detected (max index: {max_index})")
-        else:
-            logger.info(f"Standard vocabulary detected (max index: {max_index})")
-        
-        # Initialize the enharmonic mapping for consistent chord lookup
-        self._initialize_enharmonic_mapping()
+        # Initialize extended mappings (inversions, variants, etc.)
+        self.initialize_chord_mapping()
 
-    def _initialize_enharmonic_mapping(self):
-        """Initialize mappings between flat and sharp notes for consistent chord lookup"""
-        # Create bidirectional mapping for enharmonic equivalents
-        self.enharmonic_map = {
+    def initialize_chord_mapping(self, chord_mapping=None):
+        """
+        Ensure chord_mapping is initialized, with extensive handling of variants
+        
+        Args:
+            chord_mapping: Chord mapping to use, if specified
+        """
+        if chord_mapping:
+            self.chord_mapping = chord_mapping.copy()  # Create a copy to avoid modifying the original
+            logger.info(f"Chord mapping set with {len(chord_mapping)} entries")
+        elif not hasattr(self, 'chord_mapping') or not self.chord_mapping:
+            # Create empty mapping if none exists
+            self.chord_mapping = {}
+            logger.warning("Using empty chord mapping - chord lookups will use formula-based approach")
+        
+        # Make a copy of the original mapping before we start adding to it
+        original_mapping = dict(self.chord_mapping)
+        
+        # ---- PART 1: ADD BARE ROOTS FOR ENHARMONIC EQUIVALENTS ----
+        
+        # Define the flat and sharp equivalents including more variants
+        all_enharmonics = [
+            ('Bb', 'A#'), ('Db', 'C#'), ('Eb', 'D#'), ('Gb', 'F#'), ('Ab', 'G#')
+        ]
+        
+        # First make sure ALL bare roots are correctly mapped (both ways)
+        for flat, sharp in all_enharmonics:
+            # If EITHER form exists, ensure BOTH forms are mapped
+            if flat in self.chord_mapping:
+                flat_idx = self.chord_mapping[flat]
+                self.chord_mapping[sharp] = flat_idx
+                logger.debug(f"Added bare root enharmonic: {sharp} -> {flat_idx}")
+            elif sharp in self.chord_mapping:
+                sharp_idx = self.chord_mapping[sharp]
+                self.chord_mapping[flat] = sharp_idx
+                logger.debug(f"Added bare root enharmonic: {flat} -> {sharp_idx}")
+            
+            # Also ensure the :maj forms exist
+            flat_maj = f"{flat}:maj"
+            sharp_maj = f"{sharp}:maj"
+            
+            if flat in self.chord_mapping and flat_maj not in self.chord_mapping:
+                self.chord_mapping[flat_maj] = self.chord_mapping[flat]
+                logger.debug(f"Added maj form: {flat_maj} -> {self.chord_mapping[flat]}")
+            
+            if sharp in self.chord_mapping and sharp_maj not in self.chord_mapping:
+                self.chord_mapping[sharp_maj] = self.chord_mapping[sharp]
+                logger.debug(f"Added maj form: {sharp_maj} -> {self.chord_mapping[sharp]}")
+            
+            # Ensure bare roots are mapped to :maj forms
+            if flat_maj in self.chord_mapping and flat not in self.chord_mapping:
+                self.chord_mapping[flat] = self.chord_mapping[flat_maj]
+                logger.debug(f"Added bare root from maj: {flat} -> {self.chord_mapping[flat_maj]}")
+            
+            if sharp_maj in self.chord_mapping and sharp not in self.chord_mapping:
+                self.chord_mapping[sharp] = self.chord_mapping[sharp_maj]
+                logger.debug(f"Added bare root from maj: {sharp} -> {self.chord_mapping[sharp_maj]}")
+                
+        # ---- PART 2: GENERATE ALL QUALITY VARIANTS FOR ENHARMONICS ----
+        
+        # Generate all quality variants for enharmonic equivalents
+        qualities = ['', ':maj', ':min', ':7', ':maj7', ':min7', ':dim', ':aug', ':sus2', ':sus4', 
+                    ':6', ':9', ':maj9', ':min9', ':13', ':maj13', ':min13', ':dim7', ':hdim7', 
+                    ':minmaj7', ':sus', ':11', ':maj11', ':min11']
+        
+        # For each enharmonic pair, make sure all qualities are mapped
+        for flat, sharp in all_enharmonics:
+            # For each quality, map between flat and sharp
+            for q in qualities:
+                flat_chord = flat + q
+                sharp_chord = sharp + q
+                
+                # Map from flat to sharp
+                if flat_chord in self.chord_mapping and sharp_chord not in self.chord_mapping:
+                    self.chord_mapping[sharp_chord] = self.chord_mapping[flat_chord]
+                    logger.debug(f"Added enharmonic quality: {sharp_chord} -> {self.chord_mapping[flat_chord]}")
+                # Map from sharp to flat
+                elif sharp_chord in self.chord_mapping and flat_chord not in self.chord_mapping:
+                    self.chord_mapping[flat_chord] = self.chord_mapping[sharp_chord]
+                    logger.debug(f"Added enharmonic quality: {flat_chord} -> {self.chord_mapping[sharp_chord]}")
+                
+                # Also handle all inversions for each quality
+                for inversion in ['2', '3', '4', '5', '6', '7', '9', 'b2', 'b3', 'b5', 'b6', 'b7', 'b9', '#5', '#9']:
+                    flat_inv = f"{flat_chord}/{inversion}"
+                    sharp_inv = f"{sharp_chord}/{inversion}"
+                    
+                    # Map flat inversions to their sharp equivalents
+                    if flat_chord in self.chord_mapping:
+                        self.chord_mapping[flat_inv] = self.chord_mapping[flat_chord]
+                        self.chord_mapping[sharp_inv] = self.chord_mapping[flat_chord]
+                    elif sharp_chord in self.chord_mapping:
+                        self.chord_mapping[sharp_inv] = self.chord_mapping[sharp_chord]
+                        self.chord_mapping[flat_inv] = self.chord_mapping[sharp_chord]
+        
+        # ---- PART 3: HANDLE MAJOR/MINOR BASE FORM VARIATIONS ----
+        
+        # Handle implicit and explicit major chord forms
+        for root in ['C', 'C#', 'Db', 'D', 'D#', 'Eb', 'E', 'F', 'F#', 'Gb', 'G', 'G#', 'Ab', 'A', 'A#', 'Bb', 'B']:
+            # Handle both root forms (G and G:maj)
+            root_form = root
+            maj_form = f"{root}:maj"
+            
+            # Map between the two forms
+            if root_form in self.chord_mapping and maj_form not in self.chord_mapping:
+                self.chord_mapping[maj_form] = self.chord_mapping[root_form]
+                logger.debug(f"Added major mapping: {maj_form} -> {self.chord_mapping[root_form]}")
+            elif maj_form in self.chord_mapping and root_form not in self.chord_mapping:
+                self.chord_mapping[root_form] = self.chord_mapping[maj_form]
+                logger.debug(f"Added major mapping: {root_form} -> {self.chord_mapping[maj_form]}")
+        
+        # ---- PART 4: HANDLE INVERSIONS ----
+        
+        # Create a new mapping of chords to process inversions and other variants
+        extended_mapping = dict(self.chord_mapping)
+        
+        # Process all chords in our mapping to add their inversions
+        for chord, idx in extended_mapping.items():
+            # Skip special chords like N or X
+            if chord in ['N', 'X']:
+                continue
+                
+            # Extract the root and quality
+            if ':' in chord:
+                root, quality = chord.split(':', 1)
+            else:
+                root = chord
+                quality = 'maj'  # Implicit major
+            
+            # Handle basic inversions: map G/3, G/5, G/7, etc. to G
+            # Include ALL common inversion numbers and bass notes
+            for inversion in ['2', '3', '4', '5', '6', '7', '9', 'b2', 'b3', 'b5', 'b6', 'b7', 'b9', '#5', '#9']:
+                # For quality-specified chords (e.g., "E:min/5")
+                inv_chord = f"{root}:{quality}/{inversion}"
+                if inv_chord not in self.chord_mapping:
+                    self.chord_mapping[inv_chord] = idx
+                    logger.debug(f"Added inversion mapping: {inv_chord} -> {idx}")
+                
+                # For implicit major chords (e.g., "A/3")
+                if quality == 'maj':
+                    implicit_inv = f"{root}/{inversion}"
+                    if implicit_inv not in self.chord_mapping:
+                        self.chord_mapping[implicit_inv] = idx
+                        logger.debug(f"Added implicit major inversion: {implicit_inv} -> {idx}")
+        
+        # ---- PART 5: HANDLE EXTENSIONS AND ALTERATIONS ----
+        
+        # Map extended chords (9, 11, 13) to their base 7th chord forms
+        extension_mappings = {
+            'maj9': 'maj7',      # Cmaj9 -> Cmaj7
+            'maj11': 'maj7',     # Cmaj11 -> Cmaj7
+            'maj13': 'maj7',     # Cmaj13 -> Cmaj7
+            'maj9(*7)': 'maj7',  # Cmaj9(*7) -> Cmaj7
+            '9': '7',            # C9 -> C7
+            '11': '7',           # C11 -> C7
+            '13': '7',           # C13 -> C7
+            '9(11)': '7',        # C9(11) -> C7
+            'min9': 'min7',      # Cmin9 -> Cmin7
+            'min11': 'min7',     # Cmin11 -> Cmin7
+            'min13': 'min7',     # Cmin13 -> Cmin7
+            '7(#9)': '7',        # C7(#9) -> C7
+            '7(b9)': '7',        # C7(b9) -> C7
+            '7(#5)': '7',        # C7(#5) -> C7
+            'maj(9)': 'maj7',    # Cmaj(9) -> Cmaj7
+            'maj(b9)': 'maj7',   # Cmaj(b9) -> Cmaj7
+            'maj(4)': 'maj',     # Cmaj(4) -> Cmaj
+            'dim/b3': 'dim',     # Cdim/b3 -> Cdim
+            'sus4(2)': 'sus4',   # Csus4(2) -> Csus4
+            'sus4(9)': 'sus4',   # Csus4(9) -> Csus4
+            'sus4(b7)': 'sus4',  # Csus4(b7) -> Csus4
+            'sus2(b7)': 'sus2',  # Csus2(b7) -> Csus2
+            '(1)': 'maj',        # C(1) -> C
+            '(1,5)': 'maj',      # C(1,5) -> C
+            '(1,b7)': '7',       # C(1,b7) -> C7
+            '(1,b3)': 'min',     # C(1,b3) -> Cmin
+            '(1,4,b7)': '7',     # C(1,4,b7) -> C7
+            'maj(*5)': 'maj',    # Cmaj(*5) -> C
+            'min(*b3)': 'min',   # Cmin(*b3) -> Cmin
+            'min(*b3,*5)': 'min' # Cmin(*b3,*5) -> Cmin
+        }
+        
+        # Adding extended mappings for each root note
+        all_roots = []
+        # Include all possible root notes, both sharps and flats
+        for root in ['C', 'C#', 'Db', 'D', 'D#', 'Eb', 'E', 'F', 'F#', 'Gb', 'G', 'G#', 'Ab', 'A', 'A#', 'Bb', 'B']:
+            if root not in all_roots:
+                all_roots.append(root)
+                
+        for root in all_roots:
+            for ext, base in extension_mappings.items():
+                ext_chord = f"{root}:{ext}"
+                base_chord = f"{root}:{base}"
+                
+                # Try both with and without colon for the base chord (for major quality)
+                if base_chord in self.chord_mapping and ext_chord not in self.chord_mapping:
+                    self.chord_mapping[ext_chord] = self.chord_mapping[base_chord]
+                    logger.debug(f"Added extension mapping: {ext_chord} -> {self.chord_mapping[base_chord]}")
+                
+                # Special case for 'maj' quality which might be implicit
+                if base == 'maj' and root in self.chord_mapping and ext_chord not in self.chord_mapping:
+                    self.chord_mapping[ext_chord] = self.chord_mapping[root]
+                    logger.debug(f"Added extension to implicit major: {ext_chord} -> {self.chord_mapping[root]}")
+                
+                # Also handle inversions of extended chords - CRITICAL for patterns like "E:9/5"
+                for inversion in ['2', '3', '4', '5', '6', '7', '9', 'b2', 'b3', 'b5', 'b6', 'b7', 'b9', '#5', '#9']:
+                    ext_inv_chord = f"{root}:{ext}/{inversion}"
+                    if base_chord in self.chord_mapping and ext_inv_chord not in self.chord_mapping:
+                        self.chord_mapping[ext_inv_chord] = self.chord_mapping[base_chord]
+                        logger.debug(f"Added extension inversion: {ext_inv_chord} -> {self.chord_mapping[base_chord]}")
+                    
+                    # Handle special case for maj quality
+                    if base == 'maj' and root in self.chord_mapping and ext_inv_chord not in self.chord_mapping:
+                        self.chord_mapping[ext_inv_chord] = self.chord_mapping[root]
+                        logger.debug(f"Added extension inversion to implicit major: {ext_inv_chord} -> {self.chord_mapping[root]}")
+        
+        # ---- PART 6: VERIFY PROBLEMATIC CHORDS ----
+        
+        # Verify common problematic chords seen in logs
+        problem_chords = [
+            # Bare enharmonics
+            'Bb', 'Eb', 'Db', 'Gb', 'Ab',
+            # Common inversions
+            'G/3', 'A/3', 'E:min/5', 'A/5', 'E:min/b7', 'D/5', 'C#:min/5',
+            # Altered and extended chords
+            'E:9', 'D:9', 'F:9', 'C:9', 'D:min9', 'F:maj9(*7)', 'C:maj(4)', 'E:(1)',
+            'A:min/b3', 'E:7/3', 'A:7/b7', 'A:7/5', 'G:sus4(b7)', 'F#:(1,4,b7)'
+        ]
+        
+        # Verify the mappings and log results
+        logger.info("\n==== Verifying Critical Chord Mappings ====")
+        mapped_count = 0
+        for chord in problem_chords:
+            if chord in self.chord_mapping:
+                mapped_count += 1
+                logger.info(f"  ✓ {chord} -> {self.chord_mapping[chord]}")
+            else:
+                logger.warning(f"  ✗ {chord} -> Not mapped")
+                
+                # Try to find the root/quality to see where mapping is failing
+                if ':' in chord:
+                    root, quality = chord.split(':', 1)
+                    if '/' in quality:
+                        quality, _ = quality.split('/', 1)
+                    
+                    # Check if we have the base quality
+                    base_chord = f"{root}:{quality}"
+                    if base_chord in self.chord_mapping:
+                        logger.warning(f"    - Base chord {base_chord} IS mapped -> {self.chord_mapping[base_chord]}")
+                    
+                    # If enharmonic, check alternative form
+                    if root in self.enharmonic_map:
+                        alt_root = self.enharmonic_map[root]
+                        alt_chord = f"{alt_root}:{quality}"
+                        if alt_chord in self.chord_mapping:
+                            logger.warning(f"    - Enharmonic {alt_chord} IS mapped -> {self.chord_mapping[alt_chord]}")
+                
+        # Log success rate
+        logger.info(f"Successfully mapped {mapped_count}/{len(problem_chords)} critical chords")
+        logger.info(f"Chord mapping expanded from {len(original_mapping)} to {len(self.chord_mapping)} entries")
+    
+    def get_chord_idx(self, chord_name, use_large_voca=False):
+        """
+        Get chord index with enhanced fallback and simplification logic
+        
+        Args:
+            chord_name (str): Chord name to look up
+            use_large_voca (bool): Whether to use large vocabulary
+            
+        Returns:
+            int: Chord index
+        """
+        # Handle special cases
+        if chord_name == "N" or chord_name == "NC":
+            return 169 if use_large_voca else 24
+        if chord_name == "X":
+            return 168 if use_large_voca else 25
+        
+        # Direct lookup first (most efficient)
+        if chord_name in self.chord_mapping:
+            return self.chord_mapping[chord_name]
+        
+        # FALLBACK 1: Try both implicit and explicit forms for major chords
+        if ':' not in chord_name and '/' not in chord_name:
+            # This is a bare root, try with explicit major
+            maj_form = f"{chord_name}:maj"
+            if maj_form in self.chord_mapping:
+                logger.debug(f"Using explicit major: {chord_name} -> {maj_form}")
+                return self.chord_mapping[maj_form]
+        elif ':maj' in chord_name:
+            # This is an explicit major, try implicit form
+            root = chord_name.split(':')[0]
+            if root in self.chord_mapping:
+                logger.debug(f"Using implicit major: {chord_name} -> {root}")
+                return self.chord_mapping[root]
+                
+        # FALLBACK 2: Try enharmonic equivalents
+        enharmonic = self._get_enharmonic(chord_name)
+        if enharmonic and enharmonic in self.chord_mapping:
+            logger.debug(f"Using enharmonic: {chord_name} -> {enharmonic}")
+            return self.chord_mapping[enharmonic]
+        
+        # FALLBACK 3: Try removing inversions
+        if '/' in chord_name:
+            base_chord = chord_name.split('/')[0]
+            if base_chord in self.chord_mapping:
+                logger.debug(f"Removed inversion: {chord_name} -> {base_chord}")
+                return self.chord_mapping[base_chord]
+            
+            # Try enharmonic of base chord
+            base_enharmonic = self._get_enharmonic(base_chord)
+            if base_enharmonic and base_enharmonic in self.chord_mapping:
+                logger.debug(f"Using enharmonic base: {chord_name} -> {base_enharmonic}")
+                return self.chord_mapping[base_enharmonic]
+        
+        # FALLBACK 4: Try simplification (more complex/slower)
+        simplified_chord = self._simplify_chord(chord_name)
+        if simplified_chord in self.chord_mapping:
+            logger.debug(f"Using simplified: {chord_name} -> {simplified_chord}")
+            return self.chord_mapping[simplified_chord]
+            
+        # FALLBACK 5: Try simplified enharmonic
+        simplified_enharmonic = self._get_enharmonic(simplified_chord)
+        if simplified_enharmonic and simplified_enharmonic in self.chord_mapping:
+            logger.debug(f"Using simplified enharmonic: {chord_name} -> {simplified_enharmonic}")
+            return self.chord_mapping[simplified_enharmonic]
+        
+        # FALLBACK 6: Try to extract root and directly map to major/minor
+        if ':' in chord_name:
+            root, quality = chord_name.split(':', 1)
+            if '/' in quality:  # Remove inversion if present
+                quality = quality.split('/')[0]
+                
+            # For minor-like chords
+            if 'min' in quality or 'm' == quality or 'dim' in quality:
+                minor_form = f"{root}:min"
+                if minor_form in self.chord_mapping:
+                    logger.debug(f"Mapped to minor: {chord_name} -> {minor_form}")
+                    return self.chord_mapping[minor_form]
+                    
+            # For dominant-like chords
+            if '7' in quality or '9' in quality or '11' in quality or '13' in quality:
+                dominant_form = f"{root}:7"
+                if dominant_form in self.chord_mapping:
+                    logger.debug(f"Mapped to dominant: {chord_name} -> {dominant_form}")
+                    return self.chord_mapping[dominant_form]
+                    
+            # For major-like chords
+            if quality.startswith('maj') or quality in ['', '6', 'sus2', 'sus4']:
+                if root in self.chord_mapping:
+                    logger.debug(f"Mapped to major: {chord_name} -> {root}")
+                    return self.chord_mapping[root]
+        
+        # If everything fails, map to unknown chord
+        logger.warning(f"Could not map chord: {chord_name}, using unknown chord index")
+        return 169 if use_large_voca else 24
+    
+    def _get_enharmonic(self, chord_name):
+        """
+        Get enharmonic equivalent of a chord name if possible
+        
+        Args:
+            chord_name (str): Chord name to find enharmonic for
+            
+        Returns:
+            str: Enharmonic equivalent or None
+        """
+        if not chord_name or chord_name in ["N", "X", "NC"]:
+            return None
+            
+        # Define flat-sharp conversion map
+        enharmonic_map = {
             'Bb': 'A#', 'A#': 'Bb',
             'Db': 'C#', 'C#': 'Db',
             'Eb': 'D#', 'D#': 'Eb',
@@ -883,140 +1002,157 @@ class Chords:
             'Ab': 'G#', 'G#': 'Ab',
         }
         
-        # Add chord mappings for enharmonic equivalents if one exists but the other doesn't
-        if hasattr(self, 'chord_mapping') and self.chord_mapping:
-            # Check each root note with both flat and sharp variants
-            for flat, sharp in [('Bb', 'A#'), ('Db', 'C#'), ('Eb', 'D#'), ('Gb', 'F#'), ('Ab', 'G#')]:
-                # For major chords (root only)
-                if flat in self.chord_mapping and sharp not in self.chord_mapping:
-                    self.chord_mapping[sharp] = self.chord_mapping[flat]
-                elif sharp in self.chord_mapping and flat not in self.chord_mapping:
-                    self.chord_mapping[flat] = self.chord_mapping[sharp]
+        # Handle chord without quality (e.g., "Bb")
+        if ':' not in chord_name and '/' not in chord_name:
+            return enharmonic_map.get(chord_name)
+            
+        # Handle chord with quality and/or bass (e.g., "Bb:maj7/5")
+        parts = chord_name.split(':')
+        root = parts[0]
+        
+        if root in enharmonic_map:
+            # Replace root with enharmonic equivalent
+            enharmonic_root = enharmonic_map[root]
+            if len(parts) == 1:
+                return enharmonic_root
+            else:
+                # Keep the quality and bass parts intact
+                return f"{enharmonic_root}:{parts[1]}"
                 
-                # For common qualities
-                for quality in ['min', 'maj', 'dim', 'aug', '7', 'maj7', 'min7']:
-                    flat_chord = f"{flat}:{quality}"
-                    sharp_chord = f"{sharp}:{quality}"
-                    
-                    if flat_chord in self.chord_mapping and sharp_chord not in self.chord_mapping:
-                        self.chord_mapping[sharp_chord] = self.chord_mapping[flat_chord]
-                    elif sharp_chord in self.chord_mapping and flat_chord not in self.chord_mapping:
-                        self.chord_mapping[flat_chord] = self.chord_mapping[sharp_chord]
+        return None
 
     def get_chord_idx(self, chord_name, use_large_voca=False):
         """
-        Get chord index for a given chord name, with fallbacks for error cases.
+        Get the index for a chord name, with fallbacks for unknown chords.
         
-        Parameters
-        ----------
-        chord_name : str
-            The chord name to look up
-        use_large_voca : bool
-            Whether to use the large vocabulary (170 chords)
+        Args:
+            chord_name (str): Chord name to look up
+            use_large_voca (bool): Whether to use large vocabulary mode
             
-        Returns
-        -------
-        int
-            The chord index
+        Returns:
+            int: Chord index
         """
-        # Direct lookup first (most efficient)
-        if hasattr(self, 'chord_mapping') and self.chord_mapping and chord_name in self.chord_mapping:
-            return self.chord_mapping[chord_name]
-            
-        # Handle special cases
-        if chord_name == "N":
+        # Special cases
+        if chord_name == "N" or chord_name == "NC":
             return 169 if use_large_voca else 24
         if chord_name == "X":
             return 168 if use_large_voca else 25
             
-        # Try parsing the chord
-        try:
-            # Process the chord label with error correction
-            modified_chord = self.label_error_modify(chord_name)
+        # Direct lookup (most efficient)
+        if chord_name in self.chord_mapping:
+            return self.chord_mapping[chord_name]
             
-            # Parse the chord
-            root, bass, intervals, is_major = self.chord(modified_chord)
+        # Try normalized form
+        normalized, root, quality, _ = self.normalize_chord(chord_name)
+        if normalized in self.chord_mapping:
+            return self.chord_mapping[normalized]
             
-            # For large vocabulary, extract quality
-            if use_large_voca:
-                quality = None
-                if ':' in modified_chord:
-                    _, quality = modified_chord.split(':', 1)
-                    if '/' in quality:
-                        quality = quality.split('/', 1)[0]
-                else:
-                    quality = 'maj'  # Default
+        # Try simplified form
+        simplified = self.simplify_chord(chord_name)
+        if simplified in self.chord_mapping:
+            return self.chord_mapping[simplified]
+            
+        # If root exists, try basic forms
+        if root:
+            # Try major form of root (both implicit and explicit)
+            if root in self.chord_mapping:
+                return self.chord_mapping[root]
+            elif f"{root}:maj" in self.chord_mapping:
+                return self.chord_mapping[f"{root}:maj"]
                 
-                return self.convert_to_id_voca(root=root, quality=quality)
-            else:
-                # For standard vocabulary
-                return self.convert_to_id(root=root, is_major=is_major)
-                
-        except Exception as e:
-            logger.warning(f"Error parsing chord '{chord_name}': {e}")
-            return 169 if use_large_voca else 24  # Default to N
+            # If it's a major quality variant, try using just the root
+            if quality and (quality.startswith('maj') or quality in ['6', '9', '13']):
+                if root in self.chord_mapping:
+                    return self.chord_mapping[root]
+                    
+            # If it's a dominant quality, try using root:7
+            if quality and ('7' in quality or '9' in quality or '11' in quality or '13' in quality):
+                if f"{root}:7" in self.chord_mapping:
+                    return self.chord_mapping[f"{root}:7"]
+                    
+            # If it's a minor quality variant, try using root:min
+            if quality and ('min' in quality or 'm' == quality):
+                if f"{root}:min" in self.chord_mapping:
+                    return self.chord_mapping[f"{root}:min"]
+        
+        # Log warning and return unknown chord as last resort
+        logger.warning(f"Could not map chord: {chord_name}")
+        return 169 if use_large_voca else 24  # Default to no-chord
 
-    def initialize_chord_mapping(self, chord_mapping=None):
-        """
-        Ensure chord_mapping is initialized, logging availability for debugging
-        
-        Args:
-            chord_mapping: Chord mapping to use, if specified
-        """
-        if chord_mapping:
-            self.chord_mapping = chord_mapping
-            logger.info(f"Chord mapping set with {len(chord_mapping)} entries")
-        elif not hasattr(self, 'chord_mapping') or not self.chord_mapping:
-            # Create empty mapping if none exists
-            self.chord_mapping = {}
-            logger.warning("Using empty chord mapping - chord lookups will use formula-based approach")
-            
-        # Log the mapping of standard notes to verify correctness
-        debug_mappings = {
-            'C': self.chord_mapping.get('C', None),
-            'C#': self.chord_mapping.get('C#', None),
-            'D': self.chord_mapping.get('D', None),
-            'D#': self.chord_mapping.get('D#', None),
-            'C:min': self.chord_mapping.get('C:min', None),
-            'C:maj': self.chord_mapping.get('C:maj', None),
-            'C:min7': self.chord_mapping.get('C:min7', None)
-        }
-        logger.debug(f"Sample mappings: {debug_mappings}")
-
-    def check_chord_mapping_completeness(self):
-        """
-        Check that our chord mapping contains all expected chord types
-        and log any missing entries.
-        """
-        # Only run check if chord_mapping is set
-        if not hasattr(self, 'chord_mapping') or not self.chord_mapping:
-            logger.warning("Cannot check chord mapping completeness - mapping not set")
-            return False
-            
-        # Check all key chord types
-        missing_chords = []
-        
-        # Check for major chords (just the root note, no quality suffix)
-        for root in PITCH_CLASS:
-            if root not in self.chord_mapping:
-                missing_chords.append(root)
-                
-        # Check for other common qualities
-        qualities = ['min', 'dim', 'aug', 'sus4', '7', 'maj7', 'min7']
-        for root in PITCH_CLASS:
-            for quality in qualities:
-                chord_key = f"{root}:{quality}"
-                if chord_key not in self.chord_mapping:
-                    missing_chords.append(chord_key)
-        
-        if missing_chords:
-            logger.warning(f"Missing {len(missing_chords)} expected chords in mapping")
-            if len(missing_chords) < 20:
-                logger.warning(f"Missing chords: {missing_chords}")
-            return False
+    def convert_to_id(self, root, is_major):
+        """Legacy method for small vocabulary (25 chords)"""
+        if root == -1:
+            return 24  # No chord
         else:
-            logger.info("Chord mapping is complete with all expected chord types")
-            return True
+            if is_major:
+                return root * 2  # Even indices for major
+            else:
+                return root * 2 + 1  # Odd indices for minor
+
+    def convert_to_id_voca(self, root, quality):
+        """Legacy method for large vocabulary (170 chords)"""
+        if root == -1:
+            return 169  # No chord
+            
+        # First normalize the quality
+        quality = self.normalize_quality(quality) if hasattr(self, 'normalize_quality') else quality
+        
+        # Try mapping directly if available
+        chord_key = f"{PITCH_CLASS[root]}:{quality}" if quality and quality != 'maj' else PITCH_CLASS[root]
+        if hasattr(self, 'chord_mapping') and chord_key in self.chord_mapping:
+            return self.chord_mapping[chord_key]
+            
+        # Fall back to formula-based mapping
+        if quality == 'min':
+            return root * 14
+        elif quality == 'maj' or not quality:
+            return root * 14 + 1
+        elif quality == 'dim':
+            return root * 14 + 2
+        elif quality == 'aug':
+            return root * 14 + 3
+        elif quality == 'min6':
+            return root * 14 + 4
+        elif quality == 'maj6':
+            return root * 14 + 5
+        elif quality == 'min7':
+            return root * 14 + 6
+        elif quality == 'minmaj7':
+            return root * 14 + 7
+        elif quality == 'maj7':
+            return root * 14 + 8
+        elif quality == '7':
+            return root * 14 + 9
+        elif quality == 'dim7':
+            return root * 14 + 10
+        elif quality == 'hdim7':
+            return root * 14 + 11
+        elif quality == 'sus2':
+            return root * 14 + 12
+        elif quality == 'sus4':
+            return root * 14 + 13
+        else:
+            return 168  # Unknown chord
+
+    def assign_chord_id(self, entry):
+        """Legacy method for compatibility"""
+        df = pd.DataFrame(data=entry[['root', 'is_major']])
+        df['chord_id'] = df.apply(lambda row: self.convert_to_id(row['root'], row['is_major']), axis=1)
+        return df
+
+    def get_converted_chord(self, filename):
+        """Legacy method for compatibility"""
+        loaded_chord = self.load_chords(filename)
+        triads = self.reduce_to_triads(loaded_chord['chord'])
+        df = self.assign_chord_id(triads)
+        df['start'] = loaded_chord['start']
+        df['end'] = loaded_chord['end']
+        return df
+
+    def get_converted_chord_voca(self, filename):
+        """Legacy method for compatibility"""
+        # ...existing code...
+
 
 def idx2voca_chord():
     """

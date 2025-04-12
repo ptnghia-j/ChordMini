@@ -156,14 +156,17 @@ spec:
               value: "1.0"  # Default scale: 1.0 = base model
             # Learning rate parameters
             - name: LEARNING_RATE
-              value: "0.0002"  # Lower base learning rate for fine-tuning
+              value: "0.0001"  # Lower base learning rate for fine-tuning
             - name: MIN_LEARNING_RATE
               value: "0.00001"  # Minimum learning rate
             # Knowledge distillation settings
             - name: USE_KD_LOSS
               value: "false"  # Set to "true" to enable KD loss
+            # Add explicit note about KD status
+            - name: KD_STATUS_CHECK
+              value: "disabled_explicitly"  # For debugging purposes
             - name: KD_ALPHA
-              value: "0.3"  # Weight for KD loss (0-1)
+              value: "0.3"  # Weight for KD loss (0-1) - only used if KD is enabled
             - name: TEMPERATURE
               value: "2.0"  # Temperature for softening distributions
             # Focal loss settings
@@ -172,19 +175,19 @@ spec:
             - name: FOCAL_GAMMA
               value: "2.0"   # Focusing parameter
             - name: FOCAL_ALPHA
-              value: "0.3"   # Class weight parameter
+              value: "0.25"   # Class weight parameter
             # Warmup settings
             - name: USE_WARMUP
-              value: "true"  # Set to "true" to enable learning rate warm-up
+              value: "false"  # Set to "true" to enable learning rate warm-up
             - name: WARMUP_START_LR
-              value: "0.00005"  # Starting learning rate for warm-up
+              value: "0.00001"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.0002"  # Final learning rate after warm-up
+              value: "0.00004"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "5"  # Number of epochs for warm-up
+              value: "4"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
-              value: "0.3"  # Set dropout probability (0-1)
+              value: "0.2"  # Set dropout probability (0-1)
             # Data paths
             - name: DATA_ROOT
               value: "/mnt/storage/data"
@@ -197,12 +200,12 @@ spec:
             - name: FREEZE_FEATURE_EXTRACTOR
               value: "false"  # Whether to freeze feature extraction layers
             - name: EPOCHS
-              value: "50"  # Number of fine-tuning epochs
+              value: "100"  # Number of fine-tuning epochs
             - name: BATCH_SIZE
               value: "32"  # Batch size for training
             # LR schedule
             - name: LR_SCHEDULE
-              value: "cosine"  # LR schedule type
+              value: "validation"  # LR schedule type
             # GPU settings
             - name: GPU_MEMORY_FRACTION
               value: "0.95"  # Use 95% of available GPU memory

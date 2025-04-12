@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-mini-large
+  name: chord-mini-large-01
   namespace: csuf-titans
   labels:
     app: chord-student-training
@@ -20,7 +20,7 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-GeForce-RTX-3090
+                - NVIDIA-GeForce-RTX-4090
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -176,7 +176,7 @@ spec:
               value: "1.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
             # Learning rate scheduling options - overrides student_config.yaml settings
             - name: LR_SCHEDULE
-              value: "cosine"  # Changed from empty string to 'validation'
+              value: "validation"  # Changed from empty string to 'validation'
             # Additional learning rate parameters - new additions
             - name: LEARNING_RATE
               value: "0.001"  # Base learning rate
@@ -200,11 +200,11 @@ spec:
             - name: USE_WARMUP
               value: "true"  # Set to "true" to enable learning rate warm-up
             - name: WARMUP_START_LR
-              value: "0.0001"  # Starting learning rate for warm-up
+              value: "0.0004"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.001"  # Final learning rate after warm-up
+              value: "0.0006"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "20"  # Number of epochs for warm-up
+              value: "6"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
               value: "0.3"  # Set dropout probability (0-1)
@@ -228,7 +228,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
             - name: SUB_DIR
-              value: "combined-logits-02"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
+              value: "combined-logits"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
@@ -239,7 +239,7 @@ spec:
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: "0.05"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: "null"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
           command:
@@ -560,16 +560,16 @@ spec:
               python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
             requests:
-              # cpu: "3"             
-              # memory: "72Gi"    
-              cpu: "3"
-              memory: "12Gi"
+              cpu: "3"             
+              memory: "72Gi"    
+              # cpu: "3"
+              # memory: "12Gi"
               nvidia.com/gpu: "1"
             limits:
-              # cpu: "12"             
-              # memory: "132Gi" 
-              cpu: "12"
-              memory: "48Gi"
+              cpu: "12"             
+              memory: "132Gi" 
+              # cpu: "12"
+              # memory: "48Gi"
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage

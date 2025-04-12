@@ -73,35 +73,61 @@ def main():
         device = torch.device('cpu')
         logger.info("Using CPU for training")
     
-    # Override config values with command line arguments
-    config.misc['seed'] = args.seed
-    config.paths['checkpoints_dir'] = args.save_dir
-    config.paths['storage_root'] = args.storage_root
+    # Override config values with command line arguments - IMPROVED CONFIG HANDLING
+    config.misc['seed'] = args.seed if args.seed is not None else config.misc.get('seed', 42)
+    config.paths['checkpoints_dir'] = args.save_dir if args.save_dir else config.paths.get('checkpoints_dir', './checkpoints/cv_kd')
+    config.paths['storage_root'] = args.storage_root if args.storage_root else config.paths.get('storage_root', None)
     
-    if args.learning_rate:
-        config.training['learning_rate'] = args.learning_rate
+    if args.learning_rate is not None:
+        config.training['learning_rate'] = float(args.learning_rate)
     
-    if args.batch_size:
-        config.training['batch_size'] = args.batch_size
+    if args.batch_size is not None:
+        config.training['batch_size'] = int(args.batch_size)
     
-    # Set large vocabulary config if specified
+    # IMPROVED: Handle knowledge distillation settings properly with type conversion
+    use_kd_loss = args.use_kd_loss
+    if not use_kd_loss:
+        # Check if config has this value as a string that needs conversion
+        config_kd = config.training.get('use_kd_loss', False)
+        if isinstance(config_kd, str):
+            use_kd_loss = config_kd.lower() == "true"
+        else:
+            use_kd_loss = bool(config_kd)
+    
+    # Log KD settings explicitly
+    if use_kd_loss:
+        logger.info("Knowledge Distillation Loss ENABLED")
+        kd_alpha = float(args.kd_alpha) if args.kd_alpha is not None else float(config.training.get('kd_alpha', 0.5))
+        temperature = float(args.temperature) if args.temperature is not None else float(config.training.get('temperature', 1.0))
+        logger.info(f"KD Alpha: {kd_alpha}, Temperature: {temperature}")
+    else:
+        logger.info("Knowledge Distillation Loss DISABLED")
+    
+    # Set large vocabulary config if specified - maintain consistent types
     if args.use_voca:
         config.feature['large_voca'] = True
-        config.model['num_chords'] = 170  # 170 chord types (12 roots × 14 qualities + 2 special chords)
+        config.model['num_chords'] = 170  # 170 chord types
         logger.info("Using large vocabulary with 170 chord classes")
+    elif hasattr(config.feature, 'large_voca') and isinstance(config.feature.large_voca, str):
+        # Handle string "true"/"false" in config
+        config.feature['large_voca'] = config.feature.large_voca.lower() == "true"
+        if config.feature['large_voca']:
+            config.model['num_chords'] = 170
+            logger.info("Using large vocabulary with 170 chord classes (from config)")
     else:
         # Set to small vocabulary explicitly if not using large vocabulary
         config.feature['large_voca'] = False
         config.model['num_chords'] = 25  # Only major/minor chords + no-chord
         logger.info("Using small vocabulary with 25 chord classes")
     
-    # Set random seed for reproducibility
-    seed = config.misc['seed']
+    # Set random seed for reproducibility - ensure this is an integer
+    seed = int(config.misc['seed'])
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+    logger.info(f"Random seed set to {seed}")
     
     # Create save directory
     save_dir = config.paths['checkpoints_dir']
@@ -339,31 +365,48 @@ def main():
         weight_decay=config.training.get('weight_decay', 0.0)
     )
     
-    # Create trainer with knowledge distillation
+    # IMPROVED: Handle string representations of boolean values
+    use_focal_loss = args.use_focal_loss
+    if not use_focal_loss:
+        config_focal = config.training.get('use_focal_loss', False)
+        if isinstance(config_focal, str):
+            use_focal_loss = config_focal.lower() == "true"
+        else:
+            use_focal_loss = bool(config_focal)
+            
+    focal_gamma = float(args.focal_gamma) if args.focal_gamma is not None else float(config.training.get('focal_gamma', 2.0))
+    focal_alpha = float(args.focal_alpha) if args.focal_alpha is not None else config.training.get('focal_alpha')
+    
+    if use_focal_loss:
+        logger.info(f"Using Focal Loss with gamma={focal_gamma}")
+        if focal_alpha is not None:
+            logger.info(f"Focal Loss alpha={focal_alpha}")
+    
+    # Create trainer with knowledge distillation - with properly typed parameters
     trainer = StudentTrainer(
         model=model,
         optimizer=optimizer,
         device=device,
-        num_epochs=config.training.get('num_epochs', 50),
+        num_epochs=int(config.training.get('num_epochs', 50)),
         logger=logger,
         checkpoint_dir=save_dir,
         class_weights=None,  # No class weights for now
         idx_to_chord=idx2voca_chord(),
         normalization={'mean': mean, 'std': std},
-        early_stopping_patience=config.training.get('early_stopping_patience', 5),
-        lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
-        min_lr=config.training.get('min_learning_rate', 5e-6),
-        use_warmup=config.training.get('use_warmup', False),
-        warmup_epochs=config.training.get('warmup_epochs', 5),
-        warmup_start_lr=config.training.get('warmup_start_lr', 1e-6),
-        warmup_end_lr=config.training.get('warmup_end_lr', config.training.get('learning_rate', 0.0001)),
-        lr_schedule_type=config.training.get('lr_schedule_type', 'cosine'),
-        use_focal_loss=config.training.get('use_focal_loss', False),
-        focal_gamma=config.training.get('focal_gamma', 2.0),
-        focal_alpha=None,
-        use_kd_loss=args.use_kd_loss,
-        kd_alpha=args.kd_alpha,
-        temperature=args.temperature,
+        early_stopping_patience=int(config.training.get('early_stopping_patience', 5)),
+        lr_decay_factor=float(config.training.get('lr_decay_factor', 0.95)),
+        min_lr=float(config.training.get('min_learning_rate', 5e-6)),
+        use_warmup=args.use_warmup if args.use_warmup else bool(config.training.get('use_warmup', False)),
+        warmup_epochs=int(config.training.get('warmup_epochs', 5)) if config.training.get('warmup_epochs') else None,
+        warmup_start_lr=float(config.training.get('warmup_start_lr', 1e-6)) if config.training.get('warmup_start_lr') else None,
+        warmup_end_lr=float(config.training.get('warmup_end_lr', config.training.get('learning_rate', 0.0001))) if config.training.get('warmup_end_lr') else None,
+        lr_schedule_type=config.training.get('lr_schedule_type'),
+        use_focal_loss=use_focal_loss,
+        focal_gamma=focal_gamma,
+        focal_alpha=focal_alpha,
+        use_kd_loss=use_kd_loss,
+        kd_alpha=kd_alpha,
+        temperature=temperature,
         teacher_model=teacher_model,
         teacher_normalization={'mean': teacher_mean, 'std': teacher_std},
         teacher_predictions=teacher_predictions
