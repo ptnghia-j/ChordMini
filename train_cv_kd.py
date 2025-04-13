@@ -68,10 +68,10 @@ def main():
     # Set up device
     if config.misc.get('use_cuda', True) and is_cuda_available():
         device = get_device()
-        logger.info(f"Using CUDA for training on device: {torch.cuda.get_device_name(0)}")
+        logger.info(f"CUDA available. Using device: {device} ({torch.cuda.get_device_name(0)})")
     else:
         device = torch.device('cpu')
-        logger.info("Using CPU for training")
+        logger.info("CUDA not available or not requested. Using CPU.")
     
     # Override config values with command line arguments - IMPROVED CONFIG HANDLING
     config.misc['seed'] = args.seed if args.seed is not None else config.misc.get('seed', 42)
@@ -298,41 +298,46 @@ def main():
     
     # Calculate global mean and std
     logger.info("Calculating global mean and std")
-    mean = 0
-    square_mean = 0
+    mean = 0.0
+    square_mean = 0.0
     k = 0
     
     mean_std_cache = os.path.join(cache_dir, f'normalization_fold{args.kfold}.pt')
     if os.path.exists(mean_std_cache):
         # Load from cache
-        normalization = torch.load(mean_std_cache)
-        mean = normalization.get('mean', 0)
-        std = normalization.get('std', 1)
+        normalization_data = torch.load(mean_std_cache)
+        mean = normalization_data.get('mean', 0.0)
+        std = normalization_data.get('std', 1.0)
         logger.info(f"Loaded normalization from cache: mean={mean}, std={std}")
     else:
         # Calculate from data
-        for i, data in enumerate(train_loader):
-            features = data['spectro']  # Get the spectrograms from dictionary
-            features = features.to(device)
+        temp_loader = train_dataset.get_data_loader(batch_size=batch_size, shuffle=True, num_workers=2)
+        for i, data in enumerate(temp_loader):
+            features = data['spectro'].to('cpu')
             mean += torch.mean(features).item()
             square_mean += torch.mean(features.pow(2)).item()
             k += 1
-            if i >= 100:  # Limit calculation to avoid excessive time
+            if i >= 99:
                 break
-        
+
         if k > 0:
             square_mean = square_mean / k
             mean = mean / k
-            std = np.sqrt(square_mean - mean * mean)
-            
-            # Save normalization
-            normalization = {'mean': mean, 'std': std}
-            torch.save(normalization, mean_std_cache)
+            std = np.sqrt(max(0, square_mean - mean * mean))
+            if std == 0: std = 1.0
+
+            normalization_data = {'mean': mean, 'std': std}
+            torch.save(normalization_data, mean_std_cache)
+            logger.info(f"Calculated normalization: mean={mean:.4f}, std={std:.4f}")
         else:
-            mean = 0
-            std = 1
-        
-        logger.info(f"Calculated normalization: mean={mean}, std={std}")
+            logger.warning("Could not calculate normalization stats (k=0). Using defaults.")
+            mean = 0.0
+            std = 1.0
+    
+    mean_tensor = torch.tensor(mean, device=device, dtype=torch.float32)
+    std_tensor = torch.tensor(std, device=device, dtype=torch.float32)
+    normalization = {'mean': mean_tensor, 'std': std_tensor}
+    logger.info(f"Normalization tensors created on device: {device}")
     
     # Create model
     n_classes = 170 if args.use_voca or config.feature.get('large_voca', False) else 25
@@ -392,7 +397,7 @@ def main():
         checkpoint_dir=save_dir,
         class_weights=None,  # No class weights for now
         idx_to_chord=idx2voca_chord(),
-        normalization={'mean': mean, 'std': std},
+        normalization=normalization,
         early_stopping_patience=int(config.training.get('early_stopping_patience', 5)),
         lr_decay_factor=float(config.training.get('lr_decay_factor', 0.95)),
         min_lr=float(config.training.get('min_learning_rate', 5e-6)),

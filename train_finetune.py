@@ -317,10 +317,10 @@ def main():
     # Then check device availability
     if config.misc.get('use_cuda') and is_cuda_available():
         device = get_device()
-        logger.info(f"Using CUDA for training on device: {torch.cuda.get_device_name(0)}")
+        logger.info(f"CUDA available. Using device: {device} ({torch.cuda.get_device_name(0)})")
     else:
         device = torch.device('cpu')
-        logger.info("Using CPU for training")
+        logger.info("CUDA not available or not requested. Using CPU.")
     
     # Override config values with command line arguments if provided
     config.misc['seed'] = args.seed if args.seed is not None else config.misc.get('seed', 42)
@@ -801,9 +801,10 @@ def main():
         logger.warning("Using default mean=0.0, std=1.0 due to calculation error")
     
     # Create normalized tensors on device
-    mean = torch.tensor(mean, device=device)
-    std = torch.tensor(std, device=device)
-    normalization = {'mean': mean, 'std': std}
+    mean_tensor = torch.tensor(mean, device=device, dtype=torch.float32)
+    std_tensor = torch.tensor(std, device=device, dtype=torch.float32)
+    normalization = {'mean': mean_tensor, 'std': std_tensor}
+    logger.info(f"Normalization tensors created on device: {device}")
     
     # Final memory cleanup before training
     if torch.cuda.is_available():
