@@ -6,22 +6,24 @@ from torch.utils.data import Dataset, DataLoader
 from collections import Counter
 import glob
 from pathlib import Path
-import matplotlib.pyplot as plt
 import time
 from multiprocessing import Pool
 from functools import partial
 import pickle
-import warnings
-from tqdm import tqdm
 import hashlib
 import re
+from tqdm import tqdm
 from modules.utils.device import get_device, to_device, clear_gpu_cache
+from modules.utils.chords import Chords, idx2voca_chord
+from modules.utils import logger
+
 
 # Define a wrapper function for multiprocessing
 def process_file_wrapper(args):
     """Wrapper function for multiprocessing file processing"""
     dataset_instance, spec_file, file_id, label_files_dict, return_skip_reason = args
     return dataset_instance._process_file(spec_file, file_id, label_files_dict, return_skip_reason)
+
 
 class SynthDataset(Dataset):
     """
@@ -32,7 +34,8 @@ class SynthDataset(Dataset):
     - 'maestro': Uses arbitrary filenames with format maestro-v3.0.0/file-name_spec.npy
     - 'combined': Loads both 'fma' and 'maestro' datasets simultaneously
     """
-    def __init__(self, spec_dir, label_dir, chord_mapping=None, seq_len=10, stride=None, 
+    def __init__(self, spec_dir, label_dir, config, 
+                 chord_mapping=None, seq_len=10, stride=None, 
                  frame_duration=0.1, num_workers=0, cache_file=None, verbose=True,
                  use_cache=True, metadata_only=True, cache_fraction=0.1, logits_dir=None,
                  lazy_init=False, require_teacher_logits=False, device=None,
@@ -44,6 +47,7 @@ class SynthDataset(Dataset):
         Args:
             spec_dir: Directory containing spectrograms (or list of directories for 'combined' type)
             label_dir: Directory containing labels (or list of directories for 'combined' type)
+            config: Configuration object for determining settings like use_large_voca
             chord_mapping: Mapping of chord names to indices
             seq_len: Sequence length for segmentation
             stride: Stride for segmentation (default: same as seq_len)
@@ -65,12 +69,11 @@ class SynthDataset(Dataset):
             dataset_type: Type of dataset format ('fma', 'maestro', or 'combined')
         """
         # First, log initialization time start to track potential timeout issues
-        import time
         init_start_time = time.time()
         if verbose:
-            print(f"SynthDataset initialization started at {time.strftime('%H:%M:%S')}")
-            print(f"Using spec_dir: {spec_dir}")
-            print(f"Using label_dir: {label_dir}")
+            logger.info(f"SynthDataset initialization started at {time.strftime('%H:%M:%S')}")
+            logger.info(f"Using spec_dir: {spec_dir}")
+            logger.info(f"Using label_dir: {label_dir}")
         
         # Support for both single path and list of paths for combined dataset mode
         self.is_combined_mode = isinstance(spec_dir, list) and isinstance(label_dir, list)
@@ -114,51 +117,78 @@ class SynthDataset(Dataset):
         self.dataset_type = dataset_type  # Dataset format type ('fma', 'maestro', or 'combined')
         
         if self.dataset_type not in ['fma', 'maestro', 'combined']:
-            warnings.warn(f"Unknown dataset_type '{dataset_type}', defaulting to 'fma'")
+            logger.warning(f"Unknown dataset_type '{dataset_type}', defaulting to 'fma'")
             self.dataset_type = 'fma'
         
         # Disable pin_memory since we're using a single worker
         self.pin_memory = True
         if pin_memory and verbose:
-            print("Disabling pin_memory since we're using a single worker")
+            logger.info("Disabling pin_memory since we're using a single worker")
             
         self.prefetch_factor = prefetch_factor
         self.batch_gpu_cache = batch_gpu_cache
         self.small_dataset_percentage = small_dataset_percentage
         
+        # Determine and store use_large_voca consistently
+        self.config = config
+        self.use_large_voca = self.config.feature.get('large_voca', False)
+        logger.info(f"SynthDataset initialized with use_large_voca = {self.use_large_voca}")
+
+        # Determine N and X indices based on use_large_voca
+        self.n_chord_idx = 169 if self.use_large_voca else 24
+        self.x_chord_idx = 168 if self.use_large_voca else 25
+        logger.info(f"Using N index: {self.n_chord_idx}, X index: {self.x_chord_idx}")
+
+        # Initialize Chords processor
+        self.chord_processor = Chords()
+        if chord_mapping:
+            processed_mapping = {k: v for k, v in chord_mapping.items() if k not in ["N", "X"]}
+            self.chord_processor.set_chord_mapping(processed_mapping)
+            self.chord_processor.initialize_chord_mapping()
+        self.original_chord_mapping = chord_mapping
+
         # Map from chord name to index
         if self.chord_mapping is not None:
-            self.chord_to_idx = self.chord_mapping
+            self.chord_to_idx = {k: v for k, v in self.chord_mapping.items() if k not in ["N", "X"]}
         else:
             self.chord_to_idx = {}
-            
+        
         # Set up regex patterns - always define both patterns regardless of dataset type
         # For Maestro dataset, match any filename pattern ending with _spec, _logits, or .lab
         self.file_pattern = re.compile(r'(.+?)(?:_spec|_logits)?\.(?:npy|lab)$')
         # For FMA dataset - the 6-digit numeric ID pattern
         self.numeric_id_pattern = re.compile(r'(\d{6})')
-        
-        # Auto-detect device if not provided - use device module with safer initialization
+
+        # Create the idx_to_chord mapping needed by the trainer
+        self.idx_to_chord = idx2voca_chord(large_voca=self.use_large_voca)
+        if self.n_chord_idx not in self.idx_to_chord or self.idx_to_chord[self.n_chord_idx] != 'N':
+            logger.warning(f"idx_to_chord might be missing or have incorrect 'N' mapping for index {self.n_chord_idx}")
+            self.idx_to_chord[self.n_chord_idx] = 'N'
+        if self.x_chord_idx not in self.idx_to_chord or self.idx_to_chord[self.x_chord_idx] != 'X':
+            logger.warning(f"idx_to_chord might be missing or have incorrect 'X' mapping for index {self.x_chord_idx}")
+            self.idx_to_chord[self.x_chord_idx] = 'X'
+
+        # Auto-detect device if not provided
         if device is None:
             try:
                 self.device = get_device()
             except Exception as e:
                 if verbose:
-                    print(f"Error initializing GPU device: {e}")
-                    print("Falling back to CPU")
+                    logger.error(f"Error initializing GPU device: {e}")
+                    logger.info("Falling back to CPU")
                 self.device = torch.device('cpu')
         else:
             self.device = device
             
         if self.verbose:
-            print(f"Using device: {self.device}")
+            logger.info(f"Using device: {self.device}")
             
         # Initialize GPU batch cache cautiously
         try:
             self.gpu_batch_cache = {} if self.batch_gpu_cache and self.device.type == 'cuda' else None
         except Exception as e:
             if self.verbose:
-                print(f"Warning: Could not initialize GPU batch cache: {e}")
+                logger.warning(f"Warning: Could not initialize GPU batch cache: {e}")
             self.gpu_batch_cache = None
         
         # Safety check: if require_teacher_logits is True, logits_dir must be provided
@@ -170,7 +200,7 @@ class SynthDataset(Dataset):
         self._zero_logit_cache = {}
         
         # Cache the N chord index
-        self._n_chord_idx = 0  # Default value, will be updated later if needed
+        self._n_chord_idx = self.n_chord_idx
             
         # Generate a safer cache file name using hashing if none provided
         if cache_file is None:
@@ -178,20 +208,20 @@ class SynthDataset(Dataset):
             cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
             self.cache_file = f"dataset_cache_{dataset_type}_{cache_hash}.pkl"
             if verbose:
-                print(f"Using cache file: {self.cache_file}")
+                logger.info(f"Using cache file: {self.cache_file}")
         else:
             self.cache_file = cache_file
             
         # Only load data if not using lazy initialization
         if not self.lazy_init:
             if verbose:
-                print(f"Starting full data loading at {time.time() - init_start_time:.1f}s from init start")
-                print("This may take a while - consider using lazy_init=True for faster startup")
+                logger.info(f"Starting full data loading at {time.time() - init_start_time:.1f}s from init start")
+                logger.info("This may take a while - consider using lazy_init=True for faster startup")
             self._load_data()
             self._generate_segments()
         else:
             if verbose:
-                print(f"Using lazy initialization (faster startup) at {time.time() - init_start_time:.1f}s from init start")
+                logger.info(f"Using lazy initialization (faster startup) at {time.time() - init_start_time:.1f}s from init start")
             self.samples = []
             self.segment_indices = []
             
@@ -211,8 +241,8 @@ class SynthDataset(Dataset):
                 self._init_gpu_cache()
             except Exception as e:
                 if self.verbose:
-                    print(f"Warning: Could not initialize GPU cache: {e}")
-                    print("GPU caching will be disabled")
+                    logger.warning(f"Warning: Could not initialize GPU cache: {e}")
+                    logger.warning("GPU caching will be disabled")
                 self._zero_spec_cache = {}
                 self._zero_logit_cache = {}
                 self.batch_gpu_cache = None
@@ -220,12 +250,12 @@ class SynthDataset(Dataset):
         # Report total initialization time
         init_time = time.time() - init_start_time
         if verbose:
-            print(f"Dataset initialization completed in {init_time:.2f} seconds")
+            logger.info(f"Dataset initialization completed in {init_time:.2f} seconds")
             if init_time > 60:
-                print(f"NOTE: Slow initialization detected ({init_time:.1f}s). For large datasets, consider:")
-                print("1. Using lazy_init=True to speed up startup")
-                print("2. Using metadata_only=True to reduce memory usage")
-                print("3. Using a smaller dataset with small_dataset_percentage=0.01")
+                logger.info(f"NOTE: Slow initialization detected ({init_time:.1f}s). For large datasets, consider:")
+                logger.info("1. Using lazy_init=True to speed up startup")
+                logger.info("2. Using metadata_only=True to reduce memory usage")
+                logger.info("3. Using a smaller dataset with small_dataset_percentage=0.01")
 
     def _init_gpu_cache(self):
         """Initialize GPU cache with commonly used zero tensors for better memory efficiency"""
@@ -259,14 +289,14 @@ class SynthDataset(Dataset):
             if np.isnan(teacher_logits).any():
                 # Handle corrupted logits with NaN values
                 if self.verbose:
-                    print(f"Warning: NaN values in logits file {logit_file}, fixing...")
+                    logger.warning(f"Warning: NaN values in logits file {logit_file}, fixing...")
                 teacher_logits = np.nan_to_num(teacher_logits, nan=0.0)
             return teacher_logits
         except Exception as e:
             if self.require_teacher_logits:
                 raise RuntimeError(f"Error loading required logits file {logit_file}: {e}")
             if self.verbose:
-                print(f"Warning: Error loading logits file {logit_file}: {e}")
+                logger.warning(f"Warning: Error loading logits file {logit_file}: {e}")
             return None
     
     def get_tensor_cache(self, shape, is_logits=False):
@@ -295,28 +325,6 @@ class SynthDataset(Dataset):
         else:
             # Use provided normalization parameters
             return (spec - mean) / (std if std != 0 else 1.0)
-    
-    # def apply_gpu_cache(self, batch):
-    #     """Apply GPU batch caching for repeated access patterns"""
-    #     if not self.gpu_batch_cache:
-    #         return batch
-            
-    #     # Generate a cache key from the batch
-    #     key_tensor = batch['spectro'][:, 0, 0] if isinstance(batch['spectro'], torch.Tensor) and len(batch['spectro'].shape) > 2 else None
-        
-    #     if key_tensor is not None:
-    #         # Create a tuple key from the first values
-    #         key = tuple(key_tensor.cpu().numpy().tolist())
-            
-    #         # Check if batch is already cached
-    #         if key in self.gpu_batch_cache:
-    #             return self.gpu_batch_cache[key]
-            
-    #         # Cache the new batch (only if it's small enough)
-    #         if len(self.gpu_batch_cache) < 1000:  # Limit cache size
-    #             self.gpu_batch_cache[key] = batch
-                
-    #     return batch
 
     def _load_data(self):
         """Load data from files or cache with optimized memory usage and error handling"""
@@ -333,23 +341,23 @@ class SynthDataset(Dataset):
                     self.chord_to_idx = cache_data['chord_to_idx']
                     
                     if self.verbose:
-                        print(f"Loaded {len(self.samples)} samples from cache file {self.cache_file}")
+                        logger.info(f"Loaded {len(self.samples)} samples from cache file {self.cache_file}")
                     
                     return
                 else:
-                    print("Cache format invalid, rebuilding dataset")
+                    logger.warning("Cache format invalid, rebuilding dataset")
             except Exception as e:
                 if self.verbose:
-                    print(f"Error loading cache, rebuilding dataset: {e}")
+                    logger.warning(f"Error loading cache, rebuilding dataset: {e}")
         
         # Check if directories exist
         for spec_path in self.spec_dirs:
             if not spec_path.exists():
-                warnings.warn(f"Spectrogram directory does not exist: {spec_path}")
+                logger.warning(f"Spectrogram directory does not exist: {spec_path}")
         
         for label_path in self.label_dirs:
             if not label_path.exists():
-                warnings.warn(f"Label directory does not exist: {label_path}")
+                logger.warning(f"Label directory does not exist: {label_path}")
         
         # First, create a mapping of label files for quick lookup from all label directories
         label_files_dict = {}
@@ -360,7 +368,7 @@ class SynthDataset(Dataset):
             # Add debug info about which directories we're scanning
             if self.verbose:
                 is_maestro = "maestro" in str(label_dir).lower()
-                print(f"Scanning {'Maestro' if is_maestro else 'FMA'} labels from: {label_dir}")
+                logger.debug(f"Scanning {'Maestro' if is_maestro else 'FMA'} labels from: {label_dir}")
                 
             # Use recursive glob to scan all subdirectories
             for label_path in label_dir.glob("**/*.lab"):
@@ -378,7 +386,7 @@ class SynthDataset(Dataset):
                     
                     # Debug first few files
                     if maestro_label_count < 3 and self.verbose:
-                        print(f"  Maestro label: {label_path}, ID: {file_id}")
+                        logger.debug(f"  Maestro label: {label_path}, ID: {file_id}")
                         
                     label_files_dict[file_id] = label_path
                     maestro_label_count += 1
@@ -390,9 +398,9 @@ class SynthDataset(Dataset):
                         fma_label_count += 1
                     
         if self.verbose:
-            print(f"Found {len(label_files_dict)} label files with valid IDs across all directories")
-            print(f"  FMA: {fma_label_count} label files")
-            print(f"  Maestro: {maestro_label_count} label files")
+            logger.info(f"Found {len(label_files_dict)} label files with valid IDs across all directories")
+            logger.info(f"  FMA: {fma_label_count} label files")
+            logger.info(f"  Maestro: {maestro_label_count} label files")
         
         # Find all spectrogram files from all spectrogram directories
         valid_spec_files = []
@@ -406,7 +414,7 @@ class SynthDataset(Dataset):
             if use_maestro_logic:
                 # Maestro-specific search logic
                 if self.verbose:
-                    print(f"Using Maestro logic for {spec_dir}")
+                    logger.debug(f"Using Maestro logic for {spec_dir}")
                     
                 # Look recursively through all subdirectories for Maestro files
                 for spec_path in spec_dir.glob("**/*.npy"):
@@ -421,9 +429,9 @@ class SynthDataset(Dataset):
                         
                         # Debug first few files
                         if maestro_spec_count < 10 and self.verbose:
-                            print(f"  Maestro spec: {spec_path}")
-                            print(f"  ID: {file_id}")
-                            print(f"  In dict: {file_id in label_files_dict}")
+                            logger.debug(f"  Maestro spec: {spec_path}")
+                            logger.debug(f"  ID: {file_id}")
+                            logger.debug(f"  In dict: {file_id in label_files_dict}")
                             
                         if file_id in label_files_dict:
                             valid_spec_files.append((spec_path, file_id))
@@ -446,18 +454,18 @@ class SynthDataset(Dataset):
                                     fma_spec_count += 1
         
         if not valid_spec_files:
-            warnings.warn(f"No valid spectrogram files found for dataset type '{self.dataset_type}'. Check your data paths.")
+            logger.warning(f"No valid spectrogram files found for dataset type '{self.dataset_type}'. Check your data paths.")
             return
             
         if self.verbose:
-            print(f"Found {len(valid_spec_files)} valid spectrogram files")
-            print(f"  FMA: {fma_spec_count} spectrogram files")
-            print(f"  Maestro: {maestro_spec_count} spectrogram files")
+            logger.info(f"Found {len(valid_spec_files)} valid spectrogram files")
+            logger.info(f"  FMA: {fma_spec_count} spectrogram files")
+            logger.info(f"  Maestro: {maestro_spec_count} spectrogram files")
             
             if valid_spec_files:
-                print("Sample spectrogram paths:")
+                logger.info("Sample spectrogram paths:")
                 for i, (path, _) in enumerate(valid_spec_files[:3]):
-                    print(f"  {i+1}. {path}")
+                    logger.info(f"  {i+1}. {path}")
         
         # Handle small dataset percentage option with special handling for combined mode
         if self.small_dataset_percentage is not None:
@@ -483,11 +491,11 @@ class SynthDataset(Dataset):
                 
                 # Add debugging to verify dataset detection
                 if self.verbose:
-                    print(f"Dataset distribution before sampling:")
+                    logger.debug(f"Dataset distribution before sampling:")
                     for i, dir_path in enumerate(self.spec_dirs):
                         dataset_name = "Maestro" if "maestro" in str(dir_path) else "FMA"
                         file_count = len(dataset_files.get(i, []))
-                        print(f"  {dataset_name}: {file_count} files detected from {dir_path}")
+                        logger.debug(f"  {dataset_name}: {file_count} files detected from {dir_path}")
                 
                 # Apply percentage to each dataset individually
                 sampled_files = []
@@ -504,11 +512,11 @@ class SynthDataset(Dataset):
                     
                     # Always show this information since it's critical for understanding dataset mixture
                     dataset_name = "Maestro" if "maestro" in str(self.spec_dirs[dataset_key]) else "FMA"
-                    print(f"Using {len(sampled_dataset_files)} {dataset_name} files ({self.small_dataset_percentage*100:.2f}% of {len(files)})")
+                    logger.info(f"Using {len(sampled_dataset_files)} {dataset_name} files ({self.small_dataset_percentage*100:.2f}% of {len(files)})")
                     if sampled_dataset_files:
-                        print(f"First {dataset_name} file: {sampled_dataset_files[0][0]}")
+                        logger.info(f"First {dataset_name} file: {sampled_dataset_files[0][0]}")
                         if len(sampled_dataset_files) > 1:
-                            print(f"Last {dataset_name} file: {sampled_dataset_files[-1][0]}")
+                            logger.info(f"Last {dataset_name} file: {sampled_dataset_files[-1][0]}")
                 
                 # Update valid_spec_files with the combined sampled files
                 valid_spec_files = sampled_files
@@ -525,10 +533,10 @@ class SynthDataset(Dataset):
                     valid_spec_files = valid_spec_files[:sample_size]
                     
                     if self.verbose:
-                        print(f"Using {sample_size} files ({self.small_dataset_percentage*100:.2f}% of dataset) for quick testing")
-                        print(f"First file: {valid_spec_files[0][0]}")
+                        logger.info(f"Using {sample_size} files ({self.small_dataset_percentage*100:.2f}% of dataset) for quick testing")
+                        logger.info(f"First file: {valid_spec_files[0][0]}")
                         if len(valid_spec_files) > 1:
-                            print(f"Last file: {valid_spec_files[-1][0]}")
+                            logger.info(f"Last file: {valid_spec_files[-1][0]}")
         
         self.samples = []
         self.total_processed = 0
@@ -545,13 +553,13 @@ class SynthDataset(Dataset):
         if len(valid_spec_files) < num_cpus * 4:
             num_cpus = max(1, len(valid_spec_files) // 2)
             if self.verbose:
-                print(f"Small dataset detected, reducing worker count to {num_cpus}")
+                logger.info(f"Small dataset detected, reducing worker count to {num_cpus}")
 
         args_list = [(self, spec_file, file_id, label_files_dict, True) 
                     for spec_file, file_id in valid_spec_files]
         
         if self.verbose:
-            print(f"Processing {len(args_list)} files with {num_cpus} parallel workers")
+            logger.info(f"Processing {len(args_list)} files with {num_cpus} parallel workers")
             
         try:
             with Pool(processes=num_cpus) as pool:
@@ -575,9 +583,9 @@ class SynthDataset(Dataset):
             import traceback
             error_msg = traceback.format_exc()
             if self.verbose:
-                print(f"ERROR in multiprocessing: {e}")
-                print(f"Traceback:\n{error_msg}")
-                print(f"Attempting fallback to sequential processing...")
+                logger.error(f"ERROR in multiprocessing: {e}")
+                logger.error(f"Traceback:\n{error_msg}")
+                logger.info(f"Attempting fallback to sequential processing...")
             
             process_results = []
             for args in tqdm(args_list, desc="Loading data (sequential fallback)"):
@@ -595,14 +603,14 @@ class SynthDataset(Dataset):
         if hasattr(self, 'total_processed') and self.total_processed > 0:
             skip_percentage = (self.total_skipped / self.total_processed) * 100
             if self.verbose:
-                print(f"\nFile processing statistics:")
-                print(f"  Total processed: {self.total_processed}")
-                print(f"  Skipped: {self.total_skipped} ({skip_percentage:.1f}%)")
+                logger.info(f"\nFile processing statistics:")
+                logger.info(f"  Total processed: {self.total_processed}")
+                logger.info(f"  Skipped: {self.total_skipped} ({skip_percentage:.1f}%)")
                 if hasattr(self, 'skipped_reasons'):
                     for reason, count in self.skipped_reasons.items():
                         if count > 0:
                             reason_pct = (count / self.total_skipped) * 100 if self.total_skipped > 0 else 0
-                            print(f"    - {reason}: {count} ({reason_pct:.1f}%)")
+                            logger.info(f"    - {reason}: {count} ({reason_pct:.1f}%)")
         
         if self.samples and self.use_cache:
             try:
@@ -615,7 +623,7 @@ class SynthDataset(Dataset):
                 if self.metadata_only:
                     samples_meta = []
                     for sample in samples_to_cache:
-                        meta = {k: sample[k] for k in sample if k != 'spectro'}
+                        meta = {k: sample[k] for k, v in sample.items() if k != 'spectro'}
                         spec_path = os.path.join(self.spec_dir, f"{sample['song_id']}.npy")
                         if os.path.exists(spec_path):
                             meta['spec_path'] = spec_path
@@ -640,12 +648,12 @@ class SynthDataset(Dataset):
                         }, f)
                         
                 if self.verbose:
-                    print(f"Saved dataset cache to {self.cache_file}")
+                    logger.info(f"Saved dataset cache to {self.cache_file}")
                     if self.small_dataset_percentage is not None:
-                        print(f"Cache includes small_dataset_percentage={self.small_dataset_percentage}")
+                        logger.info(f"Cache includes small_dataset_percentage={self.small_dataset_percentage}")
             except Exception as e:
                 if self.verbose:
-                    print(f"Error saving cache (will continue without caching): {e}")
+                    logger.warning(f"Error saving cache (will continue without caching): {e}")
                 
         if self.samples:
             first_sample = self.samples[0]
@@ -659,23 +667,23 @@ class SynthDataset(Dataset):
                         first_spec = first_spec[first_sample['frame_idx']]
                 except Exception as e:
                     if self.verbose:
-                        print(f"Error loading first spectrogram: {e}")
+                        logger.warning(f"Error loading first spectrogram: {e}")
                     first_spec = np.zeros((144,))
             else:
                 first_spec = np.zeros((144,))
                 if self.verbose:
-                    print("WARNING: Could not determine spectrogram shape from first sample")
-                    print("Using default frequency dimension of 144")
+                    logger.warning("WARNING: Could not determine spectrogram shape from first sample")
+                    logger.warning("Using default frequency dimension of 144")
             
             freq_dim = first_spec.shape[-1] if hasattr(first_spec, 'shape') and len(first_spec.shape) > 0 else 144
             spec_type = "CQT (Constant-Q Transform)" if freq_dim <= 256 else "STFT"
             
             if self.verbose:
-                print(f"Loaded {len(self.samples)} valid samples")
-                print(f"Spectrogram frequency dimension: {freq_dim} (likely {spec_type})")
+                logger.info(f"Loaded {len(self.samples)} valid samples")
+                logger.info(f"Spectrogram frequency dimension: {freq_dim} (likely {spec_type})")
                 
                 chord_counter = Counter(sample['chord_label'] for sample in self.samples)
-                print(f"Found {len(chord_counter)} unique chord classes")
+                logger.info(f"Found {len(chord_counter)} unique chord classes")
                 
                 # Add detailed chord distribution analysis
                 from modules.utils.chords import get_chord_quality
@@ -689,27 +697,27 @@ class SynthDataset(Dataset):
                 
                 # Sort qualities by count for better reporting
                 total_samples = len(self.samples)
-                print(f"Dataset loading completed in {time.time() - start_time:.2f} seconds")
-                print(f"Chord quality distribution:")
+                logger.info(f"Dataset loading completed in {time.time() - start_time:.2f} seconds")
+                logger.info(f"Chord quality distribution:")
                 for quality, count in quality_counter.most_common():
                     percentage = (count / total_samples) * 100
-                    print(f"  {quality}: {count} samples ({percentage:.2f}%)")
+                    logger.info(f"  {quality}: {count} samples ({percentage:.2f}%)")
                 
                 # Print the most common chord types to see what we have
-                print("\nMost common chord types:")
+                logger.info("\nMost common chord types:")
                 for chord, count in chord_counter.most_common(20):
                     percentage = (count / total_samples) * 100
-                    print(f"  {chord}: {count} samples ({percentage:.2f}%)")
+                    logger.info(f"  {chord}: {count} samples ({percentage:.2f}%)")
                     
                 # List some less common chord types to see what unusual chords exist
-                print("\nSome less common chord types:")
+                logger.info("\nSome less common chord types:")
                 less_common = [item for item in chord_counter.most_common()[100:120]]
                 for chord, count in less_common:
                     percentage = (count / total_samples) * 100
-                    print(f"  {chord}: {count} samples ({percentage:.2f}%)")
+                    logger.info(f"  {chord}: {count} samples ({percentage:.2f}%)")
                 
                 end_time = time.time()
-                print(f"Dataset loading completed in {end_time - start_time:.2f} seconds")
+                logger.info(f"Dataset loading completed in {end_time - start_time:.2f} seconds")
                 
                 # Add additional metrics at the end of loading
                 if self.samples and hasattr(self, 'is_combined_mode') and self.is_combined_mode:
@@ -729,12 +737,13 @@ class SynthDataset(Dataset):
                             dataset_sample_counts[dataset_key] += 1
                     
                     if self.verbose:
-                        print("\nSample distribution by dataset source:")
+                        logger.info("\nSample distribution by dataset source:")
                         for dataset_key, count in dataset_sample_counts.items():
                             percentage = (count / total_samples) * 100
-                            print(f"  {dataset_key}: {count} samples ({percentage:.2f}%)")
+                            logger.info(f"  {dataset_key}: {count} samples ({percentage:.2f}%)")
         else:
-            warnings.warn("No samples loaded. Check your data paths and structure.")
+            logger.warning("No samples loaded. Check your data paths and structure.")
+
     def _process_file(self, spec_file, file_id, label_files_dict, return_skip_reason=False):
         """Process a single spectrogram file based on dataset type"""
         samples = []
@@ -795,7 +804,7 @@ class SynthDataset(Dataset):
                             if chord_label not in self.chord_to_idx:
                                 self.chord_to_idx[chord_label] = len(self.chord_to_idx)
                         elif chord_label not in self.chord_mapping:
-                            warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
+                            logger.warning(f"Unknown chord label {chord_label}, using 'N'")
                             chord_label = "N"
                         
                         if self.dataset_type == 'maestro':
@@ -818,7 +827,7 @@ class SynthDataset(Dataset):
                 spec = np.load(spec_file)
                 
                 if np.isnan(spec).any():
-                    warnings.warn(f"NaN values found in {spec_file}, replacing with zeros")
+                    logger.warning(f"NaN values found in {spec_file}, replacing with zeros")
                     spec = np.nan_to_num(spec, nan=0.0)
                 
                 chord_labels = self._parse_label_file(label_file)
@@ -830,7 +839,7 @@ class SynthDataset(Dataset):
                         if chord_label not in self.chord_to_idx:
                             self.chord_to_idx[chord_label] = len(self.chord_to_idx)
                     elif chord_label not in self.chord_mapping:
-                        warnings.warn(f"Unknown chord label {chord_label} found in {label_file}")
+                        logger.warning(f"Unknown chord label {chord_label} found in {label_file}")
                         return []
                         
                     sample_dict = {
@@ -846,7 +855,7 @@ class SynthDataset(Dataset):
                             if teacher_logits is not None:
                                 sample_dict['teacher_logits'] = teacher_logits
                         except Exception as e:
-                            warnings.warn(f"Error loading logits file {logit_file}: {e}")
+                            logger.warning(f"Error loading logits file {logit_file}: {e}")
                             return []
                     
                     samples.append(sample_dict)
@@ -856,7 +865,7 @@ class SynthDataset(Dataset):
                         try:
                             teacher_logits = self._load_logits_file(logit_file)
                         except Exception as e:
-                            warnings.warn(f"Error loading logits file {logit_file}: {e}")
+                            logger.warning(f"Error loading logits file {logit_file}: {e}")
                             return []
                     
                     for t in range(spec.shape[0]):
@@ -867,7 +876,7 @@ class SynthDataset(Dataset):
                             if chord_label not in self.chord_to_idx:
                                 self.chord_to_idx[chord_label] = len(self.chord_to_idx)
                         elif chord_label not in self.chord_mapping:
-                            warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
+                            logger.warning(f"Unknown chord label {chord_label}, using 'N'")
                             chord_label = "N"
                             
                         sample_dict = {
@@ -896,7 +905,7 @@ class SynthDataset(Dataset):
                     self.skipped_reasons['load_error'] += 1
                     skip_reason = 'load_error'
             
-            warnings.warn(f"Error processing file {spec_file}: {str(e)}")
+            logger.warning(f"Error processing file {spec_file}: {str(e)}")
             
             if return_skip_reason:
                 return [], skip_reason
@@ -920,7 +929,7 @@ class SynthDataset(Dataset):
                             chord = parts[2]
                             result.append((start_time, end_time, chord))
         except Exception as e:
-            print(f"Error parsing label file {label_file}: {e}")
+            logger.error(f"Error parsing label file {label_file}: {e}")
             
         return result
     
@@ -941,7 +950,7 @@ class SynthDataset(Dataset):
     def _generate_segments(self):
         """Generate segments more efficiently using song boundaries"""
         if not self.samples:
-            warnings.warn("No samples to generate segments from")
+            logger.warning("No samples to generate segments from")
             return
         
         if self.require_teacher_logits:
@@ -957,12 +966,12 @@ class SynthDataset(Dataset):
                 new_count = len(self.samples)
                 removed = original_count - new_count
                 removed_percent = (removed / original_count * 100) if original_count > 0 else 0
-                print(f"Filtered out {removed} samples without teacher logits ({removed_percent:.1f}%)")
-                print(f"Remaining samples with teacher logits: {new_count}")
+                logger.info(f"Filtered out {removed} samples without teacher logits ({removed_percent:.1f}%)")
+                logger.info(f"Remaining samples with teacher logits: {new_count}")
                 
                 if new_count < original_count * 0.1:
-                    warnings.warn(f"WARNING: Only {new_count} samples ({new_count/original_count*100:.1f}%) have teacher logits.")
-                    warnings.warn(f"This may indicate an issue with logits availability or paths.")
+                    logger.warning(f"WARNING: Only {new_count} samples ({new_count/original_count*100:.1f}%) have teacher logits.")
+                    logger.warning(f"This may indicate an issue with logits availability or paths.")
         
         song_samples = {}
         for i, sample in enumerate(self.samples):
@@ -972,7 +981,7 @@ class SynthDataset(Dataset):
             song_samples[song_id].append(i)
         
         if self.verbose:
-            print(f"Found {len(song_samples)} unique songs")
+            logger.info(f"Found {len(song_samples)} unique songs")
         
         start_time = time.time()
         total_segments = 0
@@ -992,7 +1001,7 @@ class SynthDataset(Dataset):
         
         if self.verbose:
             end_time = time.time()
-            print(f"Generated {total_segments} segments in {end_time - start_time:.2f} seconds")
+            logger.info(f"Generated {total_segments} segments in {end_time - start_time:.2f} seconds")
 
     def __len__(self):
         return len(self.segment_indices)
@@ -1117,7 +1126,7 @@ class SynthDataset(Dataset):
                         logits_vec = torch.zeros_like(teacher_logits_seq[0], device=self.device)
                         teacher_logits_seq.append(logits_vec)
                     elif self.verbose and not hasattr(self, '_logits_load_error'):
-                        print(f"Warning: Error loading logits, will use zeros: {e}")
+                        logger.warning(f"Warning: Error loading logits, will use zeros: {e}")
                         self._logits_load_error = True
                         # Create dummy tensor
                         teacher_logits_seq.append(torch.zeros(170, dtype=torch.float, device=self.device))
@@ -1185,13 +1194,13 @@ class SynthDataset(Dataset):
                 sample_out['teacher_logits'] = teacher_logits_stacked
                 
                 if self.verbose and not hasattr(self, '_logit_shape_info'):
-                    print(f"Teacher logits shape: {teacher_logits_stacked.shape}")
+                    logger.debug(f"Teacher logits shape: {teacher_logits_stacked.shape}")
                     self._logit_shape_info = True
                     
             except Exception as e:
                 if self.verbose and not hasattr(self, '_logits_error'):
-                    print(f"Error processing teacher logits: {e}")
-                    print(f"Will use dummy tensor instead")
+                    logger.error(f"Error processing teacher logits: {e}")
+                    logger.error(f"Will use dummy tensor instead")
                     self._logits_error = True
                 
                 # Create dummy tensor with fixed shape
@@ -1210,7 +1219,7 @@ class SynthDataset(Dataset):
                     del self.gpu_batch_cache[oldest_key]
             except Exception as e:
                 if self.verbose and not hasattr(self, '_cache_error_warning'):
-                    print(f"Warning: Error in GPU batch caching: {e}")
+                    logger.warning(f"Warning: Error in GPU batch caching: {e}")
                     self._cache_error_warning = True
                 
                 # Clear cache if an error occurs
@@ -1233,7 +1242,7 @@ class SynthDataset(Dataset):
             DataLoader object
         """
         if not indices:
-            warnings.warn(f"No {name} segments available")
+            logger.warning(f"No {name} segments available")
             return DataLoader(
                 SynthSegmentSubset(self, []),
                 batch_size=batch_size,

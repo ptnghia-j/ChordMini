@@ -46,7 +46,6 @@ class CrossValidationDataset(Dataset):
         self.total_folds = total_folds
         self.device = device
         self.teacher_model = teacher_model
-        self.chord_mapping = chord_mapping
         self.random_seed = random_seed
         
         # Initialize preprocessor to None here, before it's first accessed
@@ -74,15 +73,14 @@ class CrossValidationDataset(Dataset):
         # Define audio_label_pairs list for analyze_label_files
         self.audio_label_pairs = []
         
-        # Get N and X chord IDs based on the stored use_large_voca flag
-        if self.chord_mapping:
-            self.n_chord_id = self.chord_mapping.get("N", 169 if self.use_large_voca else 24)
-            self.x_chord_id = self.chord_mapping.get("X", 168 if self.use_large_voca else 25)
-        else:
-            self.n_chord_id = 169 if self.use_large_voca else 24
-            self.x_chord_id = 168 if self.use_large_voca else 25
-        
+        # --- Determine N and X chord IDs based *only* on the use_large_voca flag ---
+        self.n_chord_id = 169 if self.use_large_voca else 24
+        self.x_chord_id = 168 if self.use_large_voca else 25
         logger.info(f"Using N chord ID={self.n_chord_id}, X chord ID={self.x_chord_id}")
+        # --- End N/X ID determination ---
+
+        # Store the original mapping if needed, but don't use it for N/X lookup
+        self.original_chord_mapping = chord_mapping
         
         # Setup cache directory
         self.cache_dir = cache_dir
@@ -321,7 +319,7 @@ class CrossValidationDataset(Dataset):
         quality_counts = defaultdict(int)
         total_chords = 0
 
-        # Use the stored N and X chord indices
+        # Use the stored N and X chord indices determined in __init__
         n_chord_idx = self.n_chord_id
         x_chord_idx = self.x_chord_id
 
@@ -330,8 +328,8 @@ class CrossValidationDataset(Dataset):
         expected_size = 170 if self.use_large_voca else 26
         if len(idx_to_chord_name) < expected_size - 5:
             logger.warning(f"idx_to_chord_name map size ({len(idx_to_chord_name)}) seems small for use_large_voca={self.use_large_voca}. Quality analysis might be inaccurate.")
-            if self.chord_mapping:
-                idx_to_chord_name = {v: k for k, v in self.chord_mapping.items()}
+            if self.original_chord_mapping:
+                idx_to_chord_name = {v: k for k, v in self.original_chord_mapping.items()}
 
         # Iterate through all chord indices in all samples
         for path in self.paths:
@@ -376,3 +374,40 @@ class CrossValidationDataset(Dataset):
             'total_chords': total_chords,
             'quality_counts': quality_counts
         }
+
+    def analyze_label_files(self, num_files=5):
+        """Analyze a few label files for diagnostic purposes."""
+        logger.info("Analyzing label files...")
+        sample_pairs = random.sample(self.audio_label_pairs, min(num_files, len(self.audio_label_pairs)))
+
+        # Temporarily create a Chords instance for analysis
+        analyzer_chord_processor = Chords()
+        if self.original_chord_mapping: # Use original mapping here for analysis setup
+            # Filter N and X before passing to processor
+            processed_mapping = {k: v for k, v in self.original_chord_mapping.items() if k not in ["N", "X"]}
+            analyzer_chord_processor.set_chord_mapping(processed_mapping)
+            analyzer_chord_processor.initialize_chord_mapping()
+
+        for audio_path, label_path in sample_pairs:
+            try:
+                logger.info(f"Analyzing label file: {label_path}")
+                with open(label_path, 'r') as f:
+                    chord_labels = [line.strip().split()[-1] for line in f.readlines()]
+
+                unknown_count = 0
+                x_chord_idx = self.x_chord_id # Use the class attribute determined in __init__
+
+                for chord in chord_labels:
+                    if chord == "N":
+                        idx = self.n_chord_id
+                    elif chord == "X":
+                        idx = self.x_chord_id
+                    else:
+                        idx = analyzer_chord_processor.get_chord_idx(chord, self.use_large_voca)
+
+                    if idx == x_chord_idx and chord != "X":
+                        unknown_count += 1
+
+                logger.info(f"File {label_path} has {unknown_count} unknown chords mapped to X.")
+            except Exception as e:
+                logger.error(f"Error analyzing label file {label_path}: {e}")
