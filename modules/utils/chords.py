@@ -878,20 +878,38 @@ class Chords:
 
 def idx2voca_chord():
     """
-    Create a mapping from chord index to chord label.
-    Adjust the mapping as needed to match your evaluation conventions.
+    Create a mapping from chord index (0-169) to chord label for the large vocabulary.
+    Uses standard mir_eval-compatible notations (e.g., C:maj, G:min, D:7).
+    Index 168 = X (Unknown), Index 169 = N (No Chord).
     """
-    # For example, assuming indices 0..167 map to chords via convert_to_id_voca,
-    # and 168, 169 map to unknown and no-chord respectively.
     mapping = {}
-    for i in range(168):
-        # This assumes a predefined order; customize as needed.
-        root = i // 14
-        quality_idx = i % 14
-        quality_list = ['min', 'maj', 'dim', 'aug', 'min6', 'maj6', 'min7', 'minmaj7', 'maj7', '7', 'dim7', 'hdim7', 'sus2', 'sus4']
-        # Use chords from PITCH_CLASS defined in this module.
-        label = PITCH_CLASS[root] + (":" + quality_list[quality_idx] if quality_idx != 1 else "")
-        mapping[i] = label
-    mapping[168] = "X"
-    mapping[169] = "N"
+    # Quality names in a standard order, matching potential model output structure
+    # Ensure these match mir_eval expectations where possible
+    quality_list = [
+        'min', 'maj', 'dim', 'aug', 'min6', 'maj6', 'min7', 'minmaj7',
+        'maj7', '7', 'dim7', 'hdim7', 'sus2', 'sus4'
+    ]
+    num_qualities = len(quality_list) # Should be 14
+
+    for root_idx in range(12):
+        root_note = PITCH_CLASS[root_idx]
+        for quality_idx in range(num_qualities):
+            chord_idx = root_idx * num_qualities + quality_idx
+            quality = quality_list[quality_idx]
+
+            # Construct label: Root:Quality (omit :maj for major triads)
+            if quality == 'maj':
+                label = root_note # mir_eval often treats "C" as "C:maj"
+            else:
+                label = f"{root_note}:{quality}"
+            mapping[chord_idx] = label
+
+    # Add special chords
+    mapping[168] = "X"  # Unknown chord
+    mapping[169] = "N"  # No chord
+
+    # Verify expected size
+    if len(mapping) != 170:
+         logger.warning(f"Generated idx2voca_chord mapping has {len(mapping)} entries, expected 170.")
+
     return mapping

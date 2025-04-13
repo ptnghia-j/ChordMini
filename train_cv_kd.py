@@ -59,12 +59,22 @@ def main():
                         help='Batch size for training (overrides config value)')
     parser.add_argument('--preprocess', action='store_true',
                       help='Run preprocessing step to generate all features')
+    parser.add_argument('--log_chord_details', action='store_true',
+                       help='Enable detailed logging of chords during MIR evaluation')
     
     args = parser.parse_args()
 
     # Load configuration
     config = HParams.load(args.config)
-    
+
+    # Override with command line args
+    if args.log_chord_details:
+        if 'misc' not in config: config['misc'] = {}
+        config.misc['log_chord_details'] = True
+        logger.info("Detailed chord logging during evaluation ENABLED via command line.")
+    elif config.misc.get('log_chord_details'):
+        logger.info("Detailed chord logging during evaluation ENABLED via config/env.")
+
     # Set up device
     if config.misc.get('use_cuda', True) and is_cuda_available():
         device = get_device()
@@ -103,22 +113,49 @@ def main():
     else:
         logger.info("Knowledge Distillation Loss DISABLED")
     
-    # Set large vocabulary config if specified - maintain consistent types
-    if args.use_voca:
-        config.feature['large_voca'] = True
-        config.model['num_chords'] = 170  # 170 chord types
-        logger.info("Using large vocabulary with 170 chord classes")
-    elif hasattr(config.feature, 'large_voca') and isinstance(config.feature.large_voca, str):
-        # Handle string "true"/"false" in config
-        config.feature['large_voca'] = config.feature.large_voca.lower() == "true"
-        if config.feature['large_voca']:
-            config.model['num_chords'] = 170
-            logger.info("Using large vocabulary with 170 chord classes (from config)")
+    # Set up chord mapping
+    # Determine if large vocabulary is used
+    use_large_voca = args.use_voca or config.feature.get('large_voca', False)
+
+    if use_large_voca:
+        logger.info("Using large vocabulary chord mapping (170 chords)")
+        master_mapping = idx2voca_chord() # Get idx -> chord mapping
+        chord_mapping = {chord: idx for idx, chord in master_mapping.items()} # Create reverse mapping
+        n_classes = 170
     else:
-        # Set to small vocabulary explicitly if not using large vocabulary
-        config.feature['large_voca'] = False
-        config.model['num_chords'] = 25  # Only major/minor chords + no-chord
-        logger.info("Using small vocabulary with 25 chord classes")
+        # Use the 25-chord vocabulary mapping (major/minor + no chord)
+        logger.info("Using standard vocabulary chord mapping (25 chords)")
+        chord_mapping = {} # chord -> idx
+        master_mapping = {} # idx -> chord
+        for i in range(12):
+            root = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'][i]
+            # Major chords
+            maj_idx = i * 2
+            maj_chord = f"{root}:maj" # Use explicit :maj
+            chord_mapping[maj_chord] = maj_idx
+            master_mapping[maj_idx] = maj_chord
+            # Minor chords
+            min_idx = i * 2 + 1
+            min_chord = f"{root}:min"
+            chord_mapping[min_chord] = min_idx
+            master_mapping[min_idx] = min_chord
+        # Special chords: N (no chord) and X (unknown)
+        chord_mapping["N"] = 24
+        master_mapping[24] = "N"
+        chord_mapping["X"] = 25
+        master_mapping[25] = "X"
+        n_classes = 26 # 0-25 inclusive
+
+    # Initialize chord class with the reverse mapping (chord -> idx)
+    chord_class = Chords()
+    chord_class.set_chord_mapping(chord_mapping)
+    chord_class.initialize_chord_mapping() # Initialize variants
+
+    # Log mapping info
+    logger.info(f"\nUsing idx->chord mapping with {len(master_mapping)} entries")
+    logger.info(f"Sample idx->chord mapping: {dict(list(master_mapping.items())[:5])}")
+    logger.info(f"Reverse chord->idx mapping created with {len(chord_mapping)} entries")
+    logger.info(f"Sample chord->idx mapping: {dict(list(chord_mapping.items())[:5])}")
     
     # Set random seed for reproducibility - ensure this is an integer
     seed = int(config.misc['seed'])
@@ -132,28 +169,6 @@ def main():
     # Create save directory
     save_dir = config.paths['checkpoints_dir']
     os.makedirs(save_dir, exist_ok=True)
-    
-    # Set up chord mapping
-    if args.use_voca or config.feature.get('large_voca', False):
-        # Use the full 170-chord vocabulary mapping
-        logger.info("Using large vocabulary chord mapping (170 chords)")
-        chord_mapping = {idx2voca_chord()[i]: i for i in range(170)}
-    else:
-        # Use the 25-chord vocabulary mapping (major/minor + no chord)
-        logger.info("Using standard vocabulary chord mapping (25 chords)")
-        chord_mapping = {}
-        for i in range(12):
-            # Major chords
-            chord_mapping[f"{['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'][i]}"] = i * 2
-            # Minor chords
-            chord_mapping[f"{['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'][i]}:min"] = i * 2 + 1
-        # Special chords: N (no chord) and X (unknown)
-        chord_mapping["N"] = 24
-        chord_mapping["X"] = 25
-    
-    # Initialize chord class with the mapping
-    chord_class = Chords()
-    chord_class.set_chord_mapping(chord_mapping)
     
     # Set up datasets
     if args.audio_dirs:
@@ -340,7 +355,6 @@ def main():
     logger.info(f"Normalization tensors created on device: {device}")
     
     # Create model
-    n_classes = 170 if args.use_voca or config.feature.get('large_voca', False) else 25
     logger.info(f"Creating model with {n_classes} output classes")
     
     # Log additional information about feature dimensions
@@ -396,7 +410,7 @@ def main():
         logger=logger,
         checkpoint_dir=save_dir,
         class_weights=None,  # No class weights for now
-        idx_to_chord=idx2voca_chord(),
+        idx_to_chord=master_mapping,
         normalization=normalization,
         early_stopping_patience=int(config.training.get('early_stopping_patience', 5)),
         lr_decay_factor=float(config.training.get('lr_decay_factor', 0.95)),
@@ -440,7 +454,7 @@ def main():
                 model=model,
                 test_loader=val_loader,
                 device=device,
-                idx_to_chord=idx2voca_chord(),
+                idx_to_chord=master_mapping,
                 normalization={'mean': mean, 'std': std},
                 output_dir=save_dir,
                 logger=logger
@@ -472,7 +486,7 @@ def main():
                     valid_dataset2 = val_dataset.samples[split:2*split]
                     valid_dataset3 = val_dataset.samples[2*split:]
                     
-                    # Evaluate each split
+                    # Evaluate each split using large_voca_score_calculation
                     logger.info(f"Evaluating model on {len(valid_dataset1)} samples in split 1...")
                     score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
                         valid_dataset=valid_dataset1, config=config, model=model, model_type='ChordNet', 

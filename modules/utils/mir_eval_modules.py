@@ -223,64 +223,10 @@ def lab_file_error_modify(ref_labels):
                 ref_labels[i] = ref_labels[i][:ref_labels[i].find('min')] + ':' + ref_labels[i][ref_labels[i].find('min'):]
     return ref_labels
 
-def normalize_chord_name(chord_name):
-    """
-    Normalize chord names to handle enharmonic equivalents and common notation variants.
-    
-    Args:
-        chord_name (str): Original chord name
-        
-    Returns:
-        str: Normalized chord name
-    """
-    if chord_name in ['N', 'X']:
-        return 'N'  # Standardize no-chord symbols
-    
-    # Handle enharmonic equivalents by converting flats to sharps
-    enharmonic_map = {
-        'Bb': 'A#', 'Eb': 'D#', 'Ab': 'G#', 'Db': 'C#', 'Gb': 'F#',
-        'Bbm': 'A#:min', 'Ebm': 'D#:min', 'Abm': 'G#:min', 'Dbm': 'C#:min', 'Gbm': 'F#:min',
-        'Bb:': 'A#:', 'Eb:': 'D#:', 'Ab:': 'G#:', 'Db:': 'C#:', 'Gb:': 'F#:'
-    }
-    
-    # Replace flat-based root with sharp equivalent
-    for flat_notation, sharp_notation in enharmonic_map.items():
-        if chord_name.startswith(flat_notation):
-            # Only replace at the beginning of the string (the root note)
-            chord_name = sharp_notation + chord_name[len(flat_notation):]
-            break
-    
-    # Handle shortened minor notation (e.g., "Cm" -> "C:min")
-    if 'm' in chord_name and ':' not in chord_name:
-        parts = chord_name.split('m', 1)
-        if len(parts) == 2 and (len(parts[0]) <= 2) and (parts[1] == '' or parts[1].startswith('/')):
-            chord_name = f"{parts[0]}:min{parts[1]}"
-    
-    # Handle inversions by mapping to base chord when needed for evaluation
-    if '/' in chord_name:
-        base_chord = chord_name.split('/', 1)[0]
-        # Keep the base chord for evaluation if the inversion isn't in the vocabulary
-        if base_chord.endswith(':min') or ':' not in base_chord:
-            return base_chord
-    
-    # Handle extended chords by simplifying to core triad types
-    # This is a fallback for evaluation metrics
-    if ':' in chord_name:
-        root, quality = chord_name.split(':', 1)
-        # Map various extensions to basic triads
-        if quality.startswith(('maj7', 'maj9', '7', '9')) and not quality.startswith('min'):
-            return f"{root}"  # Map to major
-        elif quality.startswith(('min7', 'min9')):
-            return f"{root}:min"  # Map to minor
-        elif 'sus' in quality:
-            return root  # Map to major for suspended chords
-    
-    return chord_name
-
 def large_voca_score_calculation(valid_dataset, config, model, model_type='BTC', mean=0, std=1, device='cpu'):
     """
     Enhanced version of the evaluation function that's more robust to different chord notations
-    and provides better diagnostics.
+    and provides better diagnostics. Uses direct labels for mir_eval.
     """
     # Suppress warnings from sklearn and mir_eval
     import warnings
@@ -289,6 +235,7 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type='BTC',
     
     # Debugging mode
     debug_mode = config.misc.get('debug_mode', False)
+    log_chord_details = config.misc.get('log_chord_details', False) # Add flag for detailed logging
     
     # Put model in evaluation mode
     model.eval()
@@ -305,15 +252,14 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type='BTC',
     # Get chord mapping once
     idx_to_chord_dict = idx2voca_chord()
     
-    # Track chord normalization statistics
-    normalization_count = 0
+    # Track chord normalization statistics (now less relevant)
     total_chords = 0
     
     # Track unknown chords for diagnostic purposes
-    unknown_chords = {}
+    unknown_chords_ref = {}
+    unknown_chords_pred = {}
     
     logger.info(f"Evaluating {len(valid_dataset)} samples with {model_type} model")
-    logger.info("Using enhanced chord normalization to handle enharmonic equivalents")
     
     for i, sample in enumerate(tqdm(valid_dataset, desc="Evaluating songs")):
         try:
@@ -377,59 +323,49 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type='BTC',
                     error_samples += 1
                     continue
             
-            # Convert indices to chord names with normalization
+            # Convert indices to chord names - Use direct mapping
             ref_chords = []
             for idx in label_idx:
                 try:
                     idx_int = int(idx)
                     if idx_int in idx_to_chord_dict:
-                        # Get original chord name
-                        original_chord = idx_to_chord_dict[idx_int]
+                        chord_label = idx_to_chord_dict[idx_int]
                         total_chords += 1
-                        
-                        # Normalize the chord name
-                        normalized_chord = normalize_chord_name(original_chord)
-                        if normalized_chord != original_chord:
-                            normalization_count += 1
-                            
-                        # Add standardized chord to list
-                        if normalized_chord == 'N':
-                            ref_chords.append('N')
-                        elif ':' not in normalized_chord and normalized_chord != 'N':
-                            ref_chords.append(f"{normalized_chord}:maj")  # Add quality to root-only notation
+                        # Minimal formatting for mir_eval compatibility if needed
+                        if chord_label == 'N' or chord_label == 'X':
+                             ref_chords.append('N') # Standardize no-chord/unknown
+                        elif ':' not in chord_label and chord_label not in ['N', 'X']:
+                             ref_chords.append(f"{chord_label}:maj")
                         else:
-                            ref_chords.append(normalized_chord)
+                             ref_chords.append(chord_label)
                     else:
-                        ref_chords.append('N')  # Default to no-chord for unknown indices
-                except:
+                        ref_chords.append('N') # Default to no-chord for unknown indices
+                        unknown_chords_ref[idx_int] = unknown_chords_ref.get(idx_int, 0) + 1
+                except ValueError:
                     ref_chords.append('N')
-                    
-            # Convert prediction indices to chord names
+                    unknown_chords_ref[str(idx)] = unknown_chords_ref.get(str(idx), 0) + 1
+
+            # Convert prediction indices to chord names - Use direct mapping
             pred_chords = []
             for idx in pred_idx:
                 try:
                     idx_int = int(idx)
                     if idx_int in idx_to_chord_dict:
-                        # Get original chord name
-                        original_chord = idx_to_chord_dict[idx_int]
-                        
-                        # Normalize the chord name
-                        normalized_chord = normalize_chord_name(original_chord)
-                        
-                        # Add standardized chord to list
-                        if normalized_chord == 'N':
-                            pred_chords.append('N')
-                        elif ':' not in normalized_chord and normalized_chord != 'N':
-                            pred_chords.append(f"{normalized_chord}:maj")  # Add quality to root-only notation
+                        chord_label = idx_to_chord_dict[idx_int]
+                        # Minimal formatting for mir_eval compatibility
+                        if chord_label == 'N' or chord_label == 'X':
+                             pred_chords.append('N')
+                        elif ':' not in chord_label and chord_label not in ['N', 'X']:
+                             pred_chords.append(f"{chord_label}:maj")
                         else:
-                            pred_chords.append(normalized_chord)
+                             pred_chords.append(chord_label)
                     else:
-                        if debug_mode:
-                            logger.debug(f"Sample {i}: unknown prediction index: {idx_int}")
-                        pred_chords.append('N')  # Default to no-chord for unknown indices
-                except:
+                        pred_chords.append('N')
+                        unknown_chords_pred[idx_int] = unknown_chords_pred.get(idx_int, 0) + 1
+                except ValueError:
                     pred_chords.append('N')
-                    
+                    unknown_chords_pred[str(idx)] = unknown_chords_pred.get(str(idx), 0) + 1
+
             # Check if we have valid chord sequences
             min_len = min(len(ref_chords), len(pred_chords))
             if min_len == 0:
@@ -451,12 +387,8 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type='BTC',
                         valid_ref = ref
                     else:
                         valid_ref = 'N'
-                except Exception as e:
-                    # Track unknown chords for diagnostics
-                    if ref in unknown_chords:
-                        unknown_chords[ref] += 1
-                    else:
-                        unknown_chords[ref] = 1
+                except ValueError:
+                    unknown_chords_ref[ref] = unknown_chords_ref.get(ref, 0) + 1
                     valid_ref = 'N'
                 
                 # Validate/fix prediction chord format
@@ -467,12 +399,13 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type='BTC',
                         valid_pred = pred
                     else:
                         valid_pred = 'N'
-                except Exception as e:
+                except ValueError:
+                    unknown_chords_pred[pred] = unknown_chords_pred.get(pred, 0) + 1
                     valid_pred = 'N'
                 
                 valid_ref_chords.append(valid_ref)
                 valid_pred_chords.append(valid_pred)
-            
+
             # Record song length
             song_length_list.append(min_len)
             
@@ -517,12 +450,14 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type='BTC',
     
     # Report statistics
     logger.info(f"Evaluation complete: {successful_samples} successful samples, {error_samples} error samples")
-    logger.info(f"Chord normalization: {normalization_count}/{total_chords} chords normalized ({normalization_count/max(1,total_chords)*100:.1f}%)")
     
     # Report most common unknown chords if any
-    if unknown_chords:
-        top_unknown = sorted(unknown_chords.items(), key=lambda x: x[1], reverse=True)[:10]
-        logger.info(f"Top unknown chords: {top_unknown}")
+    if unknown_chords_ref:
+        top_unknown_ref = sorted(unknown_chords_ref.items(), key=lambda x: x[1], reverse=True)[:10]
+        logger.info(f"Top unknown reference chord indices/labels: {top_unknown_ref}")
+    if unknown_chords_pred:
+        top_unknown_pred = sorted(unknown_chords_pred.items(), key=lambda x: x[1], reverse=True)[:10]
+        logger.info(f"Top unknown prediction chord indices/labels: {top_unknown_pred}")
     
     # Calculate weighted averages for each metric
     if song_length_list:

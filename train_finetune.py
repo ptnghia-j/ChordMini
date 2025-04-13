@@ -256,6 +256,10 @@ def main():
     parser.add_argument('--use_voca', action='store_true',
                         help='Use large vocabulary (170 chord types instead of standard 25)')
     
+    # Add detailed chord logging argument
+    parser.add_argument('--log_chord_details', action='store_true',
+                       help='Enable detailed logging of chords during MIR evaluation')
+    
     args = parser.parse_args()
 
     # Load configuration from YAML first
@@ -291,7 +295,8 @@ def main():
         'USE_CROSS_VALIDATION': ('data', 'use_cross_validation', lambda v: v.lower() == 'true'),
         'KFOLD': ('data', 'kfold', int),
         'TOTAL_FOLDS': ('data', 'total_folds', int),
-        'USE_VOCA': ('feature', 'large_voca', lambda v: v.lower() == 'true') # Env var for large voca
+        'USE_VOCA': ('feature', 'large_voca', lambda v: v.lower() == 'true'), # Env var for large voca
+        'LOG_CHORD_DETAILS': ('misc', 'log_chord_details', lambda v: v.lower() == 'true') # Add env var for detailed logging
     }
 
     for env_var, (section, key, type_converter, *optional) in env_overrides.items():
@@ -313,6 +318,14 @@ def main():
             except Exception as e:
                 logger.warning(f"  Failed to apply ENV VAR {env_var}={value}: {e}")
     # --- End of environment variable overrides ---
+
+    # Override with command line args
+    if args.log_chord_details:
+        if 'misc' not in config: config['misc'] = {}
+        config.misc['log_chord_details'] = True
+        logger.info("Detailed chord logging during evaluation ENABLED via command line.")
+    elif config.misc.get('log_chord_details'):
+        logger.info("Detailed chord logging during evaluation ENABLED via config/env.")
 
     # Then check device availability
     if config.misc.get('use_cuda') and is_cuda_available():
@@ -530,30 +543,21 @@ def main():
     
     # Set up chord processing using the Chords class
     logger.info("\n=== Setting up chord mapping ===")
-    # First get the mapping from idx2voca_chord
+    # Get the mapping from idx2voca_chord - THIS IS THE SOURCE OF TRUTH
     master_mapping = idx2voca_chord()
-    # Then create a reverse mapping
+    # Create a reverse mapping for dataset initialization if needed
     chord_mapping = {chord: idx for idx, chord in master_mapping.items()}
     
-    # Initialize Chords class with the mapping
+    # Initialize Chords class (optional, if needed elsewhere, but mapping is key)
     chord_processor = Chords()
-    chord_processor.set_chord_mapping(chord_mapping)
-    
-    # Verify and initialize chord mapping
-    chord_processor.initialize_chord_mapping(chord_mapping)
-    
-    # Log a few chord mappings for verification
-    chord_examples = ["C", "C:min", "D", "F#:7", "G:maj7", "A:min7", "N", "X"]
-    logger.info("Example chord mappings:")
-    for chord in chord_examples:
-        if chord in chord_mapping:
-            logger.info(f"  {chord} -> {chord_mapping[chord]}")
-        else:
-            logger.info(f"  {chord} -> Not in mapping")
-    
+    chord_processor.set_chord_mapping(chord_mapping) # Use the reverse mapping here
+    chord_processor.initialize_chord_mapping() # Initialize variants
+
     # Log mapping info
-    logger.info(f"\nUsing chord mapping from chords.py with {len(chord_mapping)} unique chords")
-    logger.info(f"Sample chord mapping: {dict(list(chord_mapping.items())[:5])}")
+    logger.info(f"\nUsing idx->chord mapping from idx2voca_chord with {len(master_mapping)} entries")
+    logger.info(f"Sample idx->chord mapping: {dict(list(master_mapping.items())[:5])}")
+    logger.info(f"Reverse chord->idx mapping created with {len(chord_mapping)} entries")
+    logger.info(f"Sample chord->idx mapping: {dict(list(chord_mapping.items())[:5])}")
     
     # Resolve checkpoints directory path
     checkpoints_dir_config = config.paths.get('checkpoints_dir', 'checkpoints/finetune')
@@ -847,7 +851,7 @@ def main():
         teacher_normalization={'mean': teacher_mean, 'std': teacher_std} if teacher_mean is not None else None,
     )
     
-    # Attach chord mapping to trainer
+    # Attach chord mapping to trainer (chord -> idx) if needed by trainer internals
     trainer.set_chord_mapping(chord_mapping)
     
     # Run training
@@ -899,7 +903,7 @@ def main():
                 model=model,
                 test_loader=test_loader,
                 device=device,
-                idx_to_chord=master_mapping,
+                idx_to_chord=master_mapping, # Pass idx->chord mapping
                 normalization=normalization,
                 output_dir=checkpoints_dir,
                 logger=logger
@@ -960,7 +964,7 @@ def main():
                 logger.info(f"Evaluating model on {len(valid_dataset1)} samples in split 1...")
                 score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
                     valid_dataset=valid_dataset1, config=config, model=model, model_type='ChordNet', 
-                    mean=mean, std=std, device=device)
+                    mean=mean, std=std, device=device) # config is passed, includes log_chord_details flag
                 
                 logger.info(f"Evaluating model on {len(valid_dataset2)} samples in split 2...")
                 score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
