@@ -1,14 +1,14 @@
-import multiprocessing
-import sys
-import os
-import torch  
-import numpy as np
-import argparse
-import glob
-import gc
-import json
-import random
-import traceback
+import json # Add json import if not already present
+import traceback # Add traceback import if not already present
+import multiprocessing # Add multiprocessing import
+import sys # Add sys import
+import os # Add os import
+import torch # Add torch import
+import numpy as np # Add numpy import
+import argparse # Add argparse import
+import glob # Add glob import
+import gc # Add gc import
+import random # Add random import
 from pathlib import Path
 from collections import Counter
 
@@ -265,59 +265,7 @@ def main():
     # Load configuration from YAML first
     config = HParams.load(args.config)
 
-    # --- NEW: Override config with environment variables ---
-    logger.info("Checking environment variables for config overrides...")
-    env_overrides = {
-        'MODEL_SCALE': ('model', 'scale', float),
-        'LEARNING_RATE': ('training', 'learning_rate', float),
-        'MIN_LEARNING_RATE': ('training', 'min_learning_rate', float),
-        'USE_KD_LOSS': ('training', 'use_kd_loss', lambda v: v.lower() == 'true'),
-        'KD_ALPHA': ('training', 'kd_alpha', float),
-        'TEMPERATURE': ('training', 'temperature', float),
-        'USE_FOCAL_LOSS': ('training', 'use_focal_loss', lambda v: v.lower() == 'true'),
-        'FOCAL_GAMMA': ('training', 'focal_gamma', float),
-        'FOCAL_ALPHA': ('training', 'focal_alpha', float, True), # Allow None
-        'USE_WARMUP': ('training', 'use_warmup', lambda v: v.lower() == 'true'),
-        'WARMUP_START_LR': ('training', 'warmup_start_lr', float),
-        'WARMUP_END_LR': ('training', 'warmup_end_lr', float),
-        'WARMUP_EPOCHS': ('training', 'warmup_epochs', int),
-        'DROPOUT': ('model', 'dropout', float),
-        'DATA_ROOT': ('paths', 'storage_root', str),
-        'NUM_CHORDS': ('model', 'num_chords', int),
-        'PRETRAINED_MODEL': ('paths', 'pretrained_model', str), # Env var for pretrained path
-        'FREEZE_FEATURE_EXTRACTOR': ('training', 'freeze_feature_extractor', lambda v: v.lower() == 'true'),
-        'EPOCHS': ('training', 'num_epochs', int),
-        'BATCH_SIZE': ('training', 'batch_size', int),
-        'LR_SCHEDULE': ('training', 'lr_schedule', str),
-        'DISABLE_CACHE': ('data', 'disable_cache', lambda v: v.lower() == 'true'),
-        'METADATA_CACHE': ('data', 'metadata_cache', lambda v: v.lower() == 'true'),
-        'SAVE_DIR': ('paths', 'checkpoints_dir', str),
-        'USE_CROSS_VALIDATION': ('data', 'use_cross_validation', lambda v: v.lower() == 'true'),
-        'KFOLD': ('data', 'kfold', int),
-        'TOTAL_FOLDS': ('data', 'total_folds', int),
-        'USE_VOCA': ('feature', 'large_voca', lambda v: v.lower() == 'true'), # Env var for large voca
-        'LOG_CHORD_DETAILS': ('misc', 'log_chord_details', lambda v: v.lower() == 'true') # Add env var for detailed logging
-    }
-
-    for env_var, (section, key, type_converter, *optional) in env_overrides.items():
-        value = os.environ.get(env_var)
-        if value is not None:
-            try:
-                # Ensure section exists
-                if section not in config:
-                    config[section] = {}
-
-                allow_none = len(optional) > 0 and optional[0] is True
-                if allow_none and value.lower() in ['none', 'null', '']:
-                    converted_value = None
-                else:
-                    converted_value = type_converter(value)
-
-                config[section][key] = converted_value
-                logger.info(f"  Overriding config.{section}.{key} with ENV VAR {env_var}={converted_value}")
-            except Exception as e:
-                logger.warning(f"  Failed to apply ENV VAR {env_var}={value}: {e}")
-    # --- End of environment variable overrides ---
+    # --- REMOVED Environment variable override block ---
 
     # Override with command line args
     if args.log_chord_details:
@@ -1094,78 +1042,18 @@ def main():
     except Exception as e:
         logger.error(f"Error saving final model: {e}")
     
-    # Advanced MIR Evaluation on validation set
-    logger.info("\n=== Advanced MIR Evaluation ===")
-    try:
-        # Make sure we're using the best model
-        if trainer.load_best_model():
-            score_metrics = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
-            
-            # Get validation dataset
-            dataset_length = len()
-            
-            if dataset_length < 3:
-                logger.info("Not enough validation samples to compute chord metrics.")
-            else:
-                # Create balanced splits
-                split = dataset_length // 3
-                valid_dataset1 = [val_dataset[val_dataset.val_indices[i]] for i in range(split)]
-                valid_dataset2 = [val_dataset[val_dataset.val_indices[split + i]] for i in range(min(split, dataset_length - split))]
-                valid_dataset3 = [val_dataset[val_dataset.val_indices[2*split + i]] for i in range(min(split, dataset_length - 2*split))]
-                
-                # Evaluate each split
-                logger.info(f"Evaluating model on {len(valid_dataset1)} samples in split 1...")
-                score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
-                    valid_dataset=valid_dataset1, config=config, model=model, model_type='ChordNet', 
-                    mean=mean, std=std, device=device) # config is passed, includes log_chord_details flag
-                
-                logger.info(f"Evaluating model on {len(valid_dataset2)} samples in split 2...")
-                score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
-                    valid_dataset=valid_dataset2, config=config, model=model, model_type='ChordNet', 
-                    mean=mean, std=std, device=device)
-                
-                logger.info(f"Evaluating model on {len(valid_dataset3)} samples in split 3...")
-                score_list_dict3, song_length_list3, average_score_dict3 = large_voca_score_calculation(
-                    valid_dataset=valid_dataset3, config=config, model=model, model_type='ChordNet', 
-                    mean=mean, std=std, device=device)
-                
-                # Calculate weighted averages
-                mir_eval_results = {}
-                for m in score_metrics:
-                    if song_length_list1 and song_length_list2 and song_length_list3:
-                        # Calculate weighted average based on song lengths
-                        avg = (np.sum(song_length_list1) * average_score_dict1[m] +
-                               np.sum(song_length_list2) * average_score_dict2[m] +
-                               np.sum(song_length_list3) * average_score_dict3[m]) / (
-                               np.sum(song_length_list1) + np.sum(song_length_list2) + np.sum(song_length_list3))
-                        
-                        # Log individual split scores
-                        logger.info(f"==== {m} score 1: {average_score_dict1[m]:.4f}")
-                        logger.info(f"==== {m} score 2: {average_score_dict2[m]:.4f}")
-                        logger.info(f"==== {m} score 3: {average_score_dict3[m]:.4f}")
-                        logger.info(f"==== {m} weighted average: {avg:.4f}")
-                        
-                        # Store in results dictionary
-                        mir_eval_results[m] = {
-                            'split1': float(average_score_dict1[m]),
-                            'split2': float(average_score_dict2[m]),
-                            'split3': float(average_score_dict3[m]),
-                            'weighted_avg': float(avg)
-                        }
-                    else:
-                        logger.info(f"==== {m} scores couldn't be calculated properly")
-                        mir_eval_results[m] = {'error': 'Calculation failed'}
-                
-                # Save MIR-eval metrics
-                mir_eval_path = os.path.join(checkpoints_dir, "mir_eval_metrics.json")
-                with open(mir_eval_path, 'w') as f:
-                    json.dump(mir_eval_results, f, indent=2)
-                logger.info(f"MIR evaluation metrics saved to {mir_eval_path}")
-        else:
-            logger.warning("Could not load best model for MIR evaluation")
-    except Exception as e:
-        logger.error(f"Error during MIR evaluation: {e}")
-        logger.error(traceback.format_exc())
+    # --- REMOVE Redundant/Incorrect MIR Evaluation Block ---
+    # The following block uses 'val_dataset' which is not defined here
+    # and duplicates evaluation already done on the test set. It has been removed.
+    # logger.info("\n=== Advanced MIR Evaluation ===")
+    # try:
+    #     # Make sure we're using the best model
+    #     if trainer.load_best_model():
+    #         # ... (code using val_dataset) ...
+    # except Exception as e:
+    #     logger.error(f"Error during MIR evaluation: {e}")
+    #     logger.error(traceback.format_exc())
+    # --- End REMOVAL ---
     
     logger.info("Fine-tuning and evaluation complete!")
 

@@ -730,7 +730,7 @@ class Chords:
         #     logger.debug(f"Sample added mappings: {dict(list(extended_mapping.items())[:5])}")
 
 
-    def get_chord_idx(self, chord_name, use_large_voca=False):
+    def get_chord_idx(self, chord_name, use_large_voca=True):
         """
         Get chord index using comprehensive mapping strategy.
         Handles enharmonic equivalents, simplification of extensions, and inversions.
@@ -786,7 +786,7 @@ class Chords:
                     return self.chord_mapping[enh_simplified]
 
             # Try enharmonic of normalized (root position)
-            norm_root, norm_qual, _ = self.normalize_chord(normalized.split('/')[0])[1:] # Use root position
+            norm_root, norm_qual, _ = self.normalize_chord(normalized_chord.split('/')[0])[1:] # Use root position
             if norm_root and norm_root in enharmonic_map:
                 enh_norm_root = enharmonic_map[norm_root]
                 enh_normalized_root_pos = f"{enh_norm_root}" + (f":{norm_qual}" if norm_qual else "")

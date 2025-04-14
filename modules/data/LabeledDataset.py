@@ -159,9 +159,14 @@ class LabeledDataset(Dataset):
         # Convert to ConfigDict for dual access patterns
         self.feature_config = ConfigDict(raw_config)
         
-        # Determine and store use_large_voca consistently
-        self.use_large_voca = True
-        logger.info(f"Dataset initialized with use_large_voca = {self.use_large_voca}")
+        # --- FIX: Determine use_large_voca based on chord_mapping size ---
+        # Infer from the size of the provided mapping (excluding N/X if they exist)
+        # A mapping size > 30 typically indicates the large vocabulary (170).
+        # The standard small vocabulary has 26 entries (including N/X).
+        num_unique_chords_in_mapping = len(chord_mapping) if chord_mapping else 0
+        self.use_large_voca = num_unique_chords_in_mapping > 30 
+        # --- End FIX ---
+        logger.info(f"Dataset initialized with use_large_voca = {self.use_large_voca} (inferred from mapping size: {num_unique_chords_in_mapping})")
 
         # --- Determine N and X indices based *only* on use_large_voca ---
         self.n_chord_idx = 169 if self.use_large_voca else 24
@@ -878,9 +883,9 @@ class LabeledDataset(Dataset):
         """Get a sample by index"""
         sample = self.samples[idx]
         
-        # Convert to torch tensors
-        spectro = torch.tensor(sample['spectro'], dtype=torch.float32)
-        chord_idx = torch.tensor(sample['chord_idx'], dtype=torch.long)
+        # Convert to torch tensors and move to the specified device
+        spectro = torch.tensor(sample['spectro'], dtype=torch.float32).to(self.device)
+        chord_idx = torch.tensor(sample['chord_idx'], dtype=torch.long).to(self.device)
         
         return {
             'spectro': spectro,
@@ -893,6 +898,8 @@ class LabeledDataset(Dataset):
 
     def get_train_iterator(self, batch_size=32, shuffle=True, num_workers=2, pin_memory=True):
         """Get data loader for training set"""
+        # Pin memory is generally not needed if data is already on GPU in __getitem__
+        pin_memory = False if self.device.type == 'cuda' else pin_memory 
         return DataLoader(
             Subset(self, self.train_indices),
             batch_size=batch_size,
@@ -903,6 +910,8 @@ class LabeledDataset(Dataset):
 
     def get_val_iterator(self, batch_size=32, shuffle=False, num_workers=2, pin_memory=True):
         """Get data loader for validation set"""
+        # Pin memory is generally not needed if data is already on GPU in __getitem__
+        pin_memory = False if self.device.type == 'cuda' else pin_memory
         return DataLoader(
             Subset(self, self.val_indices),
             batch_size=batch_size,
@@ -913,6 +922,8 @@ class LabeledDataset(Dataset):
     
     def get_test_iterator(self, batch_size=32, shuffle=False, num_workers=2, pin_memory=True):
         """Get data loader for test set"""
+        # Pin memory is generally not needed if data is already on GPU in __getitem__
+        pin_memory = False if self.device.type == 'cuda' else pin_memory
         return DataLoader(
             Subset(self, self.test_indices),
             batch_size=batch_size,
@@ -937,6 +948,9 @@ class LabeledDataset(Dataset):
         """
         # Filter samples by song ID
         song_indices = [i for i, sample in enumerate(self.samples) if sample['song_id'] == song_id]
+        
+        # Pin memory is generally not needed if data is already on GPU in __getitem__
+        pin_memory = False if self.device.type == 'cuda' else pin_memory
         
         return DataLoader(
             Subset(self, song_indices),
