@@ -34,7 +34,7 @@ class SynthDataset(Dataset):
     - 'maestro': Uses arbitrary filenames with format maestro-v3.0.0/file-name_spec.npy
     - 'combined': Loads both 'fma' and 'maestro' datasets simultaneously
     """
-    def __init__(self, spec_dir, label_dir, config, 
+    def __init__(self, spec_dir, label_dir,
                  chord_mapping=None, seq_len=10, stride=None, 
                  frame_duration=0.1, num_workers=0, cache_file=None, verbose=True,
                  use_cache=True, metadata_only=True, cache_fraction=0.1, logits_dir=None,
@@ -47,7 +47,6 @@ class SynthDataset(Dataset):
         Args:
             spec_dir: Directory containing spectrograms (or list of directories for 'combined' type)
             label_dir: Directory containing labels (or list of directories for 'combined' type)
-            config: Configuration object for determining settings like use_large_voca
             chord_mapping: Mapping of chord names to indices
             seq_len: Sequence length for segmentation
             stride: Stride for segmentation (default: same as seq_len)
@@ -129,16 +128,6 @@ class SynthDataset(Dataset):
         self.batch_gpu_cache = batch_gpu_cache
         self.small_dataset_percentage = small_dataset_percentage
         
-        # Determine and store use_large_voca consistently
-        self.config = config
-        self.use_large_voca = self.config.feature.get('large_voca', False)
-        logger.info(f"SynthDataset initialized with use_large_voca = {self.use_large_voca}")
-
-        # Determine N and X indices based on use_large_voca
-        self.n_chord_idx = 169 if self.use_large_voca else 24
-        self.x_chord_idx = 168 if self.use_large_voca else 25
-        logger.info(f"Using N index: {self.n_chord_idx}, X index: {self.x_chord_idx}")
-
         # Initialize Chords processor
         self.chord_processor = Chords()
         if chord_mapping:
@@ -160,13 +149,7 @@ class SynthDataset(Dataset):
         self.numeric_id_pattern = re.compile(r'(\d{6})')
 
         # Create the idx_to_chord mapping needed by the trainer
-        self.idx_to_chord = idx2voca_chord(large_voca=self.use_large_voca)
-        if self.n_chord_idx not in self.idx_to_chord or self.idx_to_chord[self.n_chord_idx] != 'N':
-            logger.warning(f"idx_to_chord might be missing or have incorrect 'N' mapping for index {self.n_chord_idx}")
-            self.idx_to_chord[self.n_chord_idx] = 'N'
-        if self.x_chord_idx not in self.idx_to_chord or self.idx_to_chord[self.x_chord_idx] != 'X':
-            logger.warning(f"idx_to_chord might be missing or have incorrect 'X' mapping for index {self.x_chord_idx}")
-            self.idx_to_chord[self.x_chord_idx] = 'X'
+        self.idx_to_chord = idx2voca_chord()
 
         # Auto-detect device if not provided
         if device is None:
@@ -198,9 +181,7 @@ class SynthDataset(Dataset):
         # Initialize zero tensor caches
         self._zero_spec_cache = {}
         self._zero_logit_cache = {}
-        
-        # Cache the N chord index
-        self._n_chord_idx = self.n_chord_idx
+
             
         # Generate a safer cache file name using hashing if none provided
         if cache_file is None:
@@ -278,9 +259,6 @@ class SynthDataset(Dataset):
             # Cache for logits
             if shape not in self._zero_logit_cache:
                 self._zero_logit_cache[shape] = torch.zeros(shape, dtype=torch.float32, device=self.device)
-                
-        # Store the N chord index for quick lookup
-        self._n_chord_idx = self.chord_to_idx.get("N", 0)
 
     def _load_logits_file(self, logit_file):
         """Load teacher logits file with error handling"""

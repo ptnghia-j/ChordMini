@@ -334,8 +334,8 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type='BTC',
                         # Minimal formatting for mir_eval compatibility if needed
                         if chord_label == 'N' or chord_label == 'X':
                              ref_chords.append('N') # Standardize no-chord/unknown
-                        elif ':' not in chord_label and chord_label not in ['N', 'X']:
-                             ref_chords.append(f"{chord_label}:maj")
+                        # elif ':' not in chord_label and chord_label not in ['N', 'X']:
+                        #      ref_chords.append(f"{chord_label}:maj")
                         else:
                              ref_chords.append(chord_label)
                     else:
@@ -355,8 +355,8 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type='BTC',
                         # Minimal formatting for mir_eval compatibility
                         if chord_label == 'N' or chord_label == 'X':
                              pred_chords.append('N')
-                        elif ':' not in chord_label and chord_label not in ['N', 'X']:
-                             pred_chords.append(f"{chord_label}:maj")
+                        # elif ':' not in chord_label and chord_label not in ['N', 'X']:
+                        #      pred_chords.append(f"{chord_label}:maj")
                         else:
                              pred_chords.append(chord_label)
                     else:

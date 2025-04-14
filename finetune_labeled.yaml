@@ -156,9 +156,9 @@ spec:
               value: "1.0"  # Default scale: 1.0 = base model
             # Learning rate parameters
             - name: LEARNING_RATE
-              value: "0.0001"  # Lower base learning rate for fine-tuning
+              value: "0.00001"  # Lower base learning rate for fine-tuning
             - name: MIN_LEARNING_RATE
-              value: "0.00001"  # Minimum learning rate
+              value: "0.000001"  # Minimum learning rate
             # Knowledge distillation settings
             - name: USE_KD_LOSS
               value: "false"  # Set to "true" to enable KD loss
