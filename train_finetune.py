@@ -6,9 +6,9 @@ import numpy as np
 import argparse
 import glob
 import gc
-import traceback
 import json
 import random
+import traceback
 from pathlib import Path
 from collections import Counter
 
@@ -891,10 +891,11 @@ def main():
     logger.info("\n=== Testing ===")
     try:
         if trainer.load_best_model():
+            # Use the test iterator from labeled_dataset
             test_loader = labeled_dataset.get_test_iterator(
                 batch_size=config.training.get('batch_size', 16),
                 shuffle=False,
-                num_workers=0,
+                num_workers=0, # Use 0 workers for evaluation consistency
                 pin_memory=False
             )
             
@@ -903,7 +904,7 @@ def main():
                 model=model,
                 test_loader=test_loader,
                 device=device,
-                idx_to_chord=master_mapping, # Pass idx->chord mapping
+                idx_to_chord=master_mapping, # Use master_mapping (idx->chord)
                 normalization=normalization,
                 output_dir=checkpoints_dir,
                 logger=logger
@@ -919,13 +920,166 @@ def main():
                 logger.info(f"Test metrics saved to {metrics_path}")
             except Exception as e:
                 logger.error(f"Error saving test metrics: {e}")
+
+            # NEW: Generate chord quality distribution and accuracy visualization
+            logger.info("\n=== Generating Chord Quality Distribution and Accuracy Graph ===")
+            try:
+                from modules.utils.visualize import plot_chord_quality_distribution_accuracy
+                
+                # Collect all predictions and targets from test set
+                all_preds = []
+                all_targets = []
+                model.eval()
+                with torch.no_grad():
+                    for batch in test_loader:
+                        inputs, targets = batch['spectro'], batch['chord_idx']
+                        inputs = inputs.to(device)
+                        targets = targets.to(device)
+                        
+                        # Apply normalization if available
+                        if normalization and 'mean' in normalization and 'std' in normalization:
+                            inputs = (inputs - normalization['mean']) / normalization['std']
+                            
+                        outputs = model(inputs)
+                        if isinstance(outputs, tuple):
+                            logits = outputs[0]
+                        else:
+                            logits = outputs
+                            
+                        # Handle 3D logits (sequence data) - Average over time dimension for frame-level eval
+                        if logits.ndim == 3 and targets.ndim == 2:
+                             # Flatten logits and targets for frame-level comparison
+                            logits = logits.view(-1, logits.size(-1)) # (batch*seq_len, n_classes)
+                            targets = targets.view(-1) # (batch*seq_len)
+                        elif logits.ndim == 3 and targets.ndim == 1:
+                             # If targets are already flat, just flatten logits
+                            logits = logits.view(-1, logits.size(-1))
+
+                        preds = logits.argmax(dim=1)
+                        all_preds.extend(preds.cpu().numpy())
+                        all_targets.extend(targets.cpu().numpy())
+                
+                # Define focus qualities
+                focus_qualities = ["maj", "min", "dim", "aug", "min6", "maj6", "min7", 
+                                  "min-maj7", "maj7", "7", "dim7", "hdim7", "sus2", "sus4"]
+                
+                # Create distribution and accuracy visualization
+                quality_dist_path = os.path.join(checkpoints_dir, "chord_quality_distribution_accuracy.png")
+                plot_chord_quality_distribution_accuracy(
+                    all_preds, all_targets, master_mapping, # Use master_mapping (idx->chord)
+                    save_path=quality_dist_path,
+                    title="Chord Quality Distribution and Accuracy (Test Set)",
+                    focus_qualities=focus_qualities
+                )
+                logger.info(f"Chord quality distribution and accuracy graph saved to {quality_dist_path}")
+            except ImportError:
+                 logger.warning("Could not import plot_chord_quality_distribution_accuracy. Skipping visualization.")
+                 logger.warning("Install matplotlib and seaborn: pip install matplotlib seaborn")
+            except Exception as e:
+                logger.error(f"Error creating chord quality distribution graph: {e}")
+                logger.error(traceback.format_exc())
+
+            # Advanced testing with mir_eval module
+            logger.info("\n=== MIR evaluation (Test Set) ===")
+            score_metrics = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
+            
+            # Get the actual test samples using the indices
+            test_samples = [labeled_dataset.samples[i] for i in labeled_dataset.test_indices]
+            dataset_length = len(test_samples)
+            
+            if dataset_length < 3:
+                logger.info("Not enough test samples to compute chord metrics with 3 splits.")
+                # Optionally run on the whole test set if splits aren't possible
+                if dataset_length > 0:
+                     logger.info(f"Evaluating model on all {dataset_length} test samples...")
+                     score_list_dict, song_length_list, average_score_dict = large_voca_score_calculation(
+                         valid_dataset=test_samples, config=config, model=model, model_type='ChordNet',
+                         mean=mean, std=std, device=device)
+                     mir_eval_results = average_score_dict # Store the single result
+                     logger.info(f"MIR evaluation results (all test samples): {mir_eval_results}")
+                else:
+                     logger.info("No test samples available for MIR evaluation.")
+                     mir_eval_results = {}
+
+            else:
+                # Create balanced splits from the test samples
+                split = dataset_length // 3
+                test_dataset1 = test_samples[:split]
+                test_dataset2 = test_samples[split:2*split]
+                test_dataset3 = test_samples[2*split:]
+                
+                # Evaluate each split
+                logger.info(f"Evaluating model on {len(test_dataset1)} test samples in split 1...")
+                score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
+                    valid_dataset=test_dataset1, config=config, model=model, model_type='ChordNet', 
+                    mean=mean, std=std, device=device)
+                
+                logger.info(f"Evaluating model on {len(test_dataset2)} test samples in split 2...")
+                score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
+                    valid_dataset=test_dataset2, config=config, model=model, model_type='ChordNet', 
+                    mean=mean, std=std, device=device)
+                
+                logger.info(f"Evaluating model on {len(test_dataset3)} test samples in split 3...")
+                score_list_dict3, song_length_list3, average_score_dict3 = large_voca_score_calculation(
+                    valid_dataset=test_dataset3, config=config, model=model, model_type='ChordNet', 
+                    mean=mean, std=std, device=device)
+                
+                # Calculate weighted averages
+                mir_eval_results = {}
+                # Check if all results are valid before calculating average
+                valid_results = (average_score_dict1 and average_score_dict2 and average_score_dict3 and
+                                 song_length_list1 and song_length_list2 and song_length_list3)
+
+                if valid_results:
+                    total_length = np.sum(song_length_list1) + np.sum(song_length_list2) + np.sum(song_length_list3)
+                    if total_length > 0:
+                        for m in score_metrics:
+                            # Ensure metric exists in all dictionaries
+                            if m in average_score_dict1 and m in average_score_dict2 and m in average_score_dict3:
+                                # Calculate weighted average based on song lengths
+                                avg = (np.sum(song_length_list1) * average_score_dict1[m] +
+                                       np.sum(song_length_list2) * average_score_dict2[m] +
+                                       np.sum(song_length_list3) * average_score_dict3[m]) / total_length
+                                
+                                # Log individual split scores
+                                logger.info(f"==== {m} score 1: {average_score_dict1[m]:.4f}")
+                                logger.info(f"==== {m} score 2: {average_score_dict2[m]:.4f}")
+                                logger.info(f"==== {m} score 3: {average_score_dict3[m]:.4f}")
+                                logger.info(f"==== {m} weighted average: {avg:.4f}")
+                                
+                                # Store in results dictionary
+                                mir_eval_results[m] = {
+                                    'split1': float(average_score_dict1[m]),
+                                    'split2': float(average_score_dict2[m]),
+                                    'split3': float(average_score_dict3[m]),
+                                    'weighted_avg': float(avg)
+                                }
+                            else:
+                                logger.warning(f"Metric '{m}' missing in one or more splits, cannot calculate average.")
+                                mir_eval_results[m] = {'error': f'Metric {m} missing in splits'}
+                    else:
+                         logger.warning("Total song length is zero, cannot calculate weighted average MIR scores.")
+                         mir_eval_results = {'error': 'Total song length zero'}
+                else:
+                    logger.warning("Could not calculate MIR scores properly for all splits.")
+                    mir_eval_results = {'error': 'Calculation failed for one or more splits'}
+
+            # Save MIR-eval metrics
+            try:
+                mir_eval_path = os.path.join(checkpoints_dir, "mir_eval_metrics.json")
+                with open(mir_eval_path, 'w') as f:
+                    json.dump(mir_eval_results, f, indent=2)
+                logger.info(f"MIR evaluation metrics saved to {mir_eval_path}")
+            except Exception as e:
+                 logger.error(f"Error saving MIR evaluation metrics: {e}")
+                
         else:
             logger.warning("Could not load best model for testing")
     except Exception as e:
         logger.error(f"Error during testing: {e}")
         logger.error(traceback.format_exc())
     
-    # Save the final model
+    # Save the final model (keep this part)
     try:
         save_path = os.path.join(checkpoints_dir, "student_model_final.pth")
         torch.save({
@@ -948,8 +1102,7 @@ def main():
             score_metrics = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
             
             # Get validation dataset
-            val_dataset = labeled_dataset
-            dataset_length = len(val_dataset.val_indices)
+            dataset_length = len()
             
             if dataset_length < 3:
                 logger.info("Not enough validation samples to compute chord metrics.")

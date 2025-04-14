@@ -1,3 +1,5 @@
+import json
+import traceback
 import multiprocessing
 import sys
 import os
@@ -6,8 +8,6 @@ import numpy as np
 import argparse
 import glob
 import gc
-import traceback
-import json
 from pathlib import Path
 
 # Project imports
@@ -445,105 +445,193 @@ def main():
         logger.error(f"Error during training: {e}")
         logger.error(traceback.format_exc())
     
-    # Final evaluation on validation set
-    logger.info("Performing final evaluation")
+    # Final evaluation on validation set (which is the test set for this fold)
+    logger.info("\n=== Testing (Validation Fold) ===")
     try:
         if trainer.load_best_model():
-            # Create tester
+            # Use the validation loader (acts as test loader for this fold)
+            test_loader = val_loader # Already created earlier
+            
+            # Basic testing with Tester class
             tester = Tester(
                 model=model,
-                test_loader=val_loader,
+                test_loader=test_loader, # Use the validation loader here
                 device=device,
-                idx_to_chord=master_mapping,
-                normalization={'mean': mean, 'std': std},
-                output_dir=save_dir,
+                idx_to_chord=master_mapping, # Use master_mapping (idx->chord)
+                normalization=normalization, # Use the calculated normalization
+                output_dir=save_dir, # Use save_dir for this fold
                 logger=logger
             )
             
-            # Run evaluation
-            metrics = tester.evaluate(save_plots=True)
+            test_metrics = tester.evaluate(save_plots=True)
             
-            # Save metrics
-            with open(os.path.join(save_dir, f'metrics_fold{args.kfold}.json'), 'w') as f:
-                json.dump(metrics, f, indent=2)
-            
-            logger.info(f"Evaluation metrics saved to {os.path.join(save_dir, f'metrics_fold{args.kfold}.json')}")
-            
-            # Advanced MIR Evaluation on validation dataset
-            logger.info("\n=== Advanced MIR Evaluation ===")
+            # Save test metrics for this fold
             try:
-                score_metrics = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
-                
-                # Use validation dataset
-                dataset_length = len(val_dataset.samples)
-                
-                if dataset_length < 3:
-                    logger.info("Not enough validation samples to compute chord metrics.")
-                else:
-                    # Create balanced splits
-                    split = dataset_length // 3
-                    valid_dataset1 = val_dataset.samples[:split]
-                    valid_dataset2 = val_dataset.samples[split:2*split]
-                    valid_dataset3 = val_dataset.samples[2*split:]
-                    
-                    # Evaluate each split using large_voca_score_calculation
-                    logger.info(f"Evaluating model on {len(valid_dataset1)} samples in split 1...")
-                    score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
-                        valid_dataset=valid_dataset1, config=config, model=model, model_type='ChordNet', 
-                        mean=mean, std=std, device=device)
-                    
-                    logger.info(f"Evaluating model on {len(valid_dataset2)} samples in split 2...")
-                    score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
-                        valid_dataset=valid_dataset2, config=config, model=model, model_type='ChordNet', 
-                        mean=mean, std=std, device=device)
-                    
-                    logger.info(f"Evaluating model on {len(valid_dataset3)} samples in split 3...")
-                    score_list_dict3, song_length_list3, average_score_dict3 = large_voca_score_calculation(
-                        valid_dataset=valid_dataset3, config=config, model=model, model_type='ChordNet', 
-                        mean=mean, std=std, device=device)
-                    
-                    # Calculate weighted averages
-                    mir_eval_results = {}
-                    for m in score_metrics:
-                        if song_length_list1 and song_length_list2 and song_length_list3:
-                            # Calculate weighted average based on song lengths
-                            avg = (np.sum(song_length_list1) * average_score_dict1[m] +
-                                   np.sum(song_length_list2) * average_score_dict2[m] +
-                                   np.sum(song_length_list3) * average_score_dict3[m]) / (
-                                   np.sum(song_length_list1) + np.sum(song_length_list2) + np.sum(song_length_list3))
-                            
-                            # Log individual split scores
-                            logger.info(f"==== {m} score 1: {average_score_dict1[m]:.4f}")
-                            logger.info(f"==== {m} score 2: {average_score_dict2[m]:.4f}")
-                            logger.info(f"==== {m} score 3: {average_score_dict3[m]:.4f}")
-                            logger.info(f"==== {m} weighted average: {avg:.4f}")
-                            
-                            # Store in results dictionary
-                            mir_eval_results[m] = {
-                                'split1': float(average_score_dict1[m]),
-                                'split2': float(average_score_dict2[m]),
-                                'split3': float(average_score_dict3[m]),
-                                'weighted_avg': float(avg)
-                            }
-                        else:
-                            logger.info(f"==== {m} scores couldn't be calculated properly")
-                            mir_eval_results[m] = {'error': 'Calculation failed'}
-                    
-                    # Save MIR-eval metrics
-                    mir_eval_path = os.path.join(save_dir, f"mir_eval_metrics_fold{args.kfold}.json")
-                    with open(mir_eval_path, 'w') as f:
-                        json.dump(mir_eval_results, f, indent=2)
-                    logger.info(f"MIR evaluation metrics saved to {mir_eval_path}")
+                metrics_path = os.path.join(save_dir, f"test_metrics_fold{args.kfold}.json") 
+                with open(metrics_path, 'w') as f:
+                    json.dump(test_metrics, f, indent=2)
+                logger.info(f"Test metrics for fold {args.kfold} saved to {metrics_path}")
             except Exception as e:
-                logger.error(f"Error during MIR evaluation: {e}")
+                logger.error(f"Error saving test metrics for fold {args.kfold}: {e}")
+
+            # NEW: Generate chord quality distribution and accuracy visualization
+            logger.info("\n=== Generating Chord Quality Distribution and Accuracy Graph (Validation Fold) ===")
+            try:
+                from modules.utils.visualize import plot_chord_quality_distribution_accuracy
+                
+                # Collect all predictions and targets from the validation set
+                all_preds = []
+                all_targets = []
+                model.eval()
+                with torch.no_grad():
+                    for batch in test_loader: # Iterate through validation loader
+                        inputs, targets = batch['spectro'], batch['chord_idx']
+                        inputs = inputs.to(device)
+                        targets = targets.to(device)
+                        
+                        # Apply normalization if available
+                        if normalization and 'mean' in normalization and 'std' in normalization:
+                            inputs = (inputs - normalization['mean']) / normalization['std']
+                            
+                        outputs = model(inputs)
+                        if isinstance(outputs, tuple):
+                            logits = outputs[0]
+                        else:
+                            logits = outputs
+                            
+                        # Handle 3D logits (sequence data) - Average over time dimension for frame-level eval
+                        if logits.ndim == 3 and targets.ndim == 2:
+                             # Flatten logits and targets for frame-level comparison
+                            logits = logits.view(-1, logits.size(-1)) # (batch*seq_len, n_classes)
+                            targets = targets.view(-1) # (batch*seq_len)
+                        elif logits.ndim == 3 and targets.ndim == 1:
+                             # If targets are already flat, just flatten logits
+                            logits = logits.view(-1, logits.size(-1))
+
+                        preds = logits.argmax(dim=1)
+                        all_preds.extend(preds.cpu().numpy())
+                        all_targets.extend(targets.cpu().numpy())
+                
+                # Define focus qualities
+                focus_qualities = ["maj", "min", "dim", "aug", "min6", "maj6", "min7", 
+                                  "min-maj7", "maj7", "7", "dim7", "hdim7", "sus2", "sus4"]
+                
+                # Create distribution and accuracy visualization for this fold
+                quality_dist_path = os.path.join(save_dir, f"chord_quality_distribution_accuracy_fold{args.kfold}.png")
+                plot_chord_quality_distribution_accuracy(
+                    all_preds, all_targets, master_mapping, # Use master_mapping (idx->chord)
+                    save_path=quality_dist_path,
+                    title=f"Chord Quality Distribution and Accuracy (Fold {args.kfold})",
+                    focus_qualities=focus_qualities
+                )
+                logger.info(f"Chord quality distribution graph for fold {args.kfold} saved to {quality_dist_path}")
+            except ImportError:
+                 logger.warning("Could not import plot_chord_quality_distribution_accuracy. Skipping visualization.")
+                 logger.warning("Install matplotlib and seaborn: pip install matplotlib seaborn")
+            except Exception as e:
+                logger.error(f"Error creating chord quality distribution graph for fold {args.kfold}: {e}")
                 logger.error(traceback.format_exc())
+
+            # Advanced testing with mir_eval module on validation set
+            logger.info("\n=== MIR evaluation (Validation Fold) ===")
+            score_metrics = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
+            
+            # Use the validation samples for this fold
+            validation_samples = val_dataset.samples # These are the samples for the current validation fold
+            dataset_length = len(validation_samples)
+            
+            if dataset_length < 3:
+                logger.info(f"Not enough validation samples ({dataset_length}) in fold {args.kfold} to compute chord metrics with 3 splits.")
+                 # Optionally run on the whole validation set if splits aren't possible
+                if dataset_length > 0:
+                     logger.info(f"Evaluating model on all {dataset_length} validation samples for fold {args.kfold}...")
+                     score_list_dict, song_length_list, average_score_dict = large_voca_score_calculation(
+                         valid_dataset=validation_samples, config=config, model=model, model_type='ChordNet',
+                         mean=mean, std=std, device=device)
+                     mir_eval_results = average_score_dict # Store the single result
+                     logger.info(f"MIR evaluation results for fold {args.kfold} (all samples): {mir_eval_results}")
+                else:
+                     logger.info(f"No validation samples available for MIR evaluation in fold {args.kfold}.")
+                     mir_eval_results = {}
+            else:
+                # Create balanced splits from the validation samples
+                split = dataset_length // 3
+                valid_dataset1 = validation_samples[:split]
+                valid_dataset2 = validation_samples[split:2*split]
+                valid_dataset3 = validation_samples[2*split:]
+                
+                # Evaluate each split
+                logger.info(f"Evaluating model on {len(valid_dataset1)} validation samples in split 1 (Fold {args.kfold})...")
+                score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
+                    valid_dataset=valid_dataset1, config=config, model=model, model_type='ChordNet', 
+                    mean=mean, std=std, device=device)
+                
+                logger.info(f"Evaluating model on {len(valid_dataset2)} validation samples in split 2 (Fold {args.kfold})...")
+                score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
+                    valid_dataset=valid_dataset2, config=config, model=model, model_type='ChordNet', 
+                    mean=mean, std=std, device=device)
+                
+                logger.info(f"Evaluating model on {len(valid_dataset3)} validation samples in split 3 (Fold {args.kfold})...")
+                score_list_dict3, song_length_list3, average_score_dict3 = large_voca_score_calculation(
+                    valid_dataset=valid_dataset3, config=config, model=model, model_type='ChordNet', 
+                    mean=mean, std=std, device=device)
+                
+                # Calculate weighted averages
+                mir_eval_results = {}
+                # Check if all results are valid before calculating average
+                valid_results = (average_score_dict1 and average_score_dict2 and average_score_dict3 and
+                                 song_length_list1 and song_length_list2 and song_length_list3)
+
+                if valid_results:
+                    total_length = np.sum(song_length_list1) + np.sum(song_length_list2) + np.sum(song_length_list3)
+                    if total_length > 0:
+                        for m in score_metrics:
+                             # Ensure metric exists in all dictionaries
+                            if m in average_score_dict1 and m in average_score_dict2 and m in average_score_dict3:
+                                # Calculate weighted average based on song lengths
+                                avg = (np.sum(song_length_list1) * average_score_dict1[m] +
+                                       np.sum(song_length_list2) * average_score_dict2[m] +
+                                       np.sum(song_length_list3) * average_score_dict3[m]) / total_length
+                                
+                                # Log individual split scores
+                                logger.info(f"==== (Fold {args.kfold}) {m} score 1: {average_score_dict1[m]:.4f}")
+                                logger.info(f"==== (Fold {args.kfold}) {m} score 2: {average_score_dict2[m]:.4f}")
+                                logger.info(f"==== (Fold {args.kfold}) {m} score 3: {average_score_dict3[m]:.4f}")
+                                logger.info(f"==== (Fold {args.kfold}) {m} weighted average: {avg:.4f}")
+                                
+                                # Store in results dictionary
+                                mir_eval_results[m] = {
+                                    'split1': float(average_score_dict1[m]),
+                                    'split2': float(average_score_dict2[m]),
+                                    'split3': float(average_score_dict3[m]),
+                                    'weighted_avg': float(avg)
+                                }
+                            else:
+                                logger.warning(f"(Fold {args.kfold}) Metric '{m}' missing in one or more splits, cannot calculate average.")
+                                mir_eval_results[m] = {'error': f'Metric {m} missing in splits'}
+                    else:
+                        logger.warning(f"(Fold {args.kfold}) Total song length is zero, cannot calculate weighted average MIR scores.")
+                        mir_eval_results = {'error': 'Total song length zero'}
+                else:
+                    logger.warning(f"(Fold {args.kfold}) Could not calculate MIR scores properly for all splits.")
+                    mir_eval_results = {'error': 'Calculation failed for one or more splits'}
+
+            # Save MIR-eval metrics for this fold
+            try:
+                mir_eval_path = os.path.join(save_dir, f"mir_eval_metrics_fold{args.kfold}.json")
+                with open(mir_eval_path, 'w') as f:
+                    json.dump(mir_eval_results, f, indent=2)
+                logger.info(f"MIR evaluation metrics for fold {args.kfold} saved to {mir_eval_path}")
+            except Exception as e:
+                 logger.error(f"Error saving MIR evaluation metrics for fold {args.kfold}: {e}")
+                
         else:
-            logger.warning("Could not load best model for evaluation")
+            logger.warning(f"Could not load best model for testing fold {args.kfold}")
     except Exception as e:
-        logger.error(f"Error during evaluation: {e}")
+        logger.error(f"Error during testing for fold {args.kfold}: {e}")
         logger.error(traceback.format_exc())
     
-    # Save final model
+    # Save final model for the fold (keep this part)
     try:
         final_path = os.path.join(save_dir, f'final_model_fold{args.kfold}.pth')
         torch.save({

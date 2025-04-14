@@ -160,7 +160,7 @@ class LabeledDataset(Dataset):
         self.feature_config = ConfigDict(raw_config)
         
         # Determine and store use_large_voca consistently
-        self.use_large_voca = self.feature_config.feature.get('large_voca', False)
+        self.use_large_voca = True
         logger.info(f"Dataset initialized with use_large_voca = {self.use_large_voca}")
 
         # --- Determine N and X indices based *only* on use_large_voca ---

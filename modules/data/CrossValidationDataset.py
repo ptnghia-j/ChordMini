@@ -52,7 +52,7 @@ class CrossValidationDataset(Dataset):
         self._preprocessor = None
 
         # Determine and store use_large_voca consistently
-        self.use_large_voca = self.config.feature.get('large_voca', False)
+        self.use_large_voca = True
         logger.info(f"Dataset initialized with use_large_voca = {self.use_large_voca}")
         
         # Setup audio and label directories
