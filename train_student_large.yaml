@@ -1,36 +1,56 @@
-apiVersion: batch/v1
-kind: Job
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
 metadata:
-  name: chord-mini-large-02
+  name: chord-mini-distributed
   namespace: csuf-titans
   labels:
     app: chord-student-training
 spec:
   backoffLimit: 2
-  template:
-    metadata:
-      labels:
-        app: chord-student-training
-    spec:
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: nvidia.com/gpu.product
-                operator: In
-                values:
-                - NVIDIA-GeForce-RTX-3090
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
       restartPolicy: Never
-      tolerations:
-        - key: "node.kubernetes.io/not-ready"
-          operator: "Exists"
-          effect: "NoExecute"
-          tolerationSeconds: 86400
-        - key: "node.kubernetes.io/unreachable"
-          operator: "Exists"
-          effect: "NoExecute"
-          tolerationSeconds: 86400
+      template:
+        metadata:
+          labels:
+            app: chord-student-training
+        spec:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                    - NVIDIA-GeForce-RTX-3090
+    Worker:
+      replicas: 1  # Number of worker nodes (can be adjusted based on available GPUs)
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: chord-student-training
+        spec:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                    - NVIDIA-GeForce-RTX-3090
+          tolerations:
+            - key: "node.kubernetes.io/not-ready"
+              operator: "Exists"
+              effect: "NoExecute"
+              tolerationSeconds: 86400
+            - key: "node.kubernetes.io/unreachable"
+              operator: "Exists"
+              effect: "NoExecute"
+              tolerationSeconds: 86400
       initContainers:
         - name: clone-repo
           image: alpine:3.16
@@ -65,26 +85,26 @@ spec:
             - |
               set -ex
               echo "Checking data directory structure..."
-              
+
               # Locate the spectrogram and label directories
               PROJ_ROOT="/mnt/storage/ChordMini"
               echo "Project root: $PROJ_ROOT"
-              
+
               # Create consolidated data directories if they don't exist
               # FMA dataset directories (using logits structure for all)
               mkdir -p "/mnt/storage/data/logits/synth/spectrograms"
               mkdir -p "/mnt/storage/data/logits/synth/labels"
               mkdir -p "/mnt/storage/data/logits/synth/logits"
-              
+
               # Maestro dataset directories (using logits structure for all)
               mkdir -p "/mnt/storage/data/logits/maestro_synth/spectrograms"
               mkdir -p "/mnt/storage/data/logits/maestro_synth/labels"
               mkdir -p "/mnt/storage/data/logits/maestro_synth/logits"
-              
+
               # Create symlinks from project directory to actual data location
               mkdir -p "$PROJ_ROOT/data/synth"
               mkdir -p "$PROJ_ROOT/data/maestro_synth"
-              
+
               # Create unified symlinks for FMA dataset
               if [ -L "$PROJ_ROOT/data/synth/spectrograms" ]; then
                 echo "Symlink for FMA spectrograms already exists"
@@ -92,21 +112,21 @@ spec:
                 ln -sf "/mnt/storage/data/logits/synth/spectrograms" "$PROJ_ROOT/data/synth/spectrograms"
                 echo "Created symlink for FMA spectrograms"
               fi
-              
+
               if [ -L "$PROJ_ROOT/data/synth/labels" ]; then
                 echo "Symlink for FMA labels already exists"
               else
                 ln -sf "/mnt/storage/data/logits/synth/labels" "$PROJ_ROOT/data/synth/labels"
                 echo "Created symlink for FMA labels"
               fi
-              
+
               if [ -L "$PROJ_ROOT/data/synth/logits" ]; then
                 echo "Symlink for FMA logits already exists"
               else
                 ln -sf "/mnt/storage/data/logits/synth/logits" "$PROJ_ROOT/data/synth/logits"
                 echo "Created symlink for FMA logits"
               fi
-              
+
               # Create unified symlinks for Maestro dataset
               if [ -L "$PROJ_ROOT/data/maestro_synth/spectrograms" ]; then
                 echo "Symlink for Maestro spectrograms already exists"
@@ -114,46 +134,46 @@ spec:
                 ln -sf "/mnt/storage/data/logits/maestro_synth/spectrograms" "$PROJ_ROOT/data/maestro_synth/spectrograms"
                 echo "Created symlink for Maestro spectrograms"
               fi
-              
+
               if [ -L "$PROJ_ROOT/data/maestro_synth/labels" ]; then
                 echo "Symlink for Maestro labels already exists"
               else
                 ln -sf "/mnt/storage/data/logits/maestro_synth/labels" "$PROJ_ROOT/data/maestro_synth/labels"
                 echo "Created symlink for Maestro labels"
               fi
-              
+
               if [ -L "$PROJ_ROOT/data/maestro_synth/logits" ]; then
                 echo "Symlink for Maestro logits already exists"
               else
                 ln -sf "/mnt/storage/data/logits/maestro_synth/logits" "$PROJ_ROOT/data/maestro_synth/logits"
                 echo "Created symlink for Maestro logits"
               fi
-              
+
               # Check for spectrogram files in both datasets
               echo "---- Checking for FMA spectrogram files ----"
               find "/mnt/storage/data/logits/synth/spectrograms" -name "*.npy" | head -5
-              
+
               echo "---- Checking for Maestro spectrogram files ----"
               find "/mnt/storage/data/logits/maestro_synth/spectrograms" -name "*.npy" | head -5
-              
+
               # Check for label files in both datasets
               echo "---- Checking for FMA label files ----"
               find "/mnt/storage/data/logits/synth/labels" -name "*.lab" | head -5
-              
+
               echo "---- Checking for Maestro label files ----"
               find "/mnt/storage/data/logits/maestro_synth/labels" -name "*.lab" | head -5
-              
+
               # Verify there are some relevant files for at least one dataset
               echo "Checking if there are data files to process..."
               FMA_SPEC_COUNT=$(find "/mnt/storage/data/logits/synth/spectrograms" -type f -name "*.npy" | wc -l)
               FMA_LABEL_COUNT=$(find "/mnt/storage/data/logits/synth/labels" -type f -name "*.lab" | wc -l)
-              
+
               MAESTRO_SPEC_COUNT=$(find "/mnt/storage/data/logits/maestro_synth/spectrograms" -type f -name "*.npy" | wc -l)
               MAESTRO_LABEL_COUNT=$(find "/mnt/storage/data/logits/maestro_synth/labels" -type f -name "*.lab" | wc -l)
-              
+
               echo "Found $FMA_SPEC_COUNT FMA spectrogram files and $FMA_LABEL_COUNT FMA label files"
               echo "Found $MAESTRO_SPEC_COUNT Maestro spectrogram files and $MAESTRO_LABEL_COUNT Maestro label files"
-              
+
               if [ "$FMA_SPEC_COUNT" -eq 0 ] && [ "$MAESTRO_SPEC_COUNT" -eq 0 ] || [ "$FMA_LABEL_COUNT" -eq 0 ] && [ "$MAESTRO_LABEL_COUNT" -eq 0 ]; then
                 echo "WARNING: No data files found in either dataset. Training may fail."
               else
@@ -188,7 +208,7 @@ spec:
             - name: KD_ALPHA
               value: "0.2"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
-              value: "2.0"  # Temperature for softening distributions
+              value: "3.0"  # Temperature for softening distributions
             # Focal loss settings
             - name: USE_FOCAL_LOSS
               value: "true"  # Set to "true" to enable focal loss
@@ -202,9 +222,9 @@ spec:
             - name: WARMUP_START_LR
               value: "0.0004"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.0006"  # Final learning rate after warm-up
+              value: "0.001"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "6"  # Number of epochs for warm-up
+              value: "10"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
               value: "0.3"  # Set dropout probability (0-1)
@@ -221,6 +241,21 @@ spec:
               value: "true"  # Enable GPU batch caching
             - name: PREFETCH_FACTOR
               value: "6"     # (no effect worker=0) Prefetch 6 batches for better throughput
+            # Distributed training environment variables
+            - name: MASTER_ADDR
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: MASTER_PORT
+              value: "29500"
+            - name: WORLD_SIZE
+              value: "4"  # 1 master + 3 workers
+            - name: RANK
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['kubeflow.org/replica-index']
+            - name: DISTRIBUTED_BACKEND
+              value: "nccl"
             # Add dataset type environment variable with combined option
             - name: DATASET_TYPE
               value: "combined"  # Options: "fma", "maestro", or "combined"
@@ -248,10 +283,10 @@ spec:
             - |
               set -ex
               echo "=== Student model training container started ==="
-              
+
               # Install necessary system packages
               apt-get update && apt-get install -y libsndfile1 || { echo "ERROR: Failed to install system dependencies"; exit 1; }
-              
+
               # Create a minimal requirements.txt if missing
               if [ ! -f requirements.txt ]; then
                 echo "Creating minimal requirements.txt"
@@ -262,38 +297,38 @@ spec:
                 echo "scikit-learn>=1.0.0" >> requirements.txt
                 echo "pyyaml>=6.0.0" >> requirements.txt  # Added for config loading
               fi
-              
+
               pip install --no-cache-dir -r requirements.txt || { echo "WARNING: Some requirements may have failed"; }
               pip install --no-cache-dir matplotlib tqdm pyyaml librosa scikit-learn || { echo "ERROR: Failed to install additional Python packages"; exit 1; }
-              
+
               # Verify the data paths from the config
               echo "Checking data paths from config..."
               grep -A 10 "paths:" ./config/student_config.yaml
-              
+
               # Double check that the symlinks are still valid
               if [ ! -L "./data/synth/spectrograms" ]; then
                 echo "Recreating symlink for spectrograms"
                 mkdir -p ./data/synth
                 ln -sf "/mnt/storage/data/logits/synth/spectrograms" "./data/synth/spectrograms"
               fi
-              
+
               if [ ! -L "./data/synth/labels" ]; then
                 echo "Recreating symlink for labels"
                 mkdir -p ./data/synth
                 ln -sf "/mnt/storage/data/logits/synth/labels" "./data/synth/labels"
               fi
-              
+
               # Verify that spectrograms and labels exist in the expected location
               SPEC_COUNT=$(find ./data/synth/spectrograms -type f -name "*.npy" | wc -l)
               LABEL_COUNT=$(find ./data/synth/labels -type f -name "*.lab" | wc -l)
               echo "Found $SPEC_COUNT spectrogram files and $LABEL_COUNT label files"
-              
+
               # Before starting training, verify data exists for selected dataset
               if [ "${DATASET_TYPE}" = "maestro" ]; then
                 SPEC_COUNT=$(find ./data/logits/maestro_synth/spectrograms -type f -name "*.npy" | wc -l)
                 LABEL_COUNT=$(find ./data/logits/maestro_synth/labels -type f -name "*.lab" | wc -l)
                 echo "Using Maestro dataset: Found $SPEC_COUNT spectrogram files and $LABEL_COUNT label files"
-                
+
                 # Add dataset type to training command
                 DATASET_ARG="--dataset_type maestro"
               elif [ "${DATASET_TYPE}" = "combined" ]; then
@@ -301,22 +336,22 @@ spec:
                 FMA_LABEL_COUNT=$(find ./data/logits/synth/labels -type f -name "*.lab" | wc -l)
                 MAESTRO_SPEC_COUNT=$(find ./data/logits/maestro_synth/spectrograms -type f -name "*.npy" | wc -l)
                 MAESTRO_LABEL_COUNT=$(find ./data/logits/maestro_synth/labels -type f -name "*.lab" | wc -l)
-                
+
                 echo "Using Combined datasets:"
                 echo "- FMA: Found $FMA_SPEC_COUNT spectrogram files and $FMA_LABEL_COUNT label files"
                 echo "- Maestro: Found $MAESTRO_SPEC_COUNT spectrogram files and $MAESTRO_LABEL_COUNT label files"
-                
+
                 # UPDATED: Simplified dataset type argument - no need for maestro paths
                 DATASET_ARG="--dataset_type combined"
               else
                 SPEC_COUNT=$(find ./data/logits/synth/spectrograms -type f -name "*.npy" | wc -l)
                 LABEL_COUNT=$(find ./data/logits/synth/labels -type f -name "*.lab" | wc -l)
                 echo "Using FMA dataset: Found $SPEC_COUNT spectrogram files and $LABEL_COUNT label files"
-                
+
                 # Add dataset type to training command
                 DATASET_ARG="--dataset_type fma"
               fi
-              
+
               # Get LR schedule option from environment
               LR_SCHEDULE_ARG=""
               if [ "${LR_SCHEDULE}" != "" ] && [ "${LR_SCHEDULE}" != "null" ]; then
@@ -325,47 +360,47 @@ spec:
               else
                 echo "Using default validation-based learning rate adjustment"
               fi
-              
+
               # Create separate warmup argument variable that's always set when warmup is enabled
               WARMUP_ARG=""
               if [ "${USE_WARMUP}" = "true" ]; then
                 echo "Using warm-up learning rate schedule for ${WARMUP_EPOCHS} epochs"
                 WARMUP_ARG="--use_warmup --warmup_epochs ${WARMUP_EPOCHS}"
-                
+
                 # Add the other warmup parameters to ensure they're passed to the script
                 if [ "${WARMUP_START_LR}" != "" ]; then
                   WARMUP_ARG="${WARMUP_ARG} --warmup_start_lr ${WARMUP_START_LR}"
                   echo "Using warmup start learning rate: ${WARMUP_START_LR}"
                 fi
-                
+
                 if [ "${WARMUP_END_LR}" != "" ]; then
                   WARMUP_ARG="${WARMUP_ARG} --warmup_end_lr ${WARMUP_END_LR}"
-                  echo "Using warmup end learning rate: ${WARMUP_END_LR}" 
+                  echo "Using warmup end learning rate: ${WARMUP_END_LR}"
                 fi
               fi
-              
+
               # Get learning rate arguments
               LR_ARGS=""
               if [ "${LEARNING_RATE}" != "" ]; then
                 echo "Using base learning rate: ${LEARNING_RATE}"
                 LR_ARGS="${LR_ARGS} --learning_rate ${LEARNING_RATE}"
               fi
-              
+
               if [ "${MIN_LEARNING_RATE}" != "" ]; then
                 echo "Using minimum learning rate: ${MIN_LEARNING_RATE}"
                 LR_ARGS="${LR_ARGS} --min_learning_rate ${MIN_LEARNING_RATE}"
               fi
-              
+
               if [ "${WARMUP_START_LR}" != "" ]; then
                 echo "Using warmup start learning rate: ${WARMUP_START_LR}"
                 LR_ARGS="${LR_ARGS} --warmup_start_lr ${WARMUP_START_LR}"
               fi
-              
+
               if [ "${WARMUP_END_LR}" != "" ]; then
                 echo "Using warmup end learning rate: ${WARMUP_END_LR}"
                 LR_ARGS="${LR_ARGS} --warmup_end_lr ${WARMUP_END_LR}"
               fi
-              
+
               # Get focal loss arguments
               FOCAL_LOSS_ARG=""
               if [ "${USE_FOCAL_LOSS}" = "true" ]; then
@@ -378,7 +413,7 @@ spec:
               else
                 echo "Using standard cross-entropy loss (focal loss disabled)"
               fi
-              
+
               # Get knowledge distillation arguments
               KD_LOSS_ARG=""
               if [ "${USE_KD_LOSS}" = "true" ]; then
@@ -386,11 +421,11 @@ spec:
                 KD_LOSS_ARG="--use_kd_loss --kd_alpha ${KD_ALPHA} --temperature ${TEMPERATURE} --logits_dir ${DATA_ROOT}/logits/synth/logits"
                 echo "Note: Teacher logits must be included in the batch data"
               fi
-              
+
               # Handle KD paths when KD is enabled with more flexible configuration
               if [ "${USE_KD_LOSS}" = "true" ]; then
                 echo "Knowledge distillation enabled - using teacher logits"
-                
+
                 # Define the logits paths based on dataset type
                 if [ "${DATASET_TYPE}" = "maestro" ]; then
                   # For Maestro dataset
@@ -409,7 +444,7 @@ spec:
               else
                 KD_ARGS=""
               fi
-              
+
               # Get model scale from environment
               MODEL_SCALE_ARG=""
               if [ "${MODEL_SCALE}" != "" ] && [ "${MODEL_SCALE}" != "1.0" ]; then
@@ -418,7 +453,7 @@ spec:
               else
                 echo "Using default model scale (1.0)"
               fi
-              
+
               # Handle caching options for memory optimization
               CACHE_ARGS=""
               if [ "${METADATA_CACHE}" = "true" ]; then
@@ -428,27 +463,27 @@ spec:
                 echo "Dataset caching disabled to reduce memory usage"
                 CACHE_ARGS="--disable_cache"
               fi
-              
+
               # Add cache fraction argument
               if [ "${CACHE_FRACTION}" != "" ] && [ "${CACHE_FRACTION}" != "1.0" ]; then
                 echo "Using partial dataset caching: ${CACHE_FRACTION} of samples"
                 CACHE_ARGS="${CACHE_ARGS} --cache_fraction ${CACHE_FRACTION}"
               fi
-              
+
               # GPU acceleration options
               GPU_ARGS=""
               if [ "${GPU_MEMORY_FRACTION}" != "" ]; then
                 GPU_ARGS="--gpu_memory_fraction ${GPU_MEMORY_FRACTION}"
               fi
-              
+
               if [ "${BATCH_GPU_CACHE}" = "true" ]; then
                 GPU_ARGS="${GPU_ARGS} --batch_gpu_cache"
               fi
-              
+
               if [ "${PREFETCH_FACTOR}" != "" ]; then
                 GPU_ARGS="${GPU_ARGS} --prefetch_factor ${PREFETCH_FACTOR}"
               fi
-              
+
               # Dataset initialization control arguments
               DATASET_INIT_ARGS=""
               if [ "${LAZY_INIT}" = "true" ]; then
@@ -457,14 +492,14 @@ spec:
               else
                 echo "Disabling lazy initialization for dataset (will pre-load all metadata)"
               fi
-              
+
               if [ "${SMALL_DATASET}" != "" ] && [ "${SMALL_DATASET}" != "null" ]; then
                 echo "Using only ${SMALL_DATASET} fraction of dataset (${SMALL_DATASET}%)"
                 DATASET_INIT_ARGS="${DATASET_INIT_ARGS} --small_dataset ${SMALL_DATASET}"
               else
                 echo "Using full dataset"
               fi
-              
+
               # Get dropout from environment
               DROPOUT_ARG=""
               if [ "${DROPOUT}" != "" ]; then
@@ -473,10 +508,10 @@ spec:
               else
                 echo "Using default dropout value from config"
               fi
-              
+
               # ! NOTE: Define checkpoint
               CHECKPOINTS_DIR="/mnt/storage/checkpoints/student"
-              
+
               # ! NOTE: save checkpoint directory defined in env
               if [ "${SUB_DIR}" != "" ]; then
                 # Create directory with subdirectory if SUB_DIR is specified
@@ -487,7 +522,7 @@ spec:
                 mkdir -p "${CHECKPOINTS_DIR}"
                 echo "Using checkpoint directory: ${CHECKPOINTS_DIR}"
               fi
-              
+
               # Handle checkpoint loading option
               CHECKPOINT_ARG=""
               if [ "${LOAD_CHECKPOINT}" = "auto" ]; then
@@ -532,7 +567,7 @@ spec:
                   fi
                 fi
               fi
-              
+
               # Simplify data directory paths passed to the python script based on dataset type
               if [ "${DATASET_TYPE}" = "maestro" ]; then
                 SPEC_DIR_ARG="--spec_dir ${DATA_ROOT}/logits/maestro_synth/spectrograms"
@@ -547,27 +582,30 @@ spec:
                 SPEC_DIR_ARG="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms"
                 LABEL_DIR_ARG="--label_dir ${DATA_ROOT}/logits/synth/labels"
               fi
-              
+
               # Run the student training script with all options and simplified paths
-              echo "Starting student training with GPU optimization and all options..."
-              python train_student.py $DATASET_ARG $SPEC_DIR_ARG $LABEL_DIR_ARG --config ./config/student_config.yaml --save_dir ${CHECKPOINTS_DIR}/${SUB_DIR} \
+              echo "Starting student training with GPU optimization and distributed training..."
+              python -m torch.distributed.launch \
+                --nproc_per_node=1 \
+                --nnodes=${WORLD_SIZE} \
+                --node_rank=${RANK} \
+                --master_addr=${MASTER_ADDR} \
+                --master_port=${MASTER_PORT} \
+                train_student.py $DATASET_ARG $SPEC_DIR_ARG $LABEL_DIR_ARG --config ./config/student_config.yaml --save_dir ${CHECKPOINTS_DIR}/${SUB_DIR} \
                 ${LR_SCHEDULE_ARG} ${WARMUP_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} \
-                ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS}
-              
+                ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS} \
+                --distributed --distributed_backend ${DISTRIBUTED_BACKEND}
+
               echo "=== Student model training complete ==="
-              
+
               # Clear GPU cache to release memory before exiting
               python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
             requests:
-              # cpu: "3"             
-              # memory: "72Gi"    
-              cpu: "3"
-              memory: "12Gi"
+              cpu: "4"
+              memory: "16Gi"
               nvidia.com/gpu: "1"
             limits:
-              # cpu: "12"             
-              # memory: "132Gi" 
               cpu: "12"
               memory: "48Gi"
               nvidia.com/gpu: "1"
