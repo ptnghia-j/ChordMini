@@ -25,6 +25,7 @@ def positional_encoding(batch_size, n_time, n_feature, zero_pad=False, scale=Fal
 
 class FeedForward(nn.Module):
   def __init__(self, n_feature=2048, n_hidden=512, dropout=0.2):
+    # n_hidden = n_feature // 4
     super().__init__()
     self.linear1 = nn.Linear(n_feature, n_hidden)
     self.linear2 = nn.Linear(n_hidden, n_feature)
@@ -58,6 +59,7 @@ class EncoderF(nn.Module):
     self.ff_layer = nn.ModuleList()
     for _ in range(n_layer):
       self.attn_layer.append(nn.MultiheadAttention(d_model, n_head, batch_first=True))
+      # FeedForward uses d_model as n_feature here
       self.ff_layer.append(FeedForward(n_feature=d_model, dropout=dropout))
 
     self.dropout = nn.Dropout(dropout)
@@ -105,6 +107,7 @@ class EncoderT(nn.Module):
     self.ff_layer = nn.ModuleList()
     for _ in range(n_layer):
       self.attn_layer.append(nn.MultiheadAttention(n_freq, n_head, batch_first=True))
+      # FeedForward uses n_freq as n_feature here
       self.ff_layer.append(FeedForward(n_feature=n_freq, dropout=dropout))
     
     self.dropout = nn.Dropout(dropout)
@@ -142,6 +145,7 @@ class Decoder(nn.Module):
     for _ in range(n_layer):
       self.attn_layer1.append(nn.MultiheadAttention(d_model, n_head, batch_first=True))
       self.attn_layer2.append(nn.MultiheadAttention(d_model, n_head, batch_first=True))
+      # FeedForward uses d_model as n_feature here
       self.ff_layer.append(FeedForward(n_feature=d_model, dropout=dropout))
     
     self.dropout = nn.Dropout(dropout)
@@ -196,10 +200,13 @@ class BaseTransformer(nn.Module):
         self.encoder_f = nn.ModuleList()
         self.encoder_t = nn.ModuleList()
         for _ in range(n_channel):
+            # EncoderF uses FeedForward with n_feature = n_freq // n_group
             self.encoder_f.append(EncoderF(n_freq=n_freq, n_group=n_group, n_head=f_head, 
                                             n_layer=f_layer, dropout=f_dropout, pr=f_pr))
+            # EncoderT uses FeedForward with n_feature = n_freq
             self.encoder_t.append(EncoderT(n_freq=n_freq, n_head=t_head, n_layer=t_layer, 
                                             dropout=t_dropout, pr=t_pr))
+        # Decoder uses FeedForward with n_feature = d_model = n_freq
         self.decoder = Decoder(d_model=n_freq, n_head=d_head, n_layer=d_layer, 
                                dropout=d_dropout, r1=r1, r2=r2, wr=wr, pr=d_pr)
     
