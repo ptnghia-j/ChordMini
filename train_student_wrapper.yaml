@@ -1,0 +1,231 @@
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: chord-mini-wrapper
+  namespace: csuf-titans
+  labels:
+    app: chord-student-training
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: chord-student-training
+          annotations:
+            sidecar.istio.io/inject: "false"
+        spec:
+          containers:
+          - name: pytorch
+            image: pytorch/pytorch:1.9.0-cuda11.1-cudnn8-runtime
+            workingDir: /mnt/storage/ChordMini
+            command:
+              - sh
+              - -c
+              - |
+                set -ex
+                echo "=== Master node started ==="
+
+                # Install dependencies
+                apt-get update && apt-get install -y libsndfile1 || { echo "ERROR: Failed to install system dependencies"; exit 1; }
+                if [ ! -f requirements.txt ]; then
+                  echo "Creating minimal requirements.txt"
+                  echo "numpy==1.22.0" > requirements.txt
+                  echo "librosa>=0.8.0" >> requirements.txt
+                  echo "torch>=1.9.0" >> requirements.txt
+                  echo "tqdm>=4.62.0" >> requirements.txt
+                  echo "scikit-learn>=1.0.0" >> requirements.txt
+                  echo "pyyaml>=6.0.0" >> requirements.txt  # Added for config loading
+                fi
+                pip install --no-cache-dir -r requirements.txt || { echo "WARNING: Some requirements may have failed"; }
+                pip install --no-cache-dir matplotlib tqdm pyyaml librosa scikit-learn || { echo "ERROR: Failed to install additional Python packages"; exit 1; }
+
+                echo "Master node ready, starting multi-GPU training..."
+
+                # Create a wrapper script to modify train_student.py to support distributed training
+                cat > distributed_wrapper.py << 'EOF'
+                #!/usr/bin/env python
+                import os
+                import sys
+                import argparse
+                import torch
+                import torch.distributed as dist
+                import torch.multiprocessing as mp
+                
+                def parse_args():
+                    parser = argparse.ArgumentParser(description='Distributed training wrapper for train_student.py')
+                    parser.add_argument('--nproc_per_node', type=int, default=2, help='Number of processes per node')
+                    parser.add_argument('--nnodes', type=int, default=1, help='Number of nodes')
+                    parser.add_argument('--node_rank', type=int, default=0, help='Rank of this node')
+                    parser.add_argument('--master_addr', type=str, default='localhost', help='Master address')
+                    parser.add_argument('--master_port', type=str, default='29500', help='Master port')
+                    
+                    # Add all the arguments that train_student.py accepts
+                    parser.add_argument('--config', type=str, help='Path to config file')
+                    parser.add_argument('--seed', type=int, help='Random seed')
+                    parser.add_argument('--save_dir', type=str, help='Directory to save checkpoints')
+                    parser.add_argument('--model', type=str, help='Model architecture')
+                    parser.add_argument('--storage_root', type=str, help='Storage root directory')
+                    parser.add_argument('--use_warmup', action='store_true', help='Use learning rate warmup')
+                    parser.add_argument('--warmup_epochs', type=int, help='Number of warmup epochs')
+                    parser.add_argument('--warmup_start_lr', type=float, help='Starting learning rate for warmup')
+                    parser.add_argument('--lr_schedule', type=str, choices=['cosine', 'linear_decay', 'one_cycle', 'cosine_warm_restarts', 'validation', 'none'], help='Learning rate schedule')
+                    parser.add_argument('--use_focal_loss', action='store_true', help='Use focal loss')
+                    parser.add_argument('--focal_gamma', type=float, help='Focal loss gamma parameter')
+                    parser.add_argument('--focal_alpha', type=float, help='Focal loss alpha parameter')
+                    parser.add_argument('--use_kd_loss', action='store_true', help='Use knowledge distillation loss')
+                    parser.add_argument('--kd_alpha', type=float, help='Knowledge distillation alpha parameter')
+                    parser.add_argument('--temperature', type=float, help='Temperature for knowledge distillation')
+                    parser.add_argument('--logits_dir', type=str, help='Directory containing teacher logits')
+                    parser.add_argument('--model_scale', type=float, help='Model scale factor')
+                    parser.add_argument('--dropout', type=float, help='Dropout probability')
+                    parser.add_argument('--disable_cache', action='store_true', help='Disable caching')
+                    parser.add_argument('--metadata_cache', action='store_true', help='Use metadata-only caching')
+                    parser.add_argument('--cache_fraction', type=float, help='Fraction of data to cache')
+                    parser.add_argument('--lazy_init', action='store_true', help='Use lazy initialization')
+                    parser.add_argument('--spec_dir', type=str, help='Directory containing spectrograms')
+                    parser.add_argument('--label_dir', type=str, help='Directory containing labels')
+                    parser.add_argument('--gpu_memory_fraction', type=float, help='Fraction of GPU memory to use')
+                    parser.add_argument('--batch_gpu_cache', action='store_true', help='Cache batches on GPU')
+                    parser.add_argument('--prefetch_factor', type=int, help='Prefetch factor for data loading')
+                    parser.add_argument('--small_dataset', type=float, help='Fraction of dataset to use')
+                    parser.add_argument('--learning_rate', type=float, help='Learning rate')
+                    parser.add_argument('--min_learning_rate', type=float, help='Minimum learning rate')
+                    parser.add_argument('--warmup_end_lr', type=float, help='End learning rate for warmup')
+                    parser.add_argument('--dataset_type', type=str, choices=['fma', 'maestro', 'combined'], help='Dataset type')
+                    parser.add_argument('--load_checkpoint', type=str, help='Load checkpoint policy')
+                    parser.add_argument('--reset_epoch', action='store_true', help='Reset epoch counter')
+                    parser.add_argument('--reset_scheduler', action='store_true', help='Reset scheduler')
+                    
+                    args, unknown = parser.parse_known_args()
+                    return args, unknown
+                
+                def run_worker(rank, world_size, args, unknown_args):
+                    # Set up the distributed environment
+                    os.environ['RANK'] = str(rank)
+                    os.environ['WORLD_SIZE'] = str(world_size)
+                    os.environ['MASTER_ADDR'] = args.master_addr
+                    os.environ['MASTER_PORT'] = args.master_port
+                    
+                    # Initialize the process group
+                    dist.init_process_group(backend='nccl', init_method='env://')
+                    
+                    # Prepare the command to run train_student.py
+                    cmd = ['python', 'train_student.py']
+                    
+                    # Add all the arguments that were passed to this script
+                    for arg, value in vars(args).items():
+                        if arg not in ['nproc_per_node', 'nnodes', 'node_rank', 'master_addr', 'master_port'] and value is not None:
+                            if isinstance(value, bool):
+                                if value:
+                                    cmd.append(f'--{arg}')
+                            else:
+                                cmd.append(f'--{arg}')
+                                cmd.append(str(value))
+                    
+                    # Add any unknown arguments
+                    cmd.extend(unknown_args)
+                    
+                    # Print the command
+                    print(f"Running command: {' '.join(cmd)}")
+                    
+                    # Run the command
+                    os.execvp(cmd[0], cmd)
+                
+                def main():
+                    args, unknown_args = parse_args()
+                    
+                    # Get the world size and node rank
+                    world_size = args.nproc_per_node * args.nnodes
+                    
+                    # Spawn the processes
+                    mp.spawn(
+                        run_worker,
+                        args=(world_size, args, unknown_args),
+                        nprocs=args.nproc_per_node,
+                        join=True
+                    )
+                
+                if __name__ == '__main__':
+                    main()
+                EOF
+                
+                chmod +x distributed_wrapper.py
+                
+                # Run the distributed wrapper
+                python distributed_wrapper.py \
+                  --nproc_per_node=2 \
+                  --master_addr=localhost \
+                  --master_port=29500 \
+                  --dataset_type combined \
+                  --spec_dir /mnt/storage/data/logits/synth/spectrograms \
+                  --label_dir /mnt/storage/data/logits/synth/labels \
+                  --config ./config/student_config.yaml \
+                  --save_dir /mnt/storage/checkpoints/student/combined-logits-02 \
+                  --lr_schedule validation \
+                  --use_warmup \
+                  --warmup_epochs 10 \
+                  --use_focal_loss \
+                  --focal_gamma 2.0 \
+                  --focal_alpha 0.25 \
+                  --use_kd_loss \
+                  --kd_alpha 0.2 \
+                  --temperature 3.0 \
+                  --logits_dir /mnt/storage/data/logits/synth/logits \
+                  --gpu_memory_fraction 0.95 \
+                  --batch_gpu_cache \
+                  --prefetch_factor 6 \
+                  --learning_rate 0.001 \
+                  --min_learning_rate 0.00001 \
+                  --warmup_start_lr 0.0004 \
+                  --warmup_end_lr 0.001 \
+                  --dropout 0.3 \
+                  --small_dataset 0.05
+            env:
+              # Keep necessary environment variables
+              - name: PYTHONPATH
+                value: /mnt/storage/ChordMini
+              - name: MODEL_SCALE
+                value: "1.0"
+              - name: LR_SCHEDULE
+                value: "validation"
+              - name: DISTRIBUTED_BACKEND
+                value: "nccl"
+              - name: DATA_ROOT
+                value: "/mnt/storage/data"
+            resources:
+              requests:
+                cpu: "4"
+                memory: "16Gi"
+                nvidia.com/gpu: "2"
+              limits:
+                cpu: "8"
+                memory: "32Gi"
+                nvidia.com/gpu: "2"
+            volumeMounts:
+            - name: storage
+              mountPath: /mnt/storage
+          - name: sidecar
+            image: alpine:3.16
+            command:
+              - sh
+              - -c
+              - |
+                echo "=== Sidecar started ==="
+                sleep 3600
+            resources:
+              limits:
+                cpu: "100m"
+                memory: "32Mi"
+              requests:
+                cpu: "50m"
+                memory: "16Mi"
+            volumeMounts:
+            - name: storage
+              mountPath: /mnt/storage
+          volumes:
+          - name: storage
+            persistentVolumeClaim:
+              claimName: temporary-storage-1

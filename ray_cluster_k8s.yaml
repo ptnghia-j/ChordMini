@@ -1,0 +1,87 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: chord-mini-ray-cluster
+  namespace: csuf-titans
+spec:
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      block: "true"
+    template:
+      metadata:
+        labels:
+          app: chord-mini-ray
+          component: head
+        annotations:
+          sidecar.istio.io/inject: "false"
+      spec:
+        containers:
+        - name: ray-head
+          image: rayproject/ray:2.9.0-py310
+          ports:
+          - containerPort: 6379
+            name: gcs
+          - containerPort: 8265
+            name: dashboard
+          - containerPort: 10001
+            name: client
+          resources:
+            limits:
+              cpu: "2"
+              memory: "8Gi"
+            requests:
+              cpu: "1"
+              memory: "4Gi"
+          volumeMounts:
+          - name: storage
+            mountPath: /mnt/storage
+          env:
+          - name: PYTHONPATH
+            value: /mnt/storage/ChordMini
+          - name: DATA_ROOT
+            value: "/mnt/storage/data"
+        volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: temporary-storage-1
+  workerGroupSpecs:
+  - groupName: gpu-workers
+    replicas: 3
+    minReplicas: 1
+    maxReplicas: 5
+    rayStartParams: {}
+    template:
+      metadata:
+        labels:
+          app: chord-mini-ray
+          component: worker-gpu
+        annotations:
+          sidecar.istio.io/inject: "false"
+      spec:
+        containers:
+        - name: ray-worker
+          image: rayproject/ray:2.9.0-py310-gpu
+          resources:
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+          - name: storage
+            mountPath: /mnt/storage
+          env:
+          - name: PYTHONPATH
+            value: /mnt/storage/ChordMini
+          - name: DATA_ROOT
+            value: "/mnt/storage/data"
+          - name: CUDA_VISIBLE_DEVICES
+            value: "0"
+        volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: temporary-storage-1

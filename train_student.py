@@ -14,6 +14,8 @@ import traceback
 import json
 from pathlib import Path
 from collections import Counter
+import time
+import datetime  # For timeout handling
 
 # Project imports
 from modules.utils.mir_eval_modules import large_voca_score_calculation
@@ -296,6 +298,8 @@ def main():
                       help='Distributed backend to use (nccl, gloo, etc.)')
     parser.add_argument('--local_rank', type=int, default=-1,
                       help='Local rank for distributed training (set by torch.distributed.launch)')
+    parser.add_argument('--rank', type=int, default=0,
+                      help='Global rank for distributed training')
     parser.add_argument('--world_size', type=int, default=1,
                       help='Number of processes participating in distributed training')
     parser.add_argument('--dist_url', type=str, default='env://',
@@ -305,7 +309,12 @@ def main():
     parser.add_argument('--sync_bn', action='store_true',
                       help='Use SyncBatchNorm for multi-GPU training')
 
-    args = parser.parse_args()
+    # Parse known arguments first to handle distributed args properly
+    args, unknown_args = parser.parse_known_args()
+
+    # If there are unknown arguments, print a warning but continue
+    if unknown_args:
+        logger.warning(f"Unknown arguments: {unknown_args}")
 
     # Load configuration from YAML first
     config = HParams.load(args.config)
@@ -316,10 +325,28 @@ def main():
     config.data['dataset_type'] = args.dataset_type
 
     # Initialize distributed training if enabled
+    # Check if environment variables are set for distributed training
+    args.local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank)) # Read LOCAL_RANK env var
+    args.rank = int(os.environ.get("RANK", args.rank)) # Read RANK env var
+    args.world_size = int(os.environ.get("WORLD_SIZE", args.world_size)) # Read WORLD_SIZE env var
+
+    # Set MASTER_ADDR and MASTER_PORT if not already set
+    if "MASTER_ADDR" not in os.environ and args.distributed:
+        logger.info("MASTER_ADDR not set in environment, using default")
+
+    if "MASTER_PORT" not in os.environ and args.distributed:
+        logger.info("MASTER_PORT not set in environment, using default")
+
+    if args.local_rank != -1:
+        # This means we're launched with torch.distributed.launch or torchrun
+        # Set distributed flag to True
+        args.distributed = True
+        logger.info(f"Detected distributed launch with local_rank={args.local_rank}")
+
     if args.distributed:
         # Set the device based on local_rank
         if args.local_rank == -1:
-            # Not using distributed launch, use CUDA if available
+            # This case should ideally not happen if launched via torchrun/launch
             if config.misc['use_cuda'] and is_cuda_available():
                 device = get_device()
                 logger.info(f"Using CUDA for training on device: {torch.cuda.get_device_name(0)}")
@@ -332,14 +359,60 @@ def main():
             device = torch.device(f'cuda:{args.local_rank}')
             logger.info(f"Distributed: Using CUDA device {args.local_rank}: {torch.cuda.get_device_name(args.local_rank)}")
 
-            # Initialize the process group
-            dist.init_process_group(
-                backend=args.distributed_backend,
-                init_method=args.dist_url,
-                world_size=args.world_size,
-                rank=args.local_rank
-            )
-            logger.info(f"Initialized process group: rank={args.local_rank}, world_size={dist.get_world_size()}")
+            # Initialize the process group using environment variables (standard for torchrun)
+            # Ensure dist_url is 'env://' or not set (defaults to env)
+            if args.dist_url != 'env://':
+                 logger.warning(f"Overriding dist_url '{args.dist_url}' with 'env://' for torchrun compatibility.")
+                 args.dist_url = 'env://'
+
+            # World_size and rank should already be set from environment variables or command line
+
+            logger.info(f"Initializing process group with backend={args.distributed_backend}, init_method={args.dist_url}")
+            logger.info(f"Attempting init with world_size={args.world_size}, rank={args.rank}")
+
+            # Initialize process group with explicit parameters and longer timeout
+            try:
+                # Set a longer timeout for initialization
+                timeout = datetime.timedelta(seconds=1800)  # 30 minutes
+                logger.info(f"Using timeout of {timeout} for process group initialization")
+
+                if args.dist_url == 'env://':
+                    # Use environment variables
+                    logger.info(f"Initializing with env:// and environment variables: MASTER_ADDR={os.environ.get('MASTER_ADDR')}, MASTER_PORT={os.environ.get('MASTER_PORT')}, RANK={os.environ.get('RANK')}, WORLD_SIZE={os.environ.get('WORLD_SIZE')}")
+                    dist.init_process_group(
+                        backend=args.distributed_backend,
+                        timeout=timeout
+                    )
+                else:
+                    # Use explicit parameters
+                    logger.info(f"Initializing with explicit parameters: url={args.dist_url}, rank={args.rank}, world_size={args.world_size}")
+                    dist.init_process_group(
+                        backend=args.distributed_backend,
+                        init_method=args.dist_url,
+                        world_size=args.world_size,
+                        rank=args.rank,
+                        timeout=timeout
+                    )
+                logger.info("Successfully initialized process group")
+            except Exception as e:
+                logger.error(f"Failed to initialize process group: {e}")
+                logger.error(f"Current environment: MASTER_ADDR={os.environ.get('MASTER_ADDR')}, MASTER_PORT={os.environ.get('MASTER_PORT')}, RANK={os.environ.get('RANK')}, WORLD_SIZE={os.environ.get('WORLD_SIZE')}")
+                logger.error(f"Current args: dist_url={args.dist_url}, rank={args.rank}, world_size={args.world_size}, backend={args.distributed_backend}")
+                # Don't raise the exception, just log it and continue with non-distributed mode
+                logger.warning("Falling back to non-distributed mode due to initialization failure")
+                args.distributed = False
+
+            # Verify initialization
+            logger.info(f"Initialized process group: rank={dist.get_rank()}, world_size={dist.get_world_size()}")
+            # Sanity check if env vars matched actual init
+            if dist.get_rank() != args.rank or dist.get_world_size() != args.world_size:
+                 logger.warning(f"Mismatch between arguments (RANK={args.rank}, WORLD_SIZE={args.world_size}) and dist initialization (rank={dist.get_rank()}, world_size={dist.get_world_size()}). Using dist values.")
+                 args.rank = dist.get_rank()
+                 args.world_size = dist.get_world_size()
+
+            # Print success message
+            logger.info(f"Successfully initialized distributed training with rank {args.rank} of {args.world_size}")
+
     else:
         # Not using distributed training
         if config.misc['use_cuda'] and is_cuda_available():
@@ -602,19 +675,29 @@ def main():
     val_sampler = None
 
     if args.distributed:
-        logger.info("Using DistributedSampler for training data")
-        train_sampler = DistributedSampler(
-            synth_dataset.train_indices,
-            num_replicas=dist.get_world_size(),
-            rank=args.local_rank,
-            shuffle=True
-        )
-        val_sampler = DistributedSampler(
-            synth_dataset.eval_indices,
-            num_replicas=dist.get_world_size(),
-            rank=args.local_rank,
-            shuffle=False
-        )
+        try:
+            logger.info("Using DistributedSampler for training data")
+            logger.info(f"World size: {dist.get_world_size()}, Rank: {args.rank}")
+            logger.info(f"Train indices: {len(synth_dataset.train_indices)}, Eval indices: {len(synth_dataset.eval_indices)}")
+
+            train_sampler = DistributedSampler(
+                synth_dataset.train_indices,
+                num_replicas=dist.get_world_size(),
+                rank=args.rank,  # Use global rank instead of local_rank
+                shuffle=True
+            )
+            val_sampler = DistributedSampler(
+                synth_dataset.eval_indices,
+                num_replicas=dist.get_world_size(),
+                rank=args.rank,  # Use global rank instead of local_rank
+                shuffle=False
+            )
+            logger.info("Successfully created DistributedSampler instances")
+        except Exception as e:
+            logger.error(f"Error creating DistributedSampler: {e}")
+            logger.error(traceback.format_exc())
+            logger.warning("Falling back to non-distributed sampling")
+            args.distributed = False
 
         # When using DistributedSampler, don't shuffle in the data loader
         train_loader = synth_dataset.get_train_iterator(
@@ -782,36 +865,43 @@ def main():
 
     # Create trainer (use DistributedStudentTrainer for distributed training)
     if args.distributed:
-        trainer = DistributedStudentTrainer(
-            model=model,
-            optimizer=optimizer,
-            device=device,
-            num_epochs=config.training.get('num_epochs', config.training.get('max_epochs', 100)),
-            logger=logger,
-            checkpoint_dir=checkpoints_dir,
-            class_weights=None,
-            idx_to_chord=master_mapping,
-            normalization=normalization,
-            early_stopping_patience=config.training.get('early_stopping_patience', 5),
-            lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
-            min_lr=config.training.get('min_learning_rate', 5e-6),
-            use_warmup=args.use_warmup or config.training.get('use_warmup', False),
-            # IMPORTANT: Use config.training.get() to avoid None errors if not set in config
-            warmup_epochs=config.training.get('warmup_epochs'),
-            warmup_start_lr=config.training.get('warmup_start_lr'),
-            warmup_end_lr=config.training.get('warmup_end_lr'),
-            lr_schedule_type=lr_schedule_type,
-            use_focal_loss=args.use_focal_loss or config.training.get('use_focal_loss', False),
-            focal_gamma=args.focal_gamma or config.training.get('focal_gamma', 2.0),
-            focal_alpha=args.focal_alpha or config.training.get('focal_alpha', None),
-            use_kd_loss=use_kd,
-            kd_alpha=kd_alpha,
-            temperature=temperature,
-            # Distributed training parameters
-            rank=args.local_rank,
-            world_size=dist.get_world_size() if args.distributed else 1
-        )
-        logger.info(f"Using DistributedStudentTrainer with rank {args.local_rank} of {dist.get_world_size()}")
+        try:
+            logger.info("Creating DistributedStudentTrainer")
+            trainer = DistributedStudentTrainer(
+                model=model,
+                optimizer=optimizer,
+                device=device,
+                num_epochs=config.training.get('num_epochs', config.training.get('max_epochs', 100)),
+                logger=logger,
+                checkpoint_dir=checkpoints_dir,
+                class_weights=None,
+                idx_to_chord=master_mapping,
+                normalization=normalization,
+                early_stopping_patience=config.training.get('early_stopping_patience', 5),
+                lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
+                min_lr=config.training.get('min_learning_rate', 5e-6),
+                use_warmup=args.use_warmup or config.training.get('use_warmup', False),
+                # IMPORTANT: Use config.training.get() to avoid None errors if not set in config
+                warmup_epochs=config.training.get('warmup_epochs'),
+                warmup_start_lr=config.training.get('warmup_start_lr'),
+                warmup_end_lr=config.training.get('warmup_end_lr'),
+                lr_schedule_type=lr_schedule_type,
+                use_focal_loss=args.use_focal_loss or config.training.get('use_focal_loss', False),
+                focal_gamma=args.focal_gamma or config.training.get('focal_gamma', 2.0),
+                focal_alpha=args.focal_alpha or config.training.get('focal_alpha', None),
+                use_kd_loss=use_kd,
+                kd_alpha=kd_alpha,
+                temperature=temperature,
+                # Distributed training parameters
+                rank=args.rank,
+                world_size=dist.get_world_size() if args.distributed else 1
+            )
+            logger.info(f"Successfully created DistributedStudentTrainer with rank {args.rank} of {dist.get_world_size()}")
+        except Exception as e:
+            logger.error(f"Error creating DistributedStudentTrainer: {e}")
+            logger.error(traceback.format_exc())
+            logger.warning("Falling back to standard StudentTrainer")
+            args.distributed = False
     else:
         trainer = StudentTrainer(
             model=model,
@@ -919,33 +1009,86 @@ def main():
 
         # For distributed training, use train_epoch method with epoch-based sampler setting
         if args.distributed:
-            # Set the epoch for distributed samplers to ensure proper shuffling
-            for epoch in range(start_epoch, config.training.get('num_epochs', 100) + 1):
-                # Only log on main process to avoid duplicate logs
-                if args.local_rank == 0:
-                    logger.info(f"\n=== Epoch {epoch}/{config.training.get('num_epochs', 100)} ===")
+            try:
+                # Set the epoch for distributed samplers to ensure proper shuffling
+                for epoch in range(start_epoch, config.training.get('num_epochs', 100) + 1):
+                    # Only log on main process (rank 0) to avoid duplicate logs
+                    # Use dist.get_rank() which is reliable after init
+                    current_rank = dist.get_rank()
+                    if current_rank == 0:
+                        logger.info(f"\n=== Epoch {epoch}/{config.training.get('num_epochs', 100)} ===")
 
-                # Set epoch for samplers to ensure proper shuffling
-                train_sampler.set_epoch(epoch)
-                val_sampler.set_epoch(epoch)
+                    # Set epoch for samplers to ensure proper shuffling
+                    logger.info(f"Setting epoch {epoch} for train_sampler")
+                    train_sampler.set_epoch(epoch)
 
-                # Train for one epoch
-                early_stop = trainer.train_epoch(train_loader, val_loader, epoch)
+                    # Check if val_sampler exists before setting epoch
+                    if val_sampler:
+                        logger.info(f"Setting epoch {epoch} for val_sampler")
+                        val_sampler.set_epoch(epoch)
 
-                # Synchronize processes after each epoch
-                dist.barrier()
+                    # Train for one epoch
+                    logger.info(f"Starting training for epoch {epoch}")
+                    early_stop = trainer.train_epoch(train_loader, val_loader, epoch)
+                    logger.info(f"Completed training for epoch {epoch}")
 
-                # Check for early stopping
-                if early_stop:
-                    if args.local_rank == 0:
-                        logger.info("Early stopping triggered, ending training")
-                    break
-        else:
-            # Standard training
+                    # Synchronize processes after each epoch
+                    logger.info("Waiting at barrier for synchronization")
+                    dist.barrier()
+                    logger.info("Passed barrier, continuing")
+
+                    # Check for early stopping (only rank 0 needs to decide, but all ranks need the result)
+                    # Broadcast the early_stop decision from rank 0
+                    early_stop_tensor = torch.tensor(int(early_stop), device=device)
+                    dist.broadcast(early_stop_tensor, src=0)
+                    early_stop = bool(early_stop_tensor.item())
+                    logger.info(f"Early stopping status: {early_stop}")
+
+                    if early_stop:
+                        if current_rank == 0:
+                            logger.info("Early stopping triggered, ending training")
+                        break # All ranks break
+            except Exception as e:
+                logger.error(f"Error in distributed training loop: {e}")
+                logger.error(traceback.format_exc())
+                logger.warning("Falling back to standard training")
+                args.distributed = False
+                # Create standard trainer if we haven't already
+                if not isinstance(trainer, StudentTrainer):
+                    trainer = StudentTrainer(
+                        model=model,
+                        optimizer=optimizer,
+                        device=device,
+                        num_epochs=config.training.get('num_epochs', config.training.get('max_epochs', 100)),
+                        logger=logger,
+                        checkpoint_dir=checkpoints_dir,
+                        class_weights=None,
+                        idx_to_chord=master_mapping,
+                        normalization=normalization,
+                        early_stopping_patience=config.training.get('early_stopping_patience', 5),
+                        lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
+                        min_lr=config.training.get('min_learning_rate', 5e-6),
+                        use_warmup=args.use_warmup or config.training.get('use_warmup', False),
+                        warmup_epochs=config.training.get('warmup_epochs'),
+                        warmup_start_lr=config.training.get('warmup_start_lr'),
+                        warmup_end_lr=config.training.get('warmup_end_lr'),
+                        lr_schedule_type=lr_schedule_type,
+                        use_focal_loss=args.use_focal_loss or config.training.get('use_focal_loss', False),
+                        focal_gamma=args.focal_gamma or config.training.get('focal_gamma', 2.0),
+                        focal_alpha=args.focal_alpha or config.training.get('focal_alpha', None),
+                        use_kd_loss=use_kd,
+                        kd_alpha=kd_alpha,
+                        temperature=temperature,
+                    )
+
+        # Standard training (either by default or as fallback)
+        if not args.distributed:
+            logger.info("Using standard training loop")
             trainer.train(train_loader, val_loader, start_epoch=start_epoch)
 
         # Only log completion on main process in distributed mode
-        if not args.distributed or args.local_rank == 0:
+        current_rank = dist.get_rank() if args.distributed else 0
+        if current_rank == 0:
             logger.info("Training completed successfully!")
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
@@ -954,34 +1097,21 @@ def main():
         logger.error(traceback.format_exc())
 
     # Final evaluation on test set (only run on main process in distributed mode)
-    if not args.distributed or args.local_rank == 0:
+    current_rank = dist.get_rank() if args.distributed else 0
+    if current_rank == 0:
         logger.info("\n=== Testing ===")
     try:
         # In distributed mode, only the main process needs to load the model and run evaluation
-        if not args.distributed or args.local_rank == 0:
+        if current_rank == 0:
             if trainer.load_best_model():
-                # Create test loader with distributed sampler if needed
-                if args.distributed:
-                    test_sampler = DistributedSampler(
-                        synth_dataset.test_indices,
-                        num_replicas=dist.get_world_size(),
-                        rank=args.local_rank,
-                        shuffle=False
-                    )
-                    test_loader = synth_dataset.get_test_iterator(
-                        batch_size=config.training['batch_size'],
-                        shuffle=False,
-                        sampler=test_sampler,
-                        num_workers=0,
-                        pin_memory=False
-                    )
-                else:
-                    test_loader = synth_dataset.get_test_iterator(
-                        batch_size=config.training['batch_size'],
-                        shuffle=False,
-                        num_workers=0,
-                        pin_memory=False
-                    )
+                # Create test loader (no sampler needed for single-process testing)
+                test_loader = synth_dataset.get_test_iterator(
+                    batch_size=config.training['batch_size'],
+                    shuffle=False,
+                    # sampler=test_sampler, # Remove sampler for rank 0 testing
+                    num_workers=0,
+                    pin_memory=False
+                )
 
                 # Basic testing with Tester class
                 tester = Tester(
@@ -1116,16 +1246,18 @@ def main():
                     logger.info(f"MIR evaluation metrics saved to {mir_eval_path}")
 
         else:
-            logger.warning("Could not load best model for testing")
+            # Other ranks don't perform testing
+            pass
     except Exception as e:
-        if not args.distributed or args.local_rank == 0:
+        if current_rank == 0:
             logger.error(f"Error during testing: {e}")
             logger.error(traceback.format_exc())
 
     # Save the final model (only on rank 0 for distributed training)
     try:
         # In distributed training, only save on the master process (rank 0)
-        if not args.distributed or args.local_rank == 0:
+        current_rank = dist.get_rank() if args.distributed else 0
+        if current_rank == 0:
             save_path = os.path.join(checkpoints_dir, "student_model_final.pth")
 
             # Get the model state dict (handle DDP wrapper)
@@ -1144,22 +1276,34 @@ def main():
             }, save_path)
             logger.info(f"Final model saved to {save_path}")
         elif args.distributed:
-            logger.info(f"Rank {args.local_rank}: Skipping model saving (only rank 0 saves the model)")
+            logger.info(f"Rank {current_rank}: Skipping model saving (only rank 0 saves the model)")
     except Exception as e:
         logger.error(f"Error saving final model: {e}")
 
     # Clean up distributed processes
     if args.distributed:
-        logger.info(f"Rank {args.local_rank}: Cleaning up distributed process group")
+        logger.info(f"Rank {dist.get_rank()}: Cleaning up distributed process group")
         dist.destroy_process_group()
 
-    if not args.distributed or args.local_rank == 0:
+    current_rank = dist.get_rank() if args.distributed else 0
+    if current_rank == 0:
         logger.info("Student training and evaluation complete!")
 
 if __name__ == '__main__':
     try:
-        multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        # Start method already set
-        pass
-    main()
+        # Set start method for multiprocessing
+        try:
+            multiprocessing.set_start_method('spawn', force=True)
+        except RuntimeError:
+            # Start method already set
+            pass
+
+        # Set environment variable to enable detailed error messages
+        os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'DETAIL'
+
+        # Run the main function with error handling
+        main()
+    except Exception as e:
+        logger.error(f"Unhandled exception in main: {e}")
+        logger.error(traceback.format_exc())
+        sys.exit(1)

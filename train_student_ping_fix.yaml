@@ -1,0 +1,422 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: chord-mini-headless-ping
+  namespace: csuf-titans
+  labels:
+    app: chord-student-training-ping
+spec:
+  clusterIP: None
+  selector:
+    app: chord-student-training-ping
+  ports:
+  - port: 29500
+    name: dist
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: chord-mini-distributed-ping
+  namespace: csuf-titans
+  labels:
+    app: chord-student-training-ping
+spec:
+  serviceName: chord-mini-headless-ping
+  replicas: 3
+  podManagementPolicy: OrderedReady  # Ensure master starts first
+  selector:
+    matchLabels:
+      app: chord-student-training-ping
+  template:
+    metadata:
+      labels:
+        app: chord-student-training-ping
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: pytorch
+        image: pytorch/pytorch:1.9.0-cuda11.1-cudnn8-runtime
+        workingDir: /mnt/storage/ChordMini
+        command:
+          - bash
+          - -c
+          - |
+            set -ex
+            echo "=== Node started ==="
+            HOSTNAME=$(hostname)
+            
+            # Determine node rank based on hostname
+            if [ "$HOSTNAME" = "chord-mini-distributed-ping-0" ]; then
+              NODE_RANK=0
+              echo "This is the master node"
+              IS_MASTER=true
+            elif [ "$HOSTNAME" = "chord-mini-distributed-ping-1" ]; then
+              NODE_RANK=1
+              echo "This is worker node 1"
+              IS_MASTER=false
+            elif [ "$HOSTNAME" = "chord-mini-distributed-ping-2" ]; then
+              NODE_RANK=2
+              echo "This is worker node 2"
+              IS_MASTER=false
+            else
+              echo "Unknown hostname: $HOSTNAME, defaulting to NODE_RANK=0"
+              NODE_RANK=0
+              IS_MASTER=true
+            fi
+            
+            # Install dependencies
+            apt-get update && apt-get install -y libsndfile1 iputils-ping net-tools dnsutils netcat lsof || { echo "ERROR: Failed to install system dependencies"; exit 1; }
+            
+            if [ ! -f requirements.txt ]; then
+              echo "Creating minimal requirements.txt"
+              echo "numpy==1.22.0" > requirements.txt
+              echo "librosa>=0.8.0" >> requirements.txt
+              echo "torch>=1.9.0" >> requirements.txt
+              echo "tqdm>=4.62.0" >> requirements.txt
+              echo "scikit-learn>=1.0.0" >> requirements.txt
+              echo "pyyaml>=6.0.0" >> requirements.txt  # Added for config loading
+            fi
+            
+            pip install --no-cache-dir -r requirements.txt || { echo "WARNING: Some requirements may have failed"; }
+            pip install --no-cache-dir matplotlib tqdm pyyaml librosa scikit-learn || { echo "ERROR: Failed to install additional Python packages"; exit 1; }
+
+            # Cache DNS resolution to avoid inconsistency
+            MASTER_HOST="chord-mini-distributed-ping-0.chord-mini-headless-ping"
+            echo "Resolving and caching $MASTER_HOST..."
+            MASTER_IP=$(getent hosts $MASTER_HOST | awk '{print $1}')
+            
+            if [ -z "$MASTER_IP" ]; then
+              echo "Failed to resolve $MASTER_HOST, using hostname directly"
+            else
+              echo "Resolved $MASTER_HOST to $MASTER_IP"
+              # Add to /etc/hosts to ensure stable resolution
+              echo "$MASTER_IP $MASTER_HOST" >> /etc/hosts
+              echo "Added $MASTER_HOST to /etc/hosts"
+            fi
+            
+            # Network debugging
+            echo "=== Network debugging ==="
+            echo "Checking DNS resolution for $MASTER_HOST..."
+            getent hosts $MASTER_HOST || echo "DNS resolution failed"
+            
+            echo "Pinging $MASTER_HOST..."
+            ping -c 3 $MASTER_HOST || echo "Ping failed"
+            
+            # Create a simplified distributed training script with shorter timeouts
+            cat > simple_distributed.py << 'EOF'
+            #!/usr/bin/env python
+            import os
+            import sys
+            import argparse
+            import torch
+            import torch.distributed as dist
+            import torch.nn as nn
+            import torch.optim as optim
+            import time
+            import logging
+            import socket
+            import datetime
+            
+            # Configure logging
+            logging.basicConfig(
+                level=logging.INFO,
+                format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                handlers=[logging.StreamHandler(sys.stdout)]
+            )
+            logger = logging.getLogger("simple_distributed")
+            
+            def parse_args():
+                parser = argparse.ArgumentParser(description='Simple distributed training test')
+                parser.add_argument('--rank', type=int, required=True, help='Rank of this process')
+                parser.add_argument('--world_size', type=int, required=True, help='Number of processes')
+                parser.add_argument('--master_addr', type=str, required=True, help='Master address')
+                parser.add_argument('--master_port', type=str, required=True, help='Master port')
+                parser.add_argument('--backend', type=str, default='nccl', help='Distributed backend')
+                parser.add_argument('--timeout', type=int, default=300, help='Timeout in seconds')
+                return parser.parse_args()
+            
+            def run_simple_training(rank, world_size):
+                # Create a simple model
+                model = nn.Linear(10, 10).cuda()
+                
+                # Wrap the model with DistributedDataParallel
+                model = torch.nn.parallel.DistributedDataParallel(model)
+                
+                # Create optimizer
+                optimizer = optim.SGD(model.parameters(), lr=0.01)
+                
+                # Create dummy data
+                data = torch.randn(20, 10).cuda()
+                target = torch.randn(20, 10).cuda()
+                
+                # Run a few training steps
+                for step in range(10):
+                    # Forward pass
+                    output = model(data)
+                    loss = nn.MSELoss()(output, target)
+                    
+                    # Backward pass
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    
+                    # Log progress
+                    logger.info(f"Rank {rank}, Step {step}, Loss: {loss.item()}")
+                    
+                    # Add a barrier to ensure all processes are in sync
+                    dist.barrier()
+                    
+                logger.info(f"Rank {rank} completed training successfully")
+            
+            def main():
+                args = parse_args()
+                
+                # Set environment variables for distributed training
+                os.environ['MASTER_ADDR'] = args.master_addr
+                os.environ['MASTER_PORT'] = args.master_port
+                os.environ['RANK'] = str(args.rank)
+                os.environ['WORLD_SIZE'] = str(args.world_size)
+                os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'DETAIL'
+                
+                # Print node information
+                hostname = socket.gethostname()
+                logger.info(f"Running on node {hostname} with rank {args.rank}")
+                logger.info(f"Master address: {args.master_addr}, Master port: {args.master_port}")
+                logger.info(f"World size: {args.world_size}, Backend: {args.backend}")
+                
+                # Initialize the distributed process group
+                logger.info(f"Initializing process group with backend {args.backend}")
+                
+                # Use a different port for the store to avoid conflicts
+                store_port = int(args.master_port) + 1
+                logger.info(f"Using store port: {store_port}")
+                
+                # Initialize with explicit store and shorter timeout
+                timeout = datetime.timedelta(seconds=args.timeout)
+                logger.info(f"Using timeout: {args.timeout} seconds")
+                
+                try:
+                    if args.rank == 0:
+                        # Master creates the store
+                        logger.info(f"Master creating TCP store on port {store_port}")
+                        store = dist.TCPStore(args.master_addr, store_port, args.world_size, True, timeout=timeout)
+                        dist.init_process_group(backend=args.backend, store=store, rank=args.rank, world_size=args.world_size, timeout=timeout)
+                    else:
+                        # Workers connect to the store
+                        logger.info(f"Worker connecting to TCP store on port {store_port}")
+                        store = dist.TCPStore(args.master_addr, store_port, args.world_size, False, timeout=timeout)
+                        dist.init_process_group(backend=args.backend, store=store, rank=args.rank, world_size=args.world_size, timeout=timeout)
+                    
+                    # Verify the initialization
+                    logger.info(f"Process group initialized. Rank: {dist.get_rank()}, World Size: {dist.get_world_size()}")
+                    
+                    # Wait for all processes to reach this point
+                    logger.info(f"Rank {args.rank} waiting at barrier")
+                    dist.barrier()
+                    logger.info(f"Rank {args.rank} passed barrier")
+                    
+                    # Run the simple training
+                    run_simple_training(args.rank, args.world_size)
+                    
+                    # Clean up
+                    dist.destroy_process_group()
+                    logger.info(f"Rank {args.rank} destroyed process group")
+                    
+                    return 0
+                except Exception as e:
+                    logger.error(f"Error in distributed training: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    return 1
+            
+            if __name__ == '__main__':
+                try:
+                    sys.exit(main())
+                except Exception as e:
+                    logger.error(f"Unhandled exception: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    sys.exit(1)
+            EOF
+            
+            chmod +x simple_distributed.py
+            
+            # Set environment variables for distributed training
+            export MASTER_ADDR=chord-mini-distributed-ping-0.chord-mini-headless-ping
+            export MASTER_PORT=29500
+            export WORLD_SIZE=3
+            export RANK=$NODE_RANK
+            export LOCAL_RANK=0
+            export TORCH_DISTRIBUTED_DEBUG=DETAIL
+            
+            # Wait for all nodes to be ready
+            if [ "$IS_MASTER" = "true" ]; then
+              echo "Master node waiting for worker nodes to be ready..."
+              
+              # Wait for worker nodes to be reachable
+              for worker_id in 1 2; do
+                worker_host="chord-mini-distributed-ping-${worker_id}.chord-mini-headless-ping"
+                echo "Waiting for worker ${worker_id} (${worker_host}) to be reachable..."
+                
+                TIMEOUT=300  # 5 minutes
+                START_TIME=$(date +%s)
+                
+                while true; do
+                  CURRENT_TIME=$(date +%s)
+                  ELAPSED=$((CURRENT_TIME - START_TIME))
+                  
+                  if [ $ELAPSED -gt $TIMEOUT ]; then
+                    echo "Timeout waiting for worker ${worker_id} after $TIMEOUT seconds"
+                    break
+                  fi
+                  
+                  if ping -c 1 -W 2 $worker_host > /dev/null 2>&1; then
+                    echo "Worker ${worker_id} is reachable"
+                    break
+                  fi
+                  
+                  echo "Waiting for worker ${worker_id}... ($ELAPSED seconds elapsed)"
+                  sleep 5
+                done
+              done
+              
+              # Give workers time to initialize
+              echo "All workers are reachable. Waiting 30 seconds for them to initialize..."
+              sleep 30
+            else
+              # Worker node waits for master to be reachable
+              echo "Worker node ${NODE_RANK} waiting for master to be reachable..."
+              
+              TIMEOUT=300  # 5 minutes
+              START_TIME=$(date +%s)
+              
+              while true; do
+                CURRENT_TIME=$(date +%s)
+                ELAPSED=$((CURRENT_TIME - START_TIME))
+                
+                if [ $ELAPSED -gt $TIMEOUT ]; then
+                  echo "Timeout waiting for master node after $TIMEOUT seconds"
+                  exit 1
+                fi
+                
+                if ping -c 1 -W 2 $MASTER_ADDR > /dev/null 2>&1; then
+                  echo "Master node is reachable"
+                  break
+                fi
+                
+                echo "Waiting for master node... ($ELAPSED seconds elapsed)"
+                sleep 5
+              done
+              
+              # Give master time to initialize
+              echo "Master is reachable. Waiting 30 seconds for it to initialize..."
+              sleep 30
+            fi
+            
+            echo "All nodes should be ready. Starting distributed test..."
+            
+            # Run the simple distributed test with a shorter timeout
+            python simple_distributed.py \
+              --rank=$NODE_RANK \
+              --world_size=3 \
+              --master_addr=$MASTER_ADDR \
+              --master_port=$MASTER_PORT \
+              --backend=nccl \
+              --timeout=300
+            
+            SIMPLE_TEST_RESULT=$?
+            
+            # If the simple test succeeds, run the actual training
+            if [ $SIMPLE_TEST_RESULT -eq 0 ]; then
+              echo "Simple distributed test succeeded. Starting actual training..."
+              
+              # Run train_student.py directly with the correct arguments
+              python train_student.py \
+                --distributed \
+                --distributed_backend nccl \
+                --rank $RANK \
+                --world_size $WORLD_SIZE \
+                --dist_url tcp://$MASTER_ADDR:$MASTER_PORT \
+                --dataset_type combined \
+                --spec_dir /mnt/storage/data/logits/synth/spectrograms \
+                --label_dir /mnt/storage/data/logits/synth/labels \
+                --config ./config/student_config.yaml \
+                --save_dir /mnt/storage/checkpoints/student/combined-logits-02 \
+                --lr_schedule validation \
+                --use_warmup \
+                --warmup_epochs 10 \
+                --use_focal_loss \
+                --focal_gamma 2.0 \
+                --focal_alpha 0.25 \
+                --use_kd_loss \
+                --kd_alpha 0.2 \
+                --temperature 3.0 \
+                --logits_dir /mnt/storage/data/logits/synth/logits \
+                --gpu_memory_fraction 0.95 \
+                --batch_gpu_cache \
+                --prefetch_factor 6 \
+                --learning_rate 0.001 \
+                --min_learning_rate 0.00001 \
+                --warmup_start_lr 0.0004 \
+                --warmup_end_lr 0.001 \
+                --dropout 0.3 \
+                --small_dataset 0.05
+            else
+              echo "Simple distributed test failed with exit code $SIMPLE_TEST_RESULT. Exiting."
+              exit 1
+            fi
+        env:
+          # Keep necessary environment variables
+          - name: PYTHONPATH
+            value: /mnt/storage/ChordMini
+          - name: MODEL_SCALE
+            value: "1.0"
+          - name: LR_SCHEDULE
+            value: "validation"
+          - name: DISTRIBUTED_BACKEND
+            value: "nccl"
+          - name: DATA_ROOT
+            value: "/mnt/storage/data"
+          - name: CUDA_VISIBLE_DEVICES
+            value: "0"
+          - name: TORCH_DISTRIBUTED_DEBUG
+            value: "DETAIL"
+        resources:
+          requests:
+            cpu: "2"
+            memory: "8Gi"
+            nvidia.com/gpu: "1"
+          limits:
+            cpu: "4"
+            memory: "16Gi"
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - name: storage
+          mountPath: /mnt/storage
+      - name: sidecar
+        image: alpine:3.16
+        command:
+          - sh
+          - -c
+          - |
+            echo "=== Sidecar started ==="
+            sleep 3600
+        resources:
+          limits:
+            cpu: "100m"
+            memory: "64Mi"
+          requests:
+            cpu: "50m"
+            memory: "32Mi"
+        volumeMounts:
+        - name: storage
+          mountPath: /mnt/storage
+      volumes:
+      - name: storage
+        persistentVolumeClaim:
+          claimName: temporary-storage-1
+  updateStrategy:
+    type: RollingUpdate
+  revisionHistoryLimit: 3
