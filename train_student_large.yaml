@@ -20,7 +20,7 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-GeForce-RTX-3090
+                - NVIDIA-A10
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -186,7 +186,7 @@ spec:
             - name: USE_KD_LOSS
               value: "true"  # Set to "true" to enable KD loss
             - name: KD_ALPHA
-              value: "0.2"  # Weight for KD loss (0-1)
+              value: "0.1"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
               value: "2.0"  # Temperature for softening distributions
             # Focal loss settings
@@ -245,7 +245,7 @@ spec:
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: "0.02"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: "null"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
           command:
@@ -575,7 +575,7 @@ spec:
                 --save_dir ${CHECKPOINTS_DIR}/${SUB_DIR} \
                 ${LR_SCHEDULE_ARG} ${WARMUP_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} \
                 ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} \
-                ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} \
+                ${GPU_ARGS} ${DROPOUT_ARG} ${LR_ARGS} \
                 ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS}
 
               echo "=== Student model training complete ==="

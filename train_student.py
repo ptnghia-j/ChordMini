@@ -16,7 +16,7 @@ from collections import Counter
 # Project imports
 from modules.utils.mir_eval_modules import large_voca_score_calculation
 from modules.utils.device import get_device, is_cuda_available, is_gpu_available, clear_gpu_cache
-from modules.data.SynthDataset import SynthDataset
+from modules.data.SynthDataset import SynthDataset, SynthSegmentSubset
 from modules.models.Transformer.ChordNet import ChordNet
 from modules.training.StudentTrainer import StudentTrainer
 from modules.training.DistributedStudentTrainer import DistributedStudentTrainer
@@ -317,11 +317,24 @@ def main():
             rank = args.local_rank
             world_size = torch.cuda.device_count()
             logger.info(f"Initializing distributed training with local_rank={local_rank}, world_size={world_size}")
-            torch.cuda.set_device(local_rank)
-            dist.init_process_group(backend=args.distributed_backend)
-            device = torch.device(f"cuda:{local_rank}")
+            # guard invalid GPU ordinal
+            gpu_count = torch.cuda.device_count()
+            if gpu_count == 0:
+                logger.warning("No CUDA devices available, falling back to CPU")
+                device = torch.device('cpu')
+            else:
+                if local_rank >= gpu_count:
+                    logger.warning(f"local_rank {local_rank} ≥ available GPUs ({gpu_count}), defaulting to GPU 0")
+                    local_rank = 0
+                torch.cuda.set_device(local_rank)
+                device = torch.device(f"cuda:{local_rank}")
+            # initialize process group via env:// only
+            dist.init_process_group(
+                backend=args.distributed_backend,
+                init_method=args.dist_url
+            )
+
         elif args.rank is not None and args.world_size is not None:
-            # Multi-node training with manual setup
             rank = args.rank
             world_size = args.world_size
             logger.info(f"Initializing distributed training with rank={rank}, world_size={world_size}")
@@ -329,9 +342,20 @@ def main():
                                    init_method=args.dist_url,
                                    world_size=world_size,
                                    rank=rank)
-            local_rank = rank % torch.cuda.device_count()
-            torch.cuda.set_device(local_rank)
-            device = torch.device(f"cuda:{local_rank}")
+            # compute and guard local_rank
+            gpu_count = torch.cuda.device_count()
+            if gpu_count == 0:
+                logger.warning("No CUDA devices available, falling back to CPU")
+                local_rank = 0
+                device = torch.device('cpu')
+            else:
+                local_rank = rank % gpu_count
+                if local_rank >= gpu_count:
+                    logger.warning(f"Computed local_rank {local_rank} ≥ available GPUs ({gpu_count}), defaulting to GPU 0")
+                    local_rank = 0
+                torch.cuda.set_device(local_rank)
+                device = torch.device(f"cuda:{local_rank}")
+
         else:
             # Auto-detect number of GPUs for single-node training
             world_size = torch.cuda.device_count()
@@ -604,22 +628,28 @@ def main():
     logger.info(f"Using batch size: {batch_size}")
 
     if distributed_training:
+        # Create train subset using SynthSegmentSubset
+        train_subset = SynthSegmentSubset(synth_dataset, synth_dataset.train_indices)
+        eval_subset = SynthSegmentSubset(synth_dataset, synth_dataset.eval_indices)
+
         # Create distributed samplers
         train_sampler = torch.utils.data.distributed.DistributedSampler(
-            synth_dataset.train_indices,
+            train_subset,
             num_replicas=world_size,
             rank=rank,
             shuffle=True
         )
 
         val_sampler = torch.utils.data.distributed.DistributedSampler(
-            synth_dataset.eval_indices,
+            eval_subset,
             num_replicas=world_size,
             rank=rank,
             shuffle=False
         )
 
-        train_loader = synth_dataset.get_train_iterator(
+        # Create data loaders with samplers
+        train_loader = torch.utils.data.DataLoader(
+            train_subset,
             batch_size=batch_size,
             shuffle=False,  # Don't shuffle here, the sampler will do it
             sampler=train_sampler,
@@ -627,7 +657,8 @@ def main():
             pin_memory=False
         )
 
-        val_loader = synth_dataset.get_eval_iterator(
+        val_loader = torch.utils.data.DataLoader(
+            eval_subset,
             batch_size=batch_size,
             shuffle=False,
             sampler=val_sampler,
@@ -652,13 +683,25 @@ def main():
     logger.info("\n=== Checking data loaders ===")
     try:
         batch = next(iter(train_loader))
-        logger.info(f"First batch loaded successfully: {batch['spectro'].shape}")
+        if distributed_training:
+            # In distributed mode with direct DataLoader, batch is a tuple of (inputs, targets)
+            inputs, targets = batch
+            logger.info(f"First batch loaded successfully: {inputs.shape}")
 
-        if torch.cuda.is_available():
-            if batch['spectro'].device.type == 'cuda':
-                logger.info("Success: Batch tensors are already on GPU")
-            else:
-                logger.info("Note: Batch tensors are on CPU and will be moved to GPU during training")
+            if torch.cuda.is_available():
+                if inputs.device.type == 'cuda':
+                    logger.info("Success: Batch tensors are already on GPU")
+                else:
+                    logger.info("Note: Batch tensors are on CPU and will be moved to GPU during training")
+        else:
+            # In non-distributed mode with SynthDataset's iterator, batch is a dict
+            logger.info(f"First batch loaded successfully: {batch['spectro'].shape}")
+
+            if torch.cuda.is_available():
+                if batch['spectro'].device.type == 'cuda':
+                    logger.info("Success: Batch tensors are already on GPU")
+                else:
+                    logger.info("Note: Batch tensors are on CPU and will be moved to GPU during training")
     except Exception as e:
         logger.error(f"ERROR: Failed to load first batch from train_loader: {e}")
         logger.error("Cannot proceed with training due to data loading issue.")
@@ -776,6 +819,9 @@ def main():
 
     # Create trainer based on whether we're using distributed training
     if distributed_training:
+        # We don't need to wrap the model's forward method anymore since we're using SynthSegmentSubset
+        # which already returns the correct format (spectro, chord_idx)
+
         trainer = DistributedStudentTrainer(
             model=model,
             optimizer=optimizer,
@@ -922,13 +968,15 @@ def main():
             if trainer.load_best_model():
                 # Create test loader with distributed sampler if needed
                 if distributed_training:
+                    test_subset = SynthSegmentSubset(synth_dataset, synth_dataset.test_indices)
                     test_sampler = torch.utils.data.distributed.DistributedSampler(
-                        synth_dataset.test_indices,
+                        test_subset,
                         num_replicas=world_size,
                         rank=rank,
                         shuffle=False
                     )
-                    test_loader = synth_dataset.get_test_iterator(
+                    test_loader = torch.utils.data.DataLoader(
+                        test_subset,
                         batch_size=config.training['batch_size'],
                         shuffle=False,
                         sampler=test_sampler,
@@ -976,7 +1024,12 @@ def main():
                     model.eval()
                     with torch.no_grad():
                         for batch in test_loader:
-                            inputs, targets = batch['spectro'], batch['chord_idx']
+                            if distributed_training:
+                                # In distributed mode with direct DataLoader, batch is a tuple of (inputs, targets)
+                                inputs, targets = batch
+                            else:
+                                # In non-distributed mode with SynthDataset's iterator, batch is a dict
+                                inputs, targets = batch['spectro'], batch['chord_idx']
                             inputs = inputs.to(device)
                             targets = targets.to(device)
                             if normalization:
@@ -1104,6 +1157,9 @@ def distributed_main(local_rank, world_size, args):
     args.local_rank = local_rank
     args.rank = local_rank
     args.world_size = world_size
+
+    # Still distributed so we pick the DDP trainer
+    args.distributed = True
 
     # Call main function
     main()

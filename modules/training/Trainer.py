@@ -4,6 +4,7 @@ import torch.cuda.amp  # NEW: Import AMP
 from modules.utils.Timer import Timer
 from modules.utils.Animator import Animator
 import matplotlib.pyplot as plt  # For plotting loss history
+from modules.utils.logger import warning
 from tqdm import tqdm  # Import tqdm for progress tracking
 
 class BaseTrainer:
@@ -32,6 +33,13 @@ class BaseTrainer:
         if device is None:
             # Use device of first model parameter if available, else default to CPU.
             device = next(model.parameters()).device if list(model.parameters()) else torch.device('cpu')
+        # guard invalid CUDA device ordinal
+        if device is not None and device.type == 'cuda':
+            gpu_count = torch.cuda.device_count()
+            idx = device.index or 0
+            if idx >= gpu_count:
+                warning(f"Invalid CUDA device index {idx}, falling back to CPU")
+                device = torch.device('cpu')
         self.device = device
         self.model = self.model.to(self.device)
         if scheduler is None:
@@ -54,7 +62,9 @@ class BaseTrainer:
             # Set weight for ignore_index to 0 to avoid predicting it
             self.class_weights = class_weights
         else:
-            self.class_weights = [1.0] * model.fc.out_features  # Default to equal weights
+            # Handle DataParallel / DistributedDataParallel transparently
+            base_model = model.module if hasattr(model, 'module') else model
+            self.class_weights = [1.0] * base_model.fc.out_features  # Default to equal weights
 
         self.scaler = torch.cuda.amp.GradScaler() if self.device.type == "cuda" else None
         self.idx_to_chord = idx_to_chord

@@ -356,8 +356,16 @@ class StudentTrainer(BaseTrainer):
             logits = outputs[0]
         else:
             logits = outputs
-            
-        # Calculate standard loss (cross-entropy or focal)
+        
+        # --- NEW: flatten per-frame logits/targets to 2D/1D ---
+        if logits.ndim == 3 and targets.ndim == 2:
+            # (batch, time, classes) → (batch*time, classes); targets similarly
+            logits = logits.reshape(-1, logits.size(-1))
+            targets = targets.reshape(-1)
+            debug(f"Flattened for per-frame loss: logits {logits.shape}, targets {targets.shape}")
+        # -------------------------------------------------------
+        
+        # Calculate standard loss (cross‐entropy or focal)
         if self.use_focal_loss:
             standard_loss = self.focal_loss(logits, targets)
         else:
@@ -438,8 +446,7 @@ class StudentTrainer(BaseTrainer):
         self.optimizer.step()
         
         # Get predicted classes
-        _, predicted = torch.max(logits, 1)
-        
+        _, predicted = torch.max(logits, dim=1)
         # Calculate accuracy
         correct = (predicted == targets).sum().item()
         total = targets.size(0)
@@ -562,8 +569,8 @@ class StudentTrainer(BaseTrainer):
         
         Args:
             epoch: Current training epoch (1-indexed)
-            batch_idx: Current batch index within epoch (for fractional updates)
-            num_batches: Total number of batches per epoch (for fractional updates)
+            batch_idx: Current batch index within epoch (for resuming)
+            num_batches: Total number of batches per epoch (for resuming)
         
         Returns:
             Current learning rate after update
