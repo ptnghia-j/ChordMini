@@ -1,5 +1,6 @@
 import os
 import torch
+import numpy as np
 import torch.cuda.amp  # NEW: Import AMP
 from modules.utils.Timer import Timer
 from modules.utils.Animator import Animator
@@ -8,9 +9,9 @@ from modules.utils.logger import warning
 from tqdm import tqdm  # Import tqdm for progress tracking
 
 class BaseTrainer:
-    def __init__(self, model, optimizer, scheduler=None, device=None, num_epochs=100, 
-                 logger=None, use_animator=True, checkpoint_dir="checkpoints", 
-                 max_grad_norm=1.0, class_weights=None, 
+    def __init__(self, model, optimizer, scheduler=None, device=None, num_epochs=100,
+                 logger=None, use_animator=True, checkpoint_dir="checkpoints",
+                 max_grad_norm=1.0, class_weights=None,
                  idx_to_chord=None,
                  normalization=None):  # Removed use_chord_aware_loss parameter
         """
@@ -64,19 +65,35 @@ class BaseTrainer:
         else:
             # Handle DataParallel / DistributedDataParallel transparently
             base_model = model.module if hasattr(model, 'module') else model
-            self.class_weights = [1.0] * base_model.fc.out_features  # Default to equal weights
+
+            # Handle different model architectures
+            if hasattr(base_model, 'fc'):
+                # Standard model with fc layer
+                num_classes = base_model.fc.out_features
+            elif hasattr(base_model, 'output_layer') and hasattr(base_model.output_layer, 'output_size'):
+                # BTC model with output_layer
+                num_classes = base_model.output_layer.output_size
+            elif hasattr(base_model, 'num_chords'):
+                # Model with direct num_chords attribute
+                num_classes = base_model.num_chords
+            else:
+                # Fallback to a reasonable default
+                num_classes = 170  # Default for BTC model
+                print(f"Warning: Could not determine number of classes from model. Using default: {num_classes}")
+
+            self.class_weights = [1.0] * num_classes  # Default to equal weights
 
         self.scaler = torch.cuda.amp.GradScaler() if self.device.type == "cuda" else None
         self.idx_to_chord = idx_to_chord
-        
+
         # Store normalization parameters
         self.normalization = normalization
-        
+
         # Always use standard cross entropy loss
         self._log("Using standard cross entropy loss")
         weight_tensor = torch.tensor(self.class_weights, device=self.device) if class_weights is not None else None
         self.loss_fn = torch.nn.CrossEntropyLoss(weight=weight_tensor)
-        
+
         # Add lists to track losses across epochs
         self.train_losses = []
         self.val_losses = []
@@ -97,7 +114,7 @@ class BaseTrainer:
             inputs = batch['chroma'].to(self.device)
         else:
             raise KeyError("Batch dictionary must contain either 'spectro' or 'chroma' key")
-            
+
         targets = batch['chord_idx'].to(self.device)
         return inputs, targets
 
@@ -110,70 +127,70 @@ class BaseTrainer:
     def train(self, train_loader, val_loader=None):
         self.model.train()
         log_interval = max(1, len(train_loader) // 10)  # ...existing code...
-        
+
         for epoch in range(1, self.num_epochs + 1):
             self._log(f"Epoch {epoch}/{self.num_epochs} - Starting training")
             self.timer.reset(); self.timer.start()
             epoch_loss = 0.0
-            
+
             num_batches = len(train_loader)
             update_interval = max(1, num_batches // 100)
-            
+
             with tqdm(total=num_batches, desc=f"Epoch {epoch}", unit="batch") as progress_bar:
                 for batch_idx, batch in enumerate(train_loader):
                     inputs, targets = self._process_batch(batch)
                     loss = self._training_step(inputs, targets)
                     epoch_loss += loss
-                    
+
                     if batch_idx % 10 == 0:
                         progress_bar.set_postfix({'loss': f"{loss:.4f}"})
                     progress_bar.update(1)
-                    
+
                     if batch_idx % log_interval == 0:
                         self._log(f"Epoch {epoch} Batch {batch_idx}/{num_batches} - Loss: {loss:.4f}")
-                    
+
                     # Update scheduler frequently with a fractional epoch value.
                     if (batch_idx + 1) % update_interval == 0 or (batch_idx + 1) == num_batches:
                         frac_epoch = (epoch - 1) + (batch_idx + 1) / num_batches
                         self.scheduler.step(frac_epoch)
-            
+
             self.timer.stop()
             avg_loss = epoch_loss / num_batches
             self.train_losses.append(avg_loss)
-            
+
             self._log(f"Epoch {epoch}/{self.num_epochs}: Loss = {avg_loss:.4f}, Time = {self.timer.elapsed_time():.2f} sec")
             if self.animator:
                 self.animator.add(epoch, avg_loss)
-            
+
             if val_loader is not None and (epoch % 1 == 0 or epoch == self.num_epochs):
                 val_loss = self.validate(val_loader)
                 self.val_losses.append(val_loss)
             elif val_loader is not None:
                 self.val_losses.append(self.val_losses[-1] if self.val_losses else 0.0)
-            
+
             # Removed the scheduler.step() call previously located here.
             if epoch % 5 == 0 or epoch == self.num_epochs:
                 self._save_checkpoint(epoch)
-            
+
             self.scheduler.step()
-        
+
         self._print_loss_history()
         self._plot_loss_history()
 
     def _training_step(self, inputs, targets):
         """Optimized single training step."""
         self.optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
-        
+
         # Apply normalization if specified
         if self.normalization:
             inputs = (inputs - self.normalization['mean']) / self.normalization['std']
-        
+
         # Use AMP for mixed precision training
         with torch.amp.autocast(device_type='cuda', enabled=(self.device.type=='cuda')):
             outputs = self.model(inputs)
             loss = self.compute_loss(outputs, targets)
         # Convert loss to float32 to avoid precision issues when logging
-        loss_value = loss.float().item()  
+        loss_value = loss.float().item()
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -190,7 +207,7 @@ class BaseTrainer:
         """Optimized validation function."""
         self.model.eval()
         total_loss = 0.0
-        
+
         # Pre-allocate GPU memory for predictions when possible
         if hasattr(val_loader, 'dataset') and hasattr(val_loader.dataset, '__len__'):
             expected_len = len(val_loader.dataset)
@@ -200,7 +217,19 @@ class BaseTrainer:
                     # Try to pre-allocate, but fall back if we can't determine shape
                     dummy_batch = next(iter(val_loader))
                     if isinstance(dummy_batch, dict) and 'chord_idx' in dummy_batch:
-                        n_classes = self.model.fc.out_features if hasattr(self.model, 'fc') else 0
+                        # Handle different model architectures
+                        base_model = self.model.module if hasattr(self.model, 'module') else self.model
+                        n_classes = 0
+
+                        if hasattr(base_model, 'fc'):
+                            n_classes = base_model.fc.out_features
+                        elif hasattr(base_model, 'output_layer') and hasattr(base_model.output_layer, 'output_size'):
+                            n_classes = base_model.output_layer.output_size
+                        elif hasattr(base_model, 'num_chords'):
+                            n_classes = base_model.num_chords
+                        elif len(self.class_weights) > 0:
+                            n_classes = len(self.class_weights)
+
                         if n_classes > 0:
                             # Create pre-allocated tensors on the correct device
                             all_preds = torch.zeros(expected_len, dtype=torch.long, device=self.device)
@@ -216,45 +245,45 @@ class BaseTrainer:
                 pre_allocated = False
         else:
             pre_allocated = False
-        
+
         if not pre_allocated:
             # Fall back to list collection
             all_preds_list = []
             all_targets_list = []
-        
+
         # Use tqdm for progress tracking
         batch_start_idx = 0
         first_batch = True
-        
+
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(val_loader, desc="Validation", leave=False)):
                 inputs, targets = self._process_batch(batch)
-                
+
                 # Apply normalization if specified
                 if self.normalization:
                     inputs = (inputs - self.normalization['mean']) / self.normalization['std']
-                
+
                 # Fast forward pass with device-appropriate mixed precision
                 device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
                 with torch.amp.autocast(device_type=device_type, enabled=(self.device.type in ['cuda', 'mps'])):
                     outputs = self.model(inputs)
                     loss = self.compute_loss(outputs, targets)
-                
+
                 # Process predictions in a vectorized way
                 if isinstance(outputs, tuple):
                     logits = outputs[0]
                 else:
                     logits = outputs
-                
+
                 if logits.ndim == 3:
                     logits = logits.mean(dim=1)
-                
+
                 # Get predictions efficiently
                 preds = torch.argmax(logits, dim=1)
-                
+
                 # Track batch loss
                 total_loss += loss.item()
-                
+
                 # DEBUG info only for first batch
                 if first_batch:
                     # Only move a small portion to CPU for debug printing
@@ -263,7 +292,7 @@ class BaseTrainer:
                     self._log(f"DEBUG: First batch - Predictions: {debug_preds}")
                     self._log(f"DEBUG: First batch - Targets: {debug_targets}")
                     first_batch = False
-                
+
                 # Store predictions and targets efficiently
                 if pre_allocated:
                     batch_size = preds.size(0)
@@ -276,7 +305,7 @@ class BaseTrainer:
                     # Keep tensors on GPU until the end
                     all_preds_list.append(preds)
                     all_targets_list.append(targets)
-        
+
         # Process final results
         if pre_allocated:
             # We already have everything in a single tensor on the right device
@@ -293,35 +322,35 @@ class BaseTrainer:
             else:
                 # Handle empty case
                 all_preds_np = all_targets_np = np.array([])
-        
+
         # Calculate metrics
         avg_loss = total_loss / len(val_loader)
         self._log(f"Validation Loss: {avg_loss:.4f}")
-        
+
         # Analyze results conditionally
         if self.idx_to_chord and len(all_targets_np) > 0:
             self._analyze_validation_results(all_targets_np, all_preds_np)
-        
+
         self.model.train()
         return avg_loss
-    
+
     def _analyze_validation_results(self, all_targets, all_preds):
         """Separate method for analysis to keep validation loop clean."""
         from collections import Counter
         target_counter = Counter(all_targets)
         pred_counter = Counter(all_preds)
-        
+
         self._log("\nDEBUG: Target Distribution (top 10):")
         total_samples = len(all_targets)
         for idx, count in target_counter.most_common(10):
             chord_name = self.idx_to_chord.get(idx, "Unknown")
             self._log(f"Target {idx} ({chord_name}): {count} occurrences ({count/total_samples*100:.2f}%)")
-            
+
         self._log("\nDEBUG: Prediction Distribution (top 10):")
         for idx, count in pred_counter.most_common(10):
             chord_name = self.idx_to_chord.get(idx, "Unknown") if self.idx_to_chord else str(idx)
             self._log(f"Prediction {idx} ({chord_name}): {count} occurrences ({count/total_samples*100:.2f}%)")
-        
+
         if len(target_counter) > 1:
             self._log("\nAnalyzing most common predictions vs targets:")
             top_chords = [idx for idx, _ in target_counter.most_common(10)]
@@ -334,28 +363,28 @@ class BaseTrainer:
                     most_common_pred_chord = self.idx_to_chord.get(most_common_pred, str(most_common_pred)) if self.idx_to_chord else str(most_common_pred)
                     accuracy_for_chord = pred_counts.get(true_idx, 0) / len(pred_indices)
                     self._log(f"True: {true_chord} -> Most common prediction: {most_common_pred_chord} (Accuracy: {accuracy_for_chord:.2f})")
-        
+
     def compute_loss(self, outputs, targets):
         if isinstance(outputs, tuple):
             outputs = outputs[0]
         if outputs.ndim == 3:
             outputs = outputs.mean(dim=1)
-        
+
         # Diagnostic: Check for NaNs in outputs and targets
         if torch.isnan(outputs).any():
             self._log("NaN detected in model outputs")
         if torch.isnan(targets).any():
             self._log("NaN detected in targets")
-        
+
         # Use the initialized loss function
         loss = self.loss_fn(outputs, targets)
-        
+
         # Ensure loss is non-negative (critical fix)
         loss = torch.clamp(loss, min=0.0)
-        
+
         if torch.isnan(loss):
             self._log(f"NaN loss computed. Outputs: {outputs} | Targets: {targets}")
-        
+
         return loss
 
     def _print_loss_history(self):
@@ -363,33 +392,33 @@ class BaseTrainer:
         self._log("\n=== Training Loss History ===")
         for epoch, loss in enumerate(self.train_losses, 1):
             self._log(f"Epoch {epoch}: Training Loss = {loss:.6f}")
-            
+
         if self.val_losses:
             self._log("\n=== Validation Loss History ===")
             for epoch, loss in enumerate(self.val_losses, 1):
                 self._log(f"Epoch {epoch}: Validation Loss = {loss:.6f}")
-    
+
     def _plot_loss_history(self):
         """Plot the training and validation loss history."""
         try:
             plt.figure(figsize=(10, 6))
             epochs = range(1, len(self.train_losses) + 1)
             plt.plot(epochs, self.train_losses, 'b-', label='Training Loss')
-            
+
             if self.val_losses:
                 plt.plot(epochs, self.val_losses, 'r-', label='Validation Loss')
-                
+
             plt.title('Loss History')
             plt.xlabel('Epochs')
             plt.ylabel('Loss')
             plt.legend()
             plt.grid(True)
-            
+
             # Save the plot
             loss_plot_path = os.path.join(self.checkpoint_dir, "loss_history.png")
             plt.savefig(loss_plot_path)
             self._log(f"Loss history plot saved to {loss_plot_path}")
-            
+
             # Close the plot to free memory
             plt.close()
         except Exception as e:
@@ -433,53 +462,53 @@ class BaseTrainer:
     def save_model(self, path=None):
         """
         Save the trained model to disk.
-        
+
         Args:
-            path (str, optional): Specific path to save the model. If None, 
+            path (str, optional): Specific path to save the model. If None,
                                  uses default checkpoint directory.
         """
         if path is None:
             path = os.path.join(self.checkpoint_dir, "final_model.pth")
-        
+
         # Save model in a format suitable for later deployment
         if isinstance(self.model, torch.nn.DataParallel):
             model_state = self.model.module.state_dict()
         else:
             model_state = self.model.state_dict()
-        
+
         torch.save({
             'model_state_dict': model_state,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'class_weights': self.class_weights,
         }, path)
-        
+
         self._log(f"Model saved to {path}")
-        
+
         return path
 
     def load_model(self, path):
         """
         Load model weights from a saved checkpoint.
-        
+
         Args:
             path (str): Path to the saved model checkpoint
         """
         try:
             checkpoint = torch.load(path, map_location=self.device)
-            
+
             # Load model state
             if isinstance(self.model, torch.nn.DataParallel):
                 self.model.module.load_state_dict(checkpoint['model_state_dict'])
             else:
                 self.model.load_state_dict(checkpoint['model_state_dict'])
-                
+
             # Load optimizer and scheduler states if available
             if 'optimizer_state_dict' in checkpoint:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if 'scheduler_state_dict' in checkpoint:
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                
+
             self._log(f"Model loaded from {path}")
             return True
         except Exception as e:

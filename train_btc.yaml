@@ -1,16 +1,16 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: btc-large-01 # Changed name
+  name: btc-mini # Changed name for BTC small job
   namespace: csuf-titans
   labels:
-    app: btc-training # Changed label
+    app: btc-training # Changed label for BTC
 spec:
   backoffLimit: 2
   template:
     metadata:
       labels:
-        app: btc-training # Changed label
+        app: btc-training # Changed label for BTC
     spec:
       affinity:
         nodeAffinity:
@@ -20,7 +20,7 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-A10 # Or other suitable GPU
+                - NVIDIA-GeForce-RTX-3090 # Keep GPU type from train_student.yaml
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -72,12 +72,13 @@ spec:
               echo "Project root: $PROJ_ROOT"
 
               # Create consolidated data directories if they don't exist
-              # FMA dataset directories (using logits structure for all)
+              # Using the 'logits' structure for consistency, even if not using KD initially
+              # FMA dataset directories
               mkdir -p "/mnt/storage/data/logits/synth/spectrograms"
               mkdir -p "/mnt/storage/data/logits/synth/labels"
               mkdir -p "/mnt/storage/data/logits/synth/logits"
 
-              # Maestro dataset directories (using logits structure for all)
+              # Maestro dataset directories
               mkdir -p "/mnt/storage/data/logits/maestro_synth/spectrograms"
               mkdir -p "/mnt/storage/data/logits/maestro_synth/labels"
               mkdir -p "/mnt/storage/data/logits/maestro_synth/logits"
@@ -159,7 +160,7 @@ spec:
             - name: LEARNING_RATE
               value: "0.0001" # Base learning rate for BTC
             - name: MIN_LEARNING_RATE
-              value: "0.000001"    # Min learning rate for BTC (default 0)
+              value: "0.000001" # Min learning rate for BTC (default 0)
             # Knowledge distillation settings (optional for BTC)
             - name: USE_KD_LOSS
               value: "true" # Set to "true" to enable KD loss if teacher logits are available
@@ -178,9 +179,9 @@ spec:
             - name: USE_WARMUP
               value: "true"  # Set to "true" to enable learning rate warm-up
             - name: WARMUP_START_LR
-              value: "0.0005" # Starting learning rate for warm-up
+              value: "0.00001" # Starting learning rate for warm-up (lower than base)
             - name: WARMUP_END_LR
-              value: "0.001"  # Final learning rate after warm-up (matches base LR)
+              value: "0.0001"  # Final learning rate after warm-up (matches base LR)
             - name: WARMUP_EPOCHS
               value: "10"      # Number of epochs for warm-up
             # Dropout setting (can override btc_config.yaml)
@@ -192,27 +193,22 @@ spec:
             # GPU memory utilization optimization
             - name: GPU_MEMORY_FRACTION
               value: "0.95"  # Use 95% of available GPU memory
-            # Enable distributed training
-            - name: DISTRIBUTED
-              value: "true"
-            - name: DISTRIBUTED_BACKEND
-              value: "nccl"
-            # Use all available GPUs
+            # Use single GPU
             - name: CUDA_VISIBLE_DEVICES
-              value: "0,1"
+              value: "0"
             # Dataset GPU optimization flags
             - name: BATCH_GPU_CACHE
               value: "true"  # Enable GPU batch caching
             - name: PREFETCH_FACTOR
-              value: "6"     # Prefetch batches for better throughput
-            # Add dataset type environment variable with combined option
+              value: "6"     # Prefetch batches for better throughput (may have less effect with num_workers=0)
+            # Add dataset type environment variable
             - name: DATASET_TYPE
-              value: "combined"  # Options: "fma", "maestro", or "combined"
+              value: "fma"  # Options: "fma", "maestro", or "combined"
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never", "required"
             - name: SUB_DIR
-              value: "btc-combined-01" # Subdirectory for BTC checkpoints
+              value: "btc-fma-01" # Subdirectory for BTC checkpoints (adjust based on DATASET_TYPE)
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint
@@ -223,21 +219,15 @@ spec:
             - name: LAZY_INIT
               value: "false" # Controls dataset lazy initialization
             - name: SMALL_DATASET
-              value: "0.2"   # Set percentage of dataset to use (0.1 = 10%, null = full)
+              value: "null"   # Set percentage of dataset to use (0.1 = 10%, null = full)
             - name: METADATA_CACHE
               value: "false" # Use metadata-only caching
           command:
             - sh
             - -c
             - |
-              # Set environment variables for distributed training
-              export MASTER_ADDR="127.0.0.1"
-              export MASTER_PORT="29501" # Use different port from student training if run concurrently
-              export WORLD_SIZE=2
-              export RANK=0
-              export LOCAL_RANK=0
               set -ex
-              echo "=== BTC model training container started ==="
+              echo "=== BTC model training container started (single GPU) ==="
 
               # Install necessary system packages
               apt-get update && apt-get install -y libsndfile1 || { echo "ERROR: Failed to install system dependencies"; exit 1; }
@@ -256,9 +246,8 @@ spec:
               pip install --no-cache-dir -r requirements.txt || { echo "WARNING: Some requirements may have failed"; }
               pip install --no-cache-dir matplotlib tqdm pyyaml librosa scikit-learn || { echo "ERROR: Failed to install additional Python packages"; exit 1; }
 
-              # Verify the data paths from the config (btc_config.yaml)
-              echo "Checking data paths from config..."
-              # btc_config doesn't have a paths section, rely on script logic
+              # Verify the data paths (rely on script logic, btc_config has no paths section)
+              echo "Checking data paths (relying on train_btc.py logic)..."
 
               # Double check that the symlinks are still valid (same as student)
               if [ ! -L "./data/synth/spectrograms" ]; then ln -sf "/mnt/storage/data/logits/synth/spectrograms" "./data/synth/spectrograms"; fi
@@ -268,10 +257,10 @@ spec:
               if [ ! -L "./data/maestro_synth/labels" ]; then ln -sf "/mnt/storage/data/logits/maestro_synth/labels" "./data/maestro_synth/labels"; fi
               if [ ! -L "./data/maestro_synth/logits" ]; then ln -sf "/mnt/storage/data/logits/maestro_synth/logits" "./data/maestro_synth/logits"; fi
 
-              # Verify data exists for selected dataset (same logic as student)
+              # Verify data exists for selected dataset (same logic as student/btc_large)
               DATASET_ARG="--dataset_type ${DATASET_TYPE}"
               echo "Using dataset type: ${DATASET_TYPE}"
-              # (Verification logic for FMA/Maestro/Combined counts omitted for brevity, same as student)
+              # (Verification logic for FMA/Maestro/Combined counts omitted for brevity, same as student/btc_large)
 
               # --- Argument construction for train_btc.py ---
               # Get LR schedule option from environment
@@ -315,7 +304,6 @@ spec:
                   KD_ARGS="${KD_ARGS} --logits_dir ${DATA_ROOT}/logits/maestro_synth/logits"
                   echo "Using Maestro logits from: ${DATA_ROOT}/logits/maestro_synth/logits"
                 elif [ "${DATASET_TYPE}" = "combined" ]; then
-                  # For combined, specify both FMA and Maestro logits dirs if needed by script
                   # Assuming train_btc.py handles combined logits like train_student.py
                   KD_ARGS="${KD_ARGS} --logits_dir ${DATA_ROOT}/logits/synth/logits" # Primary FMA path
                   echo "Using combined dataset - train_btc.py will find logits in standard locations"
@@ -350,7 +338,7 @@ spec:
               if [ "${DROPOUT}" != "" ]; then DROPOUT_ARG="--dropout ${DROPOUT}"; fi
 
               # Define checkpoint directory for BTC
-              CHECKPOINTS_DIR="/mnt/storage/checkpoints/btc" # Centralized checkpoint directory outside of ChordMini
+              CHECKPOINTS_DIR="/mnt/storage/checkpoints/btc" # Centralized checkpoint directory
 
               # Create save directory
               SAVE_DIR="${CHECKPOINTS_DIR}"
@@ -392,7 +380,7 @@ spec:
                 fi
               fi
 
-              # Simplify data directory paths passed to the python script (same as student)
+              # Simplify data directory paths passed to the python script (same as student/btc_large)
               if [ "${DATASET_TYPE}" = "maestro" ]; then
                 SPEC_DIR_ARG="--spec_dir ${DATA_ROOT}/logits/maestro_synth/spectrograms"
                 LABEL_DIR_ARG="--label_dir ${DATA_ROOT}/logits/maestro_synth/labels"
@@ -404,15 +392,9 @@ spec:
                 LABEL_DIR_ARG="--label_dir ${DATA_ROOT}/logits/synth/labels"
               fi
 
-              # Run the BTC training script
-              echo "Starting BTC training with GPU optimization and all options..."
-              python -m torch.distributed.launch \
-                --nproc_per_node=2 \
-                --master_addr="127.0.0.1" \
-                --master_port="29501" \
-                train_btc.py \
-                --distributed \
-                --distributed_backend="nccl" \
+              # Run the BTC training script (single GPU, no distributed launch)
+              echo "Starting BTC training (single GPU) with GPU optimization and all options..."
+              python train_btc.py \
                 --config ./config/btc_config.yaml \
                 --save_dir ${SAVE_DIR} \
                 $DATASET_ARG $SPEC_DIR_ARG $LABEL_DIR_ARG \
@@ -425,18 +407,19 @@ spec:
               # Clear GPU cache
               python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
+            # Match resources from train_student.yaml
             requests:
-              cpu: "6"
-              memory: "12Gi"
-              nvidia.com/gpu: "2"
+              cpu: "5"
+              memory: "24Gi"
+              nvidia.com/gpu: "1"
             limits:
-              cpu: "16"
+              cpu: "10"
               memory: "64Gi"
-              nvidia.com/gpu: "2"
+              nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage
               mountPath: /mnt/storage
       volumes:
         - name: storage
           persistentVolumeClaim:
-            claimName: temporary-storage-1
+            claimName: temporary-storage # Use the same volume as train_student.yaml

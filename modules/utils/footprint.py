@@ -20,6 +20,8 @@ if project_root not in sys.path:
 
 # Now import after fixing the path
 from modules.models.Transformer.ChordNet import ChordNet
+# Import BTC model
+from modules.models.Transformer.btc_model import BTC_model
 from modules.utils.hparams import HParams
 
 def count_parameters(model):
@@ -88,23 +90,28 @@ def scale_config(config, scale_factor):
 
 def main():
     parser = argparse.ArgumentParser(description="Calculate footprint of the model with different scaling factors")
-    parser.add_argument('--config', default=f'{project_root}/config/student_config.yaml', help='Path to config file')
-    parser.add_argument('--scales', nargs='+', type=float, default=[0.25, 0.5, 0.75, 1.0, 1.5, 2.0], 
-                        help='Scaling factors to evaluate')
-    parser.add_argument('--n_freq', type=int, default=None, help='Override n_freq value')
+    parser.add_argument('--config', default=f'{project_root}/config/student_config.yaml', help='Path to student config file')
+    # Add argument for BTC config
+    parser.add_argument('--btc_config', default=f'{project_root}/config/btc_config.yaml', help='Path to BTC config file')
+    parser.add_argument('--scales', nargs='+', type=float, default=[0.25, 0.5, 0.75, 1.0, 1.5, 2.0],
+                        help='Scaling factors to evaluate for ChordNet')
+    parser.add_argument('--n_freq', type=int, default=None, help='Override n_freq value for ChordNet')
     parser.add_argument('--n_classes', type=int, default=170, help='Number of output classes')
-    parser.add_argument('--cqt', action='store_true', help='Use CQT configuration (smaller n_freq)')
-    parser.add_argument('--stft', action='store_true', help='Use STFT configuration (larger n_freq)')
-    
+    parser.add_argument('--cqt', action='store_true', help='Use CQT configuration (smaller n_freq) for ChordNet')
+    parser.add_argument('--stft', action='store_true', help='Use STFT configuration (larger n_freq) for ChordNet')
+    # Add flag to calculate BTC footprint
+    parser.add_argument('--calculate_btc', action='store_true', help='Calculate and print BTC model footprint')
+
     args = parser.parse_args()
-    
-    # Load configuration
-    config = HParams.load(args.config)
+
+    # --- ChordNet Calculation ---
+    # Load student configuration
+    student_config = HParams.load(args.config)
     print(f"Loaded student configuration from: {args.config}")
-    
+
     # Get n_group from config
-    n_group = config.model.get('n_group', 4)
-    
+    n_group = student_config.model.get('n_group', 4)
+
     # Choose appropriate n_freq based on CQT/STFT flag
     if args.n_freq:
         n_freq = args.n_freq
@@ -114,25 +121,25 @@ def main():
         n_freq = 1024  # Reasonable STFT size for parameter counting
     else:
         n_freq = get_valid_n_freq(n_group)
-    
+
     # Get n_classes from config or args
     n_classes = args.n_classes
-    
-    print("Using parameters:")
+
+    print("\nChordNet Parameters:")
     print(f"  n_freq: {n_freq} (must be divisible by n_group)")
     print(f"  n_classes: {n_classes}")
     print(f"  n_group: {n_group}")
-    
+
     # Prepare table data
     table_data = []
-    
+
     # Generate table rows for each scale
     for scale in sorted(args.scales):
         # Scale model config
-        scaled_params = scale_config(config, scale)
-        
+        scaled_params = scale_config(student_config, scale)
+
         # Create model with scaled parameters
-        model = ChordNet(
+        chordnet_model = ChordNet(
             n_freq=n_freq,
             n_classes=n_classes,
             n_group=n_group,
@@ -142,13 +149,13 @@ def main():
             t_head=scaled_params['t_head'],
             d_layer=scaled_params['d_layer'],
             d_head=scaled_params['d_head'],
-            dropout=config.model.get('dropout', 0.1)
+            dropout=student_config.model.get('dropout', 0.1)
         )
-        
+
         # Count parameters
-        param_count = count_parameters(model)
-        size_mb = model_size_in_bytes(model) / (1024 * 1024)
-        
+        param_count = count_parameters(chordnet_model)
+        size_mb = model_size_in_bytes(chordnet_model) / (1024 * 1024)
+
         # Add row to table
         table_data.append([
             f"{scale}x",
@@ -161,19 +168,57 @@ def main():
             f"{param_count:,}",
             f"{size_mb:.2f}"
         ])
-    
+
     # Print table
-    print("\nModel Scaling Comparison:")
+    print("\nChordNet Scaling Comparison:")
     print("=" * 80)
     print(tabulate(table_data, headers=[
-        "Scale", "F-Layers", "F-Heads", "T-Layers", "T-Heads", 
+        "Scale", "F-Layers", "F-Heads", "T-Layers", "T-Heads",
         "D-Layers", "D-Heads", "Parameters", "Size (MB)"
     ], tablefmt="grid"))
-    
+
     # If we're only checking a single scale, print detailed breakdown
     if len(args.scales) == 1:
-        print("\nDetailed parameter breakdown:")
-        print_model_parameters(model)
+        print("\nDetailed ChordNet parameter breakdown:")
+        print_model_parameters(chordnet_model)
+
+    # --- BTC Model Calculation ---
+    if args.calculate_btc:
+        print("\n" + "=" * 80)
+        print("Calculating BTC Model Footprint...")
+        try:
+            # Load BTC configuration
+            btc_config = HParams.load(args.btc_config)
+            print(f"Loaded BTC configuration from: {args.btc_config}")
+
+            # Instantiate BTC model using its config
+            # Ensure necessary parameters are present in the config or provide defaults
+            btc_model_config = btc_config.model
+            # Override n_classes if provided via args, otherwise use config
+            btc_model_config['num_chords'] = args.n_classes or btc_model_config.get('num_chords', 170)
+            # Ensure feature_size is set (important for input layer)
+            if 'feature_size' not in btc_model_config:
+                 # Try to infer from ChordNet n_freq if not in btc_config
+                 btc_model_config['feature_size'] = n_freq
+                 print(f"Warning: 'feature_size' not found in BTC config, using n_freq: {n_freq}")
+
+            btc_model = BTC_model(config=btc_model_config)
+
+            # Count parameters
+            btc_param_count = count_parameters(btc_model)
+            btc_size_mb = model_size_in_bytes(btc_model) / (1024 * 1024)
+
+            print("\nBTC Model Footprint:")
+            print(f"  Parameters: {btc_param_count:,}")
+            print(f"  Size (MB): {btc_size_mb:.2f}")
+
+            print("\nDetailed BTC parameter breakdown:")
+            print_model_parameters(btc_model)
+
+        except FileNotFoundError:
+            print(f"Error: BTC config file not found at {args.btc_config}")
+        except Exception as e:
+            print(f"Error calculating BTC footprint: {e}")
 
 if __name__ == "__main__":
     main()

@@ -173,7 +173,7 @@ spec:
               value: /mnt/storage/ChordMini
             # Model scale - overrides student_config.yaml
             - name: MODEL_SCALE
-              value: "1.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
+              value: "2.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
             # Learning rate scheduling options - overrides student_config.yaml settings
             - name: LR_SCHEDULE
               value: "validation"  # Changed from empty string to 'validation'

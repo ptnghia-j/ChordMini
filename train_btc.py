@@ -401,7 +401,14 @@ def main():
 
     # Override config values with command line arguments if provided
     config.misc['seed'] = args.seed or config.misc.get('seed', 42)
-    config.paths['checkpoints_dir'] = args.save_dir or config.paths.get('ckpt_path', 'checkpoints/btc') # Use ckpt_path from btc_config
+
+    # Set centralized checkpoint directory outside of ChordMini
+    default_checkpoints_dir = '/mnt/storage/checkpoints/btc'
+    # Fall back to local path if centralized directory doesn't exist
+    if not os.path.exists(os.path.dirname(default_checkpoints_dir)):
+        default_checkpoints_dir = 'checkpoints/btc'
+
+    config.paths['checkpoints_dir'] = args.save_dir or config.paths.get('ckpt_path', default_checkpoints_dir)
     config.paths['storage_root'] = args.storage_root or config.paths.get('root_path', None) # Use root_path from btc_config
 
     # Handle learning rate and warmup parameters from btc_config and args
@@ -948,8 +955,21 @@ def main():
     if not distributed_training or (distributed_training and rank == 0):
         logger.info("\n=== Testing ===")
         try:
-            # Use btc_model_best.pth
-            trainer.best_model_path = os.path.join(checkpoints_dir, "btc_model_best.pth")
+            # Explicitly set the best model path to use btc_model_best.pth
+            best_model_filename = "btc_model_best.pth"
+            trainer.best_model_path = os.path.join(checkpoints_dir, best_model_filename)
+            logger.info(f"Looking for best model at: {trainer.best_model_path}")
+
+            # Try to find the model with student prefix if btc prefix doesn't exist
+            if not os.path.exists(trainer.best_model_path):
+                alt_filename = "student_model_best.pth"
+                alt_path = os.path.join(checkpoints_dir, alt_filename)
+                if os.path.exists(alt_path):
+                    logger.info(f"Best model not found with 'btc' prefix, but found with 'student' prefix at: {alt_path}")
+                    logger.info(f"Copying {alt_path} to {trainer.best_model_path}")
+                    import shutil
+                    shutil.copy2(alt_path, trainer.best_model_path)
+
             if trainer.load_best_model():
                 # Create test loader with distributed sampler if needed
                 if distributed_training:
@@ -1111,9 +1131,16 @@ def main():
     # Save the final model
     try:
         # Use btc_model_final.pth
-        save_path = os.path.join(checkpoints_dir, "btc_model_final.pth")
+        final_model_filename = "btc_model_final.pth"
+        save_path = os.path.join(checkpoints_dir, final_model_filename)
+
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
         # Save the underlying model if using DDP
         model_to_save = model.module if distributed_training else model
+
+        # Save model with all necessary information
         torch.save({
             'model_state_dict': model_to_save.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -1122,9 +1149,21 @@ def main():
             'mean': normalization['mean'].cpu().numpy() if hasattr(normalization['mean'], 'cpu') else normalization['mean'],
             'std': normalization['std'].cpu().numpy() if hasattr(normalization['std'], 'cpu') else normalization['std']
         }, save_path)
+
         logger.info(f"Final BTC model saved to {save_path}")
+
+        # Also save a copy in the ChordMini/checkpoints/btc directory for backward compatibility
+        local_checkpoints_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints/btc")
+        if local_checkpoints_dir != checkpoints_dir:  # Only if they're different
+            os.makedirs(local_checkpoints_dir, exist_ok=True)
+            local_save_path = os.path.join(local_checkpoints_dir, final_model_filename)
+            import shutil
+            shutil.copy2(save_path, local_save_path)
+            logger.info(f"Also saved a copy to {local_save_path} for backward compatibility")
+
     except Exception as e:
         logger.error(f"Error saving final BTC model: {e}")
+        logger.error(traceback.format_exc())
 
     logger.info("BTC training and evaluation complete!")
 

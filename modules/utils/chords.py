@@ -897,11 +897,8 @@ def idx2voca_chord():
             chord_idx = root_idx * num_qualities + quality_idx
             quality = quality_list[quality_idx]
 
-            # Construct label: Root:Quality (omit :maj for major triads)
-            if quality == 'maj':
-                label = root_note # mir_eval often treats "C" as "C:maj"
-            else:
-                label = f"{root_note}:{quality}"
+            # Construct label: Root:Quality (ALWAYS use :maj for major triads)
+            label = f"{root_note}:{quality}"
             mapping[chord_idx] = label
 
     # Add special chords
