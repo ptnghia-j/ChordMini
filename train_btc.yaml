@@ -179,11 +179,11 @@ spec:
             - name: USE_WARMUP
               value: "true"  # Set to "true" to enable learning rate warm-up
             - name: WARMUP_START_LR
-              value: "0.00001" # Starting learning rate for warm-up (lower than base)
+              value: "0.0005" # Starting learning rate for warm-up (lower than base)
             - name: WARMUP_END_LR
-              value: "0.0001"  # Final learning rate after warm-up (matches base LR)
+              value: "0.001"  # Final learning rate after warm-up (matches base LR)
             - name: WARMUP_EPOCHS
-              value: "10"      # Number of epochs for warm-up
+              value: "15"      # Number of epochs for warm-up
             # Dropout setting (can override btc_config.yaml)
             - name: DROPOUT
               value: "0.2"     # Set dropout probability (0-1)
@@ -219,7 +219,7 @@ spec:
             - name: LAZY_INIT
               value: "false" # Controls dataset lazy initialization
             - name: SMALL_DATASET
-              value: "0.01"   # Set percentage of dataset to use (0.1 = 10%, null = full)
+              value: ""   # Set percentage of dataset to use (0.1 = 10%, null = full)
             - name: METADATA_CACHE
               value: "false" # Use metadata-only caching
           command:
