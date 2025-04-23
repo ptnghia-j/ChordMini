@@ -994,13 +994,17 @@ def main():
                 # Basic testing with Tester class
                 tester = Tester(
                     model=model,
+                    test_loader=test_loader,  # Pass the test_loader parameter
                     device=device,
                     idx_to_chord=master_mapping,
-                    normalization=normalization
+                    normalization=normalization,
+                    output_dir=checkpoints_dir  # Also add output directory for saving results
                 )
 
-                # Run test
-                test_loss, test_acc = tester.test(test_loader)
+                # Run test using the evaluate method
+                metrics = tester.evaluate(save_plots=True)
+                test_acc = metrics.get('accuracy', 0.0)
+                test_loss = metrics.get('loss', 0.0)
                 logger.info(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc*100:.2f}%")
 
                 # Save test results

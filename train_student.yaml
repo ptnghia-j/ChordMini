@@ -189,7 +189,7 @@ spec:
             - name: KD_ALPHA
               value: "0.2"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
-              value: "1.5"  # Temperature for softening distributions
+              value: "2.0"  # Temperature for softening distributions
             # Focal loss settings
             - name: USE_FOCAL_LOSS
               value: "true"  # Set to "true" to enable focal loss
@@ -208,7 +208,7 @@ spec:
               value: "20"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
-              value: "0.3"  # Set dropout probability (0-1)
+              value: "0.2"  # Set dropout probability (0-1)
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
