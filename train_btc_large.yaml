@@ -350,7 +350,7 @@ spec:
               if [ "${DROPOUT}" != "" ]; then DROPOUT_ARG="--dropout ${DROPOUT}"; fi
 
               # Define checkpoint directory for BTC
-              CHECKPOINTS_DIR="/mnt/storage/checkpoints/btc" # Centralized checkpoint directory outside of ChordMini
+              CHECKPOINTS_DIR="/mnt/storage/checkpoints/btc" # Changed directory
 
               # Create save directory
               SAVE_DIR="${CHECKPOINTS_DIR}"

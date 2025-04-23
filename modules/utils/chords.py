@@ -43,22 +43,22 @@ def idx_to_chord(idx):
 def get_chord_quality(chord_label):
     """
     Extract the quality from a chord label and map it to a standard category.
-    
+
     Args:
         chord_label (str): Chord label like "C:maj", "G:7", etc.
-        
+
     Returns:
         str: Standardized chord quality category
     """
     # Handle special non-chord labels
     if chord_label in ["N", "X"]:
         return "No Chord"
-        
+
     # Use chord parsing utilities from this module
     try:
         # Handle any error correction and standardization
         chord_label = Chords().label_error_modify(chord_label)
-        
+
         # Extract chord parts (internally handles format variations)
         if ':' in chord_label:
             root, quality = chord_label.split(':', 1)
@@ -75,53 +75,53 @@ def get_chord_quality(chord_label):
                     break
             else:
                 return "Other"  # Couldn't identify root note
-                
+
         # Map quality to standard categories
         quality_map = {
             # Major family
-            "maj": "Major", "": "Major", "M": "Major", 
-            
+            "maj": "Major", "": "Major", "M": "Major",
+
             # Minor family
             "min": "Minor", "m": "Minor",
-            
+
             # Dominant seventh
             "7": "Dom7",
-            
+
             # Major seventh
             "maj7": "Maj7", "M7": "Maj7",
-            
+
             # Minor seventh
             "min7": "Min7", "m7": "Min7",
-            
+
             # Diminished
             "dim": "Dim", "°": "Dim", "o": "Dim",
-            
+
             # Diminished seventh
             "dim7": "Dim7", "°7": "Dim7", "o7": "Dim7",
-            
+
             # Half-diminished seventh
             "hdim7": "Half-Dim", "m7b5": "Half-Dim", "ø": "Half-Dim",
-            
+
             # Augmented
             "aug": "Aug", "+": "Aug",
-            
+
             # Suspended
             "sus2": "Sus", "sus4": "Sus", "sus": "Sus",
-            
+
             # Extended chords
             "9": "Extended", "11": "Extended", "13": "Extended",
             "maj9": "Extended", "min9": "Extended",
-            
+
             # Minor/Major sixth
             "min6": "Min6", "m6": "Min6",
             "maj6": "Maj6", "6": "Maj6",
-            
+
             # Minor/Major seventh
             "minmaj7": "Min-Maj7", "mmaj7": "Min-Maj7"
         }
-        
+
         return quality_map.get(quality, "Other")
-        
+
     except Exception as e:
         logger.warning(f"Error determining chord quality for '{chord_label}': {e}")
         return "Other"
@@ -178,7 +178,7 @@ class Chords:
             'min7+5': 'min7',
             'min7-5': 'min7',
         }
-        
+
         # Simplification rules for extended qualities and special notations
         self.simplification_map = {
             # Extensions to base qualities
@@ -191,7 +191,7 @@ class Chords:
             'min9': 'min7',      # Cmin9 -> Cmin7
             'min11': 'min7',     # Cmin11 -> Cmin7
             'min13': 'min7',     # Cmin13 -> Cmin7
-            
+
             # Suspended and special chords
             'sus4(2)': 'sus4',   # Csus4(2) -> Csus4
             'maj(9)': 'maj7',    # Cmaj(9) -> Cmaj7
@@ -199,7 +199,7 @@ class Chords:
             'sus2(b7)': 'sus2',  # Csus2(b7) -> Csus2
             '7(#9)': '7',        # C7(#9) -> C7
             'maj(b9)': 'maj7',   # Cmaj(b9) -> Cmaj7
-            
+
             # Special notation patterns
             '(1)': 'maj',        # C(1) -> C
             '(1,5)': 'maj',      # C(1,5) -> C
@@ -209,7 +209,7 @@ class Chords:
             'min(*b3)': 'min',   # Cmin(*b3) -> Cmin
             'min(*b3,*5)': 'min' # Cmin(*b3,*5) -> Cmin
         }
-        
+
         # Initialize chord mapping dictionary
         self.chord_mapping = {}
 
@@ -460,29 +460,29 @@ class Chords:
         """
         Normalize a chord name to a canonical form for consistent lookup.
         Handles various notations, enharmonic equivalents, and format issues.
-        
+
         Args:
             chord_name (str): Input chord name in any supported format
-            
+
         Returns:
             tuple: (normalized_chord, root, quality, bass)
         """
         # Handle special chords
         if chord_name in ['N', 'NC', 'X']:
             return chord_name, None, None, None
-        
+
         # Apply basic error correction
         chord_name = self.label_error_modify(chord_name)
-        
+
         # Split into components
         root, quality, bass = None, None, None
-        
+
         # Handle format with separator (:)
         if ':' in chord_name:
             parts = chord_name.split(':')
             root = parts[0]
             quality_with_bass = parts[1]
-            
+
             # Handle bass note
             if '/' in quality_with_bass:
                 quality, bass = quality_with_bass.split('/')
@@ -496,7 +496,7 @@ class Chords:
             else:
                 main_chord = chord_name
                 bass = None
-                
+
             # Then extract root and quality
             # Find where the root note ends and quality starts
             for i, c in enumerate(main_chord):
@@ -512,55 +512,55 @@ class Chords:
                 # If no quality found, it's just a root (major chord)
                 root = main_chord
                 quality = ''
-        
+
         # Normalize root (prefer sharps)
         if root in self.enharmonic_map:
             root = self.enharmonic_map.get(root, root)
-        
+
         # Normalize quality
         if quality in self.quality_map:
             quality = self.quality_map[quality]
-        
+
         # Construct normalized chord name
         if not quality or quality == 'maj':
             normalized = root  # Just root for major
         else:
             normalized = f"{root}:{quality}"
-        
+
         # Add bass if present
         if bass:
             normalized += f"/{bass}"
-            
+
         return normalized, root, quality, bass
 
     def simplify_chord(self, chord_name):
         """
         Simplify a chord to its basic form by reducing extensions and removing inversions.
         This is helpful for mapping complex chords to a smaller vocabulary.
-        
+
         Args:
             chord_name (str): The chord name to simplify
-            
+
         Returns:
             str: Simplified chord name
         """
         # Special cases
         if chord_name in ['N', 'NC', 'X']:
             return chord_name
-            
+
         # First normalize the chord
         normalized, root, quality, bass = self.normalize_chord(chord_name)
         if root is None:  # Special chord
             return normalized
-            
+
         # Remove inversion (bass note)
         simplified = f"{root}:{quality}" if quality else root
-        
+
         # Apply simplification for extended qualities
         if quality in self.simplification_map:
             simple_quality = self.simplification_map[quality]
             simplified = f"{root}:{simple_quality}" if simple_quality != 'maj' else root
-        
+
         # Handle special cases with parentheses
         elif '(' in quality and quality not in self._shorthands:
             # Extract base quality if present
@@ -570,7 +570,7 @@ class Chords:
             elif any(pattern in quality for pattern in ['(1)', '(*']):
                 # Patterns like (1) or (*3) indicate root position major or altered chords
                 simplified = root
-        
+
         return simplified
 
     def label_error_modify(self, label):
@@ -579,17 +579,17 @@ class Chords:
         """
         if not label or label in ['N', 'X', 'NC']:
             return label
-            
+
         # Common format fixes
-        if label == 'Emin/4': 
+        if label == 'Emin/4':
             return 'E:min/4'
-        elif label == 'A7/3': 
+        elif label == 'A7/3':
             return 'A:7/3'
-        elif label == 'Bb7/3': 
+        elif label == 'Bb7/3':
             return 'Bb:7/3'
-        elif label == 'Bb7/5': 
+        elif label == 'Bb7/5':
             return 'Bb:7/5'
-            
+
         # Handle format without colon separator
         if ':' not in label:
             # Check for common quality strings and insert separator
@@ -597,19 +597,19 @@ class Chords:
                 if quality in label:
                     idx = label.find(quality)
                     return label[:idx] + ':' + label[idx:]
-            
+
             # Check for numeric qualities like 7, 9, etc.
             for i, c in enumerate(label):
                 if i > 0 and c.isdigit():
                     return label[:i] + ':' + label[i:]
-                    
+
         return label
 
     def set_chord_mapping(self, chord_mapping):
         """
         Set the chord mapping to be used for chord index lookup.
         Also initializes extended mappings for variants.
-        
+
         Args:
             chord_mapping (dict): Dictionary mapping chord names to indices
         """
@@ -617,11 +617,11 @@ class Chords:
             logger.warning("Empty chord mapping provided. Using formula-based approach.")
             self.chord_mapping = {}
             return
-            
+
         # Store a copy of the original mapping
         self.chord_mapping = chord_mapping.copy()
         logger.info(f"Chord mapping set with {len(chord_mapping)} entries")
-        
+
         # Initialize extended mappings (inversions, variants, etc.)
         self.initialize_chord_mapping()
 
@@ -815,15 +815,15 @@ class Chords:
         """Legacy method for large vocabulary (170 chords)"""
         if root == -1:
             return 169  # No chord
-            
+
         # First normalize the quality
         quality = self.normalize_quality(quality) if hasattr(self, 'normalize_quality') else quality
-        
+
         # Try mapping directly if available
         chord_key = f"{PITCH_CLASS[root]}:{quality}" if quality and quality != 'maj' else PITCH_CLASS[root]
         if hasattr(self, 'chord_mapping') and chord_key in self.chord_mapping:
             return self.chord_mapping[chord_key]
-            
+
         # Fall back to formula-based mapping
         if quality == 'min':
             return root * 14
@@ -891,6 +891,7 @@ def idx2voca_chord():
     ]
     num_qualities = len(quality_list) # Should be 14
 
+    # First create the standard mapping
     for root_idx in range(12):
         root_note = PITCH_CLASS[root_idx]
         for quality_idx in range(num_qualities):

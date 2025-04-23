@@ -128,7 +128,22 @@ class SynthDataset(Dataset):
 
         # Map from chord name to index
         if self.chord_mapping is not None:
-            self.chord_to_idx = self.chord_mapping
+            self.chord_to_idx = self.chord_mapping.copy()  # Make a copy to avoid modifying the original
+
+            # Add plain note names (C, D, etc.) as aliases for major chords (C:maj, D:maj)
+            # This ensures compatibility with both formats
+            for root in ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']:
+                maj_chord = f"{root}:maj"
+                if maj_chord in self.chord_to_idx and root not in self.chord_to_idx:
+                    self.chord_to_idx[root] = self.chord_to_idx[maj_chord]
+                    if self.verbose and root == 'C':  # Only log once to avoid spam
+                        print(f"Added plain note mapping: {root} -> {self.chord_to_idx[root]} (same as {maj_chord})")
+
+                # Also add the reverse mapping if needed
+                if root in self.chord_to_idx and maj_chord not in self.chord_to_idx:
+                    self.chord_to_idx[maj_chord] = self.chord_to_idx[root]
+                    if self.verbose and root == 'C':  # Only log once to avoid spam
+                        print(f"Added explicit major mapping: {maj_chord} -> {self.chord_to_idx[maj_chord]} (same as {root})")
         else:
             self.chord_to_idx = {}
 
@@ -767,8 +782,18 @@ class SynthDataset(Dataset):
                             if chord_label not in self.chord_to_idx:
                                 self.chord_to_idx[chord_label] = len(self.chord_to_idx)
                         elif chord_label not in self.chord_mapping:
-                            warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
-                            chord_label = "N"
+                            # Handle basic chord labels (C, G, etc.) by treating them as major chords
+                            # This is a common convention in chord notation
+                            if chord_label in ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']:
+                                major_chord = f"{chord_label}:maj"
+                                if major_chord in self.chord_mapping:
+                                    chord_label = major_chord
+                                else:
+                                    warnings.warn(f"Unknown chord label {chord_label} (even as major), using 'N'")
+                                    chord_label = "N"
+                            else:
+                                warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
+                                chord_label = "N"
 
                         if self.dataset_type == 'maestro':
                             expected_spec_path = str(spec_file)
@@ -802,8 +827,17 @@ class SynthDataset(Dataset):
                         if chord_label not in self.chord_to_idx:
                             self.chord_to_idx[chord_label] = len(self.chord_to_idx)
                     elif chord_label not in self.chord_mapping:
-                        warnings.warn(f"Unknown chord label {chord_label} found in {label_file}")
-                        return []
+                        # Handle basic chord labels (C, G, etc.) by treating them as major chords
+                        if chord_label in ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']:
+                            major_chord = f"{chord_label}:maj"
+                            if major_chord in self.chord_mapping:
+                                chord_label = major_chord
+                            else:
+                                warnings.warn(f"Unknown chord label {chord_label} (even as major) found in {label_file}")
+                                return []
+                        else:
+                            warnings.warn(f"Unknown chord label {chord_label} found in {label_file}")
+                            return []
 
                     sample_dict = {
                         'spectro': spec,
@@ -839,8 +873,17 @@ class SynthDataset(Dataset):
                             if chord_label not in self.chord_to_idx:
                                 self.chord_to_idx[chord_label] = len(self.chord_to_idx)
                         elif chord_label not in self.chord_mapping:
-                            warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
-                            chord_label = "N"
+                            # Handle basic chord labels (C, G, etc.) by treating them as major chords
+                            if chord_label in ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']:
+                                major_chord = f"{chord_label}:maj"
+                                if major_chord in self.chord_mapping:
+                                    chord_label = major_chord
+                                else:
+                                    warnings.warn(f"Unknown chord label {chord_label} (even as major), using 'N'")
+                                    chord_label = "N"
+                            else:
+                                warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
+                                chord_label = "N"
 
                         sample_dict = {
                             'spectro': spec[t],
@@ -1276,9 +1319,6 @@ class SynthSegmentSubset(Dataset):
         # Get the sample from the parent dataset
         sample = self.dataset[self.indices[idx]]
 
-        # For compatibility with PyTorch's DataLoader and DistributedSampler,
-        # return a tuple of (inputs, targets) instead of a dict
-        if isinstance(sample, dict) and 'spectro' in sample and 'chord_idx' in sample:
-            return sample['spectro'], sample['chord_idx']
-
+        # Always return the dictionary format for non-distributed training
+        # This ensures compatibility with both distributed and non-distributed modes
         return sample

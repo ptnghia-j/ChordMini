@@ -174,7 +174,7 @@ spec:
               value: /mnt/storage/ChordMini
             # Model scale - overrides student_config.yaml
             - name: MODEL_SCALE
-              value: "1.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
+              value: "2.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
             # Learning rate scheduling options - overrides student_config.yaml settings
             - name: LR_SCHEDULE
               value: "cosine"  # Changed from empty string to 'validation'
@@ -240,7 +240,7 @@ spec:
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: "null"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: "0.01"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
           command:
@@ -570,11 +570,11 @@ spec:
               python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
             requests:
-              cpu: "5"             
+              cpu: "4"             
               memory: "24Gi"    
               nvidia.com/gpu: "1"
             limits:
-              cpu: "10"             
+              cpu: "12"             
               memory: "64Gi" 
               nvidia.com/gpu: "1"
           volumeMounts:
