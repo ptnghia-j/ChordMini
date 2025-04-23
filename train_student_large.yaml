@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-mini-large-02
+  name: chord-mini-large-01
   namespace: csuf-titans
   labels:
     app: chord-student-training
@@ -234,7 +234,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
             - name: SUB_DIR
-              value: "combined-logits-02"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
+              value: "combined-logits-01"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
@@ -245,7 +245,7 @@ spec:
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: "0.2"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: "0.01"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
           command:

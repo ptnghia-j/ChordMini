@@ -604,9 +604,9 @@ def main():
         'frame_duration': config.feature.get('hop_duration', 0.1),
         'verbose': True,
         'device': device,
-        'pin_memory': True,  # Enable pin_memory for faster CPU->GPU transfers
-        'prefetch_factor': float(args.prefetch_factor) if args.prefetch_factor else 2,
-        'num_workers': 8,  # Use multiple workers for better CPU utilization
+        'pin_memory': False,
+        'prefetch_factor': float(args.prefetch_factor) if args.prefetch_factor else 1,
+        'num_workers': 10,
         # debug area
         'require_teacher_logits': use_kd,
         'use_cache': not config.data.get('disable_cache', False),
@@ -653,8 +653,8 @@ def main():
             batch_size=batch_size,
             shuffle=False,  # Don't shuffle here, the sampler will do it
             sampler=train_sampler,
-            num_workers=4,  # Use multiple workers for better CPU utilization
-            pin_memory=True  # Enable pin_memory for faster CPU->GPU transfers
+            num_workers=0,  # Force single worker for GPU optimization
+            pin_memory=False
         )
 
         val_loader = torch.utils.data.DataLoader(
@@ -662,22 +662,22 @@ def main():
             batch_size=batch_size,
             shuffle=False,
             sampler=val_sampler,
-            num_workers=4,  # Use multiple workers for better CPU utilization
-            pin_memory=True  # Enable pin_memory for faster CPU->GPU transfers
+            num_workers=0,  # Force single worker for GPU optimization
+            pin_memory=False
         )
     else:
         train_loader = synth_dataset.get_train_iterator(
             batch_size=batch_size,
             shuffle=True,
-            num_workers=4,  # Use multiple workers for better CPU utilization
-            pin_memory=True  # Enable pin_memory for faster CPU->GPU transfers
+            num_workers=0,  # Force single worker for GPU optimization
+            pin_memory=False
         )
 
         val_loader = synth_dataset.get_eval_iterator(
             batch_size=batch_size,
             shuffle=False,
-            num_workers=4,  # Use multiple workers for better CPU utilization
-            pin_memory=True  # Enable pin_memory for faster CPU->GPU transfers
+            num_workers=0,  # Force single worker for GPU optimization
+            pin_memory=False
         )
 
     logger.info("\n=== Checking data loaders ===")
@@ -789,8 +789,8 @@ def main():
                 replacement=True,
                 num_samples=min(1000, len(synth_dataset))
             ),
-            num_workers=4,  # Use multiple workers for better CPU utilization
-            pin_memory=True  # Enable pin_memory for faster CPU->GPU transfers
+            num_workers=0,
+            pin_memory=False
         )
 
         mean, std = get_quick_dataset_stats(stats_loader, device)
@@ -980,15 +980,15 @@ def main():
                         batch_size=config.training['batch_size'],
                         shuffle=False,
                         sampler=test_sampler,
-                        num_workers=4,  # Use multiple workers for better CPU utilization
-                        pin_memory=True  # Enable pin_memory for faster CPU->GPU transfers
+                        num_workers=0,
+                        pin_memory=False
                     )
                 else:
                     test_loader = synth_dataset.get_test_iterator(
                         batch_size=config.training['batch_size'],
                         shuffle=False,
-                        num_workers=4,  # Use multiple workers for better CPU utilization
-                        pin_memory=True  # Enable pin_memory for faster CPU->GPU transfers
+                        num_workers=0,
+                        pin_memory=False
                     )
 
                 # Basic testing with Tester class
