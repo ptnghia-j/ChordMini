@@ -17,7 +17,8 @@ from collections import Counter
 from modules.utils.mir_eval_modules import large_voca_score_calculation
 from modules.utils.device import get_device, is_cuda_available, is_gpu_available, clear_gpu_cache
 from modules.data.SynthDataset import SynthDataset, SynthSegmentSubset
-from modules.models.Transformer.ChordNet import ChordNet
+# Import BTC model instead of ChordNet
+from modules.models.Transformer.btc_model import BTC_model
 from modules.training.StudentTrainer import StudentTrainer
 from modules.training.DistributedStudentTrainer import DistributedStudentTrainer
 from modules.utils import logger
@@ -149,7 +150,17 @@ def get_quick_dataset_stats(data_loader, device, max_batches=10):
                 break
 
             # Move to CPU explicitly
-            features = batch['spectro'].to('cpu')
+            # Handle both dict and tuple batch formats
+            if isinstance(batch, dict):
+                features = batch.get('spectro')
+            else:
+                features = batch[0] # Assume features are the first element
+
+            if features is None:
+                logger.warning(f"Skipping batch {i} due to missing features.")
+                continue
+
+            features = features.to('cpu')
 
             # Calculate stats
             batch_mean = torch.mean(features).item()
@@ -183,15 +194,17 @@ def get_quick_dataset_stats(data_loader, device, max_batches=10):
 
 def main():
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Train a chord recognition student model using synthesized data")
-    parser.add_argument('--config', type=str, default='./config/student_config.yaml',
-                        help='Path to the configuration file')
+    parser = argparse.ArgumentParser(description="Train a BTC chord recognition model")
+    # Point to btc_config.yaml by default
+    parser.add_argument('--config', type=str, default='./config/btc_config.yaml',
+                        help='Path to the BTC configuration file')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed (overrides config value)')
     parser.add_argument('--save_dir', type=str, default=None,
                         help='Directory to save checkpoints (overrides config value)')
-    parser.add_argument('--model', type=str, default='ChordNet',
-                        help='Model type for evaluation')
+    # Model type defaults to BTC
+    parser.add_argument('--model', type=str, default='BTC',
+                        help='Model type for evaluation (should be BTC)')
     parser.add_argument('--storage_root', type=str, default=None,
                         help='Root directory for data storage (overrides config value)')
     parser.add_argument('--use_warmup', action='store_true',
@@ -227,7 +240,7 @@ def main():
     parser.add_argument('--focal_alpha', type=float, default=None,
                        help='Alpha parameter for focal loss (default: None)')
 
-    # Add knowledge distillation arguments
+    # Add knowledge distillation arguments (can still be used if teacher logits are available)
     parser.add_argument('--use_kd_loss', action='store_true',
                        help='Use knowledge distillation loss (teacher logits must be in batch data)')
     parser.add_argument('--kd_alpha', type=float, default=0.5,
@@ -237,13 +250,10 @@ def main():
     parser.add_argument('--logits_dir', type=str, default=None,
                        help='Directory containing teacher logits (required for KD)')
 
-    # Add model scale argument
-    parser.add_argument('--model_scale', type=float, default=None,
-                       help='Scaling factor for model capacity (0.5=half, 1.0=base, 2.0=double)')
-
-    # Add dropout argument
+    # BTC model doesn't use scale, but dropout is in btc_config
+    # parser.add_argument('--model_scale', type=float, default=None, ...) # Removed
     parser.add_argument('--dropout', type=float, default=None,
-                       help='Dropout probability (0-1)')
+                       help='Dropout probability (overrides config value, affects input, layer, attention, relu)')
 
     # Dataset caching behavior
     parser.add_argument('--disable_cache', action='store_true',
@@ -277,7 +287,7 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=None,
                         help='Base learning rate (overrides config value)')
     parser.add_argument('--min_learning_rate', type=float, default=None,
-                        help='Minimum learning rate for schedulers (overrides config value)')
+                        help='Minimum learning rate for schedulers (default: 0)') # BTC config doesn't specify min_lr
     parser.add_argument('--warmup_end_lr', type=float, default=None,
                        help='Target learning rate at the end of warm-up (default: base LR)')
 
@@ -295,15 +305,24 @@ def main():
 
     args = parser.parse_args()
 
-    # Load configuration from YAML first
+    # Load configuration from YAML first (btc_config.yaml)
     config = HParams.load(args.config)
 
-    # Override config with dataset_type if specified
+    # --- Merge relevant parts from student_config structure if needed ---
+    # Example: Ensure training section exists for compatibility with trainer
+    if not hasattr(config, 'training'):
+        config.training = {}
+    if not hasattr(config, 'misc'):
+        config.misc = {}
+    if not hasattr(config, 'paths'):
+        config.paths = {}
     if not hasattr(config, 'data'):
         config.data = {}
+
+    # Override config with dataset_type if specified
     config.data['dataset_type'] = args.dataset_type
 
-    # Set up distributed training if enabled
+    # Set up distributed training if enabled (same as train_student.py)
     distributed_training = args.distributed
     world_size = 1
     rank = 0
@@ -372,7 +391,8 @@ def main():
 
     # Then check device availability for non-distributed training
     if not distributed_training:
-        if config.misc['use_cuda'] and is_cuda_available():
+        # Use CUDA if available, otherwise CPU
+        if is_cuda_available():
             device = get_device()
             logger.info(f"Using CUDA for training on device: {torch.cuda.get_device_name(0)}")
         else:
@@ -381,49 +401,40 @@ def main():
 
     # Override config values with command line arguments if provided
     config.misc['seed'] = args.seed or config.misc.get('seed', 42)
-    config.paths['checkpoints_dir'] = args.save_dir or config.paths.get('checkpoints_dir', 'checkpoints')
-    config.paths['storage_root'] = args.storage_root or config.paths.get('storage_root', None)
+    config.paths['checkpoints_dir'] = args.save_dir or config.paths.get('ckpt_path', 'checkpoints/btc') # Use ckpt_path from btc_config
+    config.paths['storage_root'] = args.storage_root or config.paths.get('root_path', None) # Use root_path from btc_config
 
-    # Handle learning rate and warmup parameters correctly - FIX FOR WARMUP EPOCHS ISSUE
-    config.training['learning_rate'] = args.learning_rate or config.training.get('learning_rate', 0.0001)
-    config.training['min_learning_rate'] = args.min_learning_rate or config.training.get('min_learning_rate', 5e-6)
+    # Handle learning rate and warmup parameters from btc_config and args
+    # Use experiment section from btc_config
+    config.training['learning_rate'] = args.learning_rate or config.experiment.get('learning_rate', 0.0001)
+    # btc_config doesn't have min_lr, default to 0 or use arg
+    config.training['min_learning_rate'] = args.min_learning_rate or 0.0
 
-    # FIX: Use args.warmup_epochs only if explicitly provided, otherwise keep the config value as is
-    if args.warmup_epochs is not None:
-        config.training['warmup_epochs'] = args.warmup_epochs
-    # Don't set a default if not in config
-
-    # Similarly for other warmup parameters - avoid overriding config with hardcoded defaults
-    if args.warmup_start_lr is not None:
-        config.training['warmup_start_lr'] = args.warmup_start_lr
-    elif 'warmup_start_lr' not in config.training:
-        config.training['warmup_start_lr'] = config.training['learning_rate']/10
-
-    if args.warmup_end_lr is not None:
-        config.training['warmup_end_lr'] = args.warmup_end_lr
-    elif 'warmup_end_lr' not in config.training:
-        config.training['warmup_end_lr'] = config.training['learning_rate']
+    # Warmup args override config (btc_config doesn't have warmup)
+    config.training['use_warmup'] = args.use_warmup
+    config.training['warmup_epochs'] = args.warmup_epochs or 5 # Default warmup epochs if enabled
+    config.training['warmup_start_lr'] = args.warmup_start_lr or config.training['learning_rate'] / 10
+    config.training['warmup_end_lr'] = args.warmup_end_lr or config.training['learning_rate']
 
     # Log parameters that have been overridden
     logger.info(f"Using learning rate: {config.training['learning_rate']}")
     logger.info(f"Using minimum learning rate: {config.training['min_learning_rate']}")
-    if 'warmup_epochs' in config.training:
+    if config.training['use_warmup']:
         logger.info(f"Using warmup_epochs: {config.training['warmup_epochs']}")
-    logger.info(f"Using warmup_start_lr: {config.training.get('warmup_start_lr')}")
-    logger.info(f"Using warmup_end_lr: {config.training.get('warmup_end_lr')}")
+        logger.info(f"Using warmup_start_lr: {config.training.get('warmup_start_lr')}")
+        logger.info(f"Using warmup_end_lr: {config.training.get('warmup_end_lr')}")
 
     # Log training configuration
     logger.info("\n=== Training Configuration ===")
     logger.info(f"Model type: {args.model}")
-    model_scale = args.model_scale or config.model.get('scale', 1.0)
-    logger.info(f"Model scale: {model_scale}")
+    # BTC doesn't use model scale
+    # model_scale = args.model_scale or config.model.get('scale', 1.0)
+    # logger.info(f"Model scale: {model_scale}")
 
     # Log knowledge distillation settings
-    use_kd = args.use_kd_loss if args.use_kd_loss else config.training.get('use_kd_loss', False)
-    use_kd = str(use_kd).lower() == "true"
-
-    kd_alpha = args.kd_alpha or config.training.get('kd_alpha', 0.5)
-    temperature = args.temperature or config.training.get('temperature', 1.0)
+    use_kd = args.use_kd_loss # KD is optional for BTC
+    kd_alpha = args.kd_alpha
+    temperature = args.temperature
 
     if use_kd:
         logger.info("\n=== Knowledge Distillation Enabled ===")
@@ -437,18 +448,21 @@ def main():
         logger.info("Knowledge distillation is disabled, using standard loss")
 
     # Log focal loss settings
-    if args.use_focal_loss or config.training.get('use_focal_loss', False):
+    use_focal = args.use_focal_loss # Focal loss is optional
+    focal_gamma = args.focal_gamma
+    focal_alpha = args.focal_alpha
+    if use_focal:
         logger.info("\n=== Focal Loss Enabled ===")
-        logger.info(f"Gamma: {args.focal_gamma or config.training.get('focal_gamma', 2.0)}")
-        if args.focal_alpha or config.training.get('focal_alpha'):
-            logger.info(f"Alpha: {args.focal_alpha or config.training.get('focal_alpha')}")
+        logger.info(f"Gamma: {focal_gamma}")
+        if focal_alpha:
+            logger.info(f"Alpha: {focal_alpha}")
     else:
         logger.info("Using standard cross-entropy loss")
 
     # Clear summary of loss function configuration
-    if use_kd and (args.use_focal_loss or config.training.get('use_focal_loss', False)):
+    if use_kd and use_focal:
         logger.info("\n=== Final Loss Configuration ===")
-        logger.info(f"Using Focal Loss (gamma={args.focal_gamma or config.training.get('focal_gamma', 2.0)}, alpha={args.focal_alpha or config.training.get('focal_alpha')}) combined with KD Loss")
+        logger.info(f"Using Focal Loss (gamma={focal_gamma}, alpha={focal_alpha}) combined with KD Loss")
         logger.info(f"KD formula: final_loss = {kd_alpha} * KL_div_loss + {1-kd_alpha} * focal_loss")
         logger.info(f"Note: When teacher logits are not available for a batch, only focal loss will be used")
     elif use_kd:
@@ -456,9 +470,9 @@ def main():
         logger.info(f"Using standard Cross Entropy combined with KD Loss")
         logger.info(f"KD formula: final_loss = {kd_alpha} * KL_div_loss + {1-kd_alpha} * cross_entropy")
         logger.info(f"Note: When teacher logits are not available for a batch, only cross entropy will be used")
-    elif args.use_focal_loss or config.training.get('use_focal_loss', False):
+    elif use_focal:
         logger.info("\n=== Final Loss Configuration ===")
-        logger.info(f"Using only Focal Loss with gamma={args.focal_gamma or config.training.get('focal_gamma', 2.0)}, alpha={args.focal_alpha or config.training.get('focal_alpha')}")
+        logger.info(f"Using only Focal Loss with gamma={focal_gamma}, alpha={focal_alpha}")
     else:
         logger.info("\n=== Final Loss Configuration ===")
         logger.info("Using only standard Cross Entropy Loss")
@@ -493,7 +507,7 @@ def main():
         logger.info(f"Random seed set to {seed}")
 
     # Set up logging
-    logger.logging_verbosity(config.misc['logging_level'])
+    logger.logging_verbosity(config.misc.get('logging_level', 1))
 
     # Get project root and storage root
     project_root = os.path.dirname(os.path.abspath(__file__))
@@ -502,14 +516,15 @@ def main():
     logger.info(f"Storage root: {storage_root}")
 
     # Resolve primary paths from config, with CLI override
-    spec_dir_config = resolve_path(args.spec_dir or config.paths.get('spec_dir', 'data/logits/synth/spectrograms'),
+    # btc_config doesn't define spec/label dirs, use args or defaults
+    spec_dir_config = resolve_path(args.spec_dir or 'data/logits/synth/spectrograms',
                                   storage_root, project_root)
-    label_dir_config = resolve_path(args.label_dir or config.paths.get('label_dir', 'data/logits/synth/labels'),
+    label_dir_config = resolve_path(args.label_dir or 'data/logits/synth/labels',
                                    storage_root, project_root)
 
-    # Resolve alternative paths if available
-    alt_spec_dir = resolve_path(config.paths.get('alt_spec_dir'), storage_root, project_root) if config.paths.get('alt_spec_dir') else None
-    alt_label_dir = resolve_path(config.paths.get('alt_label_dir'), storage_root, project_root) if config.paths.get('alt_label_dir') else None
+    # Resolve alternative paths if available (not in btc_config)
+    alt_spec_dir = None
+    alt_label_dir = None
 
     logger.info(f"Looking for data files:")
 
@@ -528,10 +543,12 @@ def main():
         fma_label_dir, fma_label_count = find_data_directory(label_dir_config, alt_label_dir, "*.lab", "FMA label")
         fma_logits_dir = None
         if args.logits_dir:
+            # If logits_dir is provided via arg, assume it's for FMA in combined mode
             fma_logits_dir, _ = find_data_directory(args.logits_dir, None, "*.npy", "FMA logits")
         else:
-            # Use standard path for FMA logits
-            fma_logits_dir = os.path.join(data_root, "logits/synth/logits")
+            # Use standard path for FMA logits if KD is enabled
+            if use_kd:
+                fma_logits_dir = os.path.join(data_root, "logits/synth/logits")
 
         # Find Maestro data directories
         maestro_spec_count = count_files_in_subdirectories(maestro_spec_dir, "*.npy")
@@ -552,7 +569,8 @@ def main():
         # Use lists for spec_dir, label_dir, and logits_dir in combined mode
         spec_dir = [fma_spec_dir, maestro_spec_dir]
         label_dir = [fma_label_dir, maestro_label_dir]
-        logits_dir = [fma_logits_dir, maestro_logits_dir]
+        # Only include logits dirs if KD is enabled
+        logits_dir = [fma_logits_dir, maestro_logits_dir] if use_kd else None
 
     else:
         # Original single dataset mode
@@ -566,7 +584,8 @@ def main():
         # Use single directories for spec_dir, label_dir
         spec_dir = synth_spec_dir
         label_dir = synth_label_dir
-        logits_dir = args.logits_dir
+        # Use logits_dir arg only if KD is enabled
+        logits_dir = args.logits_dir if use_kd else None
 
     # Use the mapping defined in chords.py
     master_mapping = idx2voca_chord()
@@ -585,7 +604,7 @@ def main():
     logger.info(f"Sample chord mapping: {dict(list(chord_mapping.items())[:5])}")
 
     # Resolve checkpoints directory path
-    checkpoints_dir_config = config.paths.get('checkpoints_dir', 'checkpoints')
+    checkpoints_dir_config = config.paths.get('ckpt_path', 'checkpoints/btc') # Use ckpt_path from btc_config
     checkpoints_dir = resolve_path(checkpoints_dir_config, storage_root, project_root)
     os.makedirs(checkpoints_dir, exist_ok=True)
     logger.info(f"Checkpoints will be saved to: {checkpoints_dir}")
@@ -593,27 +612,26 @@ def main():
     # Initialize SynthDataset with optimized settings
     logger.info("\n=== Creating dataset ===")
 
-
+    # Use values from btc_config where appropriate
     dataset_args.update({
         'spec_dir': spec_dir,
         'label_dir': label_dir,
-        'logits_dir': logits_dir,
+        'logits_dir': logits_dir, # Pass resolved logits_dir
         'chord_mapping': chord_mapping,
-        'seq_len': config.training.get('seq_len', 10),
-        'stride': config.training.get('seq_stride', 5),
-        'frame_duration': config.feature.get('hop_duration', 0.1),
+        'seq_len': config.model.get('seq_len', 108), # From btc_config.model
+        'stride': config.model.get('stride', 108), # From btc_config.model
+        'frame_duration': config.model.get('frame_duration', 0.09288), # From btc_config.model
         'verbose': True,
         'device': device,
-        'pin_memory': True,  # Enable pin_memory for faster CPU->GPU transfers
-        'prefetch_factor': float(args.prefetch_factor) if args.prefetch_factor else 2,
-        'num_workers': 8,  # Use multiple workers for better CPU utilization
-        # debug area
+        'pin_memory': False,
+        'prefetch_factor': float(args.prefetch_factor) if args.prefetch_factor else 1,
+        'num_workers': 10,
         'require_teacher_logits': use_kd,
-        'use_cache': not config.data.get('disable_cache', False),
-        'metadata_only': str(args.metadata_cache).lower() == "true",
-        'cache_fraction': config.data.get('cache_fraction', 0.1),
-        'lazy_init': str(args.lazy_init).lower() == "true",
-        'batch_gpu_cache': str(args.batch_gpu_cache).lower() == "true",
+        'use_cache': not args.disable_cache, # Use arg directly
+        'metadata_only': args.metadata_cache, # Use arg directly
+        'cache_fraction': args.cache_fraction, # Use arg directly
+        'lazy_init': args.lazy_init, # Use arg directly
+        'batch_gpu_cache': args.batch_gpu_cache, # Use arg directly
     })
 
     # Create the dataset
@@ -624,7 +642,7 @@ def main():
     synth_dataset = SynthDataset(**dataset_args)
 
     # Create data loaders for each subset
-    batch_size = config.training.get('batch_size', 16)
+    batch_size = config.experiment.get('batch_size', 128) # From btc_config.experiment
     logger.info(f"Using batch size: {batch_size}")
 
     if distributed_training:
@@ -653,8 +671,8 @@ def main():
             batch_size=batch_size,
             shuffle=False,  # Don't shuffle here, the sampler will do it
             sampler=train_sampler,
-            num_workers=4,  # Use multiple workers for better CPU utilization
-            pin_memory=True  # Enable pin_memory for faster CPU->GPU transfers
+            num_workers=0,  # Force single worker for GPU optimization
+            pin_memory=False
         )
 
         val_loader = torch.utils.data.DataLoader(
@@ -662,22 +680,22 @@ def main():
             batch_size=batch_size,
             shuffle=False,
             sampler=val_sampler,
-            num_workers=4,  # Use multiple workers for better CPU utilization
-            pin_memory=True  # Enable pin_memory for faster CPU->GPU transfers
+            num_workers=0,  # Force single worker for GPU optimization
+            pin_memory=False
         )
     else:
         train_loader = synth_dataset.get_train_iterator(
             batch_size=batch_size,
             shuffle=True,
-            num_workers=4,  # Use multiple workers for better CPU utilization
-            pin_memory=True  # Enable pin_memory for faster CPU->GPU transfers
+            num_workers=0,  # Force single worker for GPU optimization
+            pin_memory=False
         )
 
         val_loader = synth_dataset.get_eval_iterator(
             batch_size=batch_size,
             shuffle=False,
-            num_workers=4,  # Use multiple workers for better CPU utilization
-            pin_memory=True  # Enable pin_memory for faster CPU->GPU transfers
+            num_workers=0,  # Force single worker for GPU optimization
+            pin_memory=False
         )
 
     logger.info("\n=== Checking data loaders ===")
@@ -710,36 +728,22 @@ def main():
     # Initialize model
     logger.info("\n=== Creating model ===")
 
-    # Get frequency dimension and class count
-    n_freq = getattr(config.feature, 'freq_bins', 144)
-    n_classes = len(chord_mapping)
+    # Get frequency dimension and class count from btc_config
+    n_freq = config.model.get('feature_size', 144)
+    n_classes = config.model.get('num_chords', 170)
     logger.info(f"Using frequency dimension: {n_freq}")
     logger.info(f"Output classes: {n_classes}")
 
-    # Apply model scale factor
-    if model_scale != 1.0:
-        n_group = max(1, int(32 * model_scale))
-        logger.info(f"Using n_group={n_group}, resulting in feature dimension: {n_freq // n_group}")
-    else:
-        n_group = config.model.get('n_group', 32)
+    # Override dropout if provided via args
+    if args.dropout is not None:
+        config.model['input_dropout'] = args.dropout
+        config.model['layer_dropout'] = args.dropout
+        config.model['attention_dropout'] = args.dropout
+        config.model['relu_dropout'] = args.dropout
+        logger.info(f"Overriding dropout rates with: {args.dropout}")
 
-    # Get dropout value
-    dropout_rate = args.dropout if args.dropout is not None else config.model.get('dropout', 0.3)
-    logger.info(f"Using dropout rate: {dropout_rate}")
-
-    # Create model instance
-    model = ChordNet(
-        n_freq=n_freq,
-        n_classes=n_classes,
-        n_group=n_group,
-        f_layer=config.model.get('base_config', {}).get('f_layer', 3),
-        f_head=config.model.get('base_config', {}).get('f_head', 6),
-        t_layer=config.model.get('base_config', {}).get('t_layer', 3),
-        t_head=config.model.get('base_config', {}).get('t_head', 6),
-        d_layer=config.model.get('base_config', {}).get('d_layer', 3),
-        d_head=config.model.get('base_config', {}).get('d_head', 6),
-        dropout=dropout_rate
-    ).to(device)
+    # Create model instance using the model sub-config
+    model = BTC_model(config=config.model).to(device)
 
     # Wrap model with DistributedDataParallel if using distributed training
     if distributed_training:
@@ -747,22 +751,23 @@ def main():
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=False
+            find_unused_parameters=False # Set to True if encountering issues with unused params
         )
         logger.info(f"Model wrapped with DistributedDataParallel (rank {rank})")
 
     # Attach chord mapping to model
     if distributed_training:
+        # Access the underlying model instance
         model.module.idx_to_chord = master_mapping
     else:
         model.idx_to_chord = master_mapping
     logger.info("Attached chord mapping to model for correct MIR evaluation")
 
-    # Create optimizer
+    # Create optimizer using parameters from btc_config.experiment
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=config.training['learning_rate'],
-        weight_decay=config.training.get('weight_decay', 0.0)
+        lr=config.training['learning_rate'], # Use potentially overridden LR
+        weight_decay=config.experiment.get('weight_decay', 0.0)
     )
 
     # Clean up GPU memory before training
@@ -780,7 +785,7 @@ def main():
         logger.info("Calculating global mean and std for normalization...")
 
         # Create stats loader
-        stats_batch_size = min(16, config.training['batch_size'])
+        stats_batch_size = min(16, batch_size) # Use calculated batch_size
         stats_loader = torch.utils.data.DataLoader(
             synth_dataset,
             batch_size=stats_batch_size,
@@ -789,8 +794,8 @@ def main():
                 replacement=True,
                 num_samples=min(1000, len(synth_dataset))
             ),
-            num_workers=4,  # Use multiple workers for better CPU utilization
-            pin_memory=True  # Enable pin_memory for faster CPU->GPU transfers
+            num_workers=0,
+            pin_memory=False
         )
 
         mean, std = get_quick_dataset_stats(stats_loader, device)
@@ -815,68 +820,40 @@ def main():
     if args.lr_schedule in ['validation', 'none']:
         lr_schedule_type = None
     else:
-        lr_schedule_type = args.lr_schedule or config.training.get('lr_schedule', None)
+        # Use arg if provided, otherwise btc_config doesn't specify schedule
+        lr_schedule_type = args.lr_schedule
 
     # Create trainer based on whether we're using distributed training
+    trainer_class = DistributedStudentTrainer if distributed_training else StudentTrainer
+    trainer_args = {
+        'model': model,
+        'optimizer': optimizer,
+        'device': device,
+        'num_epochs': config.experiment.get('max_epoch', 100), # From btc_config.experiment
+        'logger': logger,
+        'checkpoint_dir': checkpoints_dir,
+        'class_weights': None, # Focal loss or standard CE handles weights
+        'idx_to_chord': master_mapping,
+        'normalization': normalization,
+        'early_stopping_patience': config.training.get('early_stopping_patience', 10), # Use value from merged config
+        'lr_decay_factor': config.training.get('lr_decay_factor', 0.95), # Use value from merged config
+        'min_lr': config.training.get('min_learning_rate', 0.0), # Use value from merged config
+        'use_warmup': config.training['use_warmup'],
+        'warmup_epochs': config.training.get('warmup_epochs'),
+        'warmup_start_lr': config.training.get('warmup_start_lr'),
+        'warmup_end_lr': config.training.get('warmup_end_lr'),
+        'lr_schedule_type': lr_schedule_type,
+        'use_focal_loss': use_focal,
+        'focal_gamma': focal_gamma,
+        'focal_alpha': focal_alpha,
+        'use_kd_loss': use_kd,
+        'kd_alpha': kd_alpha,
+        'temperature': temperature,
+    }
     if distributed_training:
-        # We don't need to wrap the model's forward method anymore since we're using SynthSegmentSubset
-        # which already returns the correct format (spectro, chord_idx)
+        trainer_args.update({'rank': rank, 'world_size': world_size})
 
-        trainer = DistributedStudentTrainer(
-            model=model,
-            optimizer=optimizer,
-            device=device,
-            num_epochs=config.training.get('num_epochs', config.training.get('max_epochs', 100)),
-            logger=logger,
-            checkpoint_dir=checkpoints_dir,
-            class_weights=None,
-            idx_to_chord=master_mapping,
-            normalization=normalization,
-            early_stopping_patience=config.training.get('early_stopping_patience', 5),
-            lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
-            min_lr=config.training.get('min_learning_rate', 5e-6),
-            use_warmup=args.use_warmup or config.training.get('use_warmup', False),
-            # IMPORTANT: Use config.training.get() to avoid None errors if not set in config
-            warmup_epochs=config.training.get('warmup_epochs'),
-            warmup_start_lr=config.training.get('warmup_start_lr'),
-            warmup_end_lr=config.training.get('warmup_end_lr'),
-            lr_schedule_type=lr_schedule_type,
-            use_focal_loss=args.use_focal_loss or config.training.get('use_focal_loss', False),
-            focal_gamma=args.focal_gamma or config.training.get('focal_gamma', 2.0),
-            focal_alpha=args.focal_alpha or config.training.get('focal_alpha', None),
-            use_kd_loss=use_kd,
-            kd_alpha=kd_alpha,
-            temperature=temperature,
-            rank=rank,
-            world_size=world_size
-        )
-    else:
-        trainer = StudentTrainer(
-            model=model,
-            optimizer=optimizer,
-            device=device,
-            num_epochs=config.training.get('num_epochs', config.training.get('max_epochs', 100)),
-            logger=logger,
-            checkpoint_dir=checkpoints_dir,
-            class_weights=None,
-            idx_to_chord=master_mapping,
-            normalization=normalization,
-            early_stopping_patience=config.training.get('early_stopping_patience', 5),
-            lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
-            min_lr=config.training.get('min_learning_rate', 5e-6),
-            use_warmup=args.use_warmup or config.training.get('use_warmup', False),
-            # IMPORTANT: Use config.training.get() to avoid None errors if not set in config
-            warmup_epochs=config.training.get('warmup_epochs'),
-            warmup_start_lr=config.training.get('warmup_start_lr'),
-            warmup_end_lr=config.training.get('warmup_end_lr'),
-            lr_schedule_type=lr_schedule_type,
-            use_focal_loss=args.use_focal_loss or config.training.get('use_focal_loss', False),
-            focal_gamma=args.focal_gamma or config.training.get('focal_gamma', 2.0),
-            focal_alpha=args.focal_alpha or config.training.get('focal_alpha', None),
-            use_kd_loss=use_kd,
-            kd_alpha=kd_alpha,
-            temperature=temperature,
-        )
+    trainer = trainer_class(**trainer_args)
 
     # Set chord mapping in trainer
     trainer.set_chord_mapping(chord_mapping)
@@ -890,7 +867,13 @@ def main():
                 checkpoint = torch.load(args.load_checkpoint, map_location=device)
 
                 # Load model weights
-                model.load_state_dict(checkpoint['model_state_dict'])
+                # Handle potential DDP prefix mismatch
+                state_dict = checkpoint['model_state_dict']
+                if distributed_training and not list(state_dict.keys())[0].startswith('module.'):
+                    state_dict = {'module.' + k: v for k, v in state_dict.items()}
+                elif not distributed_training and list(state_dict.keys())[0].startswith('module.'):
+                    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+                model.load_state_dict(state_dict)
                 logger.info("Model state loaded successfully")
 
                 # Load optimizer state if available
@@ -909,7 +892,7 @@ def main():
                     # Handle scheduler reset if requested
                     if args.reset_scheduler:
                         logger.info("Reset scheduler flag set - Starting with fresh learning rate schedule")
-                        if args.use_warmup or config.training.get('use_warmup', False):
+                        if config.training['use_warmup']:
                             warmup_start_lr = config.training.get('warmup_start_lr')
                             if warmup_start_lr is not None:
                                 for param_group in optimizer.param_groups:
@@ -950,7 +933,7 @@ def main():
         logger.info("No checkpoint specified, starting from scratch")
 
     # Run training
-    logger.info(f"\n=== Starting training from epoch {start_epoch}/{config.training.get('num_epochs', 100)} ===")
+    logger.info(f"\n=== Starting training from epoch {start_epoch}/{config.experiment.get('max_epoch', 100)} ===")
     try:
         logger.info("Preparing data (this may take a while for large datasets)...")
         trainer.train(train_loader, val_loader, start_epoch=start_epoch)
@@ -965,6 +948,8 @@ def main():
     if not distributed_training or (distributed_training and rank == 0):
         logger.info("\n=== Testing ===")
         try:
+            # Use btc_model_best.pth
+            trainer.best_model_path = os.path.join(checkpoints_dir, "btc_model_best.pth")
             if trainer.load_best_model():
                 # Create test loader with distributed sampler if needed
                 if distributed_training:
@@ -977,18 +962,18 @@ def main():
                     )
                     test_loader = torch.utils.data.DataLoader(
                         test_subset,
-                        batch_size=config.training['batch_size'],
+                        batch_size=batch_size, # Use calculated batch_size
                         shuffle=False,
                         sampler=test_sampler,
-                        num_workers=4,  # Use multiple workers for better CPU utilization
-                        pin_memory=True  # Enable pin_memory for faster CPU->GPU transfers
+                        num_workers=0,
+                        pin_memory=False
                     )
                 else:
                     test_loader = synth_dataset.get_test_iterator(
-                        batch_size=config.training['batch_size'],
+                        batch_size=batch_size, # Use calculated batch_size
                         shuffle=False,
-                        num_workers=4,  # Use multiple workers for better CPU utilization
-                        pin_memory=True  # Enable pin_memory for faster CPU->GPU transfers
+                        num_workers=0,
+                        pin_memory=False
                     )
 
                 # Basic testing with Tester class
@@ -1025,10 +1010,8 @@ def main():
                     with torch.no_grad():
                         for batch in test_loader:
                             if distributed_training:
-                                # In distributed mode with direct DataLoader, batch is a tuple of (inputs, targets)
                                 inputs, targets = batch
                             else:
-                                # In non-distributed mode with SynthDataset's iterator, batch is a dict
                                 inputs, targets = batch['spectro'], batch['chord_idx']
                             inputs = inputs.to(device)
                             targets = targets.to(device)
@@ -1044,8 +1027,9 @@ def main():
                             else:
                                 logits = outputs
 
-                            if logits.ndim == 3 and targets.ndim <= 2:
-                                logits = logits.mean(dim=1)  # Average over time dimension
+                            # BTC model outputs [batch, time, classes], average over time for eval
+                            if logits.ndim == 3:
+                                logits = logits.mean(dim=1)
 
                             preds = logits.argmax(dim=1)
                             all_preds.extend(preds.cpu().numpy())
@@ -1126,26 +1110,29 @@ def main():
 
     # Save the final model
     try:
-        save_path = os.path.join(checkpoints_dir, "student_model_final.pth")
+        # Use btc_model_final.pth
+        save_path = os.path.join(checkpoints_dir, "btc_model_final.pth")
+        # Save the underlying model if using DDP
+        model_to_save = model.module if distributed_training else model
         torch.save({
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': model_to_save.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'chord_mapping': chord_mapping,
             'idx_to_chord': master_mapping,
             'mean': normalization['mean'].cpu().numpy() if hasattr(normalization['mean'], 'cpu') else normalization['mean'],
             'std': normalization['std'].cpu().numpy() if hasattr(normalization['std'], 'cpu') else normalization['std']
         }, save_path)
-        logger.info(f"Final model saved to {save_path}")
+        logger.info(f"Final BTC model saved to {save_path}")
     except Exception as e:
-        logger.error(f"Error saving final model: {e}")
+        logger.error(f"Error saving final BTC model: {e}")
 
-    logger.info("Student training and evaluation complete!")
+    logger.info("BTC training and evaluation complete!")
 
 def distributed_main(local_rank, world_size, args):
     """Main function for distributed training."""
     # Set up distributed environment
     os.environ['MASTER_ADDR'] = '127.0.0.1'
-    os.environ['MASTER_PORT'] = '29500'
+    os.environ['MASTER_PORT'] = '29500' # Use a different port if running simultaneously with student training
     dist.init_process_group(backend=args.distributed_backend or 'nccl',
                            world_size=world_size,
                            rank=local_rank)

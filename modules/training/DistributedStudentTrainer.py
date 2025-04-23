@@ -111,7 +111,7 @@ class DistributedStudentTrainer(StudentTrainer):
             total += batch_size
 
             # Log progress
-            if batch_idx % 10 == 0 and self.is_main_process:
+            if batch_idx % 100 == 0 and self.is_main_process:
                 info(f'Epoch: {epoch} | Batch: {batch_idx}/{len(train_loader)} | '
                      f'Loss: {batch_result["loss"]:.4f} | Acc: {batch_result["accuracy"]*100:.2f}%')
 
@@ -193,21 +193,25 @@ class DistributedStudentTrainer(StudentTrainer):
                 # Get input and target
                 if isinstance(batch, dict) and 'spectro' in batch:
                     # Handle dictionary format from SynthDataset's iterator
-                    spectro = batch['spectro'].to(self.device)
-                    targets = batch['chord_idx'].to(self.device)
+                    spectro = batch['spectro']
+                    targets = batch['chord_idx']
 
                     # Get teacher logits if using knowledge distillation
                     teacher_logits = None
                     if self.use_kd_loss and 'teacher_logits' in batch:
-                        teacher_logits = batch['teacher_logits'].to(self.device)
+                        teacher_logits = batch['teacher_logits']
                 else:
                     # Handle tuple format from distributed DataLoader
                     spectro, targets = batch
-                    spectro = spectro.to(self.device)
-                    targets = targets.to(self.device)
+                    teacher_logits = None  # No teacher logits in this format
 
-                    # No teacher logits in this format
-                    teacher_logits = None
+                # Move data to device if not already there
+                if spectro.device != self.device:
+                    spectro = spectro.to(self.device, non_blocking=True)
+                if targets.device != self.device:
+                    targets = targets.to(self.device, non_blocking=True)
+                if teacher_logits is not None and teacher_logits.device != self.device:
+                    teacher_logits = teacher_logits.to(self.device, non_blocking=True)
 
                 # Normalize input
                 if self.normalization:

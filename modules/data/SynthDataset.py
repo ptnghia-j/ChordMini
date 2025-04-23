@@ -95,7 +95,7 @@ class SynthDataset(Dataset):
         # Check for CUDA availability
         self.cuda_available = torch.cuda.is_available()
 
-        # Force num_workers to 0 for GPU compatibility
+        # Allow num_workers to be set based on user input
         self.num_workers = num_workers
 
         # Initialize basic parameters
@@ -117,10 +117,10 @@ class SynthDataset(Dataset):
             warnings.warn(f"Unknown dataset_type '{dataset_type}', defaulting to 'fma'")
             self.dataset_type = 'fma'
 
-        # Disable pin_memory since we're using a single worker
-        self.pin_memory = True
-        if pin_memory and verbose:
-            print("Disabling pin_memory since we're using a single worker")
+        # Set pin_memory based on user input
+        self.pin_memory = pin_memory
+        if self.verbose and pin_memory:
+            print(f"Using pin_memory={pin_memory} for faster CPU->GPU transfers")
 
         self.prefetch_factor = prefetch_factor
         self.batch_gpu_cache = batch_gpu_cache
@@ -153,9 +153,16 @@ class SynthDataset(Dataset):
         if self.verbose:
             print(f"Using device: {self.device}")
 
-        # Initialize GPU batch cache cautiously
+        # Initialize GPU batch cache cautiously - disable if using multiple workers
         try:
-            self.gpu_batch_cache = {} if self.batch_gpu_cache and self.device.type == 'cuda' else None
+            # Disable batch_gpu_cache if num_workers > 0 as it's designed for single-worker GPU loading
+            if self.num_workers > 0 and self.batch_gpu_cache:
+                if self.verbose:
+                    print(f"Disabling batch_gpu_cache since num_workers={self.num_workers} > 0")
+                self.batch_gpu_cache = False
+                self.gpu_batch_cache = None
+            else:
+                self.gpu_batch_cache = {} if self.batch_gpu_cache and self.device.type == 'cuda' else None
         except Exception as e:
             if self.verbose:
                 print(f"Warning: Could not initialize GPU batch cache: {e}")
@@ -1016,34 +1023,34 @@ class SynthDataset(Dataset):
                     if sample_i.get('frame_idx') is not None and len(spec.shape) > 1:
                         frame_idx = sample_i['frame_idx']
                         if frame_idx < spec.shape[0]:
-                            spec_vec = torch.from_numpy(spec[frame_idx]).to(dtype=torch.float, device=self.device)
+                            spec_vec = torch.from_numpy(spec[frame_idx]).to(dtype=torch.float)
                         else:
                             # Use zero tensor for out-of-bounds frame
                             padding_shape = sequence[-1].shape if sequence else (144,)
-                            spec_vec = torch.zeros(padding_shape, dtype=torch.float, device=self.device)
+                            spec_vec = torch.zeros(padding_shape, dtype=torch.float)
                     else:
                         # Single-frame spectrogram
-                        spec_vec = torch.from_numpy(spec).to(dtype=torch.float, device=self.device)
+                        spec_vec = torch.from_numpy(spec).to(dtype=torch.float)
                 except Exception:
                     # Handle loading errors with zero tensor
                     padding_shape = sequence[-1].shape if sequence else (144,)
-                    spec_vec = torch.zeros(padding_shape, dtype=torch.float, device=self.device)
+                    spec_vec = torch.zeros(padding_shape, dtype=torch.float)
             else:
                 # Use stored spectrogram if available
                 if 'spectro' in sample_i:
                     if isinstance(sample_i['spectro'], np.ndarray):
-                        spec_vec = torch.from_numpy(sample_i['spectro']).to(dtype=torch.float, device=self.device)
+                        spec_vec = torch.from_numpy(sample_i['spectro']).to(dtype=torch.float)
                     else:
-                        spec_vec = sample_i['spectro'].clone().detach().to(self.device)
+                        spec_vec = sample_i['spectro'].clone().detach()
                 else:
                     # Use zero tensor if no spectrogram data
                     padding_shape = sequence[-1].shape if sequence else (144,)
-                    spec_vec = torch.zeros(padding_shape, dtype=torch.float, device=self.device)
+                    spec_vec = torch.zeros(padding_shape, dtype=torch.float)
 
             # Get chord label index
             chord_label = sample_i['chord_label']
             chord_idx = self.chord_to_idx.get(chord_label, self.chord_to_idx.get("N", 0))
-            chord_idx_tensor = torch.tensor(chord_idx, dtype=torch.long, device=self.device)
+            chord_idx_tensor = torch.tensor(chord_idx, dtype=torch.long)
 
             # Add spectrogram and chord label to sequences
             sequence.append(spec_vec)
@@ -1053,9 +1060,9 @@ class SynthDataset(Dataset):
             if 'teacher_logits' in sample_i:
                 # Use stored teacher logits
                 if isinstance(sample_i['teacher_logits'], np.ndarray):
-                    logits_tensor = torch.from_numpy(sample_i['teacher_logits']).to(dtype=torch.float, device=self.device)
+                    logits_tensor = torch.from_numpy(sample_i['teacher_logits']).to(dtype=torch.float)
                 else:
-                    logits_tensor = sample_i['teacher_logits'].clone().detach().to(self.device)
+                    logits_tensor = sample_i['teacher_logits'].clone().detach()
 
                 # Just store the original logits - we'll process them all at once later
                 teacher_logits_seq.append(logits_tensor)
@@ -1079,7 +1086,7 @@ class SynthDataset(Dataset):
                         logits_vec = logits
 
                     # Convert to tensor without reshaping yet
-                    logits_tensor = torch.from_numpy(logits_vec).to(dtype=torch.float, device=self.device)
+                    logits_tensor = torch.from_numpy(logits_vec).to(dtype=torch.float)
                     teacher_logits_seq.append(logits_tensor)
                     has_teacher_logits = True
 
@@ -1108,12 +1115,12 @@ class SynthDataset(Dataset):
             padding_needed = self.seq_len - current_len
             padding_shape = sequence[-1].shape if sequence else (144,)
             for _ in range(padding_needed):
-                sequence.append(torch.zeros(padding_shape, dtype=torch.float, device=self.device))
-                label_seq.append(torch.tensor(self.chord_to_idx.get("N", 0), dtype=torch.long, device=self.device))
+                sequence.append(torch.zeros(padding_shape, dtype=torch.float))
+                label_seq.append(torch.tensor(self.chord_to_idx.get("N", 0), dtype=torch.long))
 
                 if has_teacher_logits and teacher_logits_seq:
                     logits_shape = teacher_logits_seq[0].shape
-                    teacher_logits_seq.append(torch.zeros(logits_shape, dtype=torch.float, device=self.device))
+                    teacher_logits_seq.append(torch.zeros(logits_shape, dtype=torch.float))
 
         # Create the output dictionary
         sample_out = {
@@ -1205,6 +1212,15 @@ class SynthDataset(Dataset):
         Returns:
             DataLoader object
         """
+        # Use class defaults if parameters are not provided
+        if num_workers is None:
+            num_workers = self.num_workers
+        if pin_memory is None:
+            pin_memory = self.pin_memory
+
+        if self.verbose:
+            print(f"Creating {name} DataLoader with num_workers={num_workers}, pin_memory={pin_memory}")
+
         if not indices:
             warnings.warn(f"No {name} segments available")
             return DataLoader(
