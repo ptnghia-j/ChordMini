@@ -403,9 +403,6 @@ spec:
                 ${CHECKPOINT_ARG} ${SMALL_DATASET_ARG}
 
               echo "=== BTC model training complete ==="
-
-              # Clear GPU cache
-              python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
             # Match resources from train_student.yaml
             requests:

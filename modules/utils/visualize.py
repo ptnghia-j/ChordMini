@@ -96,8 +96,12 @@ def plot_confusion_matrix(y_true, y_pred, class_names=None, normalize=True, titl
 
     # Normalize if requested
     if normalize:
-        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-        cm = np.nan_to_num(cm)  # Replace NaN with zero
+        # Handle division by zero by adding a small epsilon to avoid warnings
+        row_sums = cm.sum(axis=1)[:, np.newaxis]
+        # Add a small epsilon to avoid division by zero
+        row_sums = np.where(row_sums == 0, 1e-10, row_sums)
+        cm = cm.astype('float') / row_sums
+        cm = np.nan_to_num(cm)  # Replace any remaining NaN with zero
 
     # Create the figure and axes
     fig, ax = plt.subplots(figsize=figsize)
@@ -210,6 +214,8 @@ def plot_class_distribution(y_true, class_names=None, figsize=(12, 8), title='Cl
         # Ensure directory exists
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+        # Close the figure to free memory
+        plt.close(fig)
 
     return fig
 
@@ -916,6 +922,8 @@ def plot_chord_quality_distribution_accuracy(predictions, targets, idx_to_chord,
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+        # Close the figure to free memory
+        plt.close(fig)
 
     return fig
 
@@ -956,6 +964,8 @@ def plot_learning_curve(train_loss, val_loss=None, title='Learning Curve', figsi
         # Ensure directory exists
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+        # Close the figure to free memory
+        plt.close(fig)
 
     return fig
 
@@ -1014,5 +1024,7 @@ def visualize_transitions(hmm_model, idx_to_chord, top_k=10, save_path='transiti
         # Ensure directory exists
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+        # Close the figure to free memory
+        plt.close(fig)
 
     return fig

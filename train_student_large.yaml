@@ -579,9 +579,6 @@ spec:
                 ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS}
 
               echo "=== Student model training complete ==="
-
-              # Clear GPU cache to release memory before exiting
-              python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
             requests:
               # cpu: "3"

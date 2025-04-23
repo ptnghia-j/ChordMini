@@ -1145,6 +1145,14 @@ def main():
 
     logger.info("Student training and evaluation complete!")
 
+    # Clear GPU cache before exiting
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info("GPU cache cleared")
+    except Exception as e:
+        logger.error(f"Error clearing GPU cache: {e}")
+
 def distributed_main(local_rank, world_size, args):
     """Main function for distributed training."""
     # Set up distributed environment

@@ -195,6 +195,28 @@ class BTC_model(nn.Module):
         # If attention weights are needed later, modify Trainer or return a tuple/dict.
         return logits
 
+    def predict(self, x):
+        """Predict method for compatibility with evaluation functions.
+
+        Args:
+            x: Input tensor of shape [batch, time, features] or [batch, 1, time, features]
+
+        Returns:
+            Predicted class indices of shape [batch, time]
+        """
+        with torch.no_grad():
+            # Get logits from forward pass
+            logits = self(x)
+
+            # For BTC model, output is [batch, time, classes]
+            # We need to get the predicted class indices
+            if logits.dim() == 3:
+                predictions = logits.argmax(dim=2)  # Get predicted class indices
+            else:
+                predictions = logits.argmax(dim=1)  # Handle case where time dimension is collapsed
+
+        return predictions
+
         # Removed prediction, loss calculation, and second prediction return values
         # prediction,second = self.output_layer(self_attn_output)
         # prediction = prediction.view(-1)
