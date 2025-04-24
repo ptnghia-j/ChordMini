@@ -466,9 +466,22 @@ def group_chords_by_focus_qualities(predictions, targets, idx_to_chord, focus_qu
     for pred, target in zip(predictions, targets):
         # Convert numpy arrays to Python integers if needed
         if isinstance(pred, np.ndarray):
-            pred = pred.item()
+            # Handle arrays with multiple elements
+            if pred.size > 1:
+                # Take the first element or most common value
+                pred = pred[0] if pred.size > 0 else 0
+            else:
+                # For single element arrays, use item()
+                pred = pred.item()
+
         if isinstance(target, np.ndarray):
-            target = target.item()
+            # Handle arrays with multiple elements
+            if target.size > 1:
+                # Take the first element or most common value
+                target = target[0] if target.size > 0 else 0
+            else:
+                # For single element arrays, use item()
+                target = target.item()
 
         pred_quality = idx_to_quality.get(pred, "other")
         target_quality = idx_to_quality.get(target, "other")

@@ -237,12 +237,16 @@ def lab_file_error_modify(ref_labels):
     for i in range(len(ref_labels)):
         # Skip empty or None labels
         if not ref_labels[i]:
-            ref_labels[i] = "N"
+            ref_labels[i] = "N"  # Map empty to NO_CHORD
             continue
 
-        # Handle special cases
-        if ref_labels[i] in ["N", "X", "None", "Unknown"]:
-            ref_labels[i] = "N"
+        # Handle special cases but preserve X vs N distinction
+        if ref_labels[i] in ["N", "None", "NC"]:
+            ref_labels[i] = "N"  # NO_CHORD
+            continue
+
+        if ref_labels[i] in ["X", "Unknown"]:
+            ref_labels[i] = "X"  # UNKNOWN_CHORD - preserve distinction from NO_CHORD
             continue
 
         # Fix common format issues
@@ -818,6 +822,21 @@ def calculate_chord_scores(timestamps, durations, reference_labels, prediction_l
     Returns:
         Tuple of evaluation scores (root, thirds, triads, sevenths, tetrads, majmin, mirex)
     """
+    # DEBUGGING: Print the first 20 reference and prediction labels with timestamps
+    print("\n=== DETAILED MIR EVALUATION DEBUGGING ===")
+    print("First 20 frames comparison:")
+    print(f"{'Time (s)':<10} | {'Duration':<10} | {'Reference':<15} | {'Prediction':<15} | {'Match?':<6}")
+    print("-" * 65)
+
+    debug_count = min(20, len(reference_labels), len(prediction_labels))
+    for i in range(debug_count):
+        ref = reference_labels[i]
+        pred = prediction_labels[i]
+        time = timestamps[i] if i < len(timestamps) else 0
+        dur = durations[i] if i < len(durations) else 0
+        match = "✓" if ref == pred else "✗"
+        print(f"{time:<10.2f} | {dur:<10.2f} | {ref:<15} | {pred:<15} | {match:<6}")
+
     # Create intervals for mir_eval
     intervals = np.zeros((len(timestamps), 2))
     intervals[:, 0] = timestamps
@@ -826,6 +845,76 @@ def calculate_chord_scores(timestamps, durations, reference_labels, prediction_l
     # Ensure all inputs have the same length
     min_len = min(len(intervals), len(reference_labels), len(prediction_labels))
     intervals = intervals[:min_len]
+
+    # DEBUGGING: Print statistics about the labels
+    ref_counts = {}
+    pred_counts = {}
+    for ref in reference_labels[:min_len]:
+        ref_counts[ref] = ref_counts.get(ref, 0) + 1
+    for pred in prediction_labels[:min_len]:
+        pred_counts[pred] = pred_counts.get(pred, 0) + 1
+
+    print("\nReference label distribution (top 5):")
+    for label, count in sorted(ref_counts.items(), key=lambda x: x[1], reverse=True)[:5]:
+        percentage = 100 * count / min_len
+        print(f"  {label:<15}: {count} ({percentage:.2f}%)")
+
+    print("\nPrediction label distribution (top 5):")
+    for label, count in sorted(pred_counts.items(), key=lambda x: x[1], reverse=True)[:5]:
+        percentage = 100 * count / min_len
+        print(f"  {label:<15}: {count} ({percentage:.2f}%)")
+
+    # Special debugging for "X" vs "N" labels
+    x_count_ref = ref_counts.get("X", 0)
+    n_count_ref = ref_counts.get("N", 0)
+    x_count_pred = pred_counts.get("X", 0)
+    n_count_pred = pred_counts.get("N", 0)
+
+    print("\nSpecial label counts:")
+    print(f"  'X' (unknown chord): {x_count_ref} in reference, {x_count_pred} in predictions")
+    print(f"  'N' (no chord): {n_count_ref} in reference, {n_count_pred} in predictions")
+
+    # Count X/N confusion specifically
+    x_to_n = sum(1 for i in range(min_len) if reference_labels[i] == "X" and prediction_labels[i] == "N")
+    n_to_x = sum(1 for i in range(min_len) if reference_labels[i] == "N" and prediction_labels[i] == "X")
+
+    if x_count_ref > 0:
+        x_to_n_pct = 100 * x_to_n / x_count_ref
+        print(f"  X→N confusion: {x_to_n}/{x_count_ref} ({x_to_n_pct:.2f}% of X labels predicted as N)")
+
+    if n_count_ref > 0:
+        n_to_x_pct = 100 * n_to_x / n_count_ref
+        print(f"  N→X confusion: {n_to_x}/{n_count_ref} ({n_to_x_pct:.2f}% of N labels predicted as X)")
+
+    # Find examples of X/N confusion for detailed inspection
+    print("\nExamples of X/N confusion:")
+    x_to_n_examples = [(i, reference_labels[i], prediction_labels[i])
+                      for i in range(min_len)
+                      if reference_labels[i] == "X" and prediction_labels[i] == "N"][:3]
+
+    n_to_x_examples = [(i, reference_labels[i], prediction_labels[i])
+                      for i in range(min_len)
+                      if reference_labels[i] == "N" and prediction_labels[i] == "X"][:3]
+
+    if x_to_n_examples:
+        print("  X→N examples (index, ref, pred):")
+        for idx, ref, pred in x_to_n_examples:
+            print(f"    {idx}: {ref} → {pred}")
+    else:
+        print("  No X→N examples found")
+
+    if n_to_x_examples:
+        print("  N→X examples (index, ref, pred):")
+        for idx, ref, pred in n_to_x_examples:
+            print(f"    {idx}: {ref} → {pred}")
+    else:
+        print("  No N→X examples found")
+
+    # Count matches
+    matches = sum(1 for i in range(min_len) if reference_labels[i] == prediction_labels[i])
+    match_percentage = 100 * matches / min_len
+    print(f"\nRaw frame-level accuracy: {matches}/{min_len} ({match_percentage:.2f}%)")
+    print("=== END DEBUGGING INFO ===\n")
 
     # IMPORTANT: Handle potentially nested reference_labels - add this check without changing
     # the core behavior for non-nested lists
