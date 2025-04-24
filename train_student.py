@@ -717,7 +717,7 @@ def main():
     logger.info(f"Output classes: {n_classes}")
 
     # Always use n_group=12 for all inputs
-    n_group = 12
+    n_group = 4
     feature_dim = n_freq // n_group
     logger.info(f"Using fixed n_group=12, resulting in feature dimension: {feature_dim}")
 
@@ -744,11 +744,11 @@ def main():
 
         # Apply scale to model parameters
         f_layer = max(1, int(round(base_config.get('f_layer', 3) * scale_factor)))
-        f_head = max(1, int(round(base_config.get('f_head', 6) * scale_factor)))
+        f_head = max(1, int(round(base_config.get('f_head', 6))))
         t_layer = max(1, int(round(base_config.get('t_layer', 3) * scale_factor)))
-        t_head = max(1, int(round(base_config.get('t_head', 6) * scale_factor)))
+        t_head = max(1, int(round(base_config.get('t_head', 6))))
         d_layer = max(1, int(round(base_config.get('d_layer', 3) * scale_factor)))
-        d_head = max(1, int(round(base_config.get('d_head', 6) * scale_factor)))
+        d_head = max(1, int(round(base_config.get('d_head', 6))))
 
         # Ensure f_head is compatible with feature_dim (must be a divisor)
         if feature_dim % f_head != 0:

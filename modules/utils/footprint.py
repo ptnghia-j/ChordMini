@@ -73,11 +73,11 @@ def scale_config(config, scale_factor):
     
     # Apply scale to model parameters
     f_layer = max(1, int(round(base_config['f_layer'] * scale_factor)))
-    f_head = max(1, int(round(base_config['f_head'] * scale_factor)))
+    f_head = max(1, int(round(base_config['f_head'])))
     t_layer = max(1, int(round(base_config['t_layer'] * scale_factor)))
-    t_head = max(1, int(round(base_config['t_head'] * scale_factor)))
+    t_head = max(1, int(round(base_config['t_head'])))
     d_layer = max(1, int(round(base_config['d_layer'] * scale_factor)))
-    d_head = max(1, int(round(base_config['d_head'] * scale_factor)))
+    d_head = max(1, int(round(base_config['d_head'])))
     
     return {
         'f_layer': f_layer,

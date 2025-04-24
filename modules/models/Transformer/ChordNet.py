@@ -14,10 +14,6 @@ class ChordNet(nn.Module):
                  dropout=0.2, ignore_index=None, *args, **kwargs):
         super().__init__()
 
-        # Always use n_group=12 for all inputs
-        # This aligns with musical theory (12 semitones per octave)
-        n_group = 12
-
         # Ensure n_freq is divisible by n_group
         if n_freq % n_group != 0:
             warnings.warn(f"Input with n_freq={n_freq} is not divisible by n_group=12. "
