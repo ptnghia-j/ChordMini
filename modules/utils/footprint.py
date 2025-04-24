@@ -42,19 +42,6 @@ def print_model_parameters(model):
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {count_parameters(model):,}")
 
-def get_valid_n_freq(n_group, suggested_n_freq=None):
-    """Get a valid n_freq that's divisible by n_group"""
-    if suggested_n_freq is not None and suggested_n_freq % n_group == 0:
-        return suggested_n_freq
-    
-    # Common CQT values
-    if n_group <= 12:
-        return 144  # Common for CQT (12 bins per octave * 12 octaves)
-    
-    # For STFT, choose a value divisible by n_group
-    # but don't go extremely high as we're just counting parameters
-    return 1024  # A more reasonable STFT size for parameter counting
-
 def scale_config(config, scale_factor):
     """Scale model config parameters by given factor"""
     # Get base configuration for the model
@@ -109,26 +96,28 @@ def main():
     student_config = HParams.load(args.config)
     print(f"Loaded student configuration from: {args.config}")
 
-    # Get n_group from config
-    n_group = student_config.model.get('n_group', 4)
+    # Get n_group from config - NOTE: ChordNet now internally uses 12
+    # n_group_config = student_config.model.get('n_group', 4) # Keep for reference if needed elsewhere
+    n_group_fixed = 12 # Hardcode to match ChordNet.py
 
-    # Choose appropriate n_freq based on CQT/STFT flag
+    # Choose appropriate n_freq based on CQT/STFT flag or config
     if args.n_freq:
         n_freq = args.n_freq
     elif args.cqt:
         n_freq = 144  # Typical CQT size
     elif args.stft:
-        n_freq = 1024  # Reasonable STFT size for parameter counting
+        n_freq = 1024 # Reasonable STFT size for parameter counting
     else:
-        n_freq = get_valid_n_freq(n_group)
+        # Fallback to config value if available, otherwise default
+        n_freq = student_config.feature.get('freq_bins', 144) # Default to 144 if not in config
 
     # Get n_classes from config or args
     n_classes = args.n_classes
 
     print("\nChordNet Parameters:")
-    print(f"  n_freq: {n_freq} (must be divisible by n_group)")
+    print(f"  n_freq: {n_freq}")
     print(f"  n_classes: {n_classes}")
-    print(f"  n_group: {n_group}")
+    print(f"  n_group: {n_group_fixed} (fixed internally in ChordNet)") # Updated print statement
 
     # Prepare table data
     table_data = []
@@ -138,13 +127,13 @@ def main():
         # Scale model config
         scaled_params = scale_config(student_config, scale)
 
-        # Create model with scaled parameters
+        # Create model with scaled parameters, using fixed n_group
         chordnet_model = ChordNet(
             n_freq=n_freq,
             n_classes=n_classes,
-            n_group=n_group,
+            n_group=n_group_fixed, # Use the fixed n_group
             f_layer=scaled_params['f_layer'],
-            f_head=scaled_params['f_head'],
+            f_head=scaled_params['f_head'], # Pass scaled f_head, ChordNet adjusts if needed
             t_layer=scaled_params['t_layer'],
             t_head=scaled_params['t_head'],
             d_layer=scaled_params['d_layer'],

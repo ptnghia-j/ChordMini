@@ -227,7 +227,7 @@ spec:
             - name: LAZY_INIT
               value: "false" # Controls dataset lazy initialization
             - name: SMALL_DATASET
-              value: ""   # Set percentage of dataset to use (0.1 = 10%, null = full)
+              value: "0.01"   # Set percentage of dataset to use (0.1 = 10%, null = full)
             - name: METADATA_CACHE
               value: "false" # Use metadata-only caching
           command:
@@ -428,11 +428,13 @@ spec:
           resources:
             requests:
               cpu: "4"
-              memory: "128Gi"
+              #memory: "128Gi"
+              memory: "24Gi"
               nvidia.com/gpu: "2"
             limits:
               cpu: "18"
-              memory: "320Gi"
+              #memory: "320Gi"
+              memory: "64Gi"
               nvidia.com/gpu: "2"
           volumeMounts:
             - name: storage

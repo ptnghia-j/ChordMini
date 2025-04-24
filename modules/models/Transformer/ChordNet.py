@@ -31,12 +31,12 @@ class ChordNet(nn.Module):
         print(f"Using fixed n_group=12 for musical alignment with n_freq={n_freq}")
 
         # Calculate the actual feature dimension that will come out of the transformer
-        actual_feature_dim = n_freq // n_group
-        print(f"Using feature dimensions: n_freq={n_freq}, n_group={n_group}, feature_dim={actual_feature_dim}, heads={f_head}")
+        feature_dim = n_freq // n_group
+        print(f"Using feature dimensions: n_freq={n_freq}, n_group={n_group}, feature_dim={feature_dim}, heads={f_head}")
 
         # Final compatibility check
-        if actual_feature_dim % f_head != 0:
-            warnings.warn(f"Feature dimension {actual_feature_dim} not divisible by head count {f_head}. "
+        if feature_dim % f_head != 0:
+            warnings.warn(f"Feature dimension {feature_dim} not divisible by head count {f_head}. "
                          f"This will cause errors. Please adjust parameters.")
 
         self.transformer = BaseTransformer(
