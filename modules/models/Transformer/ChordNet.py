@@ -57,7 +57,9 @@ class ChordNet(nn.Module):
 
         # Use the correct feature dimension for the output linear layer
         self.n_classes = n_classes  # Store the number of classes for debugging and loading
-        self.fc = nn.Linear(actual_feature_dim, n_classes)
+        # FIX: Use n_freq as the input dimension for the final linear layer,
+        # as the BaseTransformer's decoder outputs features of size n_freq.
+        self.fc = nn.Linear(n_freq, n_classes)
         self.ignore_index = ignore_index
 
         # Dictionary to map indices to chord names - useful for evaluation
