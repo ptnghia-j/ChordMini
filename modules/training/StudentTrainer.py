@@ -372,22 +372,8 @@ class StudentTrainer(BaseTrainer):
         else:
             logits = outputs
 
-        # --- NEW: flatten per-frame logits/targets to 2D/1D ---
-        if logits.ndim == 3 and targets.ndim == 2:
-            # (batch, time, classes) → (batch*time, classes); targets similarly
-            logits = logits.reshape(-1, logits.size(-1))
-            targets = targets.reshape(-1)
-            debug(f"Flattened for per-frame loss: logits {logits.shape}, targets {targets.shape}")
-        # -------------------------------------------------------
-
-        # Calculate standard loss (cross‐entropy or focal)
-        if self.use_focal_loss:
-            standard_loss = self.focal_loss(logits, targets)
-        else:
-            standard_loss = self.loss_fn(logits, targets)
-
-        # Calculate knowledge distillation loss if enabled
-        kd_loss = torch.tensor(0.0, device=self.device)
+        # --- Get teacher logits BEFORE potential flattening ---
+        teacher_logits = None
         if self.use_kd_loss:
             # Check if teacher_model is available for on-the-fly logits
             if self.teacher_model is not None:
@@ -401,8 +387,7 @@ class StudentTrainer(BaseTrainer):
                         self.device
                     )
             else:
-                # Look for pre-computed logits in teacher_predictions
-                teacher_logits = None
+                # Look for pre-computed logits in teacher_predictions or batch
                 if 'song_id' in batch and self.teacher_predictions:
                     # Create a batch of teacher logits
                     batch_teacher_logits = []
@@ -425,28 +410,44 @@ class StudentTrainer(BaseTrainer):
                 if teacher_logits is None and 'teacher_logits' in batch:
                     teacher_logits = batch['teacher_logits'].to(self.device)
 
-            # If we have teacher logits, compute KD loss
-            if teacher_logits is not None:
-                # Handle dimensionality issues
-                if teacher_logits.shape != logits.shape:
-                    warning(f"Teacher logits shape {teacher_logits.shape} doesn't match student logits shape {logits.shape}")
+        # --- Flatten per-frame logits/targets AND teacher_logits consistently ---
+        if logits.ndim == 3 and targets.ndim == 2:
+            # Store original shape info if needed elsewhere
+            batch_size, time_steps, num_classes = logits.shape
+            debug(f"Original shapes: logits {logits.shape}, targets {targets.shape}")
 
-                    # Try basic reshaping if dimensionality is close
-                    if teacher_logits.dim() == logits.dim():
-                        # Just take the first part of the larger tensor
-                        if teacher_logits.shape[1] > logits.shape[1]:
-                            teacher_logits = teacher_logits[:, :logits.shape[1], :]
-                        elif teacher_logits.shape[1] < logits.shape[1]:
-                            # Pad with zeros
-                            pad_size = logits.shape[1] - teacher_logits.shape[1]
-                            padding = torch.zeros(teacher_logits.shape[0], pad_size, teacher_logits.shape[2],
-                                                 device=self.device)
-                            teacher_logits = torch.cat([teacher_logits, padding], dim=1)
+            # Flatten student logits and targets
+            logits = logits.reshape(-1, num_classes)
+            targets = targets.reshape(-1)
+            debug(f"Flattened student: logits {logits.shape}, targets {targets.shape}")
 
-                # Compute KD loss
+            # Flatten teacher logits if they exist and are 3D
+            if teacher_logits is not None and teacher_logits.ndim == 3:
+                if teacher_logits.shape[0] == batch_size and teacher_logits.shape[1] == time_steps:
+                    teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
+                    debug(f"Flattened teacher logits: {teacher_logits.shape}")
+                else:
+                    warning(f"Teacher logits shape {teacher_logits.shape} mismatch with student batch/time {batch_size}/{time_steps}. Cannot flatten consistently.")
+                    teacher_logits = None # Invalidate teacher logits if shapes don't match for flattening
+        # ----------------------------------------------------------------------
+
+        # Calculate standard loss (cross‐entropy or focal)
+        if self.use_focal_loss:
+            standard_loss = self.focal_loss(logits, targets)
+        else:
+            standard_loss = self.loss_fn(logits, targets)
+
+        # Calculate knowledge distillation loss if enabled and teacher_logits are valid
+        kd_loss = torch.tensor(0.0, device=self.device)
+        if self.use_kd_loss and teacher_logits is not None:
+            # Ensure shapes match *after* potential flattening
+            if logits.shape == teacher_logits.shape:
                 kd_loss = self.knowledge_distillation_loss(
                     logits, teacher_logits, self.temperature
                 )
+            else:
+                # This should ideally not happen if flattening logic above is correct
+                warning(f"Shape mismatch before KD loss calculation: student {logits.shape}, teacher {teacher_logits.shape}. Skipping KD for this batch.")
 
         # Combine losses
         if self.use_kd_loss and kd_loss.item() != 0.0:
@@ -458,6 +459,8 @@ class StudentTrainer(BaseTrainer):
 
         # Backward pass and optimizer step
         loss.backward()
+        # Use safe clipping
+        safe_clip_grad_norm_(self.model.parameters(), self.max_grad_norm, error_if_nonfinite=False)
         self.optimizer.step()
 
         # Get predicted classes
@@ -470,12 +473,13 @@ class StudentTrainer(BaseTrainer):
             'loss': loss.item(),
             'standard_loss': standard_loss.item(),
             'kd_loss': kd_loss.item() if self.use_kd_loss else 0.0,
-            'accuracy': correct / total
+            'accuracy': correct / total if total > 0 else 0.0 # Avoid division by zero
         }
 
     def knowledge_distillation_loss(self, student_logits, teacher_logits, temperature):
         """
-        Calculate knowledge distillation loss.
+        Calculate knowledge distillation loss. Assumes student_logits and teacher_logits
+        have the same shape.
 
         Args:
             student_logits: Logits from student model
@@ -485,17 +489,13 @@ class StudentTrainer(BaseTrainer):
         Returns:
             KD loss
         """
-        # Ensure teacher and student logits have the same shape
-        if student_logits.shape != teacher_logits.shape:
-            warning(f"Shape mismatch in KD loss: student {student_logits.shape}, teacher {teacher_logits.shape}")
-            return torch.tensor(0.0, device=self.device)
-
         # Apply temperature scaling
         soft_targets = torch.nn.functional.softmax(teacher_logits / temperature, dim=-1)
         log_probs = torch.nn.functional.log_softmax(student_logits / temperature, dim=-1)
 
         # Calculate KL divergence loss
-        loss = -(soft_targets * log_probs).sum(dim=-1).mean()
+        # Use batchmean reduction for stability across different batch sizes
+        loss = torch.nn.functional.kl_div(log_probs, soft_targets, reduction='batchmean')
 
         # Apply temperature^2 scaling to match the gradient scale
         return loss * (temperature ** 2)
@@ -699,6 +699,7 @@ class StudentTrainer(BaseTrainer):
         """
         Combine a KL divergence loss between softened teacher and student predictions with
         standard cross entropy loss on the targets.
+        Assumes student_logits and teacher_logits have the same shape.
 
         Args:
             student_logits (Tensor): Student raw outputs.
@@ -707,95 +708,28 @@ class StudentTrainer(BaseTrainer):
         Returns:
             Combined loss.
         """
-        # Verify dimensions match before proceeding
+        # Verify dimensions match before proceeding - Basic check, caller should ensure this.
         if student_logits.shape != teacher_logits.shape:
-            # Comment out dimension mismatch logging to reduce confusion
-            # info(f"Dimension mismatch in distillation_loss: student {student_logits.shape}, teacher {teacher_logits.shape}")
-
-            try:
-                # Cache key for shape transformation
-                s_shape, t_shape = student_logits.shape, teacher_logits.shape
-                shape_key = (tuple(t_shape), tuple(s_shape))
-
-                # See if we've handled this shape combination before
-                if not hasattr(self, '_shape_transform_cache'):
-                    self._shape_transform_cache = {}
-
-                # Use cached transformation if available
-                if shape_key in self._shape_transform_cache:
-                    teacher_logits = self._shape_transform_cache[shape_key](teacher_logits)
-                else:
-                    # Handle 4D teacher tensor (batch, seq, time, classes) → needs special handling
-                    if len(t_shape) == 4 and t_shape[1] == 1:
-                        # Define an efficient transformation for this shape pattern
-                        def transform_fn(tensor):
-                            # Use view instead of reshape when possible to avoid copying memory
-                            # contiguous() ensures memory layout is suitable for view
-                            tensor = tensor.squeeze(1).contiguous()  # Now (batch, time, classes)
-
-                            # If the student logits are already flattened (batch*time, classes)
-                            if len(s_shape) == 2:
-                                expected_batch_size = t_shape[0] * t_shape[2]  # batch * time
-                                if expected_batch_size == s_shape[0]:
-                                    return tensor.view(-1, t_shape[3])  # (batch*time, classes)
-                                elif s_shape[0] > expected_batch_size:
-                                    return tensor.view(-1, t_shape[3])
-                                else:
-                                    # More efficient slicing approach
-                                    return tensor[:s_shape[0]//t_shape[2]].view(-1, t_shape[3])
-                            return tensor
-
-                        # Apply transformation
-                        teacher_logits = transform_fn(teacher_logits)
-                        # Cache for future reuse
-                        self._shape_transform_cache[shape_key] = transform_fn
-
-                    # Simple and direct dimension handling for 2D/3D mismatch
-                    elif len(s_shape) != len(t_shape):
-                        if len(s_shape) == 2 and len(t_shape) == 3:
-                            # Create a reusable transformation function
-                            def transform_fn(tensor):
-                                return tensor.mean(dim=1)
-
-                            teacher_logits = transform_fn(teacher_logits)
-                            self._shape_transform_cache[shape_key] = transform_fn
-
-                        elif len(s_shape) == 3 and len(t_shape) == 2:
-                            # Create a reusable transformation function
-                            def transform_fn(tensor):
-                                return tensor.unsqueeze(1).expand(-1, s_shape[1], -1)
-
-                            teacher_logits = transform_fn(teacher_logits)
-                            self._shape_transform_cache[shape_key] = transform_fn
-
-                # Final check for shape match
-                if student_logits.shape != teacher_logits.shape:
-                    raise ValueError(f"Failed to match dimensions: student {student_logits.shape}, teacher {teacher_logits.shape}")
-
-            except Exception as e:
-                info(f"Error adapting dimensions: {str(e)}")
-                info("Falling back to standard cross entropy loss")
-                return F.cross_entropy(student_logits, targets)
+             warning(f"Dimension mismatch in distillation_loss: student {student_logits.shape}, teacher {teacher_logits.shape}. Falling back.")
+             # Fallback to standard loss if shapes mismatch unexpectedly
+             if self.use_focal_loss:
+                 return self.focal_loss(student_logits, targets, gamma=self.focal_gamma, alpha=self.focal_alpha)
+             else:
+                 return self.loss_fn(student_logits, targets)
 
         try:
             # Use class attributes for temperature and alpha
             temperature = self.temperature
             alpha = self.kd_alpha
 
-
-            # student_logits = student_logits - student_logits.mean(dim=-1, keepdim=True)
-            # teacher_logits = teacher_logits - teacher_logits.mean(dim=-1, keepdim=True)
-            # student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
-            # teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
-
             # Apply zero-mean normalization to the logits before softmax
             # This is important for stable knowledge distillation as suggested by research
-            student_logits_normalized = student_logits - student_logits.mean(dim=1, keepdim=True)
-            teacher_logits_normalized = teacher_logits - teacher_logits.mean(dim=1, keepdim=True)
+            student_logits_normalized = student_logits - student_logits.mean(dim=-1, keepdim=True) # Use dim=-1 for class dim
+            teacher_logits_normalized = teacher_logits - teacher_logits.mean(dim=-1, keepdim=True) # Use dim=-1 for class dim
 
             # KL divergence loss with temperature scaling for soft targets
-            student_log_probs = F.log_softmax(student_logits_normalized / temperature, dim=1)
-            teacher_probs = F.softmax(teacher_logits_normalized / temperature, dim=1)
+            student_log_probs = F.log_softmax(student_logits_normalized / temperature, dim=-1) # Use dim=-1 for class dim
+            teacher_probs = F.softmax(teacher_logits_normalized / temperature, dim=-1) # Use dim=-1 for class dim
 
             # Check for NaN values that could break the loss calculation
             if torch.isnan(student_log_probs).any() or torch.isnan(teacher_probs).any():
@@ -803,31 +737,48 @@ class StudentTrainer(BaseTrainer):
                 student_log_probs = torch.nan_to_num(student_log_probs)
                 teacher_probs = torch.nan_to_num(teacher_probs)
 
+            # Use batchmean reduction
             kl_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (temperature ** 2)
 
+            # Calculate standard loss component
             if self.use_focal_loss:
-                loss = self.focal_loss(student_logits, targets, gamma=self.focal_gamma, alpha=self.focal_alpha)
+                standard_loss = self.focal_loss(student_logits, targets, gamma=self.focal_gamma, alpha=self.focal_alpha)
             else:
-                loss = self.loss_fn(student_logits, targets)
+                standard_loss = self.loss_fn(student_logits, targets)
 
             # Combine losses with alpha weighting
-            combined_loss = alpha * kl_loss + (1 - alpha) * loss
+            combined_loss = alpha * kl_loss + (1 - alpha) * standard_loss
 
             # Add logging once for diagnostics
             if not hasattr(self, '_kd_loss_logged'):
-                info(f"KD loss breakdown - KL: {kl_loss.item():.4f}, CE: {loss.item():.4f}, Combined: {combined_loss.item():.4f}")
+                info(f"KD loss breakdown - KL: {kl_loss.item():.4f}, CE/Focal: {standard_loss.item():.4f}, Combined: {combined_loss.item():.4f}")
                 info(f"Using α={alpha}, temperature={temperature} with zero-mean logit normalization")
                 self._kd_loss_logged = True
 
             # NEW: Print teacher distribution details only once during training
             if not hasattr(self, '_teacher_distribution_logged') and teacher_probs.size(0) > 0:
-                sample_teacher = teacher_probs[0]
+                # Select the first sample, handle potential flattened shape
+                sample_idx = 0
+                sample_teacher = teacher_probs[sample_idx]
+
                 top_values, top_indices = torch.topk(sample_teacher, 10)
                 info("Teacher distribution for first sample in batch:")
                 for rank, (val, idx) in enumerate(zip(top_values, top_indices), start=1):
                     chord_name = self.idx_to_chord.get(idx.item(), f"Class-{idx.item()}") if self.idx_to_chord else f"Class-{idx.item()}"
                     info(f"  Rank {rank}: {chord_name} with probability {val.item():.4f}")
-                avg_confidence = teacher_probs.max(dim=1)[0].mean().item()
+
+                # Calculate average confidence across the batch (handle flattened shape)
+                num_classes = student_logits.size(-1)
+                if teacher_probs.dim() == 2 and student_logits.dim() == 2: # Flattened case
+                    # Reshape temporarily to [batch*time, classes] -> [batch, time, classes] if possible
+                    # This requires knowing batch_size and time_steps, which isn't directly available here.
+                    # Approximate by calculating max prob per 'frame' (row in flattened tensor)
+                    avg_confidence = teacher_probs.max(dim=-1)[0].mean().item()
+                elif teacher_probs.dim() == 3: # Original 3D case
+                     avg_confidence = teacher_probs.max(dim=-1)[0].mean().item()
+                else: # Fallback
+                     avg_confidence = teacher_probs.max(dim=-1)[0].mean().item()
+
                 info(f"Average teacher max probability in batch: {avg_confidence:.4f}")
                 # Set flag to prevent future prints
                 self._teacher_distribution_logged = True
@@ -836,7 +787,11 @@ class StudentTrainer(BaseTrainer):
         except Exception as e:
             info(f"Error in distillation loss calculation: {str(e)}")
             info("Falling back to standard cross entropy loss")
-            return F.cross_entropy(student_logits, targets)
+            # Fallback to standard loss
+            if self.use_focal_loss:
+                return self.focal_loss(student_logits, targets, gamma=self.focal_gamma, alpha=self.focal_alpha)
+            else:
+                return self.loss_fn(student_logits, targets)
 
     def label_smoothed_loss(self, logits, targets, smoothing=0.1):
         """
@@ -1086,118 +1041,84 @@ class StudentTrainer(BaseTrainer):
             # Verify and log input shapes for debugging
             orig_logits_shape = logits.shape
             orig_targets_shape = targets.shape
+            orig_teacher_logits_shape = teacher_logits.shape if teacher_logits is not None else None
 
-            # Check for and handle dimension mismatch between logits and targets
-            if logits.ndim == 3 and targets.ndim == 1:
-                info(f"WARNING: Dimension mismatch - logits: {logits.shape}, targets: {targets.shape}")
-                info("Averaging logits over time dimension")
-                logits = logits.mean(dim=1)  # Average over time dimension
-            elif logits.ndim == 3 and targets.ndim == 2:
-                if logits.size(1) != targets.size(1):
-                    info(f"WARNING: Time dimension mismatch - logits: {logits.shape}, targets: {targets.shape}")
-                    if logits.size(1) > targets.size(1):
-                        info(f"Truncating logits time dimension from {logits.size(1)} to {targets.size(1)}")
-                        logits = logits[:, :targets.size(1), :]
-                    else:
-                        info(f"Truncating targets time dimension from {targets.size(1)} to {logits.size(1)}")
-                        targets = targets[:, :logits.size(1)]
-
-                # Reshape for loss calculation
-                logits = logits.reshape(-1, logits.size(-1))
+            # --- Flattening Logic ---
+            # Check if student logits need flattening (e.g., from BTC model)
+            if logits.ndim == 3 and targets.ndim == 2:
+                batch_size, time_steps, num_classes = logits.shape
+                # Flatten student logits and targets
+                logits = logits.reshape(-1, num_classes)
                 targets = targets.reshape(-1)
 
-            # Report reshape results
-            if orig_logits_shape != logits.shape or orig_targets_shape != targets.shape:
-                info(f"Reshaped tensors for loss calculation - logits: {orig_logits_shape} -> {logits.shape}, "
-                         f"targets: {orig_targets_shape} -> {targets.shape}")
+                # Flatten teacher logits if they exist and are 3D
+                if teacher_logits is not None and teacher_logits.ndim == 3:
+                    if teacher_logits.shape[0] == batch_size and teacher_logits.shape[1] == time_steps:
+                        teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
+                    else:
+                        warning(f"Teacher logits shape {teacher_logits.shape} mismatch with student batch/time {batch_size}/{time_steps} during flattening. Disabling KD for this batch.")
+                        teacher_logits = None # Invalidate teacher logits
 
-            # Use focal loss if enabled
+            # Report reshape results if any occurred
+            if orig_logits_shape != logits.shape or \
+               orig_targets_shape != targets.shape or \
+               (orig_teacher_logits_shape is not None and teacher_logits is not None and orig_teacher_logits_shape != teacher_logits.shape) or \
+               (orig_teacher_logits_shape is not None and teacher_logits is None): # Log if teacher logits were invalidated
+                info(f"Reshaped tensors for loss - Student: {orig_logits_shape} -> {logits.shape}, Targets: {orig_targets_shape} -> {targets.shape}, Teacher: {orig_teacher_logits_shape} -> {teacher_logits.shape if teacher_logits is not None else 'None'}")
+
+            # --- Loss Calculation ---
+            # Calculate standard loss (Focal or CE)
             if self.use_focal_loss:
-                # Note: focal_loss implementation uses weight=None directly
-                # as the weight parameter is controlled by focal_alpha
-                loss = self.focal_loss(logits, targets,
-                                      gamma=self.focal_gamma,
-                                      alpha=self.focal_alpha)
+                standard_loss = self.focal_loss(logits, targets,
+                                                gamma=self.focal_gamma,
+                                                alpha=self.focal_alpha)
             else:
-                # Use the standard loss function with class weights
                 try:
-                    loss = self.loss_fn(logits, targets)
+                    standard_loss = self.loss_fn(logits, targets)
                 except RuntimeError as e:
-                    info(f"Error in loss calculation: {e}")
+                    info(f"Error in standard loss calculation: {e}")
                     info(f"Logits shape: {logits.shape}, targets shape: {targets.shape}")
                     info(f"Target values: min={targets.min().item()}, max={targets.max().item()}")
-
-                    # Try to recover by ensuring targets are in valid range
                     num_classes = logits.size(-1)
                     if targets.max().item() >= num_classes:
                         info(f"WARNING: Target values exceed output dimension {num_classes}, clamping")
                         targets = torch.clamp(targets, 0, num_classes-1)
-                        loss = self.loss_fn(logits, targets)
+                        standard_loss = self.loss_fn(logits, targets)
                     else:
-                        # Use a simpler loss function if we can't recover
                         info("Using unweighted cross entropy as fallback")
-                        loss = F.cross_entropy(logits, targets)
+                        standard_loss = F.cross_entropy(logits, targets)
 
-            # If KD loss is enabled and teacher_logits are given, compute KD loss and combine.
+            # Calculate KD loss if enabled and teacher_logits are valid
+            kd_loss = torch.tensor(0.0, device=self.device)
             if self.use_kd_loss and teacher_logits is not None:
-                try:
-                    # Standardize teacher logits dimensions - ensure they're compatible
-                    # Teacher logits should be [batch, time, classes] or [batch, classes]
+                # Ensure shapes match *after* potential flattening
+                if logits.shape == teacher_logits.shape:
+                    kd_loss = self.knowledge_distillation_loss(
+                        logits, teacher_logits, self.temperature
+                    )
+                    # Combine losses
+                    loss = self.kd_alpha * kd_loss + (1 - self.kd_alpha) * standard_loss
+                else:
+                    warning(f"Final shape mismatch before KD loss: student {logits.shape}, teacher {teacher_logits.shape}. Using standard loss only.")
+                    loss = standard_loss
+            else:
+                # Use only standard loss
+                loss = standard_loss
 
-                    # Handle 3D teacher logits (batch, time, classes)
-                    if teacher_logits.dim() == 3:
-                        # If student logits are 2D (batch, classes), then average teacher logits over time
-                        if logits.dim() == 2:
-                            teacher_logits = teacher_logits.mean(dim=1)  # Average over time dimension
-                            debug(f"Averaged 3D teacher logits over time to match 2D student logits")
-                    # Handle 1D or 2D teacher logits
-                    elif teacher_logits.dim() <= 2:
-                        # If student logits are 3D but teacher is 2D, unsqueeze teacher
-                        if logits.dim() == 3 and teacher_logits.dim() == 2:
-                            if teacher_logits.shape[0] == logits.shape[0]:  # Same batch size
-                                # Add time dimension of size 1
-                                teacher_logits = teacher_logits.unsqueeze(1)
-                                # Expand to match student time dimension
-                                teacher_logits = teacher_logits.expand(-1, logits.shape[1], -1)
-                                debug(f"Expanded 2D teacher logits to match 3D student logits")
 
-                    # Final dimension check
-                    if teacher_logits.shape[-1] != logits.shape[-1]:
-                        # Class dimension mismatch, reshape teacher
-                        if teacher_logits.shape[-1] > logits.shape[-1]:
-                            # Truncate teacher classes
-                            if teacher_logits.dim() == 3:
-                                teacher_logits = teacher_logits[:, :, :logits.shape[-1]]
-                            else:
-                                teacher_logits = teacher_logits[..., :logits.shape[-1]]
-                        else:
-                            # Pad teacher classes
-                            pad_size = logits.shape[-1] - teacher_logits.shape[-1]
-                            if teacher_logits.dim() == 3:
-                                pad_shape = (0, pad_size, 0, 0, 0, 0)  # Padding last dim
-                            else:
-                                pad_shape = (0, pad_size, 0, 0)  # Padding last dim
-                            teacher_logits = F.pad(teacher_logits, pad_shape, "constant", 0)
-
-                    # Now call distillation loss with standardized dimensions
-                    kd_loss = self.distillation_loss(logits, teacher_logits, targets)
-                    return kd_loss
-                except Exception as e:
-                    info(f"ERROR in KD loss processing - falling back to standard loss: {str(e)}")
-                    # Continue with standard loss
-
-            # Ensure loss is non-negative (critical fix)
+            # Ensure loss is non-negative and finite
             loss = torch.clamp(loss, min=0.0)
-
-            if torch.isnan(loss):
-                info(f"NaN loss detected - logits: min={logits.min().item():.4f}, max={logits.max().item():.4f}, "
+            if torch.isnan(loss) or not torch.isfinite(loss):
+                info(f"NaN or infinite loss detected - logits: min={logits.min().item():.4f}, max={logits.max().item():.4f}, "
                          f"targets: min={targets.min().item()}, max={targets.max().item()}")
-                # Return a default loss value instead of NaN
+                # Return a default loss value instead of NaN/inf
                 return torch.tensor(1.0, device=loss.device, requires_grad=True)
 
             return loss
         except Exception as e:
             info(f"Unexpected error in compute_loss: {str(e)}")
+            import traceback
+            info(traceback.format_exc())
             # Last resort fallback - provide a dummy loss to avoid training failure
             return torch.tensor(1.0, device=self.device, requires_grad=True)
 
@@ -1393,7 +1314,6 @@ class StudentTrainer(BaseTrainer):
                     if self.use_kd_loss and 'teacher_logits' in batch:
                         teacher_logits = batch['teacher_logits'].to(self.device, non_blocking=True)
                         kd_batches += 1
-
                     total_batches += 1
 
                     # Enhanced KD logging and error checking
@@ -1432,27 +1352,7 @@ class StudentTrainer(BaseTrainer):
                                 else:
                                     logits = outputs
 
-                                # For per-frame supervision, flatten logits and targets when needed
-                                if logits.ndim == 3 and targets.ndim == 2:
-                                    # Store original shape for adapting teacher_logits if needed
-                                    orig_logits_shape = logits.shape
-
-                                    logits = logits.reshape(-1, logits.size(-1))
-                                    targets = targets.reshape(-1)
-
-                                    # If we have teacher logits, reshape them too
-                                    if teacher_logits is not None and teacher_logits.ndim == 3:
-                                        if teacher_logits.shape[0:2] == orig_logits_shape[0:2]:
-                                            teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
-                                        else:
-                                            info(f"Shape mismatch between student ({orig_logits_shape}) and teacher ({teacher_logits.shape}) logits")
-                                            # Try time dimension averaging as fallback
-                                            if teacher_logits.shape[0] == orig_logits_shape[0]:
-                                                teacher_logits = teacher_logits.mean(dim=1)
-                                            elif teacher_logits.ndim > 2:
-                                                teacher_logits = teacher_logits.mean(dim=1).reshape(-1, teacher_logits.size(-1))
-
-                                # Use our custom compute_loss method with teacher_logits if available
+                                # Pass teacher_logits directly to compute_loss, it will handle flattening
                                 loss = self.compute_loss(logits, targets, teacher_logits)
 
                                 # Skip invalid losses (avoid NaN propagation)
@@ -1460,15 +1360,25 @@ class StudentTrainer(BaseTrainer):
                                     # Use scaler for mixed precision
                                     scaler.scale(loss).backward()
                                     scaler.unscale_(self.optimizer)  # Unscale before clipping
+                                    # Use safe clipping
                                     safe_clip_grad_norm_(self.model.parameters(), self.max_grad_norm, error_if_nonfinite=False)
                                     scaler.step(self.optimizer)
                                     scaler.update()
 
+                                    # Calculate accuracy based on potentially flattened logits/targets
                                     with torch.no_grad():
-                                        preds = logits.argmax(dim=1)
-                                        batch_correct = (preds == targets).sum().item()
+                                        # Re-flatten if necessary for accuracy calculation consistency
+                                        if logits.ndim == 3 and targets.ndim == 2:
+                                            logits_acc = logits.reshape(-1, logits.size(-1))
+                                            targets_acc = targets.reshape(-1)
+                                        else:
+                                            logits_acc = logits
+                                            targets_acc = targets
+
+                                        preds = logits_acc.argmax(dim=1)
+                                        batch_correct = (preds == targets_acc).sum().item()
                                         train_correct += batch_correct
-                                        train_total += targets.size(0)
+                                        train_total += targets_acc.size(0)
                                         epoch_loss += loss.item()
                                 else:
                                     info(f"WARNING: Skipping batch {batch_idx} due to invalid loss: {loss}")
@@ -1481,46 +1391,36 @@ class StudentTrainer(BaseTrainer):
                             else:
                                 logits = outputs
 
-                            # For per-frame supervision, flatten logits and targets when needed
-                            if logits.ndim == 3 and targets.ndim == 2:
-                                # Store original shape for adapting teacher_logits if needed
-                                orig_logits_shape = logits.shape
-
-                                logits = logits.reshape(-1, logits.size(-1))
-                                targets = targets.reshape(-1)
-
-                                # If we have teacher logits, reshape them too
-                                if teacher_logits is not None and teacher_logits.ndim == 3:
-                                    if teacher_logits.shape[0:2] == orig_logits_shape[0:2]:
-                                        teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
-                                    else:
-                                        info(f"Shape mismatch between student ({orig_logits_shape}) and teacher ({teacher_logits.shape}) logits")
-                                        # Try time dimension averaging as fallback
-                                        if teacher_logits.shape[0] == orig_logits_shape[0]:
-                                            teacher_logits = teacher_logits.mean(dim=1)
-                                        elif teacher_logits.ndim > 2:
-                                            teacher_logits = teacher_logits.mean(dim=1).reshape(-1, teacher_logits.size(-1))
-
-                            # Use our custom compute_loss method with teacher_logits if available
+                            # Pass teacher_logits directly to compute_loss, it will handle flattening
                             loss = self.compute_loss(logits, targets, teacher_logits)
 
                             # Skip invalid losses (avoid NaN propagation)
                             if loss is not None and not torch.isnan(loss) and torch.isfinite(loss):
                                 loss.backward()
+                                # Use safe clipping
                                 safe_clip_grad_norm_(self.model.parameters(), self.max_grad_norm, error_if_nonfinite=False)
                                 self.optimizer.step()
 
-                                preds = logits.argmax(dim=1)
-                                batch_correct = (preds == targets).sum().item()
+                                # Calculate accuracy based on potentially flattened logits/targets
+                                # Re-flatten if necessary for accuracy calculation consistency
+                                if logits.ndim == 3 and targets.ndim == 2:
+                                    logits_acc = logits.reshape(-1, logits.size(-1))
+                                    targets_acc = targets.reshape(-1)
+                                else:
+                                    logits_acc = logits
+                                    targets_acc = targets
+
+                                preds = logits_acc.argmax(dim=1)
+                                batch_correct = (preds == targets_acc).sum().item()
                                 train_correct += batch_correct
-                                train_total += targets.size(0)
+                                train_total += targets_acc.size(0)
                                 epoch_loss += loss.item()
 
                                 if batch_idx % 100 == 0:
                                     # Log current LR and indicate whether KD is being used for this batch
                                     current_lr = self.optimizer.param_groups[0]['lr']
-                                    batch_acc = batch_correct / targets.size(0) if targets.size(0) > 0 else 0
-                                    kd_status = " (with KD)" if teacher_logits is not None else ""
+                                    batch_acc = batch_correct / targets_acc.size(0) if targets_acc.size(0) > 0 else 0.0
+                                    kd_status = " (with KD)" if self.use_kd_loss and teacher_logits is not None else ""
                                     info(f"Epoch {epoch}/{self.num_epochs} | Batch {batch_idx}/{len(train_loader)} | Loss: {loss.item():.4f} | Batch Acc: {batch_acc:.4f}{kd_status} | LR: {current_lr:.7f}")
                             else:
                                 info(f"WARNING: Skipping batch {batch_idx} due to invalid loss: {loss}")
@@ -1549,7 +1449,7 @@ class StudentTrainer(BaseTrainer):
 
                 # Log training metrics for this epoch
                 avg_train_loss = epoch_loss / max(1, len(train_loader))
-                train_acc = train_correct / max(1, train_total)
+                train_acc = train_correct / max(1, train_total) if train_total > 0 else 0.0
                 self.timer.stop()
                 info(f"Epoch {epoch}/{self.num_epochs} | Train Loss: {avg_train_loss:.4f} | Train Accuracy: {train_acc:.4f} | Time: {self.timer.elapsed_time():.2f} sec")
                 self.train_losses.append(avg_train_loss)

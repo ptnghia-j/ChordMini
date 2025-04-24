@@ -683,27 +683,44 @@ def main():
     logger.info("\n=== Checking data loaders ===")
     try:
         batch = next(iter(train_loader))
-        if distributed_training:
-            # In distributed mode with direct DataLoader, batch is a tuple of (inputs, targets)
-            inputs, targets = batch
-            logger.info(f"First batch loaded successfully: {inputs.shape}")
+        # Always expect a dictionary from the DataLoader
+        if isinstance(batch, dict) and 'spectro' in batch and 'chord_idx' in batch:
+            inputs = batch['spectro'] # <--- ERROR HERE
+            targets = batch['chord_idx']
+            logger.info(f"First batch loaded successfully: inputs shape {inputs.shape}, targets shape {targets.shape}")
 
+            # Check device placement (optional but good practice)
             if torch.cuda.is_available():
                 if inputs.device.type == 'cuda':
-                    logger.info("Success: Batch tensors are already on GPU")
+                    logger.info("Success: Batch tensors are already on GPU (as expected from SynthDataset)")
                 else:
-                    logger.info("Note: Batch tensors are on CPU and will be moved to GPU during training")
-        else:
-            # In non-distributed mode with SynthDataset's iterator, batch is a dict
-            logger.info(f"First batch loaded successfully: {batch['spectro'].shape}")
+                    logger.warning("Warning: Batch tensors are on CPU, expected GPU. Check dataset device setting.")
+            else:
+                 logger.info("Running on CPU, batch tensors are on CPU.")
 
-            if torch.cuda.is_available():
-                if batch['spectro'].device.type == 'cuda':
-                    logger.info("Success: Batch tensors are already on GPU")
+            # Check for teacher logits if KD is enabled
+            if use_kd:
+                if 'teacher_logits' in batch:
+                    logger.info(f"Teacher logits found in first batch with shape: {batch['teacher_logits'].shape}")
                 else:
-                    logger.info("Note: Batch tensors are on CPU and will be moved to GPU during training")
+                    logger.warning("KD is enabled, but 'teacher_logits' key is missing in the first batch.")
+
+        elif isinstance(batch, (list, tuple)) and len(batch) >= 2:
+             # Fallback for unexpected tuple/list format (shouldn't happen with current dataset)
+             inputs, targets = batch[0], batch[1]
+             logger.warning("DataLoader yielded a tuple/list, expected dict. Using first two elements.")
+             logger.info(f"First batch loaded (tuple/list format): inputs shape {inputs.shape}, targets shape {targets.shape}")
+        else:
+             logger.error(f"ERROR: Unexpected batch format received from DataLoader: {type(batch)}")
+             raise TypeError("Unexpected batch format")
+
+    except StopIteration:
+        logger.error("ERROR: DataLoader is empty. Cannot load first batch.")
+        logger.error("Cannot proceed with training due to data loading issue.")
+        return
     except Exception as e:
-        logger.error(f"ERROR: Failed to load first batch from train_loader: {e}")
+        logger.error(f"ERROR: Failed to load or process first batch from train_loader: {e}")
+        logger.error(traceback.format_exc()) # Add traceback for more details
         logger.error("Cannot proceed with training due to data loading issue.")
         return
 

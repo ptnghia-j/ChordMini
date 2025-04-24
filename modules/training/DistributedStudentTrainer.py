@@ -222,37 +222,46 @@ class DistributedStudentTrainer(StudentTrainer):
                 else:
                     logits = outputs
 
-                # --- NEW: flatten per-frame logits/targets for loss calculation ---
+                # --- Flatten per-frame logits/targets AND teacher_logits consistently ---
+                logits_for_loss = logits
+                targets_for_loss = targets
+                teacher_logits_for_loss = teacher_logits
+
                 if logits.ndim == 3 and targets.ndim == 2:
-                    logits = logits.reshape(-1, logits.size(-1))
-                    targets = targets.reshape(-1)
-                # ------------------------------------------------------------
+                    batch_size, time_steps, num_classes = logits.shape
+                    debug(f"Eval: Original shapes: logits {logits.shape}, targets {targets.shape}")
 
-                # Calculate loss
-                if self.use_focal_loss:
-                    loss = self.focal_loss(logits, targets)
-                else:
-                    loss = self.loss_fn(logits, targets)
+                    # Flatten student logits and targets for loss
+                    logits_for_loss = logits.reshape(-1, num_classes)
+                    targets_for_loss = targets.reshape(-1)
+                    debug(f"Eval: Flattened student for loss: logits {logits_for_loss.shape}, targets {targets_for_loss.shape}")
 
-                # Add KD loss if enabled and teacher logits are available
-                if self.use_kd_loss and teacher_logits is not None:
-                    kd_loss = self.knowledge_distillation_loss(logits, teacher_logits, self.temperature)
-                    loss = self.kd_alpha * kd_loss + (1 - self.kd_alpha) * loss
+                    # Flatten teacher logits if they exist and are 3D
+                    if teacher_logits is not None and teacher_logits.ndim == 3:
+                        if teacher_logits.shape[0] == batch_size and teacher_logits.shape[1] == time_steps:
+                            teacher_logits_for_loss = teacher_logits.reshape(-1, teacher_logits.size(-1))
+                            debug(f"Eval: Flattened teacher logits for loss: {teacher_logits_for_loss.shape}")
+                        else:
+                            warning(f"Eval: Teacher logits shape {teacher_logits.shape} mismatch with student batch/time {batch_size}/{time_steps}. Cannot flatten consistently.")
+                            teacher_logits_for_loss = None # Invalidate teacher logits for loss calculation
+                # ----------------------------------------------------------------------
+
+                # Calculate loss using potentially flattened tensors
+                # Use the compute_loss method from the parent class (StudentTrainer)
+                # which now handles KD and flattening internally
+                loss = self.compute_loss(logits_for_loss, targets_for_loss, teacher_logits_for_loss)
 
                 total_loss += loss.item()
 
-                # Calculate accuracy
-                if logits.ndim == 3 and targets.ndim <= 2:
-                    # Average over time dimension for sequence data
-                    logits = logits.mean(dim=1)
+                # --- Calculate accuracy using potentially flattened tensors ---
+                # Use the same flattened tensors as used for loss calculation
+                _, predicted = logits_for_loss.max(1)
+                batch_correct = (predicted == targets_for_loss).sum().item()
+                batch_total = targets_for_loss.size(0)
 
-                _, predicted = logits.max(1)
-                batch_correct = (predicted == targets).sum().item()
-                batch_total = targets.size(0)
-
-                # collect for class‐wise metrics
+                # collect for class‐wise metrics (using the same flattened predictions/targets)
                 all_preds.extend(predicted.cpu().numpy().tolist())
-                all_targets.extend(targets.cpu().numpy().tolist())
+                all_targets.extend(targets_for_loss.cpu().numpy().tolist())
 
                 correct += batch_correct
                 total += batch_total
@@ -276,29 +285,50 @@ class DistributedStudentTrainer(StudentTrainer):
             total = total_tensor.item()
 
         # Calculate average loss and accuracy
-        avg_loss = total_loss / len(val_loader)
-        accuracy = correct / total if total > 0 else 0
+        avg_loss = total_loss / len(val_loader) if len(val_loader) > 0 else 0.0
+        accuracy = correct / total if total > 0 else 0.0
 
         # Log validation metrics
         if self.is_main_process:
             info(f'Validation Loss: {avg_loss:.4f} | Validation Acc: {accuracy*100:.2f}%')
 
-            # Per-quality accuracy
-            info("Per-quality accuracy:")
-            idx_to_quality = {
-                idx: name.split(':')[-1] for idx, name in (self.idx_to_chord or {}).items()
-            }
-            # map predictions and targets to qualities
-            pred_quals = [idx_to_quality[p] for p in all_preds]
-            targ_quals = [idx_to_quality[t] for t in all_targets]
-            for qual in sorted(set(idx_to_quality.values())):
-                # count samples of this quality
-                cnt = sum(q == qual for q in targ_quals)
-                if cnt > 0:
-                    corr = sum(p == qual for p, t in zip(pred_quals, targ_quals) if t == qual)
-                    info(f'  {qual}: {corr/cnt:.2%} ({corr}/{cnt})')
-                else:
-                    info(f'  {qual}: N/A (no samples)')
+            # Per-quality accuracy calculation (ensure idx_to_chord exists)
+            if self.idx_to_chord:
+                info("Per-quality accuracy:")
+                try:
+                    idx_to_quality = {
+                        idx: name.split(':')[-1] for idx, name in self.idx_to_chord.items()
+                        if isinstance(name, str) and ':' in name # Basic check for valid chord name format
+                    }
+                    # Filter out invalid indices from predictions and targets before mapping
+                    valid_preds = [p for p in all_preds if p in idx_to_quality]
+                    valid_targets = [t for t in all_targets if t in idx_to_quality]
+
+                    # Map valid predictions and targets to qualities
+                    pred_quals = [idx_to_quality[p] for p in valid_preds]
+                    targ_quals = [idx_to_quality[t] for t in valid_targets]
+
+                    # Ensure pred_quals and targ_quals have the same length after filtering
+                    min_len = min(len(pred_quals), len(targ_quals))
+                    pred_quals = pred_quals[:min_len]
+                    targ_quals = targ_quals[:min_len]
+
+                    all_qualities = sorted(list(set(idx_to_quality.values())))
+
+                    for qual in all_qualities:
+                        # count samples of this quality in targets
+                        cnt = sum(q == qual for q in targ_quals)
+                        if cnt > 0:
+                            # count correct predictions for this quality
+                            corr = sum(p == qual for p, t in zip(pred_quals, targ_quals) if t == qual)
+                            info(f'  {qual}: {corr/cnt:.2%} ({corr}/{cnt})')
+                        else:
+                            info(f'  {qual}: N/A (no samples)')
+                except Exception as e:
+                    error(f"Error calculating per-quality accuracy: {e}")
+            else:
+                warning("idx_to_chord mapping not available, skipping per-quality accuracy.")
+
 
         return avg_loss, accuracy
 
