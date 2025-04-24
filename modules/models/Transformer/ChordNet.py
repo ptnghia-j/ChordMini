@@ -84,28 +84,35 @@ class ChordNet(nn.Module):
         # Add safeguards for BaseTransformer call
         try:
             # Process through transformer - preserves temporal structure for attention
-            o, logits = self.transformer(x, weight)
+            # BaseTransformer returns (decoder_logits, pre_decoder_features)
+            # decoder_logits shape: [B, T, n_class]
+            # pre_decoder_features shape: [B, T, n_freq]
+            _, features = self.transformer(x, weight) # Assign the second return value to 'features'
         except Exception as e:
             warnings.warn(f"Error in transformer: {e}. This might indicate an issue with BaseTransformer implementation.")
             # Provide a fallback mechanism when BaseTransformer fails
             # We'll create dummy outputs that match the expected shapes
             batch_size = x.size(0)
             time_steps = x.size(2) if x.dim() > 2 else 1
-            feature_dim = x.size(-1) // self.transformer.n_group
+            # The feature dimension expected by self.fc is n_freq
+            feature_dim = self.transformer.decoder.fc.in_features # Should be n_freq
 
-            # Create dummy outputs that match expected shapes
-            o = torch.zeros((batch_size, time_steps, feature_dim), device=x.device)
+            # Create dummy outputs that match expected shapes for 'features'
+            features = torch.zeros((batch_size, time_steps, feature_dim), device=x.device)
             # Return early with zeros to avoid subsequent errors
-            logits = self.fc(o)
+            logits = self.fc(features) # Use dummy features
             if targets is not None:
                 criterion = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
                 loss = criterion(logits.reshape(-1, logits.size(-1)),
                                targets.reshape(-1) if targets.dim() > 1 else targets)
                 return logits, loss
-            return logits, o
+            # Return dummy logits and features
+            return logits, features
 
-        o = self.dropout(o)
-        logits = self.fc(o)
+        # Apply dropout to the features before the final linear layer
+        features = self.dropout(features)
+        # Calculate final logits using ChordNet's fc layer with the correct features
+        logits = self.fc(features)
 
         # Return loss if targets are provided
         loss = None
@@ -144,7 +151,8 @@ class ChordNet(nn.Module):
             # Ensure loss is non-negative
             loss = torch.clamp(loss, min=0.0)
 
-        return logits, o if loss is None else (logits, loss)
+        # Return final logits and the features used to compute them
+        return logits, features if loss is None else (logits, loss)
 
     def predict(self, x, *args, **kwargs):
         """
@@ -165,12 +173,15 @@ class ChordNet(nn.Module):
         per_frame = kwargs.get('per_frame', False)
 
         with torch.no_grad():
-            # Run forward pass
-            logits = self.forward(x)
+            # Run forward pass - it now returns (logits, features)
+            output = self.forward(x)
 
-            # Handle different output formats
-            if isinstance(logits, tuple):
-                logits = logits[0]  # Take primary prediction logits
+            # Handle different output formats from forward pass
+            if isinstance(output, tuple):
+                logits = output[0]  # Take primary prediction logits
+            else:
+                # Should not happen if forward always returns tuple, but handle just in case
+                logits = output
 
             # Make predictions based on mode
             if per_frame:

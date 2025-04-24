@@ -131,7 +131,7 @@ class EncoderT(nn.Module):
     return x
 
 class Decoder(nn.Module):
-  def __init__(self, d_model=512, n_head=8, n_layer=5, dropout=0.5, r1=1.0, r2=1.0, wr=1.0, pr=0.01, n_class=12):
+  def __init__(self, d_model=512, n_head=8, n_layer=5, dropout=0.5, r1=1.0, r2=1.0, wr=1.0, pr=0.01):
     super().__init__()
     self.r1 = r1
     self.r2 = r2
@@ -149,7 +149,7 @@ class Decoder(nn.Module):
       self.ff_layer.append(FeedForward(n_feature=d_model, dropout=dropout))
     
     self.dropout = nn.Dropout(dropout)
-    self.fc = nn.Linear(d_model, n_class)
+    self.fc = nn.Linear(d_model, d_model)
     self.norm_layer = nn.LayerNorm(d_model)
 
   def forward(self, x1, x2, weight=None):
