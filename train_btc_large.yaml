@@ -21,6 +21,10 @@ spec:
                 operator: In
                 values:
                 - NVIDIA-A10 # Or other suitable GPU
+              - key: kubernetes.io/hostname      # new host pin
+                operator: In
+                values:
+                - gpu-05.nrp.mghpcc.org
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -154,12 +158,12 @@ spec:
               value: /mnt/storage/ChordMini
             # Learning rate scheduling options (can override btc_config.yaml)
             - name: LR_SCHEDULE
-              value: "cosine" # Example: Use cosine schedule
+              value: "validation" # Example: Use cosine schedule
             # Learning rate parameters (can override btc_config.yaml)
             - name: LEARNING_RATE
               value: "0.0001" # Base learning rate for BTC
             - name: MIN_LEARNING_RATE
-              value: "0.000001"    # Min learning rate for BTC (default 0)
+              value: "0.00001"    # Min learning rate for BTC (default 0)
             # Knowledge distillation settings (optional for BTC)
             - name: USE_KD_LOSS
               value: "true" # Set to "true" to enable KD loss if teacher logits are available
@@ -223,7 +227,7 @@ spec:
             - name: LAZY_INIT
               value: "false" # Controls dataset lazy initialization
             - name: SMALL_DATASET
-              value: "0.2"   # Set percentage of dataset to use (0.1 = 10%, null = full)
+              value: ""   # Set percentage of dataset to use (0.1 = 10%, null = full)
             - name: METADATA_CACHE
               value: "false" # Use metadata-only caching
           command:
@@ -423,12 +427,12 @@ spec:
               echo "=== BTC model training complete ==="
           resources:
             requests:
-              cpu: "6"
-              memory: "12Gi"
+              cpu: "4"
+              memory: "128Gi"
               nvidia.com/gpu: "2"
             limits:
-              cpu: "16"
-              memory: "64Gi"
+              cpu: "18"
+              memory: "320Gi"
               nvidia.com/gpu: "2"
           volumeMounts:
             - name: storage

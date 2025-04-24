@@ -872,6 +872,22 @@ def plot_chord_quality_distribution_accuracy(predictions, targets, idx_to_chord,
                 filtered_counts.append(count)
                 filtered_accuracies.append(quality_accuracy[quality])
 
+    # Check if we have any data to plot
+    if not filtered_counts:
+        # Create an empty figure with a message
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.text(0.5, 0.5, "No chord quality data available for visualization",
+                ha='center', va='center', fontsize=14)
+        ax.set_axis_off()
+
+        # Save the figure if requested
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+            plt.close(fig)
+
+        return fig
+
     # Calculate percentages
     percentages = [100 * count / total_samples for count in filtered_counts]
 

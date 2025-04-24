@@ -716,28 +716,76 @@ def main():
     logger.info(f"Using frequency dimension: {n_freq}")
     logger.info(f"Output classes: {n_classes}")
 
-    # Apply model scale factor
-    if model_scale != 1.0:
-        n_group = max(1, int(32 * model_scale))
-        logger.info(f"Using n_group={n_group}, resulting in feature dimension: {n_freq // n_group}")
-    else:
-        n_group = config.model.get('n_group', 32)
+    # Always use n_group=12 for all inputs
+    n_group = 12
+    feature_dim = n_freq // n_group
+    logger.info(f"Using fixed n_group=12, resulting in feature dimension: {feature_dim}")
 
     # Get dropout value
     dropout_rate = args.dropout if args.dropout is not None else config.model.get('dropout', 0.3)
     logger.info(f"Using dropout rate: {dropout_rate}")
 
-    # Create model instance
+    # Scale model parameters based on model_scale
+    def scale_model_params(config, scale_factor):
+        """Scale model parameters based on the scale factor"""
+        # Get base configuration for the model
+        base_config = config.model.get('base_config', {})
+
+        # If base_config is not specified, fall back to direct model parameters
+        if not base_config:
+            base_config = {
+                'f_layer': config.model.get('f_layer', 3),
+                'f_head': config.model.get('f_head', 6),
+                't_layer': config.model.get('t_layer', 3),
+                't_head': config.model.get('t_head', 6),
+                'd_layer': config.model.get('d_layer', 3),
+                'd_head': config.model.get('d_head', 6)
+            }
+
+        # Apply scale to model parameters
+        f_layer = max(1, int(round(base_config.get('f_layer', 3) * scale_factor)))
+        f_head = max(1, int(round(base_config.get('f_head', 6) * scale_factor)))
+        t_layer = max(1, int(round(base_config.get('t_layer', 3) * scale_factor)))
+        t_head = max(1, int(round(base_config.get('t_head', 6) * scale_factor)))
+        d_layer = max(1, int(round(base_config.get('d_layer', 3) * scale_factor)))
+        d_head = max(1, int(round(base_config.get('d_head', 6) * scale_factor)))
+
+        # Ensure f_head is compatible with feature_dim (must be a divisor)
+        if feature_dim % f_head != 0:
+            # Find the largest divisor of feature_dim that's <= f_head
+            for h in range(f_head, 0, -1):
+                if feature_dim % h == 0:
+                    logger.info(f"Adjusted f_head from {f_head} to {h} to ensure compatibility with feature_dim={feature_dim}")
+                    f_head = h
+                    break
+
+        return {
+            'f_layer': f_layer,
+            'f_head': f_head,
+            't_layer': t_layer,
+            't_head': t_head,
+            'd_layer': d_layer,
+            'd_head': d_head
+        }
+
+    # Apply model scaling
+    scaled_params = scale_model_params(config, model_scale)
+    logger.info(f"Scaled model parameters (scale={model_scale}):")
+    logger.info(f"  Frequency encoder: {scaled_params['f_layer']} layers, {scaled_params['f_head']} heads")
+    logger.info(f"  Time encoder: {scaled_params['t_layer']} layers, {scaled_params['t_head']} heads")
+    logger.info(f"  Decoder: {scaled_params['d_layer']} layers, {scaled_params['d_head']} heads")
+
+    # Create model instance with scaled parameters
     model = ChordNet(
         n_freq=n_freq,
         n_classes=n_classes,
         n_group=n_group,
-        f_layer=config.model.get('base_config', {}).get('f_layer', 3),
-        f_head=config.model.get('base_config', {}).get('f_head', 6),
-        t_layer=config.model.get('base_config', {}).get('t_layer', 3),
-        t_head=config.model.get('base_config', {}).get('t_head', 6),
-        d_layer=config.model.get('base_config', {}).get('d_layer', 3),
-        d_head=config.model.get('base_config', {}).get('d_head', 6),
+        f_layer=scaled_params['f_layer'],
+        f_head=scaled_params['f_head'],
+        t_layer=scaled_params['t_layer'],
+        t_head=scaled_params['t_head'],
+        d_layer=scaled_params['d_layer'],
+        d_head=scaled_params['d_head'],
         dropout=dropout_rate
     ).to(device)
 

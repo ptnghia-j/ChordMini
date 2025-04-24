@@ -15,7 +15,7 @@ experiment:
   weight_decay : 0.0
   max_epoch : 100
   batch_size : 128
-  save_step : 40
+  save_step : 10
   data_ratio : 0.8
 
 model:

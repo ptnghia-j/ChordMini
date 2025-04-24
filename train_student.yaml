@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-mini
+  name: chord-mini-02
   namespace: csuf-titans
   labels:
     app: chord-student-training
@@ -177,7 +177,7 @@ spec:
               value: "2.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
             # Learning rate scheduling options - overrides student_config.yaml settings
             - name: LR_SCHEDULE
-              value: "cosine"  # Changed from empty string to 'validation'
+              value: "validation"  # Changed from empty string to 'validation'
             # Additional learning rate parameters - new additions
             - name: LEARNING_RATE
               value: "0.001"  # Base learning rate
@@ -229,7 +229,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
             - name: SUB_DIR
-              value: "fma"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
+              value: "fma-02"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
@@ -571,7 +571,7 @@ spec:
               memory: "24Gi"
               nvidia.com/gpu: "1"
             limits:
-              cpu: "12"
+              cpu: "16"
               memory: "64Gi"
               nvidia.com/gpu: "1"
           volumeMounts:
