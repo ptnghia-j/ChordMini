@@ -1057,6 +1057,12 @@ class StudentTrainer(BaseTrainer):
         info(f"Epoch Validation Loss: {avg_loss:.4f}, Accuracy: {val_acc:.4f}")
 
         # Pass the current epoch to the confusion matrix function
+        # Only print detailed class distribution and confusion matrix every 5 epochs or on the last epoch
+        is_last_epoch = current_epoch == self.num_epochs
+        is_print_epoch = current_epoch % 5 == 0 or current_epoch == 1 or is_last_epoch
+
+        # The calculate_confusion_matrix function now handles the printing logic internally
+        # based on the current_epoch value
         calculate_confusion_matrix(all_preds, all_targets, self.idx_to_chord, self.checkpoint_dir, current_epoch)
 
         self.model.train()
@@ -1510,7 +1516,7 @@ class StudentTrainer(BaseTrainer):
                                 train_total += targets.size(0)
                                 epoch_loss += loss.item()
 
-                                if batch_idx % 20 == 0:
+                                if batch_idx % 100 == 0:
                                     # Log current LR and indicate whether KD is being used for this batch
                                     current_lr = self.optimizer.param_groups[0]['lr']
                                     batch_acc = batch_correct / targets.size(0) if targets.size(0) > 0 else 0

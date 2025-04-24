@@ -577,6 +577,7 @@ def calculate_confusion_matrix(predictions, targets, idx_to_chord, checkpoint_di
     Calculate, log, and save the confusion matrix.
     Prints chord quality groups for clearer visualization and also saves the
     full class confusion matrix every 10 epochs.
+    Detailed class distribution and confusion matrix analysis are printed every 5 epochs.
 
     Args:
         predictions: List of predicted class indices
@@ -586,6 +587,12 @@ def calculate_confusion_matrix(predictions, targets, idx_to_chord, checkpoint_di
     if not predictions or not targets:
         error("Cannot calculate confusion matrix: no predictions or targets")
         return
+
+    # Determine if we should print detailed information
+    # Print on: first epoch, last epoch, every 5th epoch, or when current_epoch is None
+    is_first_epoch = current_epoch == 1
+    is_last_epoch = False  # We don't know this, but we'll handle it separately
+    is_print_epoch = current_epoch is None or is_first_epoch or is_last_epoch or current_epoch % 5 == 0
 
     try:
         # Count occurrences of each class in targets
@@ -615,85 +622,90 @@ def calculate_confusion_matrix(predictions, targets, idx_to_chord, checkpoint_di
             for cls in most_common_classes:
                 chord_names[cls] = f"Class-{cls}"
 
-        # Log class distribution for top 10 classes (print only)
-        info("\nClass distribution in validation set (Top 10):")
-        for cls in most_common_classes:
-            try:
-                count = target_counter.get(cls, 0)
-                percentage = 100 * count / total_samples if total_samples > 0 else 0
-                chord_name = chord_names.get(cls, f"Class-{cls}")
-                info(f"  {chord_name}: {count} samples ({percentage:.2f}%)")
-            except Exception as e:
-                error(f"Error processing class {cls}: {e}")
+        # Only print detailed class distribution on print epochs
+        if is_print_epoch:
+            info("\nClass distribution in validation set (Top 10):")
+            for cls in most_common_classes:
+                try:
+                    count = target_counter.get(cls, 0)
+                    percentage = 100 * count / total_samples if total_samples > 0 else 0
+                    chord_name = chord_names.get(cls, f"Class-{cls}")
+                    info(f"  {chord_name}: {count} samples ({percentage:.2f}%)")
+                except Exception as e:
+                    error(f"Error processing class {cls}: {e}")
 
-        # Calculate confusion matrix values for top classes (printed to log)
-        confusion = {}
-        for true_cls in most_common_classes:
-            try:
-                # Get indices where true class equals this class
-                true_indices = [i for i, t in enumerate(targets) if t == true_cls]
-                if not true_indices:
-                    continue
+            # Calculate confusion matrix values for top classes (printed to log)
+            confusion = {}
+            for true_cls in most_common_classes:
+                try:
+                    # Get indices where true class equals this class
+                    true_indices = [i for i, t in enumerate(targets) if t == true_cls]
+                    if not true_indices:
+                        continue
 
-                # Get predictions for these indices
-                cls_preds = [predictions[i] for i in true_indices]
-                pred_counter = Counter(cls_preds)
+                    # Get predictions for these indices
+                    cls_preds = [predictions[i] for i in true_indices]
+                    pred_counter = Counter(cls_preds)
 
-                # Calculate accuracy for this class
-                correct = pred_counter.get(true_cls, 0)
-                total = len(true_indices)
-                accuracy = correct / total if total > 0 else 0
+                    # Calculate accuracy for this class
+                    correct = pred_counter.get(true_cls, 0)
+                    total = len(true_indices)
+                    accuracy = correct / total if total > 0 else 0
 
-                # Get the most commonly predicted class for this true class
-                most_predicted = pred_counter.most_common(1)[0][0] if pred_counter else true_cls
+                    # Get the most commonly predicted class for this true class
+                    most_predicted = pred_counter.most_common(1)[0][0] if pred_counter else true_cls
 
-                # Use the chord_names dictionary consistently
-                true_chord_name = chord_names.get(true_cls, f"Class-{true_cls}")
-                pred_chord_name = chord_names.get(most_predicted, f"Class-{most_predicted}")
+                    # Use the chord_names dictionary consistently
+                    true_chord_name = chord_names.get(true_cls, f"Class-{true_cls}")
+                    pred_chord_name = chord_names.get(most_predicted, f"Class-{most_predicted}")
 
-                confusion[true_chord_name] = {
-                    'accuracy': accuracy,
-                    'most_predicted': pred_chord_name,
-                    'correct': correct,
-                    'total': total
-                }
-            except Exception as e:
-                error(f"Error processing confusion data for class {true_cls}: {e}")
+                    confusion[true_chord_name] = {
+                        'accuracy': accuracy,
+                        'most_predicted': pred_chord_name,
+                        'correct': correct,
+                        'total': total
+                    }
+                except Exception as e:
+                    error(f"Error processing confusion data for class {true_cls}: {e}")
 
-        # Log confusion matrix information for top classes
-        info("\nConfusion Matrix Analysis (Top 10 Classes):")
-        info(f"{'True Class':<20} | {'Accuracy':<10} | {'Most Predicted':<20} | {'Correct/Total'}")
-        info(f"{'-'*20} | {'-'*10} | {'-'*20} | {'-'*15}")
+            # Log confusion matrix information for top classes
+            info("\nConfusion Matrix Analysis (Top 10 Classes):")
+            info(f"{'True Class':<20} | {'Accuracy':<10} | {'Most Predicted':<20} | {'Correct/Total'}")
+            info(f"{'-'*20} | {'-'*10} | {'-'*20} | {'-'*15}")
 
-        for true_class, stats in confusion.items():
-            info(f"{true_class:<20} | {stats['accuracy']:.4f}     | {stats['most_predicted']:<20} | {stats['correct']}/{stats['total']}")
+            for true_class, stats in confusion.items():
+                info(f"{true_class:<20} | {stats['accuracy']:.4f}     | {stats['most_predicted']:<20} | {stats['correct']}/{stats['total']}")
 
-        # Calculate overall metrics for these common classes
-        common_correct = sum(confusion[cls]['correct'] for cls in confusion)
-        common_total = sum(confusion[cls]['total'] for cls in confusion)
-        common_acc = common_correct / common_total if common_total > 0 else 0
-        info(f"\nAccuracy on most common classes: {common_acc:.4f} ({common_correct}/{common_total})")
+            # Calculate overall metrics for these common classes
+            common_correct = sum(confusion[cls]['correct'] for cls in confusion)
+            common_total = sum(confusion[cls]['total'] for cls in confusion)
+            common_acc = common_correct / common_total if common_total > 0 else 0
+            info(f"\nAccuracy on most common classes: {common_acc:.4f} ({common_correct}/{common_total})")
 
         # NEW: Create and visualize chord quality group confusion matrix using chords.py
         if idx_to_chord:
-            info("\n=== Creating chord quality group confusion matrix ===")
+            # Only print detailed quality information on print epochs
+            if is_print_epoch:
+                info("\n=== Creating chord quality group confusion matrix ===")
+
             try:
                 # Use the visualization module to calculate quality statistics
                 quality_cm, quality_counts, quality_accuracy, quality_groups = calculate_quality_confusion_matrix(
                     predictions, targets, idx_to_chord
                 )
 
-                # Log quality distribution
-                info("\nChord quality distribution:")
-                for i, quality in enumerate(quality_groups):
-                    count = quality_counts.get(i, 0)
-                    percentage = 100 * count / len(targets) if targets else 0
-                    info(f"  {quality}: {count} samples ({percentage:.2f}%)")
+                # Log quality distribution on print epochs
+                if is_print_epoch:
+                    info("\nChord quality distribution:")
+                    for i, quality in enumerate(quality_groups):
+                        count = quality_counts.get(i, 0)
+                        percentage = 100 * count / len(targets) if targets else 0
+                        info(f"  {quality}: {count} samples ({percentage:.2f}%)")
 
-                # Log accuracies by quality
-                info("\nAccuracy by chord quality:")
-                for quality, acc in sorted(quality_accuracy.items(), key=lambda x: x[1], reverse=True):
-                    info(f"  {quality}: {acc:.4f}")
+                    # Log accuracies by quality
+                    info("\nAccuracy by chord quality:")
+                    for quality, acc in sorted(quality_accuracy.items(), key=lambda x: x[1], reverse=True):
+                        info(f"  {quality}: {acc:.4f}")
 
                 # Create and save chord quality confusion matrix
                 title = f"Chord Quality Confusion Matrix - Epoch {current_epoch}"
@@ -708,15 +720,17 @@ def calculate_confusion_matrix(predictions, targets, idx_to_chord, checkpoint_di
                         predictions, targets, idx_to_chord,
                         title=title, save_path=quality_cm_path
                     )
-                    info(f"Saved chord quality confusion matrix to {quality_cm_path}")
+                    if is_print_epoch:
+                        info(f"Saved chord quality confusion matrix to {quality_cm_path}")
                 except Exception as e:
                     error(f"Error plotting chord quality confusion matrix: {e}")
-                    # Print normalized confusion matrix as text fallback
-                    info("\nChord Quality Confusion Matrix (normalized):")
-                    normalized_cm = quality_cm.astype('float') / quality_cm.sum(axis=1)[:, np.newaxis]
-                    normalized_cm = np.nan_to_num(normalized_cm)  # Replace NaN with zero
-                    for i, row in enumerate(normalized_cm):
-                        info(f"{quality_groups[i]:<10}: " + " ".join([f"{x:.2f}" for x in row]))
+                    # Print normalized confusion matrix as text fallback on print epochs
+                    if is_print_epoch:
+                        info("\nChord Quality Confusion Matrix (normalized):")
+                        normalized_cm = quality_cm.astype('float') / quality_cm.sum(axis=1)[:, np.newaxis]
+                        normalized_cm = np.nan_to_num(normalized_cm)  # Replace NaN with zero
+                        for i, row in enumerate(normalized_cm):
+                            info(f"{quality_groups[i]:<10}: " + " ".join([f"{x:.2f}" for x in row]))
 
             except Exception as e:
                 error(f"Error creating quality-based confusion matrix: {e}")

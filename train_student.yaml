@@ -20,7 +20,8 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-GeForce-RTX-3090
+                # - NVIDIA-GeForce-RTX-3090
+                - NVIDIA-A10
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
