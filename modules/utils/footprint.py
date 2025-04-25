@@ -23,6 +23,8 @@ from modules.models.Transformer.ChordNet import ChordNet
 # Import BTC model
 from modules.models.Transformer.btc_model import BTC_model
 from modules.utils.hparams import HParams
+# Import chord mapping utility if needed for n_classes default
+# from modules.utils.chords import idx2voca_chord
 
 def count_parameters(model):
     """Count trainable parameters in a model"""
@@ -42,30 +44,65 @@ def print_model_parameters(model):
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {count_parameters(model):,}")
 
-def scale_config(config, scale_factor):
-    """Scale model config parameters by given factor"""
+def scale_config(config, scale_factor, n_freq, n_group):
+    """
+    Scale model config parameters by given factor, matching train_student.py logic.
+
+    Args:
+        config: HParams object containing model configuration.
+        scale_factor: The scaling factor (e.g., 0.5, 1.0, 2.0).
+        n_freq: Number of frequency bins.
+        n_group: Number of groups (fixed at 12 in ChordNet).
+
+    Returns:
+        dict: Scaled model parameters.
+    """
     # Get base configuration for the model
     base_config = config.model.get('base_config', {})
-    
+
     # If base_config is not specified, fall back to direct model parameters
     if not base_config:
         base_config = {
             'f_layer': config.model.get('f_layer', 3),
-            'f_head': config.model.get('f_head', 6),
+            # Use base f_head from config or default, train_student now uses 4
+            'f_head': config.model.get('f_head', 4),
             't_layer': config.model.get('t_layer', 3),
-            't_head': config.model.get('t_head', 6),
+            # Use base t_head from config or default, train_student now uses 4
+            't_head': config.model.get('t_head', 4),
             'd_layer': config.model.get('d_layer', 3),
-            'd_head': config.model.get('d_head', 6)
+            # Use base d_head from config or default, train_student now uses 4
+            'd_head': config.model.get('d_head', 4)
         }
-    
-    # Apply scale to model parameters
-    f_layer = max(1, int(round(base_config['f_layer'] * scale_factor)))
-    f_head = max(1, int(round(base_config['f_head'])))
-    t_layer = max(1, int(round(base_config['t_layer'] * scale_factor)))
-    t_head = max(1, int(round(base_config['t_head'])))
-    d_layer = max(1, int(round(base_config['d_layer'] * scale_factor)))
-    d_head = max(1, int(round(base_config['d_head'])))
-    
+
+    # Apply scale to layer parameters
+    f_layer = max(1, int(round(base_config.get('f_layer', 3) * scale_factor)))
+    t_layer = max(1, int(round(base_config.get('t_layer', 3) * scale_factor)))
+    d_layer = max(1, int(round(base_config.get('d_layer', 3) * scale_factor)))
+
+    # Fix t_head and d_head similar to train_student.py (now using 4)
+    t_head = 4
+    d_head = 4
+
+    # Handle f_head based on divisibility, similar to train_student.py (now starting from 4)
+    f_head_base = base_config.get('f_head', 4) # Start with base f_head (now 4)
+    feature_dim = n_freq // n_group
+    f_head = f_head_base # Initialize f_head
+
+    if feature_dim % f_head != 0:
+        # Find the largest divisor of feature_dim that's <= f_head
+        adjusted = False
+        for h in range(f_head, 0, -1):
+            if feature_dim % h == 0:
+                print(f"Note: Adjusted f_head from {f_head} to {h} for scale {scale_factor}x "
+                      f"to ensure compatibility with feature_dim={feature_dim}")
+                f_head = h
+                adjusted = True
+                break
+        if not adjusted:
+             print(f"Warning: Could not find compatible f_head for feature_dim={feature_dim} "
+                   f"with base f_head={f_head_base}. Using f_head=1.")
+             f_head = 1 # Fallback if no divisor found
+
     return {
         'f_layer': f_layer,
         'f_head': f_head,
@@ -83,7 +120,9 @@ def main():
     parser.add_argument('--scales', nargs='+', type=float, default=[0.25, 0.5, 0.75, 1.0, 1.5, 2.0],
                         help='Scaling factors to evaluate for ChordNet')
     parser.add_argument('--n_freq', type=int, default=None, help='Override n_freq value for ChordNet')
-    parser.add_argument('--n_classes', type=int, default=170, help='Number of output classes')
+    # Default n_classes to 170, matching common usage derived from idx2voca_chord
+    parser.add_argument('--n_classes', type=int, default=170,
+                        help='Number of output classes (default: 170, common for idx2voca_chord)')
     parser.add_argument('--cqt', action='store_true', help='Use CQT configuration (smaller n_freq) for ChordNet')
     parser.add_argument('--stft', action='store_true', help='Use STFT configuration (larger n_freq) for ChordNet')
     # Add flag to calculate BTC footprint
@@ -113,6 +152,7 @@ def main():
 
     # Get n_classes from config or args
     n_classes = args.n_classes
+    print(f"Note: Using n_classes = {n_classes}. Ensure this matches your training setup.")
 
     print("\nChordNet Parameters:")
     print(f"  n_freq: {n_freq}")
@@ -124,8 +164,11 @@ def main():
 
     # Generate table rows for each scale
     for scale in sorted(args.scales):
-        # Scale model config
-        scaled_params = scale_config(student_config, scale)
+        # Scale model config using the updated function
+        scaled_params = scale_config(student_config, scale, n_freq, n_group_fixed)
+
+        # Get dropout from config, default to 0.3 like train_student.py if missing
+        dropout_rate = student_config.model.get('dropout', 0.3)
 
         # Create model with scaled parameters, using fixed n_group
         chordnet_model = ChordNet(
@@ -133,12 +176,12 @@ def main():
             n_classes=n_classes,
             n_group=n_group_fixed, # Use the fixed n_group
             f_layer=scaled_params['f_layer'],
-            f_head=scaled_params['f_head'], # Pass scaled f_head, ChordNet adjusts if needed
+            f_head=scaled_params['f_head'], # Pass scaled f_head
             t_layer=scaled_params['t_layer'],
-            t_head=scaled_params['t_head'],
+            t_head=scaled_params['t_head'], # Pass fixed t_head
             d_layer=scaled_params['d_layer'],
-            d_head=scaled_params['d_head'],
-            dropout=student_config.model.get('dropout', 0.1)
+            d_head=scaled_params['d_head'], # Pass fixed d_head
+            dropout=dropout_rate # Use dropout from config
         )
 
         # Count parameters

@@ -694,7 +694,7 @@ def calculate_confusion_matrix(predictions, targets, idx_to_chord, checkpoint_di
                     predictions, targets, idx_to_chord
                 )
 
-                # Log quality distribution on print epochs
+                # Log quality distribution only on print epochs (every 5 epochs)
                 if is_print_epoch:
                     info("\nChord quality distribution:")
                     for i, quality in enumerate(quality_groups):

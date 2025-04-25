@@ -397,10 +397,38 @@ def root_majmin_score_calculation(valid_dataset, config, mean, std, device, mode
                 # Process each segment
                 for t in range(num_instance):
                     # Extract frame-level predictions for this segment
-                    prediction = model.predict(
-                        feature[:, n_timestep * t:n_timestep * (t + 1), :],
-                        per_frame=True
-                    ).squeeze()
+                    try:
+                        # Check if model is wrapped with DistributedDataParallel
+                        if hasattr(model, 'module'):
+                            # Access the underlying model
+                            base_model = model.module
+                            prediction = base_model.predict(
+                                feature[:, n_timestep * t:n_timestep * (t + 1), :],
+                                per_frame=True
+                            ).squeeze()
+                        else:
+                            # Regular model (not DDP wrapped)
+                            prediction = model.predict(
+                                feature[:, n_timestep * t:n_timestep * (t + 1), :],
+                                per_frame=True
+                            ).squeeze()
+                    except Exception as e:
+                        # Fall back to direct model call if predict method fails
+                        print(f"Warning: Error in model.predict: {e}. Falling back to direct model call.")
+                        # Get predictions using direct model call
+                        outputs = model(feature[:, n_timestep * t:n_timestep * (t + 1), :])
+
+                        # Handle different output formats
+                        if isinstance(outputs, tuple):
+                            logits = outputs[0]
+                        else:
+                            logits = outputs
+
+                        # Get predictions from logits
+                        if logits.dim() == 3:  # [batch, time, classes]
+                            prediction = logits.argmax(dim=2).squeeze()
+                        else:
+                            prediction = logits.argmax(dim=-1).squeeze()
 
                     # Ensure prediction is a 1D tensor
                     if prediction.dim() == 0:
@@ -615,21 +643,33 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                 # Get predictions from the model
                 with torch.no_grad():
                     try:
-                        # First try to use the predict method if it exists
-                        if hasattr(model, 'predict'):
-                            output = model.predict(input_tensor)
+                        # Check if model is wrapped with DistributedDataParallel
+                        if hasattr(model, 'module'):
+                            # Access the underlying model
+                            base_model = model.module
+
+                            # Try to use the predict method if it exists on the base model
+                            if hasattr(base_model, 'predict'):
+                                output = base_model.predict(input_tensor)
+                            else:
+                                # Fall back to direct model call
+                                output = model(input_tensor)
                         else:
-                            # Fall back to direct model call for models like BTC_model
-                            output = model(input_tensor)
+                            # Regular model (not DDP wrapped)
+                            if hasattr(model, 'predict'):
+                                output = model.predict(input_tensor)
+                            else:
+                                # Fall back to direct model call for models like BTC_model
+                                output = model(input_tensor)
 
-                            # Handle different output formats
-                            if isinstance(output, tuple):
-                                output = output[0]  # Take first element if it's a tuple
+                        # Handle different output formats
+                        if isinstance(output, tuple):
+                            output = output[0]  # Take first element if it's a tuple
 
-                            # For BTC model, output is [batch, time, classes]
-                            # We need to get the predicted class indices
-                            if output.dim() == 3:
-                                output = output.argmax(dim=2)  # Get predicted class indices
+                        # For BTC model, output is [batch, time, classes]
+                        # We need to get the predicted class indices
+                        if output.dim() == 3:
+                            output = output.argmax(dim=2)  # Get predicted class indices
                     except Exception as e:
                         print(f"Error getting predictions from model: {e}")
                         raise
@@ -652,12 +692,15 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                     try:
                         from modules.utils.chords import idx2voca_chord
                         idx_to_chord = idx2voca_chord()
-                        print("WARNING: model.idx_to_chord not found. Using idx2voca_chord() as fallback.")
+                        # Commented out to reduce log verbosity
+                        # print("WARNING: model.idx_to_chord not found. Using idx2voca_chord() as fallback.")
 
-                        # Print a sample of the mapping to verify it's correct
-                        sample_keys = list(idx_to_chord.keys())[:5]
-                        sample_mapping = {k: idx_to_chord[k] for k in sample_keys}
-                        print(f"Sample chord mapping: {sample_mapping}")
+                        # Print a sample of the mapping to verify it's correct (only once)
+                        if not hasattr(large_voca_score_calculation, '_chord_mapping_logged'):
+                            sample_keys = list(idx_to_chord.keys())[:5]
+                            sample_mapping = {k: idx_to_chord[k] for k in sample_keys}
+                            print(f"Using standard chord mapping: {sample_mapping}")
+                            large_voca_score_calculation._chord_mapping_logged = True
                     except Exception as e:
                         print(f"Error using idx2voca_chord: {e}")
 
@@ -703,18 +746,22 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                         if max_pred >= 169:
                             idx_to_chord[169] = "N"  # No chord
 
-                        print("WARNING: model.idx_to_chord not found. Created standard chord mapping.")
+                        # Commented out to reduce log verbosity
+                        # print("WARNING: model.idx_to_chord not found. Created standard chord mapping.")
 
-                        # Print a sample of the mapping to verify it's correct
-                        sample_keys = sorted(list(idx_to_chord.keys()))[:5]
-                        sample_mapping = {k: idx_to_chord[k] for k in sample_keys}
-                        print(f"Sample chord mapping: {sample_mapping}")
+                        # Print a sample of the mapping to verify it's correct (only once)
+                        if not hasattr(large_voca_score_calculation, '_chord_mapping_logged'):
+                            sample_keys = sorted(list(idx_to_chord.keys()))[:5]
+                            sample_mapping = {k: idx_to_chord[k] for k in sample_keys}
+                            print(f"Using standard chord mapping: {sample_mapping}")
 
-                        # Also print the special chord mappings
-                        special_keys = [k for k in idx_to_chord.keys() if k >= 168]
-                        if special_keys:
-                            special_mapping = {k: idx_to_chord[k] for k in special_keys}
-                            print(f"Special chord mappings: {special_mapping}")
+                            # Also print the special chord mappings
+                            special_keys = [k for k in idx_to_chord.keys() if k >= 168]
+                            if special_keys:
+                                special_mapping = {k: idx_to_chord[k] for k in special_keys}
+                                print(f"Special chord mappings: {special_mapping}")
+
+                            large_voca_score_calculation._chord_mapping_logged = True
 
                     # This section is intentionally left empty as we've moved the code inside the try/except blocks
 
@@ -735,10 +782,11 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                 collected_refs.extend(reference_labels)
                 collected_preds.extend(pred_chords)
 
-                # Debug first few predicted chords to verify format
-                if i == 0:
+                # Debug first few predicted chords to verify format (only for the first song)
+                if i == 0 and not hasattr(large_voca_score_calculation, '_first_chords_logged'):
                     print(f"First 5 predicted chords: {pred_chords[:5]}")
                     print(f"First 5 reference chords: {reference_labels[:5]}")
+                    large_voca_score_calculation._first_chords_logged = True
 
                 # Calculate scores
                 durations = np.diff(np.append(timestamps, [timestamps[-1] + frame_duration]))
@@ -759,11 +807,14 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                 song_length_list.append(song_length)
 
                 # Debug first few songs - FIX: Convert numpy arrays to float values before formatting
-                if i < 5:
+                if i < 5 and not hasattr(large_voca_score_calculation, '_song_scores_logged'):
                     # Convert scores to float values if they're numpy arrays
                     root_score_val = float(root_score) if hasattr(root_score, 'item') else root_score
                     mirex_score_val = float(mirex_score) if hasattr(mirex_score, 'item') else mirex_score
                     print(f"Song {song_id}: length={song_length:.1f}s, root={root_score_val:.4f}, mirex={mirex_score_val:.4f}")
+                    # Set flag after the first song is processed
+                    if i == 0:
+                        large_voca_score_calculation._song_scores_logged = True
 
         except Exception as e:
             import traceback

@@ -1038,10 +1038,10 @@ class StudentTrainer(BaseTrainer):
             if teacher_logits is not None and teacher_logits.device != device:
                 teacher_logits = teacher_logits.to(device, non_blocking=True)
 
-            # Verify and log input shapes for debugging
-            orig_logits_shape = logits.shape
-            orig_targets_shape = targets.shape
-            orig_teacher_logits_shape = teacher_logits.shape if teacher_logits is not None else None
+            # Verify and log input shapes for debugging (commented out to reduce log verbosity)
+            # orig_logits_shape = logits.shape
+            # orig_targets_shape = targets.shape
+            # orig_teacher_logits_shape = teacher_logits.shape if teacher_logits is not None else None
 
             # --- Flattening Logic ---
             # Check if student logits need flattening (e.g., from BTC model)
@@ -1059,12 +1059,12 @@ class StudentTrainer(BaseTrainer):
                         warning(f"Teacher logits shape {teacher_logits.shape} mismatch with student batch/time {batch_size}/{time_steps} during flattening. Disabling KD for this batch.")
                         teacher_logits = None # Invalidate teacher logits
 
-            # Report reshape results if any occurred
-            if orig_logits_shape != logits.shape or \
-               orig_targets_shape != targets.shape or \
-               (orig_teacher_logits_shape is not None and teacher_logits is not None and orig_teacher_logits_shape != teacher_logits.shape) or \
-               (orig_teacher_logits_shape is not None and teacher_logits is None): # Log if teacher logits were invalidated
-                info(f"Reshaped tensors for loss - Student: {orig_logits_shape} -> {logits.shape}, Targets: {orig_targets_shape} -> {targets.shape}, Teacher: {orig_teacher_logits_shape} -> {teacher_logits.shape if teacher_logits is not None else 'None'}")
+            # Report reshape results if any occurred (commented out to reduce log verbosity)
+            # if orig_logits_shape != logits.shape or \
+            #    orig_targets_shape != targets.shape or \
+            #    (orig_teacher_logits_shape is not None and teacher_logits is not None and orig_teacher_logits_shape != teacher_logits.shape) or \
+            #    (orig_teacher_logits_shape is not None and teacher_logits is None): # Log if teacher logits were invalidated
+            #     info(f"Reshaped tensors for loss - Student: {orig_logits_shape} -> {logits.shape}, Targets: {orig_targets_shape} -> {targets.shape}, Teacher: {orig_teacher_logits_shape} -> {teacher_logits.shape if teacher_logits is not None else 'None'}")
 
             # --- Loss Calculation ---
             # Calculate standard loss (Focal or CE)

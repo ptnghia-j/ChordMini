@@ -763,9 +763,9 @@ def main():
         f_layer = max(1, int(round(base_config.get('f_layer', 3) * scale_factor)))
         t_layer = max(1, int(round(base_config.get('t_layer', 3) * scale_factor)))
         d_layer = max(1, int(round(base_config.get('d_layer', 3) * scale_factor)))
-        f_head = 6
-        t_head = 6
-        d_head = 6
+        f_head = 4
+        t_head = 4
+        d_head = 4
 
         # Ensure f_head is compatible with feature_dim (must be a divisor)
         if feature_dim % f_head != 0:
@@ -823,12 +823,43 @@ def main():
         model.idx_to_chord = master_mapping
     logger.info("Attached chord mapping to model for correct MIR evaluation")
 
-    # Create optimizer
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=config.training['learning_rate'],
-        weight_decay=config.training.get('weight_decay', 0.0)
-    )
+    # Create optimizer with different learning rates for ReZero parameters
+    # Separate parameters into two groups: ReZero alpha parameters and all other parameters
+    rezero_params = []
+    other_params = []
+
+    # Helper function to identify ReZero parameters
+    def is_rezero_param(name):
+        return 'alpha' in name
+
+    # Collect parameters based on their names
+    if distributed_training:
+        # For distributed training, access the module
+        for name, param in model.module.named_parameters():
+            if is_rezero_param(name):
+                rezero_params.append(param)
+                logger.info(f"ReZero parameter found: {name}")
+            else:
+                other_params.append(param)
+    else:
+        # For non-distributed training
+        for name, param in model.named_parameters():
+            if is_rezero_param(name):
+                rezero_params.append(param)
+                logger.info(f"ReZero parameter found: {name}")
+            else:
+                other_params.append(param)
+
+    # Create optimizer with parameter groups
+    base_lr = config.training['learning_rate']
+    rezero_lr = base_lr * 0.1  # 10x smaller learning rate for ReZero parameters
+
+    optimizer = torch.optim.Adam([
+        {'params': other_params, 'lr': base_lr},
+        {'params': rezero_params, 'lr': rezero_lr}
+    ], weight_decay=config.training.get('weight_decay', 0.0))
+
+    logger.info(f"Using learning rate {base_lr} for main parameters and {rezero_lr} for ReZero parameters")
 
     # Clean up GPU memory before training
     if torch.cuda.is_available():
