@@ -645,21 +645,78 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
 
                 # Prepare for mir_eval format
                 idx_to_chord = model.idx_to_chord if hasattr(model, 'idx_to_chord') else None
-                if idx_to_chord is None:
-                    # Try to infer from dataset or fall back to default
-                    # Handle case where predictions are numpy arrays
-                    max_pred = 0
-                    for pred in predictions:
-                        if isinstance(pred, np.ndarray):
-                            # Get the maximum value from the numpy array
-                            pred_val = int(pred.item()) if pred.size == 1 else int(pred[0])
-                            max_pred = max(max_pred, pred_val)
-                        else:
-                            # Already an integer or other comparable type
-                            max_pred = max(max_pred, pred)
 
-                    idx_to_chord = {i: f"class_{i}" for i in range(max_pred + 1)}
-                    print("WARNING: model.idx_to_chord not found. Using default class_N mapping, which may cause MIR-eval errors.")
+                # If model doesn't have idx_to_chord, create a proper mapping
+                if idx_to_chord is None:
+                    # Try to use the idx2voca_chord function from modules.utils.chords as a fallback
+                    try:
+                        from modules.utils.chords import idx2voca_chord
+                        idx_to_chord = idx2voca_chord()
+                        print("WARNING: model.idx_to_chord not found. Using idx2voca_chord() as fallback.")
+
+                        # Print a sample of the mapping to verify it's correct
+                        sample_keys = list(idx_to_chord.keys())[:5]
+                        sample_mapping = {k: idx_to_chord[k] for k in sample_keys}
+                        print(f"Sample chord mapping: {sample_mapping}")
+                    except Exception as e:
+                        print(f"Error using idx2voca_chord: {e}")
+
+                        # Create a basic mapping with proper chord names
+                        # Find the maximum prediction value to determine the size of the mapping
+                        max_pred = 0
+                        for pred in predictions:
+                            if isinstance(pred, np.ndarray):
+                                # Get the maximum value from the numpy array
+                                pred_val = int(pred.item()) if pred.size == 1 else int(pred[0])
+                                max_pred = max(max_pred, pred_val)
+                            else:
+                                # Already an integer or other comparable type
+                                max_pred = max(max_pred, pred)
+
+                        # Create a mapping that follows standard chord notation
+                        idx_to_chord = {}
+
+                        # Define root notes (12 semitones)
+                        root_notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+                        # Define chord qualities
+                        qualities = ['maj', 'min', '7', 'maj7', 'min7', 'dim', 'aug', 'sus4', 'sus2',
+                                    'dim7', 'hdim7', 'minmaj7', 'maj6', 'min6']
+
+                        # Create mapping for all root+quality combinations
+                        idx = 0
+                        for root in root_notes:
+                            # Major chords (just the root note means major)
+                            idx_to_chord[idx] = f"{root}:maj"
+                            idx += 1
+
+                            # Add all other qualities
+                            for quality in qualities[1:]:  # Skip 'maj' as we already added it
+                                if idx <= max_pred:
+                                    idx_to_chord[idx] = f"{root}:{quality}"
+                                    idx += 1
+
+                        # Special handling for N and X chords
+                        # These are typically at the end of the mapping
+                        if max_pred >= 168:
+                            idx_to_chord[168] = "X"  # Unknown chord
+                        if max_pred >= 169:
+                            idx_to_chord[169] = "N"  # No chord
+
+                        print("WARNING: model.idx_to_chord not found. Created standard chord mapping.")
+
+                        # Print a sample of the mapping to verify it's correct
+                        sample_keys = sorted(list(idx_to_chord.keys()))[:5]
+                        sample_mapping = {k: idx_to_chord[k] for k in sample_keys}
+                        print(f"Sample chord mapping: {sample_mapping}")
+
+                        # Also print the special chord mappings
+                        special_keys = [k for k in idx_to_chord.keys() if k >= 168]
+                        if special_keys:
+                            special_mapping = {k: idx_to_chord[k] for k in special_keys}
+                            print(f"Special chord mappings: {special_mapping}")
+
+                    # This section is intentionally left empty as we've moved the code inside the try/except blocks
 
                 # Convert indices to chord names
                 # Convert numpy arrays to integers first to make them hashable

@@ -315,13 +315,79 @@ class DistributedStudentTrainer(StudentTrainer):
 
                     all_qualities = sorted(list(set(idx_to_quality.values())))
 
-                    for qual in all_qualities:
-                        # count samples of this quality in targets
-                        cnt = sum(q == qual for q in targ_quals)
-                        if cnt > 0:
-                            # count correct predictions for this quality
-                            corr = sum(p == qual for p, t in zip(pred_quals, targ_quals) if t == qual)
-                            info(f'  {qual}: {corr/cnt:.2%} ({corr}/{cnt})')
+                    # Create a mapping from index to quality for all targets and predictions
+                    quality_counts = {}
+                    correct_counts = {}
+
+                    # Find indices for special chord types "N" and "X"
+                    n_chord_idx = None
+                    x_chord_idx = None
+                    for idx, name in self.idx_to_chord.items():
+                        if name == "N":
+                            n_chord_idx = idx
+                            debug(f"Found 'N' chord at index {idx}")
+                        elif name == "X":
+                            x_chord_idx = idx
+                            debug(f"Found 'X' chord at index {idx}")
+
+                    # Log the special chord indices for debugging
+                    info(f"Special chord indices - N: {n_chord_idx}, X: {x_chord_idx}")
+
+                    # Count occurrences and correct predictions for each quality
+                    for pred, target in zip(all_preds, all_targets):
+                        # Handle special chord types "N" and "X"
+                        if target == n_chord_idx:
+                            quality_counts["N"] = quality_counts.get("N", 0) + 1
+                            if pred == n_chord_idx:
+                                correct_counts["N"] = correct_counts.get("N", 0) + 1
+                            continue
+                        elif target == x_chord_idx:
+                            quality_counts["X"] = quality_counts.get("X", 0) + 1
+                            if pred == x_chord_idx:
+                                correct_counts["X"] = correct_counts.get("X", 0) + 1
+                            continue
+
+                        # Skip if target is not in the quality mapping
+                        if target not in idx_to_quality:
+                            continue
+
+                        # Get the quality of the target
+                        target_qual = idx_to_quality[target]
+
+                        # Count this quality
+                        quality_counts[target_qual] = quality_counts.get(target_qual, 0) + 1
+
+                        # Check if prediction is correct (same quality)
+                        if pred in idx_to_quality and idx_to_quality[pred] == target_qual:
+                            correct_counts[target_qual] = correct_counts.get(target_qual, 0) + 1
+
+                    # Add special chord types to the list of qualities to report
+                    all_qualities_with_special = list(all_qualities)
+                    if "N" in quality_counts:
+                        all_qualities_with_special.append("N")
+                    if "X" in quality_counts:
+                        all_qualities_with_special.append("X")
+
+                    # Log the distribution of chord qualities in the validation set
+                    total_samples = sum(quality_counts.values())
+                    info(f"Validation set contains {total_samples} total samples across {len(quality_counts)} qualities")
+
+                    # Log the top 5 most common qualities
+                    top_qualities = sorted(quality_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+                    info("Top 5 most common chord qualities in validation set:")
+                    for qual, count in top_qualities:
+                        percentage = (count / total_samples) * 100 if total_samples > 0 else 0
+                        info(f"  {qual}: {count} samples ({percentage:.2f}%)")
+
+                    # Report accuracy for each quality
+                    for qual in all_qualities_with_special:
+                        # Get the total count for this quality
+                        total_count = quality_counts.get(qual, 0)
+
+                        if total_count > 0:
+                            # Get correct count for this quality
+                            correct_count = correct_counts.get(qual, 0)
+                            info(f'  {qual}: {correct_count/total_count:.2%} ({correct_count}/{total_count})')
                         else:
                             info(f'  {qual}: N/A (no samples)')
                 except Exception as e:
