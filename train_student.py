@@ -897,7 +897,6 @@ def main():
             class_weights=None,
             idx_to_chord=master_mapping,
             normalization=normalization,
-            max_grad_norm=0.5,
             early_stopping_patience=config.training.get('early_stopping_patience', 5),
             lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
             min_lr=config.training.get('min_learning_rate', 5e-6),
