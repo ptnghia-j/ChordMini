@@ -181,9 +181,9 @@ spec:
               value: "validation"  # Changed from empty string to 'validation'
             # Additional learning rate parameters - new additions
             - name: LEARNING_RATE
-              value: "0.001"  # Base learning rate
+              value: "0.0001"  # Base learning rate
             - name: MIN_LEARNING_RATE
-              value: "0.00001"  # Minimum learning rate for schedulers
+              value: "0.000001"  # Minimum learning rate for schedulers
             # Knowledge distillation settings
             - name: USE_KD_LOSS
               value: "true"  # Set to "true" to enable KD loss
@@ -202,14 +202,14 @@ spec:
             - name: USE_WARMUP
               value: "true"  # Set to "true" to enable learning rate warm-up
             - name: WARMUP_START_LR
-              value: "0.0005"  # Starting learning rate for warm-up
+              value: "0.0001"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.0008"  # Final learning rate after warm-up
+              value: "0.0005"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "15"  # Number of epochs for warm-up
+              value: "5"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
-              value: "0.3"  # Set dropout probability (0-1)
+              value: "0.2"  # Set dropout probability (0-1)
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
@@ -241,7 +241,7 @@ spec:
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: "0.1"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: ""  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
           command:

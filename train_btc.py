@@ -1133,10 +1133,21 @@ def main():
                                         average_score_dict3.get(metric, 0.0)) / 3
                         }
 
-                    # Log results
+                    # Log results with range
                     logger.info("\nMIR Evaluation Results:")
                     for metric, values in mir_eval_results.items():
-                        logger.info(f"{metric}: {values['average']*100:.2f}% (avg)")
+                        # Calculate min and max values across the three splits
+                        split_values = [
+                            values['split1'] * 100,
+                            values['split2'] * 100,
+                            values['split3'] * 100
+                        ]
+                        min_val = min(split_values)
+                        max_val = max(split_values)
+                        avg_val = values['average'] * 100
+
+                        # Display average with min-max range
+                        logger.info(f"{metric}: {avg_val:.2f}% (avg), range: [{min_val:.2f}% - {max_val:.2f}%]")
 
                     # Save results to file
                     mir_eval_path = os.path.join(checkpoints_dir, "mir_eval_results.json")

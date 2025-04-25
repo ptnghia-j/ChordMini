@@ -155,7 +155,7 @@ spec:
               value: /mnt/storage/ChordMini
             # Learning rate scheduling options (can override btc_config.yaml)
             - name: LR_SCHEDULE
-              value: "cosine" # Example: Use cosine schedule
+              value: "validation" # Example: Use cosine schedule
             # Learning rate parameters (can override btc_config.yaml)
             - name: LEARNING_RATE
               value: "0.0001" # Base learning rate for BTC
@@ -177,7 +177,7 @@ spec:
               value: "0.25"  # Class weight parameter for focal loss
             # Warmup settings (optional for BTC)
             - name: USE_WARMUP
-              value: "true"  # Set to "true" to enable learning rate warm-up
+              value: "false"  # Set to "true" to enable learning rate warm-up
             - name: WARMUP_START_LR
               value: "0.0005" # Starting learning rate for warm-up (lower than base)
             - name: WARMUP_END_LR
@@ -208,7 +208,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never", "required"
             - name: SUB_DIR
-              value: "btc-fma-01" # Subdirectory for BTC checkpoints (adjust based on DATASET_TYPE)
+              value: "btc-fma" # Subdirectory for BTC checkpoints (adjust based on DATASET_TYPE)
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint
