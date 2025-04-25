@@ -13,7 +13,7 @@ training:
   epsilon: 1.0e-9
   early_stopping_patience: 10
   seq_len: 108
-  seq_stride: 36
+  seq_stride: 54
   save_checkpoint_interval: 10
   lr_decay_factor: 0.95
   # Warm-up parameters with expanded options

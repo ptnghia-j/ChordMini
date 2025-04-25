@@ -28,7 +28,6 @@ class ChordNet(nn.Module):
                     f_head = h
                     break
 
-        print(f"Using fixed n_group=12 for musical alignment with n_freq={n_freq}")
 
         # Calculate the actual feature dimension that will come out of the transformer
         feature_dim = n_freq // n_group

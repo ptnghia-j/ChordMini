@@ -632,7 +632,7 @@ def main():
         'device': device,
         'pin_memory': False,
         'prefetch_factor': float(args.prefetch_factor) if args.prefetch_factor else 1,
-        'num_workers': 10,
+        'num_workers': 12,
         'require_teacher_logits': use_kd,
         'use_cache': not args.disable_cache, # Use arg directly
         'metadata_only': args.metadata_cache, # Use arg directly

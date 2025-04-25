@@ -31,14 +31,27 @@ class FeedForward(nn.Module):
     self.linear2 = nn.Linear(n_hidden, n_feature)
 
     self.dropout = nn.Dropout(dropout)
+    self.batch_norm1 = nn.LayerNorm(n_hidden)
+    self.batch_norm2 = nn.LayerNorm(n_feature)
     self.norm_layer = nn.LayerNorm(n_feature)
   
 
   def forward(self, x):
     y = self.linear1(x)
+    y = y.transpose(1, 2)
+    y = self.batch_norm1(y)
+    y = y.transpose(1, 2)
+
+    # activation and drop out
     y = F.relu(y)
     y = self.dropout(y)
+
     y = self.linear2(y)
+
+    y = y.transpose(1, 2)
+    y = self.batch_norm2(y)
+    y = y.transpose(1, 2)
+
     y = self.dropout(y)
     y = self.norm_layer(y + x) # residual connection and layer normalization
 

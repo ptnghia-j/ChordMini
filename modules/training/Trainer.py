@@ -56,8 +56,8 @@ class BaseTrainer:
                                  xlim=(0, num_epochs), ylim=(0, 10),
                                  figsize=(5, 3)) if use_animator else None
         self.checkpoint_dir = checkpoint_dir
-        if not os.path.exists(self.checkpoint_dir):
-            os.makedirs(self.checkpoint_dir)
+        # Create checkpoint directory if it doesn't exist, or use existing one
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.max_grad_norm = max_grad_norm
         if class_weights is not None:
             # Set weight for ignore_index to 0 to avoid predicting it

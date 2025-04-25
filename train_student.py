@@ -606,7 +606,7 @@ def main():
         'device': device,
         'pin_memory': False,
         'prefetch_factor': float(args.prefetch_factor) if args.prefetch_factor else 1,
-        'num_workers': 10,
+        'num_workers': 12,
         # debug area
         'require_teacher_logits': use_kd,
         'use_cache': not config.data.get('disable_cache', False),
@@ -761,11 +761,11 @@ def main():
 
         # Apply scale to model parameters
         f_layer = max(1, int(round(base_config.get('f_layer', 3) * scale_factor)))
-        f_head = max(1, int(round(base_config.get('f_head', 6))))
         t_layer = max(1, int(round(base_config.get('t_layer', 3) * scale_factor)))
-        t_head = max(1, int(round(base_config.get('t_head', 6))))
         d_layer = max(1, int(round(base_config.get('d_layer', 3) * scale_factor)))
-        d_head = max(1, int(round(base_config.get('d_head', 6))))
+        f_head = 6
+        t_head = 6
+        d_head = 6
 
         # Ensure f_head is compatible with feature_dim (must be a divisor)
         if feature_dim % f_head != 0:
@@ -897,6 +897,7 @@ def main():
             class_weights=None,
             idx_to_chord=master_mapping,
             normalization=normalization,
+            max_grad_norm=0.5,
             early_stopping_patience=config.training.get('early_stopping_patience', 5),
             lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
             min_lr=config.training.get('min_learning_rate', 5e-6),
@@ -926,6 +927,7 @@ def main():
             class_weights=None,
             idx_to_chord=master_mapping,
             normalization=normalization,
+            max_grad_norm=0.5,
             early_stopping_patience=config.training.get('early_stopping_patience', 5),
             lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
             min_lr=config.training.get('min_learning_rate', 5e-6),
