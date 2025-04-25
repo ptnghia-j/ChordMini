@@ -38,9 +38,7 @@ class FeedForward(nn.Module):
 
   def forward(self, x):
     y = self.linear1(x)
-    y = y.transpose(1, 2)
     y = self.batch_norm1(y)
-    y = y.transpose(1, 2)
 
     # activation and drop out
     y = F.relu(y)
@@ -48,9 +46,7 @@ class FeedForward(nn.Module):
 
     y = self.linear2(y)
 
-    y = y.transpose(1, 2)
     y = self.batch_norm2(y)
-    y = y.transpose(1, 2)
 
     y = self.dropout(y)
     y = self.norm_layer(y + x) # residual connection and layer normalization

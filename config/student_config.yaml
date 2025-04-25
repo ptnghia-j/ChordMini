@@ -5,7 +5,7 @@
 # Training hyperparameters
 training:
   batch_size: 256
-  max_epochs: 100
+  max_epochs: 20
   learning_rate: 1.0e-3  # Base learning rate
   min_learning_rate: 5.0e-6  # Minimum learning rate for schedulers
   weight_decay: 1.0e-5
