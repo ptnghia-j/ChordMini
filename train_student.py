@@ -763,9 +763,9 @@ def main():
         f_layer = max(1, int(round(base_config.get('f_layer', 3) * scale_factor)))
         t_layer = max(1, int(round(base_config.get('t_layer', 3) * scale_factor)))
         d_layer = max(1, int(round(base_config.get('d_layer', 3) * scale_factor)))
-        f_head = 4
-        t_head = 4
-        d_head = 4
+        f_head = 6
+        t_head = 6
+        d_head = 6
 
         # Ensure f_head is compatible with feature_dim (must be a divisor)
         if feature_dim % f_head != 0:

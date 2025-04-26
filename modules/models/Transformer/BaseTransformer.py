@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from modules.utils.device import get_device, to_device  # changedimport is correct
+from modules.utils.device import get_device, to_device 
 
 def positional_encoding(batch_size, n_time, n_feature, zero_pad=False, scale=False, dtype=torch.float32):
   indices = torch.unsqueeze(torch.arange(n_time), 0).repeat(batch_size, 1)
