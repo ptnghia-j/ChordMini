@@ -78,20 +78,16 @@ def audio_file_to_features(audio_file, config):
     feature = np.log(np.abs(feature) + 1e-6)
     song_length_second = len(original_wav) / config.mp3['song_hz']
 
-    # Calculate feature_per_second correctly as a RATE, not a duration
-    # This is the key fix - make it explicit that this is frames per second
-    frames_per_second = config.mp3['song_hz'] / config.feature['hop_length']
-
-    # Also calculate and return the frame duration for reference
+    # Calculate frames per second and frame duration
+    # frame duration in seconds per frame
     frame_duration = config.feature['hop_length'] / config.mp3['song_hz']
 
     # Add diagnostic info for debugging
-    print(f"Audio file: {os.path.basename(audio_file)}")
-    print(f"Frames: {feature.shape[1]}, Frame rate: {frames_per_second:.2f} fps")
-    print(f"Frame duration: {frame_duration:.5f}s, Total duration: {song_length_second:.2f}s")
+    # print(f"Audio file: {os.path.basename(audio_file)}")
+    print(f"Frames: {feature.shape[1]}, Frame duration: {frame_duration:.5f}s, Total duration: {song_length_second:.2f}s")
 
-    # Return the frame rate, not the frame duration
-    return feature, frames_per_second, song_length_second
+    # Return frame-level CQT, frame_duration (s), and song length (s)
+    return feature, frame_duration, song_length_second
 
 # Audio files with format of wav and mp3
 def get_audio_paths(audio_dir):
@@ -376,10 +372,10 @@ def root_majmin_score_calculation(valid_dataset, config, mean, std, device, mode
         try:
             # Extract features from audio file
             n_timestep = config.model['timestep']
-            feature, feature_per_second, song_length_second = audio_file_to_features(mp3_file_path, config)
+            feature, frame_duration, song_length_second = audio_file_to_features(mp3_file_path, config)
             feature = feature.T
             feature = (feature - mean) / std
-            time_unit = feature_per_second
+            time_unit = frame_duration
 
             # Pad features to match the timestep size
             num_pad = n_timestep - (feature.shape[0] % n_timestep)

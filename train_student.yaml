@@ -175,7 +175,7 @@ spec:
               value: /mnt/storage/ChordMini
             # Model scale - overrides student_config.yaml
             - name: MODEL_SCALE
-              value: "2.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
+              value: "1.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
             # Learning rate scheduling options - overrides student_config.yaml settings
             - name: LR_SCHEDULE
               value: "cosine"  # Changed from empty string to 'validation'
@@ -206,10 +206,10 @@ spec:
             - name: WARMUP_END_LR
               value: "0.0005"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "5"  # Number of epochs for warm-up
+              value: "10"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
-              value: "0.2"  # Set dropout probability (0-1)
+              value: "0.3"  # Set dropout probability (0-1)
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
