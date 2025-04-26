@@ -24,7 +24,7 @@ spec:
               - key: kubernetes.io/hostname      # new host pin
                 operator: In
                 values:
-                - gpu-17.nrp.mghpcc.org
+                - gpu-04.nrp.mghpcc.org
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -183,9 +183,9 @@ spec:
               value: "validation"  # Changed from empty string to 'validation'
             # Additional learning rate parameters - new additions
             - name: LEARNING_RATE
-              value: "0.001"  # Base learning rate
+              value: "0.0001"  # Base learning rate
             - name: MIN_LEARNING_RATE
-              value: "0.00001"  # Minimum learning rate for schedulers
+              value: "0.000001"  # Minimum learning rate for schedulers
             # Knowledge distillation settings
             - name: USE_KD_LOSS
               value: "true"  # Set to "true" to enable KD loss
@@ -206,7 +206,7 @@ spec:
             - name: WARMUP_START_LR
               value: "0.0005"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.0007"  # Final learning rate after warm-up
+              value: "0.001"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
               value: "10"  # Number of epochs for warm-up
             # Dropout setting
@@ -249,7 +249,7 @@ spec:
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: "0.01"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: ""  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
           command:
@@ -585,18 +585,12 @@ spec:
               echo "=== Student model training complete ==="
           resources:
             requests:
-              # cpu: "3"
-              # memory: "72Gi"
               cpu: "4"
-              #memory: "128Gi"
-              memory: "24Gi"
+              memory: "196Gi"
               nvidia.com/gpu: "2"
             limits:
-              # cpu: "12"
-              # memory: "132Gi"
-              cpu: "16"
-              #memory: "272Gi"
-              memory: "64Gi"
+              cpu: "18"
+              memory: "296Gi"
               nvidia.com/gpu: "2"
           volumeMounts:
             - name: storage

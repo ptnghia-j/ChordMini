@@ -82,26 +82,18 @@ def scale_config(config, scale_factor, n_freq, n_group):
     # Fix t_head and d_head similar to train_student.py (now using 4)
     t_head = 4
     d_head = 4
+    f_head = 4
 
-    # Handle f_head based on divisibility, similar to train_student.py (now starting from 4)
-    f_head_base = base_config.get('f_head', 4) # Start with base f_head (now 4)
     feature_dim = n_freq // n_group
-    f_head = f_head_base # Initialize f_head
 
     if feature_dim % f_head != 0:
         # Find the largest divisor of feature_dim that's <= f_head
-        adjusted = False
         for h in range(f_head, 0, -1):
             if feature_dim % h == 0:
                 print(f"Note: Adjusted f_head from {f_head} to {h} for scale {scale_factor}x "
                       f"to ensure compatibility with feature_dim={feature_dim}")
                 f_head = h
-                adjusted = True
                 break
-        if not adjusted:
-             print(f"Warning: Could not find compatible f_head for feature_dim={feature_dim} "
-                   f"with base f_head={f_head_base}. Using f_head=1.")
-             f_head = 1 # Fallback if no divisor found
 
     return {
         'f_layer': f_layer,
@@ -135,9 +127,9 @@ def main():
     student_config = HParams.load(args.config)
     print(f"Loaded student configuration from: {args.config}")
 
-    # Get n_group from config - NOTE: ChordNet now internally uses 12
+    # Get n_group from config
     # n_group_config = student_config.model.get('n_group', 4) # Keep for reference if needed elsewhere
-    n_group_fixed = 12 # Hardcode to match ChordNet.py
+    n_group_fixed = 4 # Hardcode to match ChordNet.py
 
     # Choose appropriate n_freq based on CQT/STFT flag or config
     if args.n_freq:

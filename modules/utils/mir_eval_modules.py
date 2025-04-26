@@ -574,9 +574,29 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
             if all('frame_idx' in sample for sample in samples):
                 samples.sort(key=lambda x: x['frame_idx'])
 
+            # Determine frame_duration from model config or fallback
+            if hasattr(config, 'model') and 'frame_duration' in config.model:
+                frame_duration = config.model['frame_duration']
+            elif hasattr(config, 'feature') and hasattr(config, 'mp3'):
+                # fallback to hop_length / sample rate
+                hl = config.feature.get('hop_length', None)
+                sr = config.mp3.get('song_hz', None)
+                frame_duration = hl / sr if hl and sr else config.feature.get('hop_duration', 0.1)
+            else:
+                frame_duration = 0.09288
+
+            # Build timestamps from sample frame_idx when available
+            if samples and isinstance(samples[0], dict) and 'frame_idx' in samples[0]:
+                timestamps = np.array([s['frame_idx'] * frame_duration for s in samples])
+            else:
+                timestamps = np.arange(len(samples)) * frame_duration
+
+            # Pad durations so it matches timestamps length
+            durations = np.diff(np.append(timestamps, timestamps[-1] + frame_duration))
+
             # Extract timestamps
-            frame_duration = config.feature.get('hop_duration', 0.1)
-            timestamps = np.arange(len(samples)) * frame_duration
+            # frame_duration = config.feature.get('hop_duration', 0.1)
+            # timestamps = np.arange(len(samples)) * frame_duration
 
             # Process samples to get spectrograms
             spectrograms = []
@@ -789,7 +809,7 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                     large_voca_score_calculation._first_chords_logged = True
 
                 # Calculate scores
-                durations = np.diff(np.append(timestamps, [timestamps[-1] + frame_duration]))
+                # durations = np.diff(np.append(timestamps, [timestamps[-1] + frame_duration]))
                 root_score, thirds_score, triads_score, sevenths_score, tetrads_score, majmin_score, mirex_score = calculate_chord_scores(
                     timestamps, durations, reference_labels, pred_chords)
 

@@ -25,7 +25,7 @@ def positional_encoding(batch_size, n_time, n_feature, zero_pad=False, scale=Fal
 
 class FeedForward(nn.Module):
   def __init__(self, n_feature=2048, n_hidden=512, dropout=0.2):
-    n_hidden = n_feature // 4
+    n_hidden = n_feature * 4
     super().__init__()
     self.linear1 = nn.Linear(n_feature, n_hidden)
     self.linear2 = nn.Linear(n_hidden, n_feature)

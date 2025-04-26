@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: btc-large-01 # Changed name
+  name: btc-large # Changed name
   namespace: csuf-titans
   labels:
     app: btc-training # Changed label
@@ -24,7 +24,7 @@ spec:
               - key: kubernetes.io/hostname      # new host pin
                 operator: In
                 values:
-                - gpu-05.nrp.mghpcc.org
+                - gpu-03.nrp.mghpcc.org
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -163,7 +163,7 @@ spec:
             - name: LEARNING_RATE
               value: "0.0001" # Base learning rate for BTC
             - name: MIN_LEARNING_RATE
-              value: "0.00001"    # Min learning rate for BTC (default 0)
+              value: "0.000001"    # Min learning rate for BTC (default 0)
             # Knowledge distillation settings (optional for BTC)
             - name: USE_KD_LOSS
               value: "true" # Set to "true" to enable KD loss if teacher logits are available
@@ -184,9 +184,9 @@ spec:
             - name: WARMUP_START_LR
               value: "0.0005" # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.001"  # Final learning rate after warm-up (matches base LR)
+              value: "0.0006"  # Final learning rate after warm-up (matches base LR)
             - name: WARMUP_EPOCHS
-              value: "10"      # Number of epochs for warm-up
+              value: "5"      # Number of epochs for warm-up
             # Dropout setting (can override btc_config.yaml)
             - name: DROPOUT
               value: "0.2"     # Set dropout probability (0-1)
@@ -216,7 +216,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never", "required"
             - name: SUB_DIR
-              value: "btc-combined-01" # Subdirectory for BTC checkpoints
+              value: "btc-combined" # Subdirectory for BTC checkpoints
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint
@@ -227,7 +227,7 @@ spec:
             - name: LAZY_INIT
               value: "false" # Controls dataset lazy initialization
             - name: SMALL_DATASET
-              value: "0.05"   # Set percentage of dataset to use (0.1 = 10%, null = full)
+              value: ""   # Set percentage of dataset to use (0.1 = 10%, null = full)
             - name: METADATA_CACHE
               value: "false" # Use metadata-only caching
           command:
@@ -428,13 +428,11 @@ spec:
           resources:
             requests:
               cpu: "4"
-              #memory: "128Gi"
-              memory: "24Gi"
+              memory: "196Gi"
               nvidia.com/gpu: "2"
             limits:
               cpu: "18"
-              #memory: "320Gi"
-              memory: "64Gi"
+              memory: "296Gi"
               nvidia.com/gpu: "2"
           volumeMounts:
             - name: storage

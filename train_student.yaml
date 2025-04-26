@@ -178,7 +178,7 @@ spec:
               value: "2.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
             # Learning rate scheduling options - overrides student_config.yaml settings
             - name: LR_SCHEDULE
-              value: "validation"  # Changed from empty string to 'validation'
+              value: "cosine"  # Changed from empty string to 'validation'
             # Additional learning rate parameters - new additions
             - name: LEARNING_RATE
               value: "0.0001"  # Base learning rate
