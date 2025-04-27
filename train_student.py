@@ -281,9 +281,9 @@ def main():
     parser.add_argument('--warmup_end_lr', type=float, default=None,
                        help='Target learning rate at the end of warm-up (default: base LR)')
 
-    # Modify dataset_type choices to include 'combined'
-    parser.add_argument('--dataset_type', type=str, choices=['fma', 'maestro', 'combined'], default='fma',
-                      help='Dataset format type: fma (numeric IDs), maestro (arbitrary filenames), or combined (both)')
+    # Modify dataset_type choices to include 'dali_synth' and 'combined'
+    parser.add_argument('--dataset_type', type=str, choices=['fma', 'maestro', 'dali_synth', 'combined'], default='fma',
+                      help='Dataset format type: fma (numeric IDs), maestro (arbitrary filenames), dali_synth (hex IDs), or combined (all)')
 
     # Checkpoint loading
     parser.add_argument('--load_checkpoint', type=str, default=None,
@@ -513,7 +513,7 @@ def main():
 
     logger.info(f"Looking for data files:")
 
-    # For combined mode, also find Maestro paths using standardized directory structure
+    # For combined mode, also find Maestro and DALI paths using standardized directory structure
     if args.dataset_type == 'combined':
         # Use standardized paths based on the DATA_ROOT
         data_root = os.environ.get('DATA_ROOT', '/mnt/storage/data')
@@ -522,6 +522,11 @@ def main():
         maestro_spec_dir = os.path.join(data_root, "logits/maestro_synth/spectrograms")
         maestro_label_dir = os.path.join(data_root, "logits/maestro_synth/labels")
         maestro_logits_dir = os.path.join(data_root, "logits/maestro_synth/logits")
+
+        # Standard paths for DALI dataset
+        dali_spec_dir = os.path.join(data_root, "dali_synth/spectrograms")
+        dali_label_dir = os.path.join(data_root, "dali_synth/labels")
+        dali_logits_dir = os.path.join(data_root, "dali_synth/logits")
 
         # Find FMA data directories
         fma_spec_dir, fma_spec_count = find_data_directory(spec_dir_config, alt_spec_dir, "*.npy", "FMA spectrogram")
@@ -537,25 +542,55 @@ def main():
         maestro_spec_count = count_files_in_subdirectories(maestro_spec_dir, "*.npy")
         maestro_label_count = count_files_in_subdirectories(maestro_label_dir, "*.lab")
 
+        # Find DALI data directories
+        dali_spec_count = count_files_in_subdirectories(dali_spec_dir, "*.npy")
+        dali_label_count = count_files_in_subdirectories(dali_label_dir, "*.lab")
+
         # Log combined dataset files
         logger.info(f"\n=== Combined Dataset Files ===")
         logger.info(f"FMA: {fma_spec_count} spectrograms, {fma_label_count} labels")
         logger.info(f"Maestro: {maestro_spec_count} spectrograms, {maestro_label_count} labels (in {maestro_spec_dir})")
+        logger.info(f"DALI: {dali_spec_count} spectrograms, {dali_label_count} labels (in {dali_spec_dir})")
 
-        # Final check - fail if we have no data from either dataset
-        total_spec_count = fma_spec_count + maestro_spec_count
-        total_label_count = fma_label_count + maestro_label_count
+        # Final check - fail if we have no data from any dataset
+        total_spec_count = fma_spec_count + maestro_spec_count + dali_spec_count
+        total_label_count = fma_label_count + maestro_label_count + dali_label_count
 
         if total_spec_count == 0 or total_label_count == 0:
             raise RuntimeError(f"ERROR: Missing spectrogram or label files in combined mode. Found {total_spec_count} total spectrogram files and {total_label_count} total label files.")
 
         # Use lists for spec_dir, label_dir, and logits_dir in combined mode
-        spec_dir = [fma_spec_dir, maestro_spec_dir]
-        label_dir = [fma_label_dir, maestro_label_dir]
-        logits_dir = [fma_logits_dir, maestro_logits_dir]
+        spec_dir = [fma_spec_dir, maestro_spec_dir, dali_spec_dir]
+        label_dir = [fma_label_dir, maestro_label_dir, dali_label_dir]
+        logits_dir = [fma_logits_dir, maestro_logits_dir, dali_logits_dir]
 
+    elif args.dataset_type == 'dali_synth':
+        # DALI dataset mode
+        data_root = os.environ.get('DATA_ROOT', '/mnt/storage/data')
+
+        # Standard paths for DALI dataset
+        dali_spec_dir = os.path.join(data_root, "dali_synth/spectrograms")
+        dali_label_dir = os.path.join(data_root, "dali_synth/labels")
+        dali_logits_dir = os.path.join(data_root, "dali_synth/logits")
+
+        # Count files
+        dali_spec_count = count_files_in_subdirectories(dali_spec_dir, "*.npy")
+        dali_label_count = count_files_in_subdirectories(dali_label_dir, "*.lab")
+
+        # Log DALI dataset files
+        logger.info(f"\n=== DALI Dataset Files ===")
+        logger.info(f"DALI: {dali_spec_count} spectrograms, {dali_label_count} labels (in {dali_spec_dir})")
+
+        # Final check - fail if we don't have data
+        if dali_spec_count == 0 or dali_label_count == 0:
+            raise RuntimeError(f"ERROR: Missing DALI spectrogram or label files. Found {dali_spec_count} spectrogram files and {dali_label_count} label files.")
+
+        # Use DALI directories
+        spec_dir = dali_spec_dir
+        label_dir = dali_label_dir
+        logits_dir = dali_logits_dir if args.logits_dir is None else args.logits_dir
     else:
-        # Original single dataset mode
+        # Original single dataset mode (FMA or Maestro)
         synth_spec_dir, spec_count = find_data_directory(spec_dir_config, alt_spec_dir, "*.npy", "spectrogram")
         synth_label_dir, label_count = find_data_directory(label_dir_config, alt_label_dir, "*.lab", "label")
 
@@ -1176,26 +1211,95 @@ def main():
                 if dataset_length < 3:
                     logger.warning("Dataset too small for MIR evaluation")
                 else:
+                    # Synchronize all processes before MIR evaluation
+                    if distributed_training:
+                        logger.info(f"Rank {rank}: Synchronizing before MIR evaluation")
+                        dist.barrier()
+
                     # Split dataset into 3 parts for evaluation
-                    valid_dataset1 = synth_dataset.samples[:dataset_length//3]
-                    valid_dataset2 = synth_dataset.samples[dataset_length//3:2*dataset_length//3]
-                    valid_dataset3 = synth_dataset.samples[2*dataset_length//3:]
+                    all_samples = synth_dataset.samples
 
-                    # Evaluate each split
-                    logger.info(f"Evaluating model on {len(valid_dataset1)} samples in split 1...")
-                    score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
-                        valid_dataset=valid_dataset1, config=config, model=model, model_type=args.model,
-                        mean=mean, std=std, device=device)
+                    # In distributed mode, each rank evaluates a different split
+                    # In non-distributed mode, evaluate all splits sequentially
+                    if distributed_training:
+                        # Determine which split this rank should process
+                        if rank % 3 == 0:
+                            split_idx = 1
+                            split_samples = all_samples[:dataset_length//3]
+                        elif rank % 3 == 1:
+                            split_idx = 2
+                            split_samples = all_samples[dataset_length//3:2*dataset_length//3]
+                        else:
+                            split_idx = 3
+                            split_samples = all_samples[2*dataset_length//3:]
 
-                    logger.info(f"Evaluating model on {len(valid_dataset2)} samples in split 2...")
-                    score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
-                        valid_dataset=valid_dataset2, config=config, model=model, model_type=args.model,
-                        mean=mean, std=std, device=device)
+                        logger.info(f"Rank {rank}: Evaluating split {split_idx} with {len(split_samples)} samples")
 
-                    logger.info(f"Evaluating model on {len(valid_dataset3)} samples in split 3...")
-                    score_list_dict3, song_length_list3, average_score_dict3 = large_voca_score_calculation(
-                        valid_dataset=valid_dataset3, config=config, model=model, model_type=args.model,
-                        mean=mean, std=std, device=device)
+                        # Each rank evaluates only its assigned split
+                        score_list_dict, song_length_list, average_score_dict = large_voca_score_calculation(
+                            valid_dataset=split_samples, config=config, model=model, model_type=args.model,
+                            mean=mean, std=std, device=device)
+
+                        # Gather results from all ranks
+                        if world_size > 1:
+                            # Create placeholder tensors for gathering
+                            gathered_results = [None for _ in range(world_size)]
+
+                            # Convert dict to tensor for gathering
+                            metrics = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
+                            local_results = torch.tensor([average_score_dict.get(m, 0.0) for m in metrics],
+                                                        dtype=torch.float32, device=device)
+
+                            # Gather results from all processes
+                            dist.all_gather_object(gathered_results,
+                                                 (split_idx, local_results.tolist(), len(split_samples)))
+
+                            # Process gathered results on rank 0
+                            if rank == 0:
+                                # Initialize dictionaries for each split
+                                score_list_dict1, score_list_dict2, score_list_dict3 = {}, {}, {}
+                                song_length_list1, song_length_list2, song_length_list3 = [], [], []
+                                average_score_dict1, average_score_dict2, average_score_dict3 = {}, {}, {}
+
+                                # Process gathered results
+                                for split_idx, results, split_size in gathered_results:
+                                    # Convert results back to dict
+                                    split_dict = {metrics[i]: results[i] for i in range(len(metrics))}
+
+                                    if split_idx == 1:
+                                        average_score_dict1 = split_dict
+                                        song_length_list1 = [1.0] * split_size  # Placeholder
+                                    elif split_idx == 2:
+                                        average_score_dict2 = split_dict
+                                        song_length_list2 = [1.0] * split_size  # Placeholder
+                                    elif split_idx == 3:
+                                        average_score_dict3 = split_dict
+                                        song_length_list3 = [1.0] * split_size  # Placeholder
+
+                        # Synchronize after gathering results
+                        if distributed_training:
+                            dist.barrier()
+                    else:
+                        # Non-distributed mode: evaluate all splits sequentially
+                        valid_dataset1 = all_samples[:dataset_length//3]
+                        valid_dataset2 = all_samples[dataset_length//3:2*dataset_length//3]
+                        valid_dataset3 = all_samples[2*dataset_length//3:]
+
+                        # Evaluate each split
+                        logger.info(f"Evaluating model on {len(valid_dataset1)} samples in split 1...")
+                        score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
+                            valid_dataset=valid_dataset1, config=config, model=model, model_type=args.model,
+                            mean=mean, std=std, device=device)
+
+                        logger.info(f"Evaluating model on {len(valid_dataset2)} samples in split 2...")
+                        score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
+                            valid_dataset=valid_dataset2, config=config, model=model, model_type=args.model,
+                            mean=mean, std=std, device=device)
+
+                        logger.info(f"Evaluating model on {len(valid_dataset3)} samples in split 3...")
+                        score_list_dict3, song_length_list3, average_score_dict3 = large_voca_score_calculation(
+                            valid_dataset=valid_dataset3, config=config, model=model, model_type=args.model,
+                            mean=mean, std=std, device=device)
 
                     # Combine results
                     mir_eval_results = {}

@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: btc-mini # Changed name for BTC small job
+  name: btc-mini-0 # Changed name for BTC small job
   namespace: csuf-titans
   labels:
     app: btc-training # Changed label for BTC
@@ -163,11 +163,11 @@ spec:
               value: "0.000001" # Min learning rate for BTC (default 0)
             # Knowledge distillation settings (optional for BTC)
             - name: USE_KD_LOSS
-              value: "true" # Set to "true" to enable KD loss if teacher logits are available
+              value: "false" # Set to "true" to enable KD loss if teacher logits are available
             - name: KD_ALPHA
               value: "0.2"   # Weight for KD loss (0-1)
             - name: TEMPERATURE
-              value: "2.0"   # Temperature for softening distributions
+              value: "5.0"   # Temperature for softening distributions
             # Focal loss settings (optional for BTC)
             - name: USE_FOCAL_LOSS
               value: "true" # Set to "true" to enable focal loss
@@ -208,7 +208,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never", "required"
             - name: SUB_DIR
-              value: "btc-fma" # Subdirectory for BTC checkpoints (adjust based on DATASET_TYPE)
+              value: "btc-fma-0" # Subdirectory for BTC checkpoints (adjust based on DATASET_TYPE)
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint

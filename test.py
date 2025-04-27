@@ -207,37 +207,37 @@ def process_audio_with_padding(audio_file, config):
 def load_hmm_model(hmm_path, base_model, device):
     """
     Load HMM model for chord sequence smoothing
-    
+
     Args:
         hmm_path: Path to the HMM model checkpoint
         base_model: The loaded base chord recognition model
         device: Device to load the model on
-    
+
     Returns:
         Loaded HMM model or None if loading fails
     """
     try:
         from modules.models.HMM.ChordHMM import ChordHMM
-        
+
         logger.info(f"Loading HMM model from {hmm_path}")
-        
+
         # Load checkpoint
         checkpoint = torch.load(hmm_path, map_location=device)
-        
+
         # Get configuration
         config = checkpoint.get('config', {})
         num_states = config.get('num_states', 170)
-        
+
         # Create HMM model
         hmm_model = ChordHMM(
             pretrained_model=base_model,  # Use the already loaded base model
             num_states=num_states,
             device=device
         ).to(device)
-        
+
         # Load HMM state dict
         hmm_model.load_state_dict(checkpoint['model_state_dict'])
-        
+
         logger.info(f"HMM model loaded successfully with {num_states} states")
         return hmm_model
     except Exception as e:
@@ -274,11 +274,11 @@ def main():
     # Force CPU usage regardless of what's available
     device = torch.device("cpu")
     logger.info(f"Forcing CPU usage for consistent device handling")
-    
+
     # Explicitly disable MPS again to be safe
     if hasattr(torch, 'backends') and hasattr(torch.backends, 'mps'):
         torch.backends.mps.enabled = False
-    
+
     logger.info(f"Using device: {device}")
 
     # Load configuration
@@ -288,17 +288,31 @@ def main():
     # Always use large vocabulary
     config.feature['large_voca'] = True  # Set to True always
     n_classes = 170  # Large vocabulary size
-    model_file = args.model_file or './checkpoints/student_model_final.pth'
+
+    # Use external checkpoint path if model_file is not specified
+    if args.model_file:
+        model_file = args.model_file
+    else:
+        # First try external storage path
+        external_model_path = '/mnt/storage/checkpoints/student/student_model_final.pth'
+        if os.path.exists(external_model_path):
+            model_file = external_model_path
+            logger.info(f"Using external checkpoint at {model_file}")
+        else:
+            # Fall back to local path
+            model_file = './checkpoints/student_model_final.pth'
+            logger.info(f"External checkpoint not found, using local path: {model_file}")
+
     idx_to_chord = idx2voca_chord()
     logger.info("Using large vocabulary chord set (170 chords)")
 
     # Initialize model with proper scaling
     n_freq = config.feature.get('n_bins', 144)
     logger.info(f"Using n_freq={n_freq} for model input")
-    
+
     # Get base configuration for the model
     base_config = config.model.get('base_config', {})
-    
+
     # If base_config is not specified, fall back to direct model parameters
     if not base_config:
         base_config = {
@@ -309,21 +323,21 @@ def main():
             'd_layer': config.model.get('d_layer', 3),
             'd_head': config.model.get('d_head', 6)
         }
-    
+
     # Apply scale to model parameters
     model_scale = args.model_scale
     logger.info(f"Using model scale: {model_scale}")
-    
+
     f_layer = max(1, int(round(base_config.get('f_layer', 3) * model_scale)))
     f_head = max(1, int(round(base_config.get('f_head', 6) * model_scale)))
     t_layer = max(1, int(round(base_config.get('t_layer', 3) * model_scale)))
     t_head = max(1, int(round(base_config.get('t_head', 6) * model_scale)))
     d_layer = max(1, int(round(base_config.get('d_layer', 3) * model_scale)))
     d_head = max(1, int(round(base_config.get('d_head', 6) * model_scale)))
-    
+
     # Log scaled parameters
     logger.info(f"Scaled model parameters: f_layer={f_layer}, f_head={f_head}, t_layer={t_layer}, t_head={t_head}, d_layer={d_layer}, d_head={d_head}")
-    
+
     model = ChordNet(
         n_freq=n_freq,
         n_classes=n_classes,
@@ -348,13 +362,13 @@ def main():
             # Fall back to older PyTorch versions that don't have weights_only parameter
             logger.info("Falling back to legacy loading method (for older PyTorch versions)")
             checkpoint = torch.load(model_file, map_location=device)
-        
+
         # Try to extract model scale from checkpoint if available
         if 'model_scale' in checkpoint:
             loaded_scale = checkpoint['model_scale']
             if loaded_scale != model_scale:
                 logger.warning(f"Model was trained with scale {loaded_scale} but using scale {model_scale} for inference")
-        
+
         # Check if model state dict is directly available or nested
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
@@ -363,7 +377,7 @@ def main():
         else:
             # Try to load the state dict directly
             model.load_state_dict(checkpoint)
-        
+
         # Get normalization parameters
         ckpt_mean = checkpoint.get('mean', 0.0) # Use ckpt_mean/std consistently
         ckpt_std = checkpoint.get('std', 1.0)
@@ -380,14 +394,14 @@ def main():
             logger.info("HMM model will be used for prediction smoothing")
     elif args.hmm:
         logger.warning(f"HMM model file not found: {args.hmm}")
-    
+
     # Create output directory if it doesn't exist
     os.makedirs(args.save_dir, exist_ok=True)
-    
+
     # Get all audio files
     audio_paths = get_audio_paths(args.audio_dir)
     logger.info(f"Found {len(audio_paths)} audio files to process")
-    
+
     # Process each audio file - ensure consistent device usage
     for i, audio_path in enumerate(audio_paths):
         logger.info(f"Processing file {i+1} of {len(audio_paths)}: {os.path.basename(audio_path)}")
@@ -561,15 +575,15 @@ def main():
             if hmm_model is not None:
                 output_filename += '_hmm'  # Add suffix to indicate HMM processing
             output_filename += '.lab'
-            
+
             output_path = os.path.join(args.save_dir, output_filename)
-            
+
             with open(output_path, 'w') as f:
                 for line in lines:
                     f.write(line)
-            
+
             logger.info(f"Saved chord annotations to {output_path}")
-            
+
         except Exception as e:
             logger.error(f"Error processing {audio_path}: {e}")
             import traceback

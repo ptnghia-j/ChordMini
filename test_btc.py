@@ -210,7 +210,7 @@ def main():
                        help='Directory containing audio files')
     parser.add_argument('--save_dir', type=str, default='./test/output_btc',
                        help='Directory to save output .lab files')
-    parser.add_argument('--model_file', type=str, default='./checkpoints/btc/btc_model_best.pth', # Default to best BTC model
+    parser.add_argument('--model_file', type=str, default=None, # Default to None to use external path
                        help='Path to BTC model checkpoint file')
     parser.add_argument('--config', type=str, default='./config/btc_config.yaml', # Default to BTC config
                        help='Path to BTC configuration file')
@@ -250,16 +250,31 @@ def main():
 
     # Load model weights with explicit device mapping
     ckpt_mean, ckpt_std = 0.0, 1.0 # Default normalization
-    if os.path.isfile(args.model_file):
-        logger.info(f"Loading model from {args.model_file}")
+
+    # Use external checkpoint path if model_file is not specified
+    if args.model_file:
+        model_file = args.model_file
+    else:
+        # First try external storage path
+        external_model_path = '/mnt/storage/checkpoints/btc/btc_model_best.pth'
+        if os.path.exists(external_model_path):
+            model_file = external_model_path
+            logger.info(f"Using external checkpoint at {model_file}")
+        else:
+            # Fall back to local path
+            model_file = './checkpoints/btc/btc_model_best.pth'
+            logger.info(f"External checkpoint not found, using local path: {model_file}")
+
+    if os.path.isfile(model_file):
+        logger.info(f"Loading model from {model_file}")
         try:
             # First try loading with weights_only=False (for PyTorch 2.6+ compatibility)
-            checkpoint = torch.load(args.model_file, map_location=device, weights_only=False)
+            checkpoint = torch.load(model_file, map_location=device, weights_only=False)
             logger.info("Model loaded successfully with weights_only=False")
         except TypeError:
             # Fall back to older PyTorch versions that don't have weights_only parameter
             logger.info("Falling back to legacy loading method (for older PyTorch versions)")
-            checkpoint = torch.load(args.model_file, map_location=device)
+            checkpoint = torch.load(model_file, map_location=device)
 
         # Check if model state dict is directly available or nested
         if 'model_state_dict' in checkpoint:
@@ -275,7 +290,7 @@ def main():
         ckpt_std = checkpoint.get('std', 1.0)
         logger.info(f"Using Checkpoint Normalization parameters: mean={ckpt_mean:.4f}, std={ckpt_std:.4f}")
     else:
-        logger.error(f"Model file not found: {args.model_file}. Using default normalization.")
+        logger.error(f"Model file not found: {model_file}. Using default normalization.")
 
     # Create output directory if it doesn't exist
     os.makedirs(args.save_dir, exist_ok=True)

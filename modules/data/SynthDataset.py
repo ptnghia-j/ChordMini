@@ -1,36 +1,37 @@
-import multiprocessing
-import os
 import torch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from collections import Counter
-import glob
-from pathlib import Path
-import matplotlib.pyplot as plt
+import os
+import re
 import time
-from multiprocessing import Pool
-from functools import partial
 import pickle
 import warnings
-from tqdm import tqdm
 import hashlib
-import re
+import traceback
+import glob # Import glob
+from torch.utils.data import Dataset, DataLoader
+from collections import Counter
+from pathlib import Path
+from multiprocessing import Pool
+from functools import partial
+from tqdm import tqdm
+import matplotlib.pyplot as plt
 from modules.utils.device import get_device, to_device, clear_gpu_cache
 
 # Define a wrapper function for multiprocessing
 def process_file_wrapper(args):
     """Wrapper function for multiprocessing file processing"""
-    dataset_instance, spec_file, file_id, label_files_dict, return_skip_reason = args
-    return dataset_instance._process_file(spec_file, file_id, label_files_dict, return_skip_reason)
+    dataset_instance, spec_file, file_id, label_files_dict, logit_files_dict, return_skip_reason = args # Added logit_files_dict
+    return dataset_instance._process_file(spec_file, file_id, label_files_dict, logit_files_dict, return_skip_reason) # Pass logit_files_dict
 
 class SynthDataset(Dataset):
     """
     Dataset for loading preprocessed spectrograms and chord labels.
     Optimized implementation for GPU acceleration with single worker.
-    Supports three dataset formats:
+    Supports dataset formats:
     - 'fma': Uses numeric 6-digit IDs with format ddd/dddbbb_spec.npy
     - 'maestro': Uses arbitrary filenames with format maestro-v3.0.0/file-name_spec.npy
-    - 'combined': Loads both 'fma' and 'maestro' datasets simultaneously
+    - 'dali_synth': Uses hex IDs with format xxx/hexid_spec.npy (xxx is alphanumeric)
+    - 'combined': Loads 'fma', 'maestro', and 'dali_synth' datasets simultaneously
     """
     def __init__(self, spec_dir, label_dir, chord_mapping=None, seq_len=10, stride=None,
                  frame_duration=0.1, num_workers=0, cache_file=None, verbose=True,
@@ -111,9 +112,10 @@ class SynthDataset(Dataset):
         self.cache_fraction = cache_fraction  # Fraction of samples to cache (default: 10%)
         self.lazy_init = lazy_init
         self.require_teacher_logits = require_teacher_logits
-        self.dataset_type = dataset_type  # Dataset format type ('fma', 'maestro', or 'combined')
+        self.dataset_type = dataset_type  # Dataset format type
 
-        if self.dataset_type not in ['fma', 'maestro', 'combined']:
+        # Add 'dali_synth' to valid types
+        if self.dataset_type not in ['fma', 'maestro', 'dali_synth', 'combined']:
             warnings.warn(f"Unknown dataset_type '{dataset_type}', defaulting to 'fma'")
             self.dataset_type = 'fma'
 
@@ -147,11 +149,13 @@ class SynthDataset(Dataset):
         else:
             self.chord_to_idx = {}
 
-        # Set up regex patterns - always define both patterns regardless of dataset type
-        # For Maestro dataset, match any filename pattern ending with _spec, _logits, or .lab
-        self.file_pattern = re.compile(r'(.+?)(?:_spec|_logits)?\.(?:npy|lab)$')
-        # For FMA dataset - the 6-digit numeric ID pattern
+        # Set up regex patterns - always define all patterns regardless of dataset type
+        # For Maestro/DALI: Match hex ID or general filename before _spec/_logits or .lab
+        self.file_pattern = re.compile(r'([0-9a-fA-F]{32}|.+?)(?:_spec|_logits)?\.(?:npy|lab)$')
+        # For FMA: 6-digit numeric ID pattern
         self.numeric_id_pattern = re.compile(r'(\d{6})')
+        # For DALI prefix: 3 alphanumeric chars
+        self.dali_prefix_pattern = re.compile(r'^[0-9a-zA-Z]{3}$')
 
         # Auto-detect device if not provided - use device module with safer initialization
         if device is None:
@@ -338,184 +342,146 @@ class SynthDataset(Dataset):
             if not label_path.exists():
                 warnings.warn(f"Label directory does not exist: {label_path}")
 
-        # First, create a mapping of label files for quick lookup from all label directories
+        # Create mappings of label and logit files for quick lookup
         label_files_dict = {}
-        maestro_label_count = 0
-        fma_label_count = 0
+        logit_files_dict = {} # Added for logits
+        label_counts = {'fma': 0, 'maestro': 0, 'dali_synth': 0}
+        logit_counts = {'fma': 0, 'maestro': 0, 'dali_synth': 0} # Added for logits
 
+        # Scan label directories
         for label_dir in self.label_dirs:
-            # Add debug info about which directories we're scanning
+            current_type = 'fma' # Default
+            if "maestro" in str(label_dir).lower():
+                current_type = 'maestro'
+            elif "dali_synth" in str(label_dir).lower():
+                current_type = 'dali_synth'
+
             if self.verbose:
-                is_maestro = "maestro" in str(label_dir).lower()
-                print(f"Scanning {'Maestro' if is_maestro else 'FMA'} labels from: {label_dir}")
+                print(f"Scanning {current_type.upper()} labels from: {label_dir}")
 
-            # Use recursive glob to scan all subdirectories
             for label_path in label_dir.glob("**/*.lab"):
-                is_maestro = "maestro" in str(label_dir).lower()
-
-                if is_maestro:  # Maestro label file handling
-                    # Get the full path relative to label_dir for consistent addressing
-                    rel_path = label_path.relative_to(label_dir)
-
-                    # Create a combined ID that includes all parent directories
-                    file_id = str(rel_path.with_suffix(''))  # Remove .lab extension
-
-                    if file_id.endswith('_spec'):
-                        file_id = file_id[:-5]
-
-                    # Debug first few files
-                    if maestro_label_count < 3 and self.verbose:
-                        print(f"  Maestro label: {label_path}, ID: {file_id}")
-
+                match = self.file_pattern.search(label_path.name)
+                if match:
+                    file_id = match.group(1)
                     label_files_dict[file_id] = label_path
-                    maestro_label_count += 1
-                else:  # FMA label file handling - unchanged
-                    numeric_match = self.numeric_id_pattern.search(str(label_path.stem))
-                    if numeric_match:
-                        numeric_id = numeric_match.group(1)
-                        label_files_dict[numeric_id] = label_path
-                        fma_label_count += 1
+                    label_counts[current_type] += 1
+
+        # Scan logit directories (only if KD is potentially used)
+        if self.logits_dirs:
+            for logit_dir in self.logits_dirs:
+                current_type = 'fma' # Default
+                if "maestro" in str(logit_dir).lower():
+                    current_type = 'maestro'
+                elif "dali_synth" in str(logit_dir).lower():
+                    current_type = 'dali_synth'
+
+                if self.verbose:
+                    print(f"Scanning {current_type.upper()} logits from: {logit_dir}")
+
+                for logit_path in logit_dir.glob("**/*.npy"):
+                    # Use a regex that specifically looks for _logits.npy
+                    match = re.search(r'([0-9a-fA-F]{32}|.+?)_logits\.npy$', logit_path.name)
+                    if match:
+                        file_id = match.group(1)
+                        logit_files_dict[file_id] = logit_path
+                        logit_counts[current_type] += 1
 
         if self.verbose:
-            print(f"Found {len(label_files_dict)} label files with valid IDs across all directories")
-            print(f"  FMA: {fma_label_count} label files")
-            print(f"  Maestro: {maestro_label_count} label files")
+            print(f"Found {len(label_files_dict)} label files across all directories:")
+            for k, v in label_counts.items(): print(f"  {k.upper()}: {v}")
+            if self.logits_dirs:
+                print(f"Found {len(logit_files_dict)} logit files across all directories:")
+                for k, v in logit_counts.items(): print(f"  {k.upper()}: {v}")
 
         # Find all spectrogram files from all spectrogram directories
         valid_spec_files = []
-        maestro_spec_count = 0
-        fma_spec_count = 0
+        spec_counts = {'fma': 0, 'maestro': 0, 'dali_synth': 0}
 
         for spec_dir in self.spec_dirs:
-            # Determine search logic based on directory path
-            use_maestro_logic = "maestro" in str(spec_dir).lower()
+            current_type = 'fma' # Default
+            use_maestro_logic = False
+            use_dali_logic = False
 
-            if use_maestro_logic:
-                # Maestro-specific search logic
-                if self.verbose:
-                    print(f"Using Maestro logic for {spec_dir}")
+            if "maestro" in str(spec_dir).lower():
+                current_type = 'maestro'
+                use_maestro_logic = True
+            elif "dali_synth" in str(spec_dir).lower():
+                current_type = 'dali_synth'
+                use_dali_logic = True
 
-                # Look recursively through all subdirectories for Maestro files
-                for spec_path in spec_dir.glob("**/*.npy"):
-                    if "_spec.npy" in str(spec_path):
-                        # Get the full path relative to spec_dir for consistent addressing
-                        rel_path = spec_path.relative_to(spec_dir)
+            if self.verbose:
+                print(f"Scanning {current_type.upper()} spectrograms from: {spec_dir}")
 
-                        # Create file ID from the relative path (without extension) to match label file pattern
-                        file_id = str(rel_path.with_suffix(''))
-                        if file_id.endswith('_spec'):
-                            file_id = file_id[:-5]
-
-                        # Debug first few files
-                        if maestro_spec_count < 10 and self.verbose:
-                            print(f"  Maestro spec: {spec_path}")
-                            print(f"  ID: {file_id}")
-                            print(f"  In dict: {file_id in label_files_dict}")
-
-                        if file_id in label_files_dict:
-                            valid_spec_files.append((spec_path, file_id))
-                            maestro_spec_count += 1
-            else:
-                # FMA-specific search logic - unchanged
+            # Use recursive glob for Maestro and DALI
+            if use_maestro_logic or use_dali_logic:
+                for spec_path in spec_dir.glob("**/*_spec.npy"):
+                    # Extract ID using the general pattern, preferring hex if possible
+                    match = self.file_pattern.search(spec_path.name)
+                    if match:
+                        file_id = match.group(1)
+                        # Basic validation for DALI ID format (32 hex chars)
+                        if use_dali_logic and not re.fullmatch(r'[0-9a-fA-F]{32}', file_id):
+                             if self.verbose: print(f"Skipping potential DALI file with non-hex ID: {spec_path.name}")
+                             continue
+                        valid_spec_files.append((spec_path, file_id, current_type)) # Store type
+                        spec_counts[current_type] += 1
+                    elif self.verbose:
+                        print(f"Could not extract ID from {current_type.upper()} file: {spec_path.name}")
+            else: # FMA logic (numeric ID)
                 for prefix_dir in spec_dir.glob("**/"):
-                    if prefix_dir.is_dir() and len(prefix_dir.name) == 3 and prefix_dir.name.isdigit():
-                        dir_prefix = prefix_dir.name
-                        for spec_path in prefix_dir.glob(f"{dir_prefix}???_spec.npy"):
-                            filename = spec_path.stem
-                            if filename.endswith("_spec"):
-                                filename = filename[:-5]
-
-                            numeric_match = self.numeric_id_pattern.search(filename)
+                    # Check if prefix_dir name matches the 3-digit FMA pattern
+                    if re.fullmatch(r'\d{3}', prefix_dir.name):
+                        for spec_path in prefix_dir.glob("*_spec.npy"):
+                            numeric_match = self.numeric_id_pattern.search(spec_path.name)
                             if numeric_match:
-                                numeric_id = numeric_match.group(1)
-                                if numeric_id in label_files_dict:
-                                    valid_spec_files.append((spec_path, numeric_id))
-                                    fma_spec_count += 1
+                                file_id = numeric_match.group(1)
+                                valid_spec_files.append((spec_path, file_id, current_type)) # Store type
+                                spec_counts[current_type] += 1
+                            elif self.verbose:
+                                print(f"Could not extract numeric ID from FMA file: {spec_path.name}")
 
         if not valid_spec_files:
-            warnings.warn(f"No valid spectrogram files found for dataset type '{self.dataset_type}'. Check your data paths.")
+            warnings.warn(f"No valid spectrogram files found for dataset type '{self.dataset_type}'. Check data paths.")
             return
 
         if self.verbose:
-            print(f"Found {len(valid_spec_files)} valid spectrogram files")
-            print(f"  FMA: {fma_spec_count} spectrogram files")
-            print(f"  Maestro: {maestro_spec_count} spectrogram files")
-
+            print(f"Found {len(valid_spec_files)} valid spectrogram files:")
+            for k, v in spec_counts.items(): print(f"  {k.upper()}: {v}")
             if valid_spec_files:
                 print("Sample spectrogram paths:")
-                for i, (path, _) in enumerate(valid_spec_files[:3]):
-                    print(f"  {i+1}. {path}")
+                for i, (path, _, type) in enumerate(valid_spec_files[:3]):
+                    print(f"  ({type.upper()}) {path}")
 
-        # Handle small dataset percentage option with special handling for combined mode
+        # Handle small dataset percentage option
         if self.small_dataset_percentage is not None:
-            # Ensure consistent sampling by using a fixed seed
-            np.random.seed(42)
+            np.random.seed(42) # Ensure consistent sampling
 
-            # Special handling for combined dataset to ensure both datasets are represented
-            if self.is_combined_mode and self.dataset_type == 'combined' and len(self.spec_dirs) > 1:
-                # Group files by which dataset they belong to
-                dataset_files = {}
-                for spec_path, file_id in valid_spec_files:
-                    # Determine which dataset this file belongs to based on path
-                    dataset_key = None
-                    for i, dir_path in enumerate(self.spec_dirs):
-                        if str(spec_path).startswith(str(dir_path)):
-                            dataset_key = i
-                            break
+            # Group files by type ('fma', 'maestro', 'dali_synth')
+            dataset_files = {'fma': [], 'maestro': [], 'dali_synth': []}
+            for spec_path, file_id, file_type in valid_spec_files:
+                dataset_files[file_type].append((spec_path, file_id, file_type))
 
-                    if dataset_key is not None:
-                        if dataset_key not in dataset_files:
-                            dataset_files[dataset_key] = []
-                        dataset_files[dataset_key].append((spec_path, file_id))
-
-                # Add debugging to verify dataset detection
-                if self.verbose:
-                    print(f"Dataset distribution before sampling:")
-                    for i, dir_path in enumerate(self.spec_dirs):
-                        dataset_name = "Maestro" if "maestro" in str(dir_path) else "FMA"
-                        file_count = len(dataset_files.get(i, []))
-                        print(f"  {dataset_name}: {file_count} files detected from {dir_path}")
-
-                # Apply percentage to each dataset individually
-                sampled_files = []
-                for dataset_key, files in dataset_files.items():
-                    # Sort files for deterministic behavior within each dataset
-                    files.sort(key=lambda x: str(x[0]))
-
-                    # Calculate sample size for this dataset
-                    dataset_sample_size = max(1, int(len(files) * self.small_dataset_percentage))
-
-                    # Take the first portion based on percentage
-                    sampled_dataset_files = files[:dataset_sample_size]
-                    sampled_files.extend(sampled_dataset_files)
-
-                    # Always show this information since it's critical for understanding dataset mixture
-                    dataset_name = "Maestro" if "maestro" in str(self.spec_dirs[dataset_key]) else "FMA"
-                    print(f"Using {len(sampled_dataset_files)} {dataset_name} files ({self.small_dataset_percentage*100:.2f}% of {len(files)})")
-                    if sampled_dataset_files:
-                        print(f"First {dataset_name} file: {sampled_dataset_files[0][0]}")
-                        if len(sampled_dataset_files) > 1:
-                            print(f"Last {dataset_name} file: {sampled_dataset_files[-1][0]}")
-
-                # Update valid_spec_files with the combined sampled files
-                valid_spec_files = sampled_files
-            else:
-                # Original behavior for single datasets
-                sample_size = max(1, int(len(valid_spec_files) * self.small_dataset_percentage))
-
-                # Sample files - prefer deterministic subset
-                if sample_size < len(valid_spec_files):
-                    # Sort files for deterministic behavior
-                    valid_spec_files.sort(key=lambda x: str(x[0]))
-
-                    # Take the first portion based on percentage
-                    valid_spec_files = valid_spec_files[:sample_size]
-
+            sampled_files = []
+            total_sampled_count = 0
+            for file_type, files in dataset_files.items():
+                if not files: continue
+                type_sample_size = max(1, int(len(files) * self.small_dataset_percentage))
+                if type_sample_size < len(files):
+                    indices = np.random.choice(len(files), type_sample_size, replace=False)
+                    sampled_subset = [files[i] for i in indices]
                     if self.verbose:
-                        print(f"Using {sample_size} files ({self.small_dataset_percentage*100:.2f}% of dataset) for quick testing")
-                        print(f"First file: {valid_spec_files[0][0]}")
-                        if len(valid_spec_files) > 1:
-                            print(f"Last file: {valid_spec_files[-1][0]}")
+                        print(f"Sampling {type_sample_size}/{len(files)} files for {file_type.upper()}")
+                else:
+                    sampled_subset = files # Use all if sample size >= total
+                    if self.verbose:
+                        print(f"Using all {len(files)} files for {file_type.upper()} (small_dataset_percentage)")
+
+                sampled_files.extend(sampled_subset)
+                total_sampled_count += len(sampled_subset)
+
+            valid_spec_files = sampled_files
+            if self.verbose:
+                print(f"Total files after sampling: {total_sampled_count}")
 
         self.samples = []
         self.total_processed = 0
@@ -534,8 +500,8 @@ class SynthDataset(Dataset):
             if self.verbose:
                 print(f"Small dataset detected, reducing worker count to {num_cpus}")
 
-        args_list = [(self, spec_file, file_id, label_files_dict, True)
-                    for spec_file, file_id in valid_spec_files]
+        args_list = [(self, spec_file, file_id, label_files_dict, logit_files_dict, True)
+                     for spec_file, file_id, _ in valid_spec_files]
 
         if self.verbose:
             print(f"Processing {len(args_list)} files with {num_cpus} parallel workers")
@@ -708,6 +674,8 @@ class SynthDataset(Dataset):
                             dataset_key = "unknown"
                             if "maestro" in str(path).lower():
                                 dataset_key = "maestro"
+                            elif "dali_synth" in str(path).lower():
+                                dataset_key = "dali_synth"
                             else:
                                 dataset_key = "fma"
 
@@ -722,7 +690,7 @@ class SynthDataset(Dataset):
                             print(f"  {dataset_key}: {count} samples ({percentage:.2f}%)")
         else:
             warnings.warn("No samples loaded. Check your data paths and structure.")
-    def _process_file(self, spec_file, file_id, label_files_dict, return_skip_reason=False):
+    def _process_file(self, spec_file, file_id, label_files_dict, logit_files_dict, return_skip_reason=False):
         """Process a single spectrogram file based on dataset type"""
         samples = []
         skip_reason = None
@@ -730,6 +698,11 @@ class SynthDataset(Dataset):
         try:
             if self.dataset_type == 'maestro':
                 dir_prefix = spec_file.parent.name
+            elif self.dataset_type == 'dali_synth':
+                # For DALI, use the 3-character prefix from the parent directory
+                dir_prefix = spec_file.parent.name
+                if not self.dali_prefix_pattern.match(dir_prefix):
+                    dir_prefix = file_id[:3] if len(file_id) >= 3 else file_id
             else:
                 dir_prefix = file_id[:3] if len(file_id) >= 3 else file_id
 
@@ -742,11 +715,26 @@ class SynthDataset(Dataset):
                     return [], skip_reason
                 return []
 
+            # Find corresponding logit file if needed
             logit_file = None
             if self.logits_dirs is not None:
-                # Detect if this is a Maestro file by checking the file_id pattern
+                # First check if we have it in the logit_files_dict
+                if logit_files_dict is not None:
+                    logit_file = logit_files_dict.get(file_id)
+                    if self.require_teacher_logits and (not logit_file or not os.path.exists(str(logit_file))):
+                        if hasattr(self, 'skipped_reasons'):
+                            self.skipped_reasons['missing_logits'] += 1
+                        skip_reason = 'missing_logits'
+                        if return_skip_reason:
+                            return [], skip_reason
+                        return []
+
+                # If not found in dict, try the traditional path-based approach
+                # Detect file type by checking the file_id pattern
                 is_maestro_file = 'maestro' in str(spec_file).lower() or (
                     '/' in file_id and 'maestro' in file_id.lower())
+                is_dali_file = 'dali_synth' in str(spec_file).lower() or (
+                    len(file_id) == 32 and re.fullmatch(r'[0-9a-fA-F]{32}', file_id))
 
                 for logits_dir in self.logits_dirs:
                     if is_maestro_file:
@@ -758,6 +746,21 @@ class SynthDataset(Dataset):
                                 logit_file = temp_logit_file
                                 break
                         else:
+                            temp_logit_file = logits_dir / f"{file_id}_logits.npy"
+                            if os.path.exists(temp_logit_file):
+                                logit_file = temp_logit_file
+                                break
+                    elif is_dali_file:
+                        # Use DALI-specific logic for DALI files
+                        # For DALI, use the 3-character prefix directory structure
+                        if len(file_id) == 32:  # Standard 32-char hex ID
+                            prefix = file_id[:3]
+                            temp_logit_file = logits_dir / prefix / f"{file_id}_logits.npy"
+                            if os.path.exists(temp_logit_file):
+                                logit_file = temp_logit_file
+                                break
+                        else:
+                            # Fallback for unusual IDs
                             temp_logit_file = logits_dir / f"{file_id}_logits.npy"
                             if os.path.exists(temp_logit_file):
                                 logit_file = temp_logit_file
@@ -797,6 +800,8 @@ class SynthDataset(Dataset):
 
                         if self.dataset_type == 'maestro':
                             expected_spec_path = str(spec_file)
+                        elif self.dataset_type == 'dali_synth':
+                            expected_spec_path = str(self.spec_dir / dir_prefix / f"{file_id}_spec.npy")
                         else:
                             expected_spec_path = str(self.spec_dir / dir_prefix / f"{file_id}_spec.npy")
 
