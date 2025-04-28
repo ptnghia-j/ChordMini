@@ -93,9 +93,8 @@ class DistributedStudentTrainer(StudentTrainer):
             # Use timeout handler for the all_reduce operation
             with timeout_handler(seconds=timeout_seconds,
                                 error_message=f"Distributed all_reduce timed out after {timeout_minutes} minutes"):
-                info(f"Rank {self.rank}: Starting all_reduce operation")
+                # Only log if there's an issue
                 dist.all_reduce(rt, op=dist.ReduceOp.SUM)
-                info(f"Rank {self.rank}: Completed all_reduce operation")
         except TimeoutException as e:
             warning(f"Rank {self.rank}: {str(e)}")
             warning(f"Rank {self.rank}: Using local tensor value instead")

@@ -65,11 +65,11 @@ spec:
             - |
               set -ex
               echo "Checking data directory structure..."
-              
+
               # Locate the project root
               PROJ_ROOT="/mnt/storage/ChordMini"
               echo "Project root: $PROJ_ROOT"
-              
+
               # Check and create main data directories
               echo "Checking/creating data directories..."
               for dir in "/mnt/storage/data/LabeledDataset/Audio" "/mnt/storage/data/LabeledDataset/Labels" "/mnt/storage/data/LabeledDataset/cache"; do
@@ -80,7 +80,7 @@ spec:
                   echo "Created directory: $dir"
                 fi
               done
-              
+
               # Check and create audio dataset subdirectories
               echo "Checking/creating audio dataset subdirectories..."
               for subdir in "billboard" "caroleKing" "queen" "theBeatles"; do
@@ -92,7 +92,7 @@ spec:
                   echo "Created audio directory: $subdir"
                 fi
               done
-              
+
               # Check and create label dataset subdirectories
               echo "Checking/creating label dataset subdirectories..."
               for subdir in "billboardLabels" "caroleKingLabels" "queenLabels" "theBeatlesLabels"; do
@@ -104,10 +104,10 @@ spec:
                   echo "Created label directory: $subdir"
                 fi
               done
-              
+
               # Create symlinks from project directory to actual data location
               mkdir -p "$PROJ_ROOT/data/LabeledDataset"
-              
+
               # Create unified symlinks for LabeledDataset
               if [ -L "$PROJ_ROOT/data/LabeledDataset/Audio" ]; then
                 echo "Symlink for Audio already exists"
@@ -115,29 +115,29 @@ spec:
                 ln -sf "/mnt/storage/data/LabeledDataset/Audio" "$PROJ_ROOT/data/LabeledDataset/Audio"
                 echo "Created symlink for Audio"
               fi
-              
+
               if [ -L "$PROJ_ROOT/data/LabeledDataset/Labels" ]; then
                 echo "Symlink for Labels already exists"
               else
                 ln -sf "/mnt/storage/data/LabeledDataset/Labels" "$PROJ_ROOT/data/LabeledDataset/Labels"
                 echo "Created symlink for Labels"
               fi
-              
+
               if [ -L "$PROJ_ROOT/data/LabeledDataset/cache" ]; then
                 echo "Symlink for cache already exists"
               else
                 ln -sf "/mnt/storage/data/LabeledDataset/cache" "$PROJ_ROOT/data/LabeledDataset/cache"
                 echo "Created symlink for cache"
               fi
-              
+
               # Check for audio files
               echo "---- Checking for audio files ----"
               find "/mnt/storage/data/LabeledDataset/Audio" -name "*.mp3" -o -name "*.wav" | wc -l
-              
+
               # Check for label files
               echo "---- Checking for label files ----"
               find "/mnt/storage/data/LabeledDataset/Labels" -name "*.lab" -o -name "*.txt" | wc -l
-              
+
               echo "Data directory structure prepared."
           volumeMounts:
             - name: storage
@@ -160,15 +160,30 @@ spec:
             - name: MIN_LEARNING_RATE
               value: "0.000001"  # Minimum learning rate
             # Knowledge distillation settings
+            # -------------------------------------------------------------------------
+            # Knowledge Distillation (KD) allows the model to learn from a teacher model
+            # The teacher model is typically a larger, more powerful model that has been
+            # pre-trained on the same or similar task.
+            # -------------------------------------------------------------------------
             - name: USE_KD_LOSS
               value: "false"  # Set to "true" to enable KD loss
             # Add explicit note about KD status
             - name: KD_STATUS_CHECK
               value: "disabled_explicitly"  # For debugging purposes
+            # Teacher model path - if not specified, will try to find btc_model_large_voca.pt
+            - name: TEACHER_MODEL
+              value: "/mnt/storage/checkpoints/btc/btc_model_large_voca.pt"
+            # KD loss weight - controls balance between KD loss and standard loss
+            # Higher values give more weight to matching teacher outputs vs ground truth
             - name: KD_ALPHA
               value: "0.3"  # Weight for KD loss (0-1) - only used if KD is enabled
+            # Temperature for softening probability distributions
+            # Higher values make distributions softer, emphasizing knowledge transfer
             - name: TEMPERATURE
               value: "2.0"  # Temperature for softening distributions
+            # Debug mode for teacher logit extraction - saves intermediate tensors
+            - name: KD_DEBUG_MODE
+              value: "true"  # Set to "true" to enable debug mode for teacher logit extraction
             # Focal loss settings
             - name: USE_FOCAL_LOSS
               value: "true"  # Set to "true" to enable focal loss
@@ -237,10 +252,10 @@ spec:
             - |
               set -ex
               echo "=== Fine-tuning model on labeled data ==="
-              
+
               # Install necessary system packages
               apt-get update && apt-get install -y libsndfile1 || { echo "ERROR: Failed to install system dependencies"; exit 1; }
-              
+
               # Create a minimal requirements.txt if missing
               if [ ! -f requirements.txt ]; then
                 echo "Creating minimal requirements.txt"
@@ -252,29 +267,37 @@ spec:
                 echo "pyyaml>=6.0.0" >> requirements.txt  # Added for config loading
                 echo "soundfile>=0.10.0" >> requirements.txt  # For audio file loading
               fi
-              
+
               pip install --no-cache-dir -r requirements.txt || { echo "WARNING: Some requirements may have failed"; }
               pip install --no-cache-dir matplotlib tqdm pyyaml librosa scikit-learn soundfile || { echo "ERROR: Failed to install additional Python packages"; exit 1; }
-              
+
               # Verify the data paths
               echo "Checking LabeledDataset paths..."
-              
+
               # Create checkpoints directory
               mkdir -p ${SAVE_DIR}
-              
+
               # Check for audio/label files
               echo "Checking for audio files..."
               find ${DATA_ROOT}/LabeledDataset/Audio -type f | grep -E '\.(mp3|wav)$' | wc -l
-              
+
               echo "Checking for label files..."
               find ${DATA_ROOT}/LabeledDataset/Labels -type f | grep -E '\.(lab|txt)$' | wc -l
-              
+
               # Prepare command line arguments
               KD_ARGS=""
               if [ "${USE_KD_LOSS}" = "true" ]; then
                 KD_ARGS="--use_kd_loss --kd_alpha ${KD_ALPHA} --temperature ${TEMPERATURE}"
+                # Add teacher model path if specified
+                if [ -n "${TEACHER_MODEL}" ]; then
+                  KD_ARGS="${KD_ARGS} --teacher_model ${TEACHER_MODEL}"
+                fi
+                # Add debug mode if enabled
+                if [ "${KD_DEBUG_MODE}" = "true" ]; then
+                  KD_ARGS="${KD_ARGS} --kd_debug_mode"
+                fi
               fi
-              
+
               FOCAL_ARGS=""
               if [ "${USE_FOCAL_LOSS}" = "true" ]; then
                 FOCAL_ARGS="--use_focal_loss --focal_gamma ${FOCAL_GAMMA}"
@@ -282,31 +305,31 @@ spec:
                   FOCAL_ARGS="${FOCAL_ARGS} --focal_alpha ${FOCAL_ALPHA}"
                 fi
               fi
-              
+
               WARMUP_ARGS=""
               if [ "${USE_WARMUP}" = "true" ]; then
                 WARMUP_ARGS="--use_warmup --warmup_epochs ${WARMUP_EPOCHS} --warmup_start_lr ${WARMUP_START_LR} --warmup_end_lr ${WARMUP_END_LR}"
               fi
-              
+
               FREEZE_ARGS=""
               if [ "${FREEZE_FEATURE_EXTRACTOR}" = "true" ]; then
                 FREEZE_ARGS="--freeze_feature_extractor"
               fi
-              
+
               CACHE_ARGS=""
               if [ "${DISABLE_CACHE}" = "true" ]; then
                 CACHE_ARGS="--disable_cache"
               fi
-              
+
               if [ "${METADATA_CACHE}" = "true" ]; then
                 CACHE_ARGS="${CACHE_ARGS} --metadata_cache"
               fi
-              
+
               # Define directories
               AUDIO_DIRS="${DATA_ROOT}/LabeledDataset/Audio/billboard ${DATA_ROOT}/LabeledDataset/Audio/caroleKing ${DATA_ROOT}/LabeledDataset/Audio/queen ${DATA_ROOT}/LabeledDataset/Audio/theBeatles"
               LABEL_DIRS="${DATA_ROOT}/LabeledDataset/Labels/billboardLabels ${DATA_ROOT}/LabeledDataset/Labels/caroleKingLabels ${DATA_ROOT}/LabeledDataset/Labels/queenLabels ${DATA_ROOT}/LabeledDataset/Labels/theBeatlesLabels"
               CACHE_DIR="${DATA_ROOT}/LabeledDataset/cache"
-              
+
               # Cross-validation arguments
               CV_ARGS=""
               if [ "${USE_CROSS_VALIDATION}" = "true" ]; then
@@ -321,10 +344,10 @@ spec:
                     --label_dirs ${LABEL_DIRS} \
                     --cache_dir ${CACHE_DIR} \
                     --preprocess
-                  
+
                   echo "Preprocessing completed."
                 fi
-                
+
                 # Use cross-validation training script instead of standard fine-tuning
                 echo "Starting cross-validation training with fold ${KFOLD}..."
                 python train_cv_kd.py --config ./config/student_config.yaml \
@@ -357,19 +380,19 @@ spec:
                   --gpu_memory_fraction ${GPU_MEMORY_FRACTION} \
                   ${WARMUP_ARGS} ${KD_ARGS} ${FOCAL_ARGS} ${FREEZE_ARGS} ${CACHE_ARGS}
               fi
-              
+
               echo "=== Training complete ==="
-              
+
               # Clear GPU cache to release memory before exiting
               python -c "import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None"
           resources:
             requests:
-              cpu: "2"             
-              memory: "16Gi"    
+              cpu: "2"
+              memory: "16Gi"
               nvidia.com/gpu: "1"
             limits:
-              cpu: "5"             
-              memory: "24Gi" 
+              cpu: "5"
+              memory: "24Gi"
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage

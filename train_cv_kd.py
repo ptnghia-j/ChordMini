@@ -47,6 +47,8 @@ def main():
                         help='Weight for knowledge distillation loss (default: 0.5)')
     parser.add_argument('--temperature', type=float, default=1.0,
                         help='Temperature for softening distributions (default: 1.0)')
+    parser.add_argument('--kd_debug_mode', action='store_true',
+                        help='Enable debug mode for teacher logit extraction')
     parser.add_argument('--audio_dirs', type=str, nargs='+', default=None,
                       help='Directories containing audio files')
     parser.add_argument('--label_dirs', type=str, nargs='+', default=None,
@@ -211,13 +213,28 @@ def main():
                         args.teacher_model = alt_path
                         logger.info(f"Resolved teacher model path to: {args.teacher_model}")
 
-            # Load the teacher model using our utility function
-            teacher_model, teacher_mean, teacher_std = load_btc_model(
+            # Load the teacher model using our enhanced utility function
+            teacher_model, teacher_mean, teacher_std, teacher_status = load_btc_model(
                 args.teacher_model,
                 device,
                 use_voca=use_voca
             )
-            logger.info("Teacher model loaded successfully for knowledge distillation")
+
+            # Check if loading was successful
+            if teacher_status["success"] and teacher_model is not None:
+                logger.info(f"Teacher model loaded successfully: {teacher_status['message']}")
+                logger.info(f"Model implementation: {teacher_status['implementation']}")
+                logger.info(f"Model validation: {teacher_status['model_validated']}")
+
+                # Check if we have mean/std for normalization
+                if not teacher_status["has_mean_std"]:
+                    logger.warning("Teacher model does not have mean/std values for normalization")
+                    logger.warning("Using default values: mean=0.0, std=1.0")
+            else:
+                logger.error(f"Failed to load teacher model: {teacher_status['message']}")
+                teacher_model = None
+                use_kd_loss = False
+                logger.warning("Knowledge distillation disabled due to teacher model loading failure")
         except Exception as e:
             logger.error(f"Error loading teacher model: {e}")
             logger.error(traceback.format_exc())
@@ -299,17 +316,46 @@ def main():
         logits_dir = os.path.join(save_dir, f"teacher_logits_fold{args.kfold}")
         os.makedirs(logits_dir, exist_ok=True)
 
-        # Generate predictions
-        teacher_predictions = generate_teacher_predictions(
+        # Use debug mode if specified
+        debug_mode = args.kd_debug_mode
+        if debug_mode:
+            logger.info("Debug mode for teacher logit extraction is ENABLED")
+        else:
+            logger.info("Debug mode for teacher logit extraction is disabled")
+
+        # Generate predictions with enhanced error handling
+        teacher_predictions, generation_status = generate_teacher_predictions(
             teacher_model,
             train_loader,
             teacher_mean,
             teacher_std,
             device,
-            save_dir=logits_dir
+            save_dir=logits_dir,
+            debug_mode=debug_mode
         )
 
-        logger.info(f"Generated teacher predictions for {len(teacher_predictions)} samples")
+        # Check if generation was successful
+        if generation_status["success"]:
+            logger.info(f"Generated teacher predictions for {len(teacher_predictions)} samples")
+            logger.info(f"Success rate: {generation_status['successful_samples']}/{generation_status['total_samples']} samples ({generation_status['successful_samples']/generation_status['total_samples']*100:.2f}%)")
+            logger.info(f"Extraction methods used: {generation_status['extraction_methods_used']}")
+
+            # Save generation status for reference
+            status_path = os.path.join(logits_dir, "generation_status.json")
+            try:
+                with open(status_path, 'w') as f:
+                    # Convert any non-serializable values to strings
+                    serializable_status = {k: str(v) if not isinstance(v, (dict, list, int, float, bool, str, type(None))) else v
+                                          for k, v in generation_status.items()}
+                    json.dump(serializable_status, f, indent=2)
+                logger.info(f"Saved generation status to {status_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save generation status: {e}")
+        else:
+            logger.error(f"Failed to generate teacher predictions: {generation_status['message']}")
+            logger.warning("Continuing without knowledge distillation")
+            use_kd_loss = False
+            teacher_predictions = None
 
     # Calculate global mean and std
     logger.info("Calculating global mean and std")

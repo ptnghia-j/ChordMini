@@ -187,6 +187,8 @@ def main():
                        help='Temperature for softening distributions (default: 1.0)')
     parser.add_argument('--teacher_model', type=str, default=None,
                        help='Path to teacher model for knowledge distillation')
+    parser.add_argument('--kd_debug_mode', action='store_true',
+                       help='Enable debug mode for teacher logit extraction')
 
     # Add model scale argument
     parser.add_argument('--model_scale', type=float, default=None,
@@ -717,26 +719,43 @@ def main():
             # Determine vocabulary size based on args and config
             use_voca = args.use_voca or config.feature.get('large_voca', False)
 
-            # Load the teacher model
-            teacher_model, teacher_mean, teacher_std = load_btc_model(
+            # Load the teacher model with enhanced error handling
+            teacher_model, teacher_mean, teacher_std, teacher_status = load_btc_model(
                 teacher_model_path,
                 device,
                 use_voca=use_voca
             )
-            logger.info("Teacher model loaded successfully for knowledge distillation")
 
-            # If we don't have explicit KD loss but loaded a teacher, enable it
-            if not use_kd_loss:
-                use_kd_loss = True
-                logger.info("Automatically enabling knowledge distillation with loaded teacher model")
-                kd_alpha = args.kd_alpha if args.kd_alpha is not None else float(config.training.get('kd_alpha', 0.5))
-                temperature = args.temperature if args.temperature is not None else float(config.training.get('temperature', 1.0))
-                logger.info(f"Using KD alpha: {kd_alpha}, temperature: {temperature}")
+            # Check if loading was successful
+            if teacher_status["success"] and teacher_model is not None:
+                logger.info(f"Teacher model loaded successfully: {teacher_status['message']}")
+                logger.info(f"Model implementation: {teacher_status['implementation']}")
+                logger.info(f"Model validation: {teacher_status['model_validated']}")
+
+                # If we don't have explicit KD loss but loaded a teacher, enable it
+                if not use_kd_loss:
+                    use_kd_loss = True
+                    logger.info("Automatically enabling knowledge distillation with loaded teacher model")
+                    kd_alpha = args.kd_alpha if args.kd_alpha is not None else float(config.training.get('kd_alpha', 0.5))
+                    temperature = args.temperature if args.temperature is not None else float(config.training.get('temperature', 1.0))
+                    logger.info(f"Using KD alpha: {kd_alpha}, temperature: {temperature}")
+
+                # Check if we have mean/std for normalization
+                if not teacher_status["has_mean_std"]:
+                    logger.warning("Teacher model does not have mean/std values for normalization")
+                    logger.warning("Using default values: mean=0.0, std=1.0")
+            else:
+                logger.error(f"Failed to load teacher model: {teacher_status['message']}")
+                teacher_model = None
+                use_kd_loss = False
+                logger.warning("Knowledge distillation disabled due to teacher model loading failure")
 
         except Exception as e:
             logger.error(f"Error loading teacher model: {e}")
             logger.error(traceback.format_exc())
             teacher_model = None
+            use_kd_loss = False
+            logger.warning("Knowledge distillation disabled due to exception")
 
     # Create optimizer - only optimize unfrozen parameters
     optimizer = torch.optim.Adam(
@@ -843,18 +862,50 @@ def main():
             os.makedirs(logits_dir, exist_ok=True)
 
             from modules.utils.teacher_utils import generate_teacher_predictions
-            teacher_preds = generate_teacher_predictions(
+
+            # Use debug mode if specified
+            debug_mode = args.kd_debug_mode
+            if debug_mode:
+                logger.info("Debug mode for teacher logit extraction is ENABLED")
+            else:
+                logger.info("Debug mode for teacher logit extraction is disabled")
+
+            # Generate predictions with enhanced error handling
+            teacher_preds, generation_status = generate_teacher_predictions(
                 teacher_model,
                 train_loader,
                 teacher_mean,
                 teacher_std,
                 device,
-                save_dir=logits_dir
+                save_dir=logits_dir,
+                debug_mode=debug_mode
             )
-            logger.info(f"Generated teacher predictions for {len(teacher_preds)} samples")
 
-            # Set the predictions in the trainer
-            trainer.teacher_predictions = teacher_preds
+            # Check if generation was successful
+            if generation_status["success"]:
+                logger.info(f"Generated teacher predictions for {len(teacher_preds)} samples")
+                logger.info(f"Success rate: {generation_status['successful_samples']}/{generation_status['total_samples']} samples ({generation_status['successful_samples']/generation_status['total_samples']*100:.2f}%)")
+                logger.info(f"Extraction methods used: {generation_status['extraction_methods_used']}")
+
+                # Set the predictions in the trainer
+                trainer.teacher_predictions = teacher_preds
+
+                # Save generation status for reference
+                status_path = os.path.join(logits_dir, "generation_status.json")
+                try:
+                    with open(status_path, 'w') as f:
+                        # Convert any non-serializable values to strings
+                        serializable_status = {k: str(v) if not isinstance(v, (dict, list, int, float, bool, str, type(None))) else v
+                                              for k, v in generation_status.items()}
+                        json.dump(serializable_status, f, indent=2)
+                    logger.info(f"Saved generation status to {status_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to save generation status: {e}")
+            else:
+                logger.error(f"Failed to generate teacher predictions: {generation_status['message']}")
+                logger.warning("Continuing without knowledge distillation")
+                use_kd_loss = False
+                trainer.use_kd_loss = False
 
         trainer.train(train_loader, val_loader)
         logger.info("Fine-tuning completed successfully!")

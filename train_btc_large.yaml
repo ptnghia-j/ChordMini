@@ -193,11 +193,11 @@ spec:
               value: "0.000001"    # Min learning rate for BTC (default 0)
             # Knowledge distillation settings (optional for BTC)
             - name: USE_KD_LOSS
-              value: "true" # Set to "true" to enable KD loss if teacher logits are available
+              value: "false" # Set to "true" to enable KD loss if teacher logits are available
             - name: KD_ALPHA
               value: "0.2"   # Weight for KD loss (0-1)
             - name: TEMPERATURE
-              value: "2.0"   # Temperature for softening distributions
+              value: "4.0"   # Temperature for softening distributions
             # Focal loss settings (optional for BTC)
             - name: USE_FOCAL_LOSS
               value: "true" # Set to "true" to enable focal loss
@@ -238,7 +238,7 @@ spec:
               value: "6"     # Prefetch batches for better throughput
             # Add dataset type environment variable with combined option
             - name: DATASET_TYPE
-              value: "dali_synth"  # Options: "fma", "maestro", "dali_synth", or "combined"
+              value: "dali_synth"  # Options: "fma", "maestro", "dali_synth", "combined", "fma+maestro", "fma+dali_synth", or "maestro+dali_synth"
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never", "required"
@@ -254,7 +254,7 @@ spec:
             - name: LAZY_INIT
               value: "false" # Controls dataset lazy initialization
             - name: SMALL_DATASET
-              value: "0.01"   # Set percentage of dataset to use (0.1 = 10%, null = full)
+              value: ""   # Set percentage of dataset to use (0.1 = 10%, null = full)
             - name: METADATA_CACHE
               value: "false" # Use metadata-only caching
           command:
@@ -349,11 +349,11 @@ spec:
                   # For DALI dataset
                   KD_ARGS="${KD_ARGS} --logits_dir ${DATA_ROOT}/dali_synth/logits"
                   echo "Using DALI logits from: ${DATA_ROOT}/dali_synth/logits"
-                elif [ "${DATASET_TYPE}" = "combined" ]; then
-                  # For combined, specify the primary FMA logits dir
+                elif [ "${DATASET_TYPE}" = "combined" ] || [ "${DATASET_TYPE}" = "fma+maestro" ] || [ "${DATASET_TYPE}" = "fma+dali_synth" ] || [ "${DATASET_TYPE}" = "maestro+dali_synth" ]; then
+                  # For combined datasets, specify the primary FMA logits dir
                   # Assuming train_btc.py handles finding all logits like train_student.py
                   KD_ARGS="${KD_ARGS} --logits_dir ${DATA_ROOT}/logits/synth/logits" # Primary FMA path
-                  echo "Using combined dataset - train_btc.py will find logits in standard locations"
+                  echo "Using ${DATASET_TYPE} dataset - train_btc.py will find logits in standard locations"
                 else # FMA
                   KD_ARGS="${KD_ARGS} --logits_dir ${DATA_ROOT}/logits/synth/logits"
                   echo "Using FMA logits from: ${DATA_ROOT}/logits/synth/logits"
@@ -441,7 +441,9 @@ spec:
               elif [ "${DATASET_TYPE}" = "dali_synth" ]; then
                 SPEC_DIR_ARG="--spec_dir ${DATA_ROOT}/dali_synth/spectrograms"
                 LABEL_DIR_ARG="--label_dir ${DATA_ROOT}/dali_synth/labels"
-              elif [ "${DATASET_TYPE}" = "combined" ]; then
+              elif [ "${DATASET_TYPE}" = "combined" ] || [ "${DATASET_TYPE}" = "fma+maestro" ] || [ "${DATASET_TYPE}" = "fma+dali_synth" ] || [ "${DATASET_TYPE}" = "maestro+dali_synth" ]; then
+                # For combined datasets, specify the primary FMA path
+                # train_btc.py will handle finding all datasets based on the dataset_type
                 SPEC_DIR_ARG="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms" # Primary FMA path
                 LABEL_DIR_ARG="--label_dir ${DATA_ROOT}/logits/synth/labels"   # Primary FMA path
               else # FMA
