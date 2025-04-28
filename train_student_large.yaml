@@ -643,7 +643,6 @@ spec:
                 $DATASET_ARG $SPEC_DIR_ARG $LABEL_DIR_ARG \
                 --config ./config/student_config.yaml \
                 --save_dir ${CHECKPOINTS_DIR}/${SUB_DIR} \
-                --timeout_minutes 30 \
                 ${LR_SCHEDULE_ARG} ${WARMUP_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} \
                 ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} \
                 ${GPU_ARGS} ${DROPOUT_ARG} ${LR_ARGS} \

@@ -1,11 +1,10 @@
 import torch
 import torch.distributed as dist
-import os
-import numpy as np
 import time
 from modules.training.StudentTrainer import StudentTrainer
 from modules.utils.logger import info, warning, error, debug
 from torch.nn.parallel import DistributedDataParallel
+from modules.utils.timeout_handler import timeout_handler, TimeoutException
 
 class DistributedStudentTrainer(StudentTrainer):
     """
@@ -19,7 +18,7 @@ class DistributedStudentTrainer(StudentTrainer):
                  min_lr=5e-6, use_warmup=False, warmup_epochs=None, warmup_start_lr=None,
                  warmup_end_lr=None, lr_schedule_type=None, use_focal_loss=False,
                  focal_gamma=2.0, focal_alpha=None, use_kd_loss=False, kd_alpha=0.5,
-                 temperature=1.0, rank=0, world_size=1):
+                 temperature=1.0, rank=0, world_size=1, timeout_minutes=30):
 
         # guard invalid CUDA device ordinal
         if isinstance(device, torch.device) and device.type == 'cuda':
@@ -59,6 +58,7 @@ class DistributedStudentTrainer(StudentTrainer):
         self.rank = rank
         self.world_size = world_size
         self.is_main_process = (rank == 0)
+        self.timeout_minutes = timeout_minutes
 
         # avoid DDP “mark variable ready twice” when using checkpointing
         if self.world_size > 1 and isinstance(self.model, DistributedDataParallel):
@@ -68,11 +68,44 @@ class DistributedStudentTrainer(StudentTrainer):
         if self.is_main_process:
             info(f"Initialized DistributedStudentTrainer with {world_size} processes")
             info(f"This is the main process (rank {rank})")
+            info(f"Using timeout of {timeout_minutes} minutes for distributed operations")
 
-    def reduce_tensor(self, tensor):
-        """Reduce tensor across all ranks."""
+    def reduce_tensor(self, tensor, timeout_minutes=None):
+        """Reduce tensor across all ranks with timeout handling.
+
+        Args:
+            tensor: Tensor to reduce
+            timeout_minutes: Timeout in minutes (default: 30)
+
+        Returns:
+            Reduced tensor
+        """
         rt = tensor.clone()
-        dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+
+        # Use class timeout if not specified
+        if timeout_minutes is None:
+            timeout_minutes = self.timeout_minutes
+
+        # Convert minutes to seconds
+        timeout_seconds = timeout_minutes * 60
+
+        try:
+            # Use timeout handler for the all_reduce operation
+            with timeout_handler(seconds=timeout_seconds,
+                                error_message=f"Distributed all_reduce timed out after {timeout_minutes} minutes"):
+                info(f"Rank {self.rank}: Starting all_reduce operation")
+                dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+                info(f"Rank {self.rank}: Completed all_reduce operation")
+        except TimeoutException as e:
+            warning(f"Rank {self.rank}: {str(e)}")
+            warning(f"Rank {self.rank}: Using local tensor value instead")
+            # Return the local tensor value if timeout occurs
+            return tensor
+        except Exception as e:
+            error(f"Rank {self.rank}: Error in all_reduce: {str(e)}")
+            # Return the local tensor value if any error occurs
+            return tensor
+
         rt /= self.world_size
         return rt
 

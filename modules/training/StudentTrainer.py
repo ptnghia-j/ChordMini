@@ -218,7 +218,8 @@ class StudentTrainer(BaseTrainer):
                  use_warmup=False, warmup_epochs=5, warmup_start_lr=None, warmup_end_lr=None,
                  lr_schedule_type=None, use_focal_loss=False, focal_gamma=2.0, focal_alpha=None,
                  use_kd_loss=False, kd_alpha=0.5, temperature=1.0,
-                 teacher_model=None, teacher_normalization=None, teacher_predictions=None):
+                 teacher_model=None, teacher_normalization=None, teacher_predictions=None,
+                 timeout_minutes=30):
 
         # First call the parent's __init__ to set up the logger and other attributes
         super().__init__(model, optimizer, scheduler, device, num_epochs,
@@ -374,6 +375,11 @@ class StudentTrainer(BaseTrainer):
         self.teacher_model = teacher_model
         self.teacher_normalization = teacher_normalization or {'mean': 0.0, 'std': 1.0}
         self.teacher_predictions = teacher_predictions or {}
+
+        # Timeout for distributed operations
+        self.timeout_minutes = timeout_minutes
+        if logger:
+            logger.info(f"Using timeout of {timeout_minutes} minutes for distributed operations")
 
     def train_batch(self, batch):
         """Train on a single batch."""

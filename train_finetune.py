@@ -245,6 +245,8 @@ def main():
                       help='Start from epoch 1 when loading pretrained model')
     parser.add_argument('--reset_scheduler', action='store_true',
                       help='Reset learning rate scheduler when loading pretrained model')
+    parser.add_argument('--timeout_minutes', type=int, default=30,
+                      help='Timeout in minutes for distributed operations (default: 30)')
 
     # Add parameters to handle model loading/saving
     parser.add_argument('--force_num_classes', type=int, default=None,
@@ -823,6 +825,7 @@ def main():
         temperature=temperature,
         teacher_model=teacher_model,
         teacher_normalization={'mean': teacher_mean, 'std': teacher_std} if teacher_mean is not None else None,
+        timeout_minutes=args.timeout_minutes,
     )
 
     # Attach chord mapping to trainer (chord -> idx) if needed by trainer internals

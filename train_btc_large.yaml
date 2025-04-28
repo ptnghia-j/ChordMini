@@ -460,7 +460,6 @@ spec:
                 --distributed_backend="nccl" \
                 --config ./config/btc_config.yaml \
                 --save_dir ${SAVE_DIR} \
-                --timeout_minutes 30 \
                 $DATASET_ARG $SPEC_DIR_ARG $LABEL_DIR_ARG \
                 ${LR_SCHEDULE_ARG} ${WARMUP_ARG} ${FOCAL_LOSS_ARG} ${KD_ARGS} \
                 ${CACHE_ARGS} ${GPU_ARGS} ${DROPOUT_ARG} ${LR_ARGS} \

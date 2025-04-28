@@ -292,6 +292,8 @@ def main():
                       help='Start from epoch 1 even when loading from checkpoint')
     parser.add_argument('--reset_scheduler', action='store_true',
                       help='Reset learning rate scheduler when --reset_epoch is used')
+    parser.add_argument('--timeout_minutes', type=int, default=30,
+                      help='Timeout in minutes for distributed operations (default: 30)')
 
     args = parser.parse_args()
 
@@ -979,7 +981,8 @@ def main():
             kd_alpha=kd_alpha,
             temperature=temperature,
             rank=rank,
-            world_size=world_size
+            world_size=world_size,
+            timeout_minutes=args.timeout_minutes
         )
     else:
         trainer = StudentTrainer(
