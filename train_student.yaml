@@ -73,9 +73,9 @@ spec:
 
               # Create the data directories if they don't exist for both dataset types
               # FMA dataset directories
-              mkdir -p "/mnt/storage/data/synth/spectrograms"
-              mkdir -p "/mnt/storage/data/synth/labels"
-              mkdir -p "/mnt/storage/data/synth/logits"
+              mkdir -p "/mnt/storage/data/logits/synth/spectrograms"
+              mkdir -p "/mnt/storage/data/logits/synth/labels"
+              mkdir -p "/mnt/storage/data/logits/synth/logits"
 
               # Maestro dataset directories
               mkdir -p "/mnt/storage/data/maestro_synth/spectrograms"
@@ -90,21 +90,21 @@ spec:
               if [ -L "$PROJ_ROOT/data/synth/spectrograms" ]; then
                 echo "Symlink for FMA spectrograms already exists"
               else
-                ln -sf "/mnt/storage/data/synth/spectrograms" "$PROJ_ROOT/data/synth/spectrograms"
+                ln -sf "/mnt/storage/data/logits/synth/spectrograms" "$PROJ_ROOT/data/synth/spectrograms"
                 echo "Created symlink for FMA spectrograms"
               fi
 
               if [ -L "$PROJ_ROOT/data/synth/labels" ]; then
                 echo "Symlink for FMA labels already exists"
               else
-                ln -sf "/mnt/storage/data/synth/labels" "$PROJ_ROOT/data/synth/labels"
+                ln -sf "/mnt/storage/data/logits/synth/labels" "$PROJ_ROOT/data/synth/labels"
                 echo "Created symlink for FMA labels"
               fi
 
               if [ -L "$PROJ_ROOT/data/synth/logits" ]; then
                 echo "Symlink for FMA logits already exists"
               else
-                ln -sf "/mnt/storage/data/synth/logits" "$PROJ_ROOT/data/synth/logits"
+                ln -sf "/mnt/storage/data/logits/synth/logits" "$PROJ_ROOT/data/synth/logits"
                 echo "Created symlink for FMA logits"
               fi
 
@@ -132,22 +132,22 @@ spec:
 
               # Check for spectrogram files in both datasets
               echo "---- Checking for FMA spectrogram files ----"
-              find "/mnt/storage/data/synth" -name "*.npy" | head -5
+              find "/mnt/storage/data/logits/synth/spectrograms" -name "*.npy" | head -5
 
               echo "---- Checking for Maestro spectrogram files ----"
               find "/mnt/storage/data/maestro_synth" -name "*.npy" | head -5
 
               # Check for label files in both datasets
               echo "---- Checking for FMA label files ----"
-              find "/mnt/storage/data/synth" -name "*.lab" | head -5
+              find "/mnt/storage/data/logits/synth/labels" -name "*.lab" | head -5
 
               echo "---- Checking for Maestro label files ----"
               find "/mnt/storage/data/maestro_synth" -name "*.lab" | head -5
 
               # Verify there are some relevant files for at least one dataset
               echo "Checking if there are data files to process..."
-              FMA_SPEC_COUNT=$(find "/mnt/storage/data/synth" -type f -name "*.npy" | wc -l)
-              FMA_LABEL_COUNT=$(find "/mnt/storage/data/synth" -type f -name "*.lab" | wc -l)
+              FMA_SPEC_COUNT=$(find "/mnt/storage/data/logits/synth/spectrograms" -type f -name "*.npy" | wc -l)
+              FMA_LABEL_COUNT=$(find "/mnt/storage/data/logits/synth/labels" -type f -name "*.lab" | wc -l)
 
               MAESTRO_SPEC_COUNT=$(find "/mnt/storage/data/maestro_synth" -type f -name "*.npy" | wc -l)
               MAESTRO_LABEL_COUNT=$(find "/mnt/storage/data/maestro_synth" -type f -name "*.lab" | wc -l)
@@ -209,7 +209,7 @@ spec:
               value: "10"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
-              value: "0.2"  # Set dropout probability (0-1)
+              value: "0.3"  # Set dropout probability (0-1)
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
@@ -230,7 +230,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
             - name: SUB_DIR
-              value: "fma"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
+              value: "student-fma"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
@@ -276,13 +276,19 @@ spec:
               if [ ! -L "./data/synth/spectrograms" ]; then
                 echo "Recreating symlink for spectrograms"
                 mkdir -p ./data/synth
-                ln -sf "/mnt/storage/data/synth/spectrograms" "./data/synth/spectrograms"
+                ln -sf "/mnt/storage/data/logits/synth/spectrograms" "./data/synth/spectrograms"
               fi
 
               if [ ! -L "./data/synth/labels" ]; then
                 echo "Recreating symlink for labels"
                 mkdir -p ./data/synth
-                ln -sf "/mnt/storage/data/synth/labels" "./data/synth/labels"
+                ln -sf "/mnt/storage/data/logits/synth/labels" "./data/synth/labels"
+              fi
+
+              if [ ! -L "./data/synth/logits" ]; then
+                echo "Recreating symlink for logits"
+                mkdir -p ./data/synth
+                ln -sf "/mnt/storage/data/logits/synth/logits" "./data/synth/logits"
               fi
 
               # Verify that spectrograms and labels exist in the expected location
@@ -395,7 +401,7 @@ spec:
               KD_LOSS_ARG=""
               if [ "${USE_KD_LOSS}" = "true" ]; then
                 echo "Using knowledge distillation with alpha=${KD_ALPHA} and temperature=${TEMPERATURE}"
-                KD_LOSS_ARG="--use_kd_loss --kd_alpha ${KD_ALPHA} --temperature ${TEMPERATURE} --logits_dir ${DATA_ROOT}/logits/synth"
+                KD_LOSS_ARG="--use_kd_loss --kd_alpha ${KD_ALPHA} --temperature ${TEMPERATURE} --logits_dir ${DATA_ROOT}/logits/synth/logits"
                 echo "Note: Teacher logits must be included in the batch data"
               fi
 
@@ -439,23 +445,21 @@ spec:
                     echo "Found complete KD directory structure with spectrograms, labels, and logits"
                     KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms --label_dir ${DATA_ROOT}/logits/synth/labels --logits_dir ${DATA_ROOT}/logits/synth/logits"
                     echo "Using spectrograms, labels, and logits from the logits directory"
-                  elif [ -d "${DATA_ROOT}/logits/synth" ]; then
+                  else
                     # All files might be in the root directory
                     KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth --label_dir ${DATA_ROOT}/logits/synth --logits_dir ${DATA_ROOT}/logits/synth"
                     echo "Using flat KD directory structure"
-                  else
-                    echo "WARNING: KD_DATA_ROOT does not exist: ${DATA_ROOT}/logits/synth"
-                    echo "Attempting to use default paths"
-                    KD_ARGS="--logits_dir /mnt/storage/data/logits/synth/logits"
-
-                    # Create parent directories to avoid errors later
-                    mkdir -p "/mnt/storage/data/logits/synth/logits"
                   fi
 
                   # Log the actual paths being used
                   echo "KD arguments: ${KD_ARGS}"
                 else
-                  KD_ARGS=""
+                  echo "WARNING: KD_DATA_ROOT does not exist: ${DATA_ROOT}/logits/synth"
+                  echo "Attempting to use default paths"
+                  KD_ARGS="--logits_dir /mnt/storage/data/logits/synth/logits"
+
+                  # Create parent directories to avoid errors later
+                  mkdir -p "/mnt/storage/data/logits/synth/logits"
                 fi
               else
                 KD_ARGS=""

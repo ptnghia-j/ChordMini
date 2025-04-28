@@ -13,6 +13,7 @@ import argparse
 import numpy as np
 import torch
 import mir_eval
+import re
 import traceback
 from tqdm import tqdm
 from pathlib import Path
@@ -317,7 +318,7 @@ def process_audio_file(audio_path, label_path, model, config, mean, std, device,
 
 def custom_calculate_chord_scores(timestamps, durations, reference_labels, prediction_labels):
     """
-    Calculate chord evaluation metrics properly handling nested lists.
+    Calculate chord evaluation metrics using mir_eval.evaluate.
 
     Args:
         timestamps: Array of frame timestamps
@@ -328,80 +329,66 @@ def custom_calculate_chord_scores(timestamps, durations, reference_labels, predi
     Returns:
         Tuple of evaluation scores (root, thirds, triads, sevenths, tetrads, majmin, mirex)
     """
-    import mir_eval
-    import numpy as np
-
-    # Create intervals for mir_eval
-    intervals = np.zeros((len(timestamps), 2))
-    intervals[:, 0] = timestamps
-    intervals[:, 1] = timestamps + durations
+    # Ensure inputs are lists
+    reference_labels = list(reference_labels)
+    prediction_labels = list(prediction_labels)
 
     # Ensure all inputs have the same length
-    min_len = min(len(intervals), len(reference_labels), len(prediction_labels))
-    intervals = intervals[:min_len]
-
-    flat_ref_labels = []
-
-    if (len(reference_labels) > 0 and isinstance(reference_labels[0], list) and
-            len(reference_labels[0]) > 0 and isinstance(reference_labels[0][0], str)):
-        logger.debug(f"Detected doubly-nested reference labels with {len(reference_labels[0])} items")
-        flat_ref_labels = [str(chord) for chord in reference_labels[0][:min_len]]
-    else:
-        for ref in reference_labels[:min_len]:
-            if isinstance(ref, (list, tuple, np.ndarray)):
-                if len(ref) > 0:
-                    flat_ref_labels.append(str(ref[0]))
-                else:
-                    flat_ref_labels.append("N")
-            else:
-                flat_ref_labels.append(str(ref))
-
-    flat_pred_labels = []
-    for pred in prediction_labels[:min_len]:
-        if isinstance(pred, (list, tuple, np.ndarray)):
-            if len(pred) > 0:
-                flat_pred_labels.append(str(pred[0]))
-            else:
-                flat_pred_labels.append("N")
-        else:
-            flat_pred_labels.append(str(pred))
-
-    final_length = min(len(flat_ref_labels), len(flat_pred_labels))
-    flat_ref_labels = flat_ref_labels[:final_length]
-    flat_pred_labels = flat_pred_labels[:final_length]
-
-    if len(durations) > final_length:
-        durations = durations[:final_length]
-
-    logger.debug(f"Reference chords: {len(flat_ref_labels)}, prediction chords: {len(flat_pred_labels)}")
-
-    root_score = thirds_score = triads_score = sevenths_score = tetrads_score = majmin_score = mirex_score = 0.0
-
-    try:
-        root_comparisons = mir_eval.chord.root(flat_ref_labels, flat_pred_labels)
-        root_score = mir_eval.chord.weighted_accuracy(root_comparisons, durations)
-
-        thirds_comparisons = mir_eval.chord.thirds(flat_ref_labels, flat_pred_labels)
-        thirds_score = mir_eval.chord.weighted_accuracy(thirds_comparisons, durations)
-
-        triads_comparisons = mir_eval.chord.triads(flat_ref_labels, flat_pred_labels)
-        triads_score = mir_eval.chord.weighted_accuracy(triads_comparisons, durations)
-
-        sevenths_comparisons = mir_eval.chord.sevenths(flat_ref_labels, flat_pred_labels)
-        sevenths_score = mir_eval.chord.weighted_accuracy(sevenths_comparisons, durations)
-
-        tetrads_comparisons = mir_eval.chord.tetrads(flat_ref_labels, flat_pred_labels)
-        tetrads_score = mir_eval.chord.weighted_accuracy(tetrads_comparisons, durations)
-
-        majmin_comparisons = mir_eval.chord.majmin(flat_ref_labels, flat_pred_labels)
-        majmin_score = mir_eval.chord.weighted_accuracy(majmin_comparisons, durations)
-
-        mirex_comparisons = mir_eval.chord.mirex(flat_ref_labels, flat_pred_labels)
-        mirex_score = mir_eval.chord.weighted_accuracy(mirex_comparisons, durations)
-    except Exception as e:
-        logger.error(f"Error in mir_eval scoring: {e}")
+    min_len = min(len(timestamps), len(durations), len(reference_labels), len(prediction_labels))
+    if min_len == 0:
+        logger.warning("Zero length input to custom_calculate_chord_scores. Returning all zeros.")
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
+    timestamps = timestamps[:min_len]
+    durations = durations[:min_len]
+    reference_labels = reference_labels[:min_len]
+    prediction_labels = prediction_labels[:min_len]
+
+    # Create intervals for mir_eval
+    ref_intervals = np.zeros((min_len, 2))
+    ref_intervals[:, 0] = timestamps
+    ref_intervals[:, 1] = timestamps + durations
+
+    est_intervals = np.zeros((min_len, 2))
+    est_intervals[:, 0] = timestamps
+    est_intervals[:, 1] = timestamps + durations
+
+    # Standardize labels before evaluation (using the function from mir_eval_modules)
+    # try:
+    #     from modules.utils.mir_eval_modules import lab_file_error_modify
+    #     standardized_refs = [lab_file_error_modify(ref) for ref in reference_labels]
+    #     standardized_preds = [lab_file_error_modify(pred) for pred in prediction_labels]
+    # except ImportError:
+    #     logger.warning("Could not import lab_file_error_modify. Using raw labels.")
+    standardized_refs = reference_labels
+    standardized_preds = prediction_labels
+    # except Exception as e:
+    #      logger.error(f"Error standardizing labels: {e}. Using raw labels.")
+    #      standardized_refs = reference_labels
+    #      standardized_preds = prediction_labels
+
+
+    # Use mir_eval.chord.evaluate for robust calculation
+    scores = {}
+    try:
+        # mir_eval.chord.evaluate handles merging, weighting, and calculates all metrics
+        scores = mir_eval.chord.evaluate(ref_intervals, standardized_refs, est_intervals, standardized_preds)
+
+        # Extract scores safely, defaulting to 0.0 if a metric is missing
+        root_score = float(scores.get('root', 0.0))
+        thirds_score = float(scores.get('thirds', 0.0))
+        triads_score = float(scores.get('triads', 0.0))
+        sevenths_score = float(scores.get('sevenths', 0.0))
+        tetrads_score = float(scores.get('tetrads', 0.0))
+        majmin_score = float(scores.get('majmin', 0.0))
+        mirex_score = float(scores.get('mirex', 0.0))
+
+    except Exception as e:
+        logger.error(f"Error during mir_eval.chord.evaluate: {e}")
+        # Return default zero scores on error
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    # Ensure all scores are within the valid range [0, 1]
     root_score = max(0.0, min(1.0, root_score))
     thirds_score = max(0.0, min(1.0, thirds_score))
     triads_score = max(0.0, min(1.0, triads_score))
@@ -767,7 +754,7 @@ def main():
             model_path = args.btc_model
         else:
             # Always use external storage path
-            external_model_path = '/mnt/storage/checkpoints/btc/btc_model_best.pth'
+            external_model_path = 'checkpoints/btc/btc_model_best.pth'
             # Create directory if it doesn't exist
             os.makedirs(os.path.dirname(external_model_path), exist_ok=True)
             model_path = external_model_path

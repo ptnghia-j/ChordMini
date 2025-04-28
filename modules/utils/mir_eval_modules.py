@@ -1012,8 +1012,10 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                         pred_chords.append(idx_to_chord.get(pred, "N"))
 
                 # Standardize chord labels for consistent evaluation with validation
-                standardized_refs = [lab_file_error_modify(ref) for ref in reference_labels]
-                standardized_preds = [lab_file_error_modify(pred) for pred in pred_chords]
+                # standardized_refs = [lab_file_error_modify(ref) for ref in reference_labels]
+                # standardized_preds = [lab_file_error_modify(pred) for pred in pred_chords]
+                standardized_refs = reference_labels
+                standardized_preds = pred_chords
 
                 # Collect raw chord label lists for individual chord accuracy
                 collected_refs.extend(standardized_refs)
@@ -1025,10 +1027,10 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                     print(f"First 5 reference chords: {standardized_refs[:5]}")
                     large_voca_score_calculation._first_chords_logged = True
 
-                # Calculate scores
-                # durations = np.diff(np.append(timestamps, [timestamps[-1] + frame_duration]))
+                # Calculate scores using the refactored function
+                # durations = np.diff(np.append(timestamps, [timestamps[-1] + frame_duration])) # Duration calculation moved inside calculate_chord_scores
                 root_score, thirds_score, triads_score, sevenths_score, tetrads_score, majmin_score, mirex_score = calculate_chord_scores(
-                    timestamps, durations, standardized_refs, standardized_preds)
+                    timestamps, frame_duration, standardized_refs, standardized_preds) # Pass frame_duration instead of pre-calculated durations
 
                 # Store scores
                 score_list_dict['root'].append(root_score)
@@ -1151,221 +1153,63 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
 
     return score_list_dict, song_length_list, average_score_dict
 
-def calculate_chord_scores(timestamps, durations, reference_labels, prediction_labels):
+def calculate_chord_scores(timestamps, frame_duration, reference_labels, prediction_labels):
     """
-    Calculate various chord evaluation metrics correctly using mir_eval.
+    Calculate various chord evaluation metrics correctly using mir_eval.evaluate.
 
     Args:
-        timestamps: Array of frame timestamps
-        durations: Array of frame durations
-        reference_labels: List of reference chord labels
-        prediction_labels: List of predicted chord labels
+        timestamps: Array of frame start timestamps.
+        frame_duration: Duration of a single frame.
+        reference_labels: List of reference chord labels (already standardized).
+        prediction_labels: List of predicted chord labels (already standardized).
 
     Returns:
         Tuple of evaluation scores (root, thirds, triads, sevenths, tetrads, majmin, mirex)
     """
-    # Create intervals for mir_eval
-    intervals = np.zeros((len(timestamps), 2))
-    intervals[:, 0] = timestamps
-    intervals[:, 1] = timestamps + durations
+    # Ensure inputs are lists
+    reference_labels = list(reference_labels)
+    prediction_labels = list(prediction_labels)
 
     # Ensure all inputs have the same length
-    min_len = min(len(intervals), len(reference_labels), len(prediction_labels))
-    intervals = intervals[:min_len]
-
-    # IMPORTANT: Handle potentially nested reference_labels - add this check without changing
-    # the core behavior for non-nested lists
-    fixed_reference_labels = []
-    fixed_prediction_labels = []
-
-    # Check for nested reference labels (e.g., [['N', 'E:min', ...]] instead of ['N', 'E:min', ...])
-    if (len(reference_labels) > 0 and isinstance(reference_labels[0], list) and
-            len(reference_labels[0]) > 0 and isinstance(reference_labels[0][0], str)):
-        print(f"Detected doubly-nested reference labels with {len(reference_labels[0])} items")
-        fixed_reference_labels = [str(chord) for chord in reference_labels[0][:min_len]]
-    else:
-        # Keep original behavior for non-nested lists
-        for ref in reference_labels[:min_len]:
-            if isinstance(ref, (list, tuple, np.ndarray)):
-                # Handle case where individual elements are also lists
-                if len(ref) > 0:
-                    fixed_reference_labels.append(str(ref[0]))  # Take first element if it's a list
-                else:
-                    fixed_reference_labels.append("N")  # Default for empty list
-            else:
-                fixed_reference_labels.append(str(ref))  # Keep as is if not a list
-
-    # Do the same for prediction labels for consistency
-    for pred in prediction_labels[:min_len]:
-        if isinstance(pred, (list, tuple, np.ndarray)):
-            if len(pred) > 0:
-                fixed_prediction_labels.append(str(pred[0]))
-            else:
-                fixed_prediction_labels.append("N")
-        else:
-            fixed_prediction_labels.append(str(pred))
-
-    # Make sure both lists are the same length
-    final_length = min(len(fixed_reference_labels), len(fixed_prediction_labels))
-    fixed_reference_labels = fixed_reference_labels[:final_length]
-    fixed_prediction_labels = fixed_prediction_labels[:final_length]
-
-    # Update durations to match the final length
-    if len(durations) > final_length:
-        durations = durations[:final_length]
-
-    # Debug output only if we actually needed to fix something
-    if len(reference_labels) != len(fixed_reference_labels) or isinstance(reference_labels[0], list):
-        print(f"Fixed reference chord list from {len(reference_labels)} to {len(fixed_reference_labels)} items")
-        if len(fixed_reference_labels) > 0:
-            print(f"First 5 reference chords (fixed): {fixed_reference_labels[:5]}")
-
-    # Continue with existing logic, but use our fixed lists
-    reference_labels = fixed_reference_labels
-    prediction_labels = fixed_prediction_labels
-
-    # Standardize chord labels for consistent evaluation with validation
-    # This is a critical step to ensure consistency between validation and MIR evaluation
-    standardized_refs = []
-    standardized_preds = []
-
-    for ref in reference_labels:
-        # Apply the same standardization as in validation
-        standardized_ref = lab_file_error_modify(ref)
-        standardized_refs.append(standardized_ref)
-
-    for pred in prediction_labels:
-        # Apply the same standardization as in validation
-        standardized_pred = lab_file_error_modify(pred)
-        standardized_preds.append(standardized_pred)
-
-    # Use the standardized labels for evaluation
-    reference_labels = standardized_refs
-    prediction_labels = standardized_preds
-
-    # Initialize default scores
-    root_score = 0.0
-    thirds_score = 0.0
-    triads_score = 0.0
-    sevenths_score = 0.0
-    tetrads_score = 0.0
-    majmin_score = 0.0
-    mirex_score = 0.0
-
-    try:
-        # Format comparison data
-        comparison_pairs = []
-
-        # Group consecutive frames with the same labels
-        if len(reference_labels) == 0:
-            # Handle empty inputs
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-
-        current_ref = reference_labels[0]
-        current_pred = prediction_labels[0]
-        start_idx = 0
-
-        for i in range(1, len(reference_labels)):
-            if reference_labels[i] != current_ref or prediction_labels[i] != current_pred:
-                # End of a segment - add it to comparison pairs
-                end_idx = i
-                seg_intervals = intervals[start_idx:end_idx]
-                seg_start = seg_intervals[0, 0]
-                seg_end = seg_intervals[-1, 1]
-
-                comparison_pairs.append((seg_start, seg_end, current_ref, current_pred))
-
-                # Start a new segment
-                current_ref = reference_labels[i]
-                current_pred = prediction_labels[i]
-                start_idx = i
-
-        # Add the final segment
-        if start_idx < len(reference_labels):
-            seg_intervals = intervals[start_idx:]
-            seg_start = seg_intervals[0, 0]
-            seg_end = seg_intervals[-1, 1]
-            comparison_pairs.append((seg_start, seg_end, current_ref, current_pred))
-
-        # Extract comparison data
-        if not comparison_pairs:
-            # Handle case where no pairs were created
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-
-        seg_refs = [pair[2] for pair in comparison_pairs]
-        seg_preds = [pair[3] for pair in comparison_pairs]
-
-        # Convert to intervals for mir_eval
-        seg_intervals = np.array([[pair[0], pair[1]] for pair in comparison_pairs])
-        durations = np.diff(seg_intervals, axis=1).flatten()
-
-        # Call mir_eval metrics with proper error handling
-        try:
-            # Root metric
-            try:
-                root_comparisons = mir_eval.chord.root(seg_refs, seg_preds)
-                root_score = max(0.0, float(mir_eval.chord.weighted_accuracy(root_comparisons, durations)))
-            except Exception as e:
-                print(f"Error calculating root score: {e}")
-                root_score = 0.0
-
-            # Thirds metric
-            try:
-                thirds_comparisons = mir_eval.chord.thirds(seg_refs, seg_preds)
-                thirds_score = max(0.0, float(mir_eval.chord.weighted_accuracy(thirds_comparisons, durations)))
-            except Exception as e:
-                print(f"Error calculating thirds score: {e}")
-                thirds_score = 0.0
-
-            # Triads metric
-            try:
-                triads_comparisons = mir_eval.chord.triads(seg_refs, seg_preds)
-                triads_score = max(0.0, float(mir_eval.chord.weighted_accuracy(triads_comparisons, durations)))
-            except Exception as e:
-                print(f"Error calculating triads score: {e}")
-                triads_score = 0.0
-
-            # Sevenths metric
-            try:
-                sevenths_comparisons = mir_eval.chord.sevenths(seg_refs, seg_preds)
-                sevenths_score = max(0.0, float(mir_eval.chord.weighted_accuracy(sevenths_comparisons, durations)))
-            except Exception as e:
-                print(f"Error calculating sevenths score: {e}")
-                sevenths_score = 0.0
-
-            # Tetrads metric
-            try:
-                tetrads_comparisons = mir_eval.chord.tetrads(seg_refs, seg_preds)
-                tetrads_score = max(0.0, float(mir_eval.chord.weighted_accuracy(tetrads_comparisons, durations)))
-            except Exception as e:
-                print(f"Error calculating tetrads score: {e}")
-                tetrads_score = 0.0
-
-            # Majmin metric
-            try:
-                majmin_comparisons = mir_eval.chord.majmin(seg_refs, seg_preds)
-                majmin_score = max(0.0, float(mir_eval.chord.weighted_accuracy(majmin_comparisons, durations)))
-            except Exception as e:
-                print(f"Error calculating majmin score: {e}")
-                majmin_score = 0.0
-
-            # Mirex metric
-            try:
-                mirex_comparisons = mir_eval.chord.mirex(seg_refs, seg_preds)
-                mirex_score = max(0.0, float(mir_eval.chord.weighted_accuracy(mirex_comparisons, durations)))
-            except Exception as e:
-                print(f"Error calculating mirex score: {e}")
-                mirex_score = 0.0
-
-        except Exception as e:
-            print(f"Error in mir_eval metrics calculation: {e}")
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-
-    except Exception as e:
-        print(f"Error in mir_eval scoring: {e}")
+    min_len = min(len(timestamps), len(reference_labels), len(prediction_labels))
+    if min_len == 0:
+        print("Warning: Zero length input to calculate_chord_scores. Returning all zeros.")
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
-    # Ensure all scores are non-negative (should be between 0 and 1)
+    timestamps = timestamps[:min_len]
+    reference_labels = reference_labels[:min_len]
+    prediction_labels = prediction_labels[:min_len]
+
+    # Create intervals for mir_eval from timestamps and frame_duration
+    ref_intervals = np.zeros((min_len, 2))
+    ref_intervals[:, 0] = timestamps
+    ref_intervals[:, 1] = timestamps + frame_duration
+
+    est_intervals = np.zeros((min_len, 2))
+    est_intervals[:, 0] = timestamps
+    est_intervals[:, 1] = timestamps + frame_duration
+
+    # Use mir_eval.chord.evaluate for robust calculation
+    scores = {}
+    try:
+        # mir_eval.chord.evaluate handles merging, weighting, and calculates all metrics
+        scores = mir_eval.chord.evaluate(ref_intervals, reference_labels, est_intervals, prediction_labels)
+
+        # Extract scores safely, defaulting to 0.0 if a metric is missing
+        root_score = float(scores.get('root', 0.0))
+        thirds_score = float(scores.get('thirds', 0.0))
+        triads_score = float(scores.get('triads', 0.0))
+        sevenths_score = float(scores.get('sevenths', 0.0))
+        tetrads_score = float(scores.get('tetrads', 0.0))
+        majmin_score = float(scores.get('majmin', 0.0))
+        mirex_score = float(scores.get('mirex', 0.0))
+
+    except Exception as e:
+        print(f"Error during mir_eval.chord.evaluate: {e}")
+        # Return default zero scores on error
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    # Ensure all scores are within the valid range [0, 1]
     root_score = max(0.0, min(1.0, root_score))
     thirds_score = max(0.0, min(1.0, thirds_score))
     triads_score = max(0.0, min(1.0, triads_score))
