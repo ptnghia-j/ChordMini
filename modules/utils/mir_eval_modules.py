@@ -343,48 +343,6 @@ def extract_chord_quality(chord):
     # Default to major if we couldn't extract a quality
     return "maj"
 
-def extract_chord_quality(chord):
-    """
-    Extract chord quality from a chord label, handling different formats.
-    Supports both colon format (C:maj) and direct format (Cmaj).
-
-    Args:
-        chord: A chord label string
-
-    Returns:
-        The chord quality as a string
-    """
-    # Handle None or empty strings
-    if not chord:
-        return "N"  # Default to "N" for empty chords
-
-    # Handle special cases
-    if chord in ["N", "None", "NC"]:
-        return "N"  # No chord
-    if chord in ["X", "Unknown"]:
-        return "X"  # Unknown chord
-
-    # Handle colon format (e.g., "C:min")
-    if ':' in chord:
-        parts = chord.split(':')
-        if len(parts) > 1:
-            # Handle bass notes (e.g., "C:min/G")
-            quality = parts[1].split('/')[0] if '/' in parts[1] else parts[1]
-            return quality
-
-    # Handle direct format without colon (e.g., "Cmin")
-    import re
-    root_pattern = r'^[A-G][#b]?'
-    match = re.match(root_pattern, chord)
-    if match:
-        quality = chord[match.end():]
-        if quality:
-            # Handle bass notes (e.g., "Cmin/G")
-            return quality.split('/')[0] if '/' in quality else quality
-
-    # Default to major if we couldn't extract a quality
-    return "maj"
-
 def compute_individual_chord_accuracy(reference_labels, prediction_labels, chunk_size=10000):
     """
     Compute accuracy for individual chord qualities.
@@ -404,9 +362,9 @@ def compute_individual_chord_accuracy(reference_labels, prediction_labels, chunk
     from collections import defaultdict
     import time
 
-    # Import the map_chord_to_quality function from visualize.py if available
+    # Always import the map_chord_to_quality function from visualize.py for consistency
     try:
-        from modules.utils.visualize import map_chord_to_quality
+        from modules.utils.visualize import map_chord_to_quality, extract_chord_quality as visualize_extract_chord_quality
         use_quality_mapping = True
         print("Using quality mapping from visualize.py for consistent reporting")
     except ImportError:
@@ -418,6 +376,7 @@ def compute_individual_chord_accuracy(reference_labels, prediction_labels, chunk
     mapped_stats = defaultdict(lambda: {'correct': 0, 'total': 0})
 
     # Quality mapping for consistent reporting with validation
+    # This should match exactly the mapping in visualize.py
     quality_mapping = {
         # Major family
         "maj": "Major", "": "Major", "M": "Major", "major": "Major",
@@ -445,7 +404,7 @@ def compute_individual_chord_accuracy(reference_labels, prediction_labels, chunk
         "minmaj7": "Min-Maj7", "mmaj7": "Min-Maj7", "min-maj7": "Min-Maj7",
         # Special cases
         "N": "No Chord",
-        "X": "Unknown",
+        "X": "No Chord",  # Map X to No Chord for consistency with validation
     }
 
     # Get total number of samples
@@ -472,16 +431,25 @@ def compute_individual_chord_accuracy(reference_labels, prediction_labels, chunk
                 continue
 
             try:
-                # Extract chord qualities using the robust method
-                q_ref_raw = extract_chord_quality(ref)
-                q_pred_raw = extract_chord_quality(pred)
+                # Standardize chord labels for consistent evaluation
+                # This is important to match the validation process
+                ref = lab_file_error_modify(ref) if isinstance(ref, str) else ref
+                pred = lab_file_error_modify(pred) if isinstance(pred, str) else pred
 
-                # Map to broader categories for consistent reporting with validation
+                # Extract chord qualities using the same method as validation
                 if use_quality_mapping:
-                    # Use the imported function if available
+                    # Use the imported function from visualize.py for consistency
+                    q_ref_raw = visualize_extract_chord_quality(ref)
+                    q_pred_raw = visualize_extract_chord_quality(pred)
+
+                    # Map to broader categories using the same function as validation
                     q_ref_mapped = map_chord_to_quality(ref)
                     q_pred_mapped = map_chord_to_quality(pred)
                 else:
+                    # Fallback to local implementation
+                    q_ref_raw = extract_chord_quality(ref)
+                    q_pred_raw = extract_chord_quality(pred)
+
                     # Use our local mapping
                     q_ref_mapped = quality_mapping.get(q_ref_raw, "Other")
                     q_pred_mapped = quality_mapping.get(q_pred_raw, "Other")
@@ -496,7 +464,7 @@ def compute_individual_chord_accuracy(reference_labels, prediction_labels, chunk
                 if q_ref_mapped == q_pred_mapped:
                     mapped_stats[q_ref_mapped]['correct'] += 1
 
-            except Exception:
+            except Exception as e:
                 malformed_chords += 1
                 continue
 
@@ -1019,20 +987,24 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                         # Already an integer or other hashable type
                         pred_chords.append(idx_to_chord.get(pred, "N"))
 
+                # Standardize chord labels for consistent evaluation with validation
+                standardized_refs = [lab_file_error_modify(ref) for ref in reference_labels]
+                standardized_preds = [lab_file_error_modify(pred) for pred in pred_chords]
+
                 # Collect raw chord label lists for individual chord accuracy
-                collected_refs.extend(reference_labels)
-                collected_preds.extend(pred_chords)
+                collected_refs.extend(standardized_refs)
+                collected_preds.extend(standardized_preds)
 
                 # Debug first few predicted chords to verify format (only for the first song)
                 if i == 0 and not hasattr(large_voca_score_calculation, '_first_chords_logged'):
-                    print(f"First 5 predicted chords: {pred_chords[:5]}")
-                    print(f"First 5 reference chords: {reference_labels[:5]}")
+                    print(f"First 5 predicted chords: {standardized_preds[:5]}")
+                    print(f"First 5 reference chords: {standardized_refs[:5]}")
                     large_voca_score_calculation._first_chords_logged = True
 
                 # Calculate scores
                 # durations = np.diff(np.append(timestamps, [timestamps[-1] + frame_duration]))
                 root_score, thirds_score, triads_score, sevenths_score, tetrads_score, majmin_score, mirex_score = calculate_chord_scores(
-                    timestamps, durations, reference_labels, pred_chords)
+                    timestamps, durations, standardized_refs, standardized_preds)
 
                 # Store scores
                 score_list_dict['root'].append(root_score)
@@ -1227,6 +1199,25 @@ def calculate_chord_scores(timestamps, durations, reference_labels, prediction_l
     # Continue with existing logic, but use our fixed lists
     reference_labels = fixed_reference_labels
     prediction_labels = fixed_prediction_labels
+
+    # Standardize chord labels for consistent evaluation with validation
+    # This is a critical step to ensure consistency between validation and MIR evaluation
+    standardized_refs = []
+    standardized_preds = []
+
+    for ref in reference_labels:
+        # Apply the same standardization as in validation
+        standardized_ref = lab_file_error_modify(ref)
+        standardized_refs.append(standardized_ref)
+
+    for pred in prediction_labels:
+        # Apply the same standardization as in validation
+        standardized_pred = lab_file_error_modify(pred)
+        standardized_preds.append(standardized_pred)
+
+    # Use the standardized labels for evaluation
+    reference_labels = standardized_refs
+    prediction_labels = standardized_preds
 
     # Initialize default scores
     root_score = 0.0

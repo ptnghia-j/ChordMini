@@ -246,6 +246,9 @@ spec:
             # Total number of folds
             - name: PREPROCESS
               value: "false"  # Set to "true" to preprocess and generate features
+            # Small dataset percentage for quick testing
+            - name: SMALL_DATASET
+              value: ""  # Set to a value like "0.1" to use only 10% of the dataset
           command:
             - sh
             - -c
@@ -361,6 +364,18 @@ spec:
                   --batch_size ${BATCH_SIZE} \
                   ${KD_ARGS}
               else
+                # Add small dataset argument if specified
+                SMALL_DATASET_ARG=""
+                if [ "${SMALL_DATASET}" != "" ]; then
+                  # Validate that SMALL_DATASET is a number between 0 and 1
+                  if [[ "${SMALL_DATASET}" =~ ^0*([.][0-9]+|1[.]0*|0|1)$ ]]; then
+                    echo "Using only ${SMALL_DATASET} fraction of dataset for quick testing"
+                    SMALL_DATASET_ARG="--small_dataset ${SMALL_DATASET}"
+                  else
+                    echo "WARNING: SMALL_DATASET value '${SMALL_DATASET}' is not a valid fraction between 0 and 1. Ignoring."
+                  fi
+                fi
+
                 # Run the standard fine-tuning script with all options
                 echo "Starting fine-tuning with all options..."
                 python train_finetune.py --config ./config/student_config.yaml \
@@ -378,7 +393,7 @@ spec:
                   --batch_size ${BATCH_SIZE} \
                   --lr_schedule ${LR_SCHEDULE} \
                   --gpu_memory_fraction ${GPU_MEMORY_FRACTION} \
-                  ${WARMUP_ARGS} ${KD_ARGS} ${FOCAL_ARGS} ${FREEZE_ARGS} ${CACHE_ARGS}
+                  ${WARMUP_ARGS} ${KD_ARGS} ${FOCAL_ARGS} ${FREEZE_ARGS} ${CACHE_ARGS} ${SMALL_DATASET_ARG}
               fi
 
               echo "=== Training complete ==="

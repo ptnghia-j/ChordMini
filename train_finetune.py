@@ -445,6 +445,9 @@ def main():
     dataset_args['small_dataset_percentage'] = args.small_dataset
     if dataset_args['small_dataset_percentage'] is None:
         logger.info("Using full dataset")
+    elif dataset_args['small_dataset_percentage'] <= 0 or dataset_args['small_dataset_percentage'] > 1.0:
+        logger.warning(f"Invalid small_dataset value: {dataset_args['small_dataset_percentage']}. Must be between 0 and 1. Using full dataset.")
+        dataset_args['small_dataset_percentage'] = 1.0
     else:
         logger.info(f"Using {dataset_args['small_dataset_percentage']*100:.1f}% of dataset")
 
@@ -558,7 +561,8 @@ def main():
         test_ratio=0.15,
         random_seed=seed,
         feature_config=feature_config,
-        device=device
+        device=device,
+        small_dataset_percentage=dataset_args.get('small_dataset_percentage', 1.0)
     )
 
     # Sample a few label files to analyze

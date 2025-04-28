@@ -80,9 +80,9 @@ def scale_config(config, scale_factor, n_freq, n_group):
     d_layer = max(1, int(round(base_config.get('d_layer', 3) * scale_factor)))
 
     # Fix t_head and d_head similar to train_student.py (now using 4)
-    t_head = 6
-    d_head = 6
-    f_head = 6
+    t_head = 4
+    d_head = 4
+    f_head = 4
 
     feature_dim = n_freq // n_group
 

@@ -243,7 +243,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never", "required"
             - name: SUB_DIR
-              value: "btc-combined" # Subdirectory for BTC checkpoints
+              value: "btc-dali-fma" # Subdirectory for BTC checkpoints
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint
