@@ -24,7 +24,7 @@ spec:
               - key: kubernetes.io/hostname      # new host pin
                 operator: In
                 values:
-                - gpu-03.nrp.mghpcc.org
+                - gpu-05.nrp.mghpcc.org
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -238,7 +238,7 @@ spec:
               value: "6"     # Prefetch batches for better throughput
             # Add dataset type environment variable with combined option
             - name: DATASET_TYPE
-              value: "combined"  # Options: "fma", "maestro", "dali_synth", or "combined"
+              value: "dali_synth"  # Options: "fma", "maestro", "dali_synth", or "combined"
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never", "required"
@@ -254,7 +254,7 @@ spec:
             - name: LAZY_INIT
               value: "false" # Controls dataset lazy initialization
             - name: SMALL_DATASET
-              value: ""   # Set percentage of dataset to use (0.1 = 10%, null = full)
+              value: "0.01"   # Set percentage of dataset to use (0.1 = 10%, null = full)
             - name: METADATA_CACHE
               value: "false" # Use metadata-only caching
           command:
@@ -462,11 +462,13 @@ spec:
           resources:
             requests:
               cpu: "4"
-              memory: "196Gi"
+              #memory: "196Gi"
+              memory: "24Gi"
               nvidia.com/gpu: "2"
             limits:
               cpu: "18"
-              memory: "296Gi"
+              #memory: "296Gi"
+              memory: "64Gi"
               nvidia.com/gpu: "2"
           volumeMounts:
             - name: storage

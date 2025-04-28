@@ -241,20 +241,11 @@ def map_chord_to_quality(chord_name):
         # Fallback implementation if get_chord_quality isn't available
 
         # Handle special cases
-        if chord_name in ["N", "X", "None", "Unknown"]:
+        if chord_name in ["N", "X", "None", "Unknown", "NC"]:
             return "No Chord"
-
-        # Check if this is a root-only chord (e.g., "C", "G#")
-        root_notes = ["A", "B", "C", "D", "E", "F", "G"]
-        if chord_name in root_notes or (len(chord_name) == 2 and chord_name[0] in root_notes and chord_name[1] in ['#', 'b']):
-            return "Major"  # Map root-only chords to Major
 
         # Extract quality using extract_chord_quality function
         quality = extract_chord_quality(chord_name)
-
-        # If quality is empty after extraction, it's likely a root-only chord
-        if quality == "":
-            return "Major"
 
         # Map extracted quality to broader categories
         quality_groups = {
@@ -298,6 +289,10 @@ def map_chord_to_quality(chord_name):
             "maj6": "Maj6", "6": "Maj6",
             "minmaj7": "Min-Maj7", "mmaj7": "Min-Maj7", "min-maj7": "Min-Maj7",
 
+            # Special cases
+            "N": "No Chord",
+            "X": "No Chord",
+
             # Add additional chord qualities that appear in your dataset
             "min(9)": "Minor", "min/5": "Minor",  # Minor with extensions or inversions
             "maj/3": "Major", "maj/5": "Major",   # Major with inversions
@@ -307,56 +302,51 @@ def map_chord_to_quality(chord_name):
         # Return mapped quality or "Other" if not found
         return quality_groups.get(quality, "Other")
 
-def extract_chord_quality(chord_name):
+def extract_chord_quality(chord):
     """
-    Extract the quality from a chord name.
+    Extract chord quality from a chord label, handling different formats.
+    Supports both colon format (C:maj) and direct format (Cmaj).
 
     Args:
-        chord_name: Chord name string (e.g., 'C:maj', 'A:min7')
+        chord: A chord label string
 
     Returns:
-        Chord quality string
+        The chord quality as a string
     """
+    # Handle None or empty strings
+    if not chord:
+        return "N"  # Default to "N" for empty chords
+
     # Handle special cases
-    if chord_name in ["N", "X", "None", "Unknown"]:
-        return "N"
+    if chord in ["N", "None", "NC"]:
+        return "N"  # No chord
+    if chord in ["X", "Unknown"]:
+        return "X"  # Unknown chord
 
-    # Handle common case where chord_name might be a numeric index instead of a string
-    if not isinstance(chord_name, str):
-        return str(chord_name)
+    # Handle common case where chord might be a numeric index instead of a string
+    if not isinstance(chord, str):
+        return str(chord)
 
-    # Remove root note and colon if present
-    if ":" in chord_name:
-        parts = chord_name.split(":", 1)
-        quality = parts[1]
-        # Handle possible bass note
-        if "/" in quality:
-            quality = quality.split("/", 1)[0]
-        return quality.strip()
-    else:
-        # Try to extract quality without colon
-        root_notes = ["A", "B", "C", "D", "E", "F", "G"]
-        root_found = False
+    # Handle colon format (e.g., "C:min")
+    if ':' in chord:
+        parts = chord.split(':')
+        if len(parts) > 1:
+            # Handle bass notes (e.g., "C:min/G")
+            quality = parts[1].split('/')[0] if '/' in parts[1] else parts[1]
+            return quality
 
-        for note in root_notes:
-            if chord_name.startswith(note):
-                # Check if there's a flat or sharp
-                if len(chord_name) > 1 and chord_name[1] in ['b', '#']:
-                    quality = chord_name[2:]  # Skip root with accidental
-                else:
-                    quality = chord_name[1:]  # Skip root without accidental
-                root_found = True
-                break
+    # Handle direct format without colon (e.g., "Cmin")
+    import re
+    root_pattern = r'^[A-G][#b]?'
+    match = re.match(root_pattern, chord)
+    if match:
+        quality = chord[match.end():]
+        if quality:
+            # Handle bass notes (e.g., "Cmin/G")
+            return quality.split('/')[0] if '/' in quality else quality
 
-        if not root_found:
-            # If no root note is found, return the full name
-            return chord_name
-
-        # Handle possible bass note
-        if "/" in quality:
-            quality = quality.split("/", 1)[0]
-
-        return quality.strip()
+    # Default to major if we couldn't extract a quality
+    return "maj"
 
 def get_chord_quality_groups():
     """
@@ -706,6 +696,28 @@ def calculate_confusion_matrix(predictions, targets, idx_to_chord, checkpoint_di
                     info("\nAccuracy by chord quality:")
                     for quality, acc in sorted(quality_accuracy.items(), key=lambda x: x[1], reverse=True):
                         info(f"  {quality}: {acc:.4f}")
+
+                    # Add special reporting for 'N' (no chord) and 'X' (unknown chord)
+                    n_chord_idx = None
+                    x_chord_idx = None
+
+                    # Find indices for 'N' and 'X' in quality_groups
+                    for i, quality in enumerate(quality_groups):
+                        if quality == "No Chord":
+                            n_chord_idx = i
+                        elif quality == "Unknown":
+                            x_chord_idx = i
+
+                    # Report counts for 'N' and 'X'
+                    if n_chord_idx is not None:
+                        n_count = quality_counts.get(n_chord_idx, 0)
+                        n_accuracy = quality_accuracy.get(n_chord_idx, 0.0)
+                        info(f"  'N' (No Chord): {n_count} samples, accuracy: {n_accuracy:.4f}")
+
+                    if x_chord_idx is not None:
+                        x_count = quality_counts.get(x_chord_idx, 0)
+                        x_accuracy = quality_accuracy.get(x_chord_idx, 0.0)
+                        info(f"  'X' (Unknown Chord): {x_count} samples, accuracy: {x_accuracy:.4f}")
 
                 # Create and save chord quality confusion matrix
                 title = f"Chord Quality Confusion Matrix - Epoch {current_epoch}"

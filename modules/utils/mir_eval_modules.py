@@ -343,6 +343,48 @@ def extract_chord_quality(chord):
     # Default to major if we couldn't extract a quality
     return "maj"
 
+def extract_chord_quality(chord):
+    """
+    Extract chord quality from a chord label, handling different formats.
+    Supports both colon format (C:maj) and direct format (Cmaj).
+
+    Args:
+        chord: A chord label string
+
+    Returns:
+        The chord quality as a string
+    """
+    # Handle None or empty strings
+    if not chord:
+        return "N"  # Default to "N" for empty chords
+
+    # Handle special cases
+    if chord in ["N", "None", "NC"]:
+        return "N"  # No chord
+    if chord in ["X", "Unknown"]:
+        return "X"  # Unknown chord
+
+    # Handle colon format (e.g., "C:min")
+    if ':' in chord:
+        parts = chord.split(':')
+        if len(parts) > 1:
+            # Handle bass notes (e.g., "C:min/G")
+            quality = parts[1].split('/')[0] if '/' in parts[1] else parts[1]
+            return quality
+
+    # Handle direct format without colon (e.g., "Cmin")
+    import re
+    root_pattern = r'^[A-G][#b]?'
+    match = re.match(root_pattern, chord)
+    if match:
+        quality = chord[match.end():]
+        if quality:
+            # Handle bass notes (e.g., "Cmin/G")
+            return quality.split('/')[0] if '/' in quality else quality
+
+    # Default to major if we couldn't extract a quality
+    return "maj"
+
 def compute_individual_chord_accuracy(reference_labels, prediction_labels):
     """
     Compute accuracy for individual chord qualities.
