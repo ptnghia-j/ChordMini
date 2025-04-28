@@ -1162,17 +1162,77 @@ def main():
 
                         # Gather results from all ranks
                         if world_size > 1:
-                            # Create placeholder tensors for gathering
-                            gathered_results = [None for _ in range(world_size)]
-
-                            # Convert dict to tensor for gathering
+                            # Use more efficient tensor-based gathering instead of object gathering
+                            # Define metrics to gather
                             metrics = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
+
+                            # Convert local results to tensor
                             local_results = torch.tensor([average_score_dict.get(m, 0.0) for m in metrics],
                                                         dtype=torch.float32, device=device)
 
-                            # Gather results from all processes
-                            dist.all_gather_object(gathered_results,
-                                                 (split_idx, local_results.tolist(), len(split_samples)))
+                            # Create tensor to gather results (world_size x num_metrics)
+                            gathered_tensor = torch.zeros(world_size, len(metrics), dtype=torch.float32, device=device)
+
+                            # Use all_gather with tensor instead of all_gather_object
+                            try:
+                                # Set a timeout for the gather operation
+                                prev_timeout = os.environ.get('NCCL_BLOCKING_WAIT', None)
+                                os.environ['NCCL_BLOCKING_WAIT'] = '0'  # Non-blocking mode
+
+                                # Gather tensors with timeout handling
+                                logger.info(f"Rank {rank}: Starting tensor gathering for MIR evaluation results")
+                                dist.all_gather_into_tensor(gathered_tensor, local_results)
+                                logger.info(f"Rank {rank}: Completed tensor gathering for MIR evaluation results")
+
+                                # Restore previous timeout setting
+                                if prev_timeout is not None:
+                                    os.environ['NCCL_BLOCKING_WAIT'] = prev_timeout
+                                else:
+                                    os.environ.pop('NCCL_BLOCKING_WAIT', None)
+                            except Exception as e:
+                                logger.error(f"Rank {rank}: Error during tensor gathering: {e}")
+                                # Fall back to point-to-point communication
+                                if rank == 0:
+                                    # Master process receives from all workers
+                                    gathered_tensor[0] = local_results  # Add own results
+                                    for src_rank in range(1, world_size):
+                                        try:
+                                            logger.info(f"Rank {rank}: Receiving results from rank {src_rank}")
+                                            dist.recv(gathered_tensor[src_rank], src=src_rank)
+                                        except Exception as recv_err:
+                                            logger.error(f"Rank {rank}: Error receiving from rank {src_rank}: {recv_err}")
+                                            # Fill with zeros if receive fails
+                                            gathered_tensor[src_rank].zero_()
+                                else:
+                                    # Worker processes send to master
+                                    try:
+                                        logger.info(f"Rank {rank}: Sending results to rank 0")
+                                        dist.send(local_results, dst=0)
+                                    except Exception as send_err:
+                                        logger.error(f"Rank {rank}: Error sending to rank 0: {send_err}")
+
+                            # Also gather split indices and sizes using simple point-to-point communication
+                            split_info = torch.tensor([split_idx, len(split_samples)], dtype=torch.int64, device=device)
+                            gathered_split_info = torch.zeros(world_size, 2, dtype=torch.int64, device=device)
+
+                            try:
+                                dist.all_gather_into_tensor(gathered_split_info, split_info)
+                            except Exception as e:
+                                logger.error(f"Rank {rank}: Error gathering split info: {e}")
+                                # Fall back to point-to-point communication
+                                if rank == 0:
+                                    gathered_split_info[0] = split_info  # Add own results
+                                    for src_rank in range(1, world_size):
+                                        try:
+                                            dist.recv(gathered_split_info[src_rank], src=src_rank)
+                                        except Exception:
+                                            # Fill with zeros if receive fails
+                                            gathered_split_info[src_rank].zero_()
+                                else:
+                                    try:
+                                        dist.send(split_info, dst=0)
+                                    except Exception:
+                                        pass  # Ignore send errors from workers
 
                             # Process gathered results on rank 0
                             if rank == 0:
@@ -1182,19 +1242,26 @@ def main():
                                 average_score_dict1, average_score_dict2, average_score_dict3 = {}, {}, {}
 
                                 # Process gathered results
-                                for split_idx, results, split_size in gathered_results:
-                                    # Convert results back to dict
-                                    split_dict = {metrics[i]: results[i] for i in range(len(metrics))}
+                                for worker_rank in range(world_size):
+                                    # Get split index and size
+                                    worker_split_idx = int(gathered_split_info[worker_rank][0].item())
+                                    worker_split_size = int(gathered_split_info[worker_rank][1].item())
 
-                                    if split_idx == 1:
+                                    # Get metrics
+                                    worker_results = gathered_tensor[worker_rank].tolist()
+
+                                    # Convert results back to dict
+                                    split_dict = {metrics[i]: worker_results[i] for i in range(len(metrics))}
+
+                                    if worker_split_idx == 1:
                                         average_score_dict1 = split_dict
-                                        song_length_list1 = [1.0] * split_size  # Placeholder
-                                    elif split_idx == 2:
+                                        song_length_list1 = [1.0] * worker_split_size  # Placeholder
+                                    elif worker_split_idx == 2:
                                         average_score_dict2 = split_dict
-                                        song_length_list2 = [1.0] * split_size  # Placeholder
-                                    elif split_idx == 3:
+                                        song_length_list2 = [1.0] * worker_split_size  # Placeholder
+                                    elif worker_split_idx == 3:
                                         average_score_dict3 = split_dict
-                                        song_length_list3 = [1.0] * split_size  # Placeholder
+                                        song_length_list3 = [1.0] * worker_split_size  # Placeholder
 
                         # Synchronize after gathering results
                         if distributed_training:

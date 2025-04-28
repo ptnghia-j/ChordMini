@@ -385,21 +385,24 @@ def extract_chord_quality(chord):
     # Default to major if we couldn't extract a quality
     return "maj"
 
-def compute_individual_chord_accuracy(reference_labels, prediction_labels):
+def compute_individual_chord_accuracy(reference_labels, prediction_labels, chunk_size=10000):
     """
     Compute accuracy for individual chord qualities.
     Uses a robust approach to extract chord qualities from different formats.
     Maps chord qualities to broader categories to match validation reporting.
+    Processes data in chunks to avoid memory issues.
 
     Args:
         reference_labels: List of reference chord labels
         prediction_labels: List of predicted chord labels
+        chunk_size: Number of samples to process in each chunk
 
     Returns:
         acc: Dictionary mapping chord quality to accuracy
         stats: Dictionary with detailed statistics for each quality
     """
     from collections import defaultdict
+    import time
 
     # Import the map_chord_to_quality function from visualize.py if available
     try:
@@ -409,9 +412,6 @@ def compute_individual_chord_accuracy(reference_labels, prediction_labels):
     except ImportError:
         use_quality_mapping = False
         print("Quality mapping from visualize.py not available, using raw qualities")
-
-    total_processed = 0
-    malformed_chords = 0
 
     # Use two sets of statistics - one for raw qualities and one for mapped qualities
     raw_stats = defaultdict(lambda: {'correct': 0, 'total': 0})
@@ -448,41 +448,67 @@ def compute_individual_chord_accuracy(reference_labels, prediction_labels):
         "X": "Unknown",
     }
 
-    for ref, pred in zip(reference_labels, prediction_labels):
-        total_processed += 1
+    # Get total number of samples
+    total_samples = min(len(reference_labels), len(prediction_labels))
+    print(f"Processing {total_samples} samples for chord quality accuracy calculation")
 
-        if not ref or not pred:
-            malformed_chords += 1
-            continue
+    # Process data in chunks to avoid memory issues
+    total_processed = 0
+    malformed_chords = 0
+    start_time = time.time()
 
-        try:
-            # Extract chord qualities using the robust method
-            q_ref_raw = extract_chord_quality(ref)
-            q_pred_raw = extract_chord_quality(pred)
+    for chunk_start in range(0, total_samples, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, total_samples)
+        chunk_size_actual = chunk_end - chunk_start
 
-            # Map to broader categories for consistent reporting with validation
-            if use_quality_mapping:
-                # Use the imported function if available
-                q_ref_mapped = map_chord_to_quality(ref)
-                q_pred_mapped = map_chord_to_quality(pred)
-            else:
-                # Use our local mapping
-                q_ref_mapped = quality_mapping.get(q_ref_raw, "Other")
-                q_pred_mapped = quality_mapping.get(q_pred_raw, "Other")
+        # Get chunk of data
+        ref_chunk = reference_labels[chunk_start:chunk_end]
+        pred_chunk = prediction_labels[chunk_start:chunk_end]
 
-            # Update raw statistics
-            raw_stats[q_ref_raw]['total'] += 1
-            if q_ref_raw == q_pred_raw:
-                raw_stats[q_ref_raw]['correct'] += 1
+        # Process chunk
+        for i, (ref, pred) in enumerate(zip(ref_chunk, pred_chunk)):
+            if not ref or not pred:
+                malformed_chords += 1
+                continue
 
-            # Update mapped statistics
-            mapped_stats[q_ref_mapped]['total'] += 1
-            if q_ref_mapped == q_pred_mapped:
-                mapped_stats[q_ref_mapped]['correct'] += 1
+            try:
+                # Extract chord qualities using the robust method
+                q_ref_raw = extract_chord_quality(ref)
+                q_pred_raw = extract_chord_quality(pred)
 
-        except Exception as e:
-            malformed_chords += 1
-            continue
+                # Map to broader categories for consistent reporting with validation
+                if use_quality_mapping:
+                    # Use the imported function if available
+                    q_ref_mapped = map_chord_to_quality(ref)
+                    q_pred_mapped = map_chord_to_quality(pred)
+                else:
+                    # Use our local mapping
+                    q_ref_mapped = quality_mapping.get(q_ref_raw, "Other")
+                    q_pred_mapped = quality_mapping.get(q_pred_raw, "Other")
+
+                # Update raw statistics
+                raw_stats[q_ref_raw]['total'] += 1
+                if q_ref_raw == q_pred_raw:
+                    raw_stats[q_ref_raw]['correct'] += 1
+
+                # Update mapped statistics
+                mapped_stats[q_ref_mapped]['total'] += 1
+                if q_ref_mapped == q_pred_mapped:
+                    mapped_stats[q_ref_mapped]['correct'] += 1
+
+            except Exception:
+                malformed_chords += 1
+                continue
+
+        # Update total processed
+        total_processed += chunk_size_actual
+
+        # Print progress every 100,000 samples
+        if total_processed % 100000 == 0 or total_processed == total_samples:
+            elapsed = time.time() - start_time
+            print(f"Processed {total_processed}/{total_samples} samples ({total_processed/total_samples*100:.1f}%) in {elapsed:.1f}s")
+
+    print(f"Processed {total_processed} samples, {malformed_chords} were malformed or caused errors")
 
     # Calculate accuracy for each quality (both raw and mapped)
     raw_acc = {}

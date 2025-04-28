@@ -395,6 +395,13 @@ spec:
               mkdir -p "${SAVE_DIR}"
               echo "Using checkpoint directory: ${SAVE_DIR}"
 
+              # Create local checkpoint directory for backward compatibility
+              LOCAL_CHECKPOINTS_DIR="/mnt/storage/ChordMini/checkpoints/btc"
+              if [ "${LOCAL_CHECKPOINTS_DIR}" != "${SAVE_DIR}" ]; then
+                mkdir -p "${LOCAL_CHECKPOINTS_DIR}"
+                echo "Also created local checkpoint directory for backward compatibility: ${LOCAL_CHECKPOINTS_DIR}"
+              fi
+
               # Handle checkpoint loading option
               CHECKPOINT_ARG=""
               BEST_CHECKPOINT_PATH="${SAVE_DIR}/btc_model_best.pth" # Changed filename
@@ -453,6 +460,7 @@ spec:
                 --distributed_backend="nccl" \
                 --config ./config/btc_config.yaml \
                 --save_dir ${SAVE_DIR} \
+                --timeout_minutes 30 \
                 $DATASET_ARG $SPEC_DIR_ARG $LABEL_DIR_ARG \
                 ${LR_SCHEDULE_ARG} ${WARMUP_ARG} ${FOCAL_LOSS_ARG} ${KD_ARGS} \
                 ${CACHE_ARGS} ${GPU_ARGS} ${DROPOUT_ARG} ${LR_ARGS} \

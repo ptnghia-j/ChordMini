@@ -543,7 +543,7 @@ spec:
               fi
 
               # ! NOTE: Define checkpoint
-              CHECKPOINTS_DIR="/mnt/storage/checkpoints/student"
+              CHECKPOINTS_DIR="/mnt/storage/checkpoints/btc"
 
               # ! NOTE: save checkpoint directory defined in env
               if [ "${SUB_DIR}" != "" ]; then
@@ -556,11 +556,19 @@ spec:
                 echo "Using checkpoint directory: ${CHECKPOINTS_DIR}"
               fi
 
+              # Create local checkpoint directory for backward compatibility
+              LOCAL_CHECKPOINTS_DIR="/mnt/storage/ChordMini/checkpoints/btc"
+              if [ "${LOCAL_CHECKPOINTS_DIR}" != "${CHECKPOINTS_DIR}" ]; then
+                mkdir -p "${LOCAL_CHECKPOINTS_DIR}"
+                echo "Also created local checkpoint directory for backward compatibility: ${LOCAL_CHECKPOINTS_DIR}"
+              fi
+
               # Handle checkpoint loading option
               CHECKPOINT_ARG=""
+              BEST_CHECKPOINT_PATH="${CHECKPOINTS_DIR}/${SUB_DIR}/student_model_best.pth"
               if [ "${LOAD_CHECKPOINT}" = "auto" ]; then
-                if [ -f "${CHECKPOINTS_DIR}/student_model_best.pth" ]; then
-                  echo "Found existing checkpoint at ${CHECKPOINTS_DIR}/student_model_best.pth"
+                if [ -f "${BEST_CHECKPOINT_PATH}" ]; then
+                  echo "Found existing checkpoint at ${BEST_CHECKPOINT_PATH}"
                   if [ "${RESET_EPOCH}" = "true" ]; then
                     RESET_ARG="--reset_epoch"
                     if [ "${RESET_SCHEDULER}" = "true" ];then
@@ -569,35 +577,38 @@ spec:
                     else
                       echo "Will load weights but start training from epoch 1 (keeping scheduler state)"
                     fi
-                    CHECKPOINT_ARG="--load_checkpoint ${CHECKPOINTS_DIR}/student_model_best.pth ${RESET_ARG}"
+                    CHECKPOINT_ARG="--load_checkpoint ${BEST_CHECKPOINT_PATH} ${RESET_ARG}"
                   else
                     echo "Will load weights and continue training from saved epoch"
-                    CHECKPOINT_ARG="--load_checkpoint ${CHECKPOINTS_DIR}/student_model_best.pth"
+                    CHECKPOINT_ARG="--load_checkpoint ${BEST_CHECKPOINT_PATH}"
                   fi
                 else
-                  echo "No existing checkpoint found at ${CHECKPOINTS_DIR}/student_model_best.pth"
+                  echo "No existing checkpoint found at ${BEST_CHECKPOINT_PATH}"
                   echo "Starting training from scratch"
                 fi
               elif [ "${LOAD_CHECKPOINT}" = "never" ]; then
                 echo "Starting fresh training (ignoring any existing checkpoints)"
               elif [ "${LOAD_CHECKPOINT}" = "required" ]; then
-                if [ -f "${CHECKPOINTS_DIR}/student_model_best.pth" ]; then
+                if [ -f "${BEST_CHECKPOINT_PATH}" ]; then
                   if [ "${RESET_EPOCH}" = "true" ]; then
                     RESET_ARG="--reset_epoch"
                     if [ "${RESET_SCHEDULER}" = "true" ]; then
-                      echo "Found required checkpoint at ${CHECKPOINTS_DIR}/student_model_best.pth"
+                      echo "Found required checkpoint at ${BEST_CHECKPOINT_PATH}"
                       echo "Will load weights but start training from epoch 1 with fresh learning rate schedule"
                       RESET_ARG="${RESET_ARG} --reset_scheduler"
                     else
-                      echo "Found required checkpoint at ${CHECKPOINTS_DIR}/student_model_best.pth"
+                      echo "Found required checkpoint at ${BEST_CHECKPOINT_PATH}"
                       echo "Will load weights but start training from epoch 1 (keeping scheduler state)"
                     fi
-                    CHECKPOINT_ARG="--load_checkpoint ${CHECKPOINTS_DIR}/student_model_best.pth ${RESET_ARG}"
+                    CHECKPOINT_ARG="--load_checkpoint ${BEST_CHECKPOINT_PATH} ${RESET_ARG}"
                   else
-                    echo "ERROR: Required checkpoint not found at ${CHECKPOINTS_DIR}/student_model_best.pth"
-                    echo "Cannot proceed with training"
-                    exit 1
+                    echo "Will load weights and continue training from saved epoch"
+                    CHECKPOINT_ARG="--load_checkpoint ${BEST_CHECKPOINT_PATH}"
                   fi
+                else
+                  echo "ERROR: Required checkpoint not found at ${BEST_CHECKPOINT_PATH}"
+                  echo "Cannot proceed with training"
+                  exit 1
                 fi
               fi
 
@@ -632,6 +643,7 @@ spec:
                 $DATASET_ARG $SPEC_DIR_ARG $LABEL_DIR_ARG \
                 --config ./config/student_config.yaml \
                 --save_dir ${CHECKPOINTS_DIR}/${SUB_DIR} \
+                --timeout_minutes 30 \
                 ${LR_SCHEDULE_ARG} ${WARMUP_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} \
                 ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} \
                 ${GPU_ARGS} ${DROPOUT_ARG} ${LR_ARGS} \
