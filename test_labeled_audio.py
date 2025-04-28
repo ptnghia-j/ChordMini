@@ -660,15 +660,12 @@ def main():
         if args.btc_model:
             model_path = args.btc_model
         else:
-            # First try external storage path
+            # Always use external storage path
             external_model_path = '/mnt/storage/checkpoints/btc/btc_model_best.pth'
-            if os.path.exists(external_model_path):
-                model_path = external_model_path
-                logger.info(f"Using external BTC checkpoint at {model_path}")
-            else:
-                # Fall back to local path
-                model_path = './checkpoints/btc/btc_model_best.pth'
-                logger.info(f"External BTC checkpoint not found, using local path: {model_path}")
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(external_model_path), exist_ok=True)
+            model_path = external_model_path
+            logger.info(f"Using external BTC checkpoint at {model_path}")
 
         logger.info(f"Using BTC model type with config: {config_path} and model: {model_path}")
     else: # Default to ChordNet
@@ -678,15 +675,12 @@ def main():
         if args.model:
             model_path = args.model
         else:
-            # First try external storage path
+            # Always use external storage path
             external_model_path = '/mnt/storage/checkpoints/student/student_model_final.pth'
-            if os.path.exists(external_model_path):
-                model_path = external_model_path
-                logger.info(f"Using external ChordNet checkpoint at {model_path}")
-            else:
-                # Fall back to local path
-                model_path = './checkpoints/student_model_final.pth'
-                logger.info(f"External ChordNet checkpoint not found, using local path: {model_path}")
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(external_model_path), exist_ok=True)
+            model_path = external_model_path
+            logger.info(f"Using external ChordNet checkpoint at {model_path}")
 
         logger.info(f"Using ChordNet model type with config: {config_path} and model: {model_path}")
 
@@ -709,18 +703,13 @@ def main():
     if args.model_type == 'ChordNet':
         hmm_path = args.hmm
 
-        # If no HMM path provided, try to find one in the external storage
+        # If no HMM path provided, use the external storage path
         if not hmm_path:
             external_hmm_path = '/mnt/storage/checkpoints/hmm/hmm_model_best.pth'
-            if os.path.exists(external_hmm_path):
-                hmm_path = external_hmm_path
-                logger.info(f"Using external HMM checkpoint at {hmm_path}")
-            else:
-                # Try local path
-                local_hmm_path = './checkpoints/hmm/hmm_model_best.pth'
-                if os.path.exists(local_hmm_path):
-                    hmm_path = local_hmm_path
-                    logger.info(f"Using local HMM checkpoint at {hmm_path}")
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(external_hmm_path), exist_ok=True)
+            hmm_path = external_hmm_path
+            logger.info(f"Using external HMM checkpoint at {hmm_path}")
 
         # Load HMM if path exists
         if hmm_path and os.path.exists(hmm_path):

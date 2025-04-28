@@ -507,9 +507,19 @@ def main():
     logger.info(f"Reverse chord->idx mapping created with {len(chord_mapping)} entries")
     logger.info(f"Sample chord->idx mapping: {dict(list(chord_mapping.items())[:5])}")
 
-    # Resolve checkpoints directory path
-    checkpoints_dir_config = config.paths.get('checkpoints_dir', 'checkpoints/finetune')
-    checkpoints_dir = resolve_path(checkpoints_dir_config, storage_root, project_root)
+    # Always use the external checkpoint path in /mnt/storage/checkpoints
+    external_dir = "/mnt/storage/checkpoints/btc"
+    try:
+        os.makedirs(external_dir, exist_ok=True)
+        checkpoints_dir = external_dir
+        logger.info(f"Using external checkpoint directory: {external_dir}")
+    except Exception as e:
+        # Fall back to config path if external directory can't be created
+        checkpoints_dir_config = config.paths.get('checkpoints_dir', 'checkpoints/finetune')
+        checkpoints_dir = resolve_path(checkpoints_dir_config, storage_root, project_root)
+        logger.info(f"Could not use external directory {external_dir}: {e}")
+        logger.info(f"Using fallback checkpoint directory: {checkpoints_dir}")
+
     os.makedirs(checkpoints_dir, exist_ok=True)
     logger.info(f"Checkpoints will be saved to: {checkpoints_dir}")
 
@@ -683,15 +693,31 @@ def main():
     teacher_mean = None
     teacher_std = None
 
-    if args.teacher_model:
-        logger.info(f"\n=== Loading teacher model from {args.teacher_model} ===")
+    # Check for teacher model - either from args or try to find btc_model_large_voca.pt
+    teacher_model_path = args.teacher_model
+    if not teacher_model_path:
+        # Try to find the BTC model in the external storage path
+        external_btc_path = "/mnt/storage/checkpoints/btc/btc_model_large_voca.pt"
+        if os.path.exists(external_btc_path):
+            logger.info(f"Found BTC teacher model at external path: {external_btc_path}")
+            teacher_model_path = external_btc_path
+            # Enable KD loss automatically if we found a teacher model
+            if not use_kd_loss:
+                use_kd_loss = True
+                logger.info("Automatically enabling knowledge distillation with found teacher model")
+                kd_alpha = args.kd_alpha if args.kd_alpha is not None else float(config.training.get('kd_alpha', 0.5))
+                temperature = args.temperature if args.temperature is not None else float(config.training.get('temperature', 1.0))
+                logger.info(f"Using KD alpha: {kd_alpha}, temperature: {temperature}")
+
+    if teacher_model_path:
+        logger.info(f"\n=== Loading teacher model from {teacher_model_path} ===")
         try:
             # Determine vocabulary size based on args and config
             use_voca = args.use_voca or config.feature.get('large_voca', False)
 
             # Load the teacher model
             teacher_model, teacher_mean, teacher_std = load_btc_model(
-                args.teacher_model,
+                teacher_model_path,
                 device,
                 use_voca=use_voca
             )
@@ -935,89 +961,247 @@ def main():
             test_samples = [labeled_dataset.samples[i] for i in labeled_dataset.test_indices]
             dataset_length = len(test_samples)
 
-            if dataset_length < 3:
-                logger.info("Not enough test samples to compute chord metrics with 3 splits.")
-                # Optionally run on the whole test set if splits aren't possible
-                if dataset_length > 0:
-                     logger.info(f"Evaluating model on all {dataset_length} test samples...")
-                     score_list_dict, song_length_list, average_score_dict = large_voca_score_calculation(
-                         valid_dataset=test_samples, config=config, model=model, model_type='ChordNet',
-                         mean=mean, std=std, device=device)
-                     mir_eval_results = average_score_dict # Store the single result
-                     logger.info(f"MIR evaluation results (all test samples): {mir_eval_results}")
-                else:
-                     logger.info("No test samples available for MIR evaluation.")
-                     mir_eval_results = {}
-
-            else:
-                # Create balanced splits from the test samples
-                split = dataset_length // 3
-                test_dataset1 = test_samples[:split]
-                test_dataset2 = test_samples[split:2*split]
-                test_dataset3 = test_samples[2*split:]
-
-                # Evaluate each split
-                logger.info(f"Evaluating model on {len(test_dataset1)} test samples in split 1...")
-                score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
-                    valid_dataset=test_dataset1, config=config, model=model, model_type='ChordNet',
-                    mean=mean, std=std, device=device)
-
-                logger.info(f"Evaluating model on {len(test_dataset2)} test samples in split 2...")
-                score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
-                    valid_dataset=test_dataset2, config=config, model=model, model_type='ChordNet',
-                    mean=mean, std=std, device=device)
-
-                logger.info(f"Evaluating model on {len(test_dataset3)} test samples in split 3...")
-                score_list_dict3, song_length_list3, average_score_dict3 = large_voca_score_calculation(
-                    valid_dataset=test_dataset3, config=config, model=model, model_type='ChordNet',
-                    mean=mean, std=std, device=device)
-
-                # Calculate weighted averages
+            if dataset_length == 0:
+                logger.info("No test samples available for MIR evaluation.")
                 mir_eval_results = {}
-                # Check if all results are valid before calculating average
-                valid_results = (average_score_dict1 and average_score_dict2 and average_score_dict3 and
-                                 song_length_list1 and song_length_list2 and song_length_list3)
+            else:
+                # Import the custom evaluation functions from modules.utils.mir_eval_modules
+                from modules.utils.mir_eval_modules import calculate_chord_scores
 
-                if valid_results:
-                    total_length = np.sum(song_length_list1) + np.sum(song_length_list2) + np.sum(song_length_list3)
+                # Prepare to collect all reference and prediction labels
+                all_reference_labels = []
+                all_prediction_labels = []
+                all_durations = []
+
+                # Process each test sample
+                logger.info(f"Evaluating {dataset_length} test samples...")
+
+                # Create a function to process a batch of samples and return their scores
+                def evaluate_batch(samples):
+                    batch_scores = {
+                        'root': [], 'thirds': [], 'triads': [], 'sevenths': [],
+                        'tetrads': [], 'majmin': [], 'mirex': []
+                    }
+                    batch_lengths = []
+                    batch_refs = []
+                    batch_preds = []
+
+                    for sample in samples:
+                        try:
+                            # Get the feature and label data
+                            feature = sample.get('feature')
+                            if feature is None:
+                                # If feature is not cached, load it from the audio file
+                                audio_path = sample.get('audio_path')
+                                if audio_path and os.path.exists(audio_path):
+                                    from modules.utils.mir_eval_modules import audio_file_to_features
+                                    feature, _, _ = audio_file_to_features(audio_path, config)
+                                    feature = feature.T  # Transpose to [time, features]
+                                else:
+                                    logger.warning(f"Skipping sample {sample.get('song_id', 'unknown')}: missing feature and audio")
+                                    continue
+
+                            # Get the reference labels
+                            reference_labels = sample.get('chord_label', [])
+                            if not reference_labels:
+                                logger.warning(f"Skipping sample {sample.get('song_id', 'unknown')}: missing reference labels")
+                                continue
+
+                            # Normalize the feature
+                            if isinstance(mean, torch.Tensor):
+                                mean_np = mean.cpu().numpy()
+                            else:
+                                mean_np = mean
+
+                            if isinstance(std, torch.Tensor):
+                                std_np = std.cpu().numpy()
+                            else:
+                                std_np = std
+
+                            feature_norm = (feature - mean_np) / std_np
+
+                            # Convert to tensor and move to device
+                            feature_tensor = torch.tensor(feature_norm, dtype=torch.float32).unsqueeze(0).to(device)
+
+                            # Get model predictions
+                            model.eval()
+                            with torch.no_grad():
+                                outputs = model(feature_tensor)
+
+                                # Handle different output formats
+                                if isinstance(outputs, tuple):
+                                    logits = outputs[0]
+                                else:
+                                    logits = outputs
+
+                                # Get predicted class indices
+                                predictions = logits.argmax(dim=-1).squeeze().cpu().numpy()
+
+                            # Convert predictions to chord labels
+                            pred_labels = []
+                            for pred_idx in predictions:
+                                chord = master_mapping.get(pred_idx, "N")
+                                pred_labels.append(chord)
+
+                            # Calculate frame duration
+                            frame_duration = config.feature.get('hop_duration', 0.1)
+                            feature_length = len(reference_labels)
+                            timestamps = np.arange(feature_length) * frame_duration
+                            durations = np.diff(np.append(timestamps, [timestamps[-1] + frame_duration]))
+
+                            # Ensure reference and prediction labels have the same length
+                            min_len = min(len(reference_labels), len(pred_labels))
+                            reference_labels = reference_labels[:min_len]
+                            pred_labels = pred_labels[:min_len]
+                            durations = durations[:min_len]
+
+                            # Add to batch collections
+                            batch_refs.extend(reference_labels)
+                            batch_preds.extend(pred_labels)
+
+                            # Calculate scores
+                            root_score, thirds_score, triads_score, sevenths_score, tetrads_score, majmin_score, mirex_score = calculate_chord_scores(
+                                timestamps[:min_len], durations, reference_labels, pred_labels)
+
+                            # Add scores to batch results
+                            batch_scores['root'].append(root_score)
+                            batch_scores['thirds'].append(thirds_score)
+                            batch_scores['triads'].append(triads_score)
+                            batch_scores['sevenths'].append(sevenths_score)
+                            batch_scores['tetrads'].append(tetrads_score)
+                            batch_scores['majmin'].append(majmin_score)
+                            batch_scores['mirex'].append(mirex_score)
+
+                            # Add song length for weighted average
+                            song_length = min_len * frame_duration
+                            batch_lengths.append(song_length)
+
+                            logger.info(f"Sample {sample.get('song_id', 'unknown')}: length={song_length:.1f}s, root={root_score:.4f}, mirex={mirex_score:.4f}")
+
+                        except Exception as e:
+                            logger.error(f"Error evaluating sample {sample.get('song_id', 'unknown')}: {str(e)}")
+                            logger.error(traceback.format_exc())
+
+                    return batch_scores, batch_lengths, batch_refs, batch_preds
+
+                # Evaluate all samples
+                if dataset_length < 3:
+                    # Evaluate all samples together
+                    score_list_dict, song_length_list, refs, preds = evaluate_batch(test_samples)
+                    all_reference_labels.extend(refs)
+                    all_prediction_labels.extend(preds)
+
+                    # Calculate average scores
+                    average_score_dict = {}
+                    total_length = sum(song_length_list) if song_length_list else 0
+
+                    if total_length > 0:
+                        for metric in score_metrics:
+                            weighted_sum = sum(score * length for score, length in zip(score_list_dict[metric], song_length_list))
+                            average_score_dict[metric] = weighted_sum / total_length
+                    else:
+                        for metric in score_metrics:
+                            average_score_dict[metric] = 0.0
+
+                    # Store results
+                    mir_eval_results = {m: float(average_score_dict[m]) for m in score_metrics}
+                    logger.info(f"MIR evaluation results (all test samples): {mir_eval_results}")
+
+                else:
+                    # Create balanced splits from the test samples
+                    split = dataset_length // 3
+                    test_dataset1 = test_samples[:split]
+                    test_dataset2 = test_samples[split:2*split]
+                    test_dataset3 = test_samples[2*split:]
+
+                    # Evaluate each split
+                    logger.info(f"Evaluating {len(test_dataset1)} test samples in split 1...")
+                    score_list_dict1, song_length_list1, refs1, preds1 = evaluate_batch(test_dataset1)
+                    all_reference_labels.extend(refs1)
+                    all_prediction_labels.extend(preds1)
+
+                    logger.info(f"Evaluating {len(test_dataset2)} test samples in split 2...")
+                    score_list_dict2, song_length_list2, refs2, preds2 = evaluate_batch(test_dataset2)
+                    all_reference_labels.extend(refs2)
+                    all_prediction_labels.extend(preds2)
+
+                    logger.info(f"Evaluating {len(test_dataset3)} test samples in split 3...")
+                    score_list_dict3, song_length_list3, refs3, preds3 = evaluate_batch(test_dataset3)
+                    all_reference_labels.extend(refs3)
+                    all_prediction_labels.extend(preds3)
+
+                    # Calculate average scores for each split
+                    average_score_dict1 = {}
+                    average_score_dict2 = {}
+                    average_score_dict3 = {}
+
+                    total_length1 = sum(song_length_list1) if song_length_list1 else 0
+                    total_length2 = sum(song_length_list2) if song_length_list2 else 0
+                    total_length3 = sum(song_length_list3) if song_length_list3 else 0
+
+                    for metric in score_metrics:
+                        if total_length1 > 0:
+                            weighted_sum1 = sum(score * length for score, length in zip(score_list_dict1[metric], song_length_list1))
+                            average_score_dict1[metric] = weighted_sum1 / total_length1
+                        else:
+                            average_score_dict1[metric] = 0.0
+
+                        if total_length2 > 0:
+                            weighted_sum2 = sum(score * length for score, length in zip(score_list_dict2[metric], song_length_list2))
+                            average_score_dict2[metric] = weighted_sum2 / total_length2
+                        else:
+                            average_score_dict2[metric] = 0.0
+
+                        if total_length3 > 0:
+                            weighted_sum3 = sum(score * length for score, length in zip(score_list_dict3[metric], song_length_list3))
+                            average_score_dict3[metric] = weighted_sum3 / total_length3
+                        else:
+                            average_score_dict3[metric] = 0.0
+
+                    # Calculate weighted averages across all splits
+                    mir_eval_results = {}
+                    total_length = total_length1 + total_length2 + total_length3
+
                     if total_length > 0:
                         for m in score_metrics:
-                            # Ensure metric exists in all dictionaries
-                            if m in average_score_dict1 and m in average_score_dict2 and m in average_score_dict3:
-                                # Calculate weighted average based on song lengths
-                                avg = (np.sum(song_length_list1) * average_score_dict1[m] +
-                                       np.sum(song_length_list2) * average_score_dict2[m] +
-                                       np.sum(song_length_list3) * average_score_dict3[m]) / total_length
+                            # Calculate weighted average based on song lengths
+                            avg = (total_length1 * average_score_dict1[m] +
+                                   total_length2 * average_score_dict2[m] +
+                                   total_length3 * average_score_dict3[m]) / total_length
 
-                                # Calculate min and max values across the three splits
-                                split_values = [
-                                    average_score_dict1[m] * 100,
-                                    average_score_dict2[m] * 100,
-                                    average_score_dict3[m] * 100
-                                ]
-                                min_val = min(split_values)
-                                max_val = max(split_values)
-                                avg_val = avg * 100
+                            # Calculate min and max values across the three splits
+                            split_values = [
+                                average_score_dict1[m] * 100,
+                                average_score_dict2[m] * 100,
+                                average_score_dict3[m] * 100
+                            ]
+                            min_val = min(split_values)
+                            max_val = max(split_values)
+                            avg_val = avg * 100
 
-                                # Log individual split scores with range
-                                logger.info(f"==== {m}: {avg_val:.2f}% (avg), range: [{min_val:.2f}% - {max_val:.2f}%]")
+                            # Log individual split scores with range
+                            logger.info(f"==== {m}: {avg_val:.2f}% (avg), range: [{min_val:.2f}% - {max_val:.2f}%]")
 
-                                # Store in results dictionary
-                                mir_eval_results[m] = {
-                                    'split1': float(average_score_dict1[m]),
-                                    'split2': float(average_score_dict2[m]),
-                                    'split3': float(average_score_dict3[m]),
-                                    'weighted_avg': float(avg)
-                                }
-                            else:
-                                logger.warning(f"Metric '{m}' missing in one or more splits, cannot calculate average.")
-                                mir_eval_results[m] = {'error': f'Metric {m} missing in splits'}
+                            # Store in results dictionary
+                            mir_eval_results[m] = {
+                                'split1': float(average_score_dict1[m]),
+                                'split2': float(average_score_dict2[m]),
+                                'split3': float(average_score_dict3[m]),
+                                'weighted_avg': float(avg)
+                            }
                     else:
-                         logger.warning("Total song length is zero, cannot calculate weighted average MIR scores.")
-                         mir_eval_results = {'error': 'Total song length zero'}
-                else:
-                    logger.warning("Could not calculate MIR scores properly for all splits.")
-                    mir_eval_results = {'error': 'Calculation failed for one or more splits'}
+                        logger.warning("Total song length is zero, cannot calculate weighted average MIR scores.")
+                        mir_eval_results = {'error': 'Total song length zero'}
+
+                # Count 'N' (no chord) and 'X' (unknown chord) labels
+                n_count_ref = sum(1 for label in all_reference_labels if label == 'N')
+                x_count_ref = sum(1 for label in all_reference_labels if label == 'X')
+                n_count_pred = sum(1 for label in all_prediction_labels if label == 'N')
+                x_count_pred = sum(1 for label in all_prediction_labels if label == 'X')
+
+                logger.info(f"\nChord label statistics:")
+                logger.info(f"Reference labels: {len(all_reference_labels)} total, {n_count_ref} 'N' ({n_count_ref/len(all_reference_labels)*100:.1f}%), {x_count_ref} 'X' ({x_count_ref/len(all_reference_labels)*100:.1f}%)")
+                logger.info(f"Predicted labels: {len(all_prediction_labels)} total, {n_count_pred} 'N' ({n_count_pred/len(all_prediction_labels)*100:.1f}%), {x_count_pred} 'X' ({x_count_pred/len(all_prediction_labels)*100:.1f}%)")
 
             # Save MIR-eval metrics
             try:

@@ -301,32 +301,97 @@ def lab_file_error_modify(ref_labels):
 
     return ref_labels
 
+def extract_chord_quality(chord):
+    """
+    Extract chord quality from a chord label, handling different formats.
+    Supports both colon format (C:maj) and direct format (Cmaj).
+
+    Args:
+        chord: A chord label string
+
+    Returns:
+        The chord quality as a string
+    """
+    # Handle None or empty strings
+    if not chord:
+        return "N"  # Default to "N" for empty chords
+
+    # Handle special cases
+    if chord in ["N", "None", "NC"]:
+        return "N"  # No chord
+    if chord in ["X", "Unknown"]:
+        return "X"  # Unknown chord
+
+    # Handle colon format (e.g., "C:min")
+    if ':' in chord:
+        parts = chord.split(':')
+        if len(parts) > 1:
+            # Handle bass notes (e.g., "C:min/G")
+            quality = parts[1].split('/')[0] if '/' in parts[1] else parts[1]
+            return quality
+
+    # Handle direct format without colon (e.g., "Cmin")
+    import re
+    root_pattern = r'^[A-G][#b]?'
+    match = re.match(root_pattern, chord)
+    if match:
+        quality = chord[match.end():]
+        if quality:
+            # Handle bass notes (e.g., "Cmin/G")
+            return quality.split('/')[0] if '/' in quality else quality
+
+    # Default to major if we couldn't extract a quality
+    return "maj"
+
 def compute_individual_chord_accuracy(reference_labels, prediction_labels):
     """
     Compute accuracy for individual chord qualities.
-    Extract chord quality as the substring after ':'; if none exists, assume 'maj'.
-    Returns a dictionary mapping quality (e.g. maj, min, min7, etc.) to accuracy.
+    Uses a robust approach to extract chord qualities from different formats.
+
+    Args:
+        reference_labels: List of reference chord labels
+        prediction_labels: List of predicted chord labels
+
+    Returns:
+        acc: Dictionary mapping chord quality to accuracy
+        stats: Dictionary with detailed statistics for each quality
     """
     from collections import defaultdict
-    def get_quality(chord):
-        if ':' in chord:
-            return chord.split(':')[1]
-        else:
-            return "maj"  # default quality if no ':' is present
+
+    total_processed = 0
+    malformed_chords = 0
+
     stats = defaultdict(lambda: {'correct': 0, 'total': 0})
+
     for ref, pred in zip(reference_labels, prediction_labels):
-        q_ref = get_quality(ref)
-        q_pred = get_quality(pred)
-        stats[q_ref]['total'] += 1
-        if q_ref == q_pred:
-            stats[q_ref]['correct'] += 1
+        total_processed += 1
+
+        if not ref or not pred:
+            malformed_chords += 1
+            continue
+
+        try:
+            # Extract chord qualities using the robust method
+            q_ref = extract_chord_quality(ref)
+            q_pred = extract_chord_quality(pred)
+
+            # Update statistics
+            stats[q_ref]['total'] += 1
+            if q_ref == q_pred:
+                stats[q_ref]['correct'] += 1
+        except Exception as e:
+            malformed_chords += 1
+            continue
+
+    # Calculate accuracy for each quality
     acc = {}
     for quality, vals in stats.items():
         if vals['total'] > 0:
             acc[quality] = vals['correct'] / vals['total']
         else:
             acc[quality] = 0.0
-    return acc
+
+    return acc, stats
 
 def root_majmin_score_calculation(valid_dataset, config, mean, std, device, model, model_type, verbose=False):
     """
@@ -871,13 +936,29 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
             ref_sample = collected_refs[:min_len]
             pred_sample = collected_preds[:min_len]
 
-            # Now compute accuracy
-            ind_acc = compute_individual_chord_accuracy(ref_sample, pred_sample)
+            # Now compute accuracy using our improved function
+            ind_acc, quality_stats = compute_individual_chord_accuracy(ref_sample, pred_sample)
             if ind_acc:
                 print("\nIndividual Chord Quality Accuracy:")
                 print("---------------------------------")
-                for chord_quality, accuracy_val in sorted(ind_acc.items(), key=lambda x: x[1], reverse=True):
-                    print(f"  {chord_quality}: {accuracy_val*100:.2f}%")
+
+                # Sort by total count first to show most common qualities
+                sorted_qualities = sorted(quality_stats.items(), key=lambda x: x[1]['total'], reverse=True)
+
+                # Print chord quality distribution
+                print("\nChord quality distribution:")
+                total_chords = sum(stats['total'] for stats in quality_stats.values())
+
+                for quality, stats in sorted_qualities:
+                    if stats['total'] > 0:
+                        percentage = (stats['total'] / total_chords) * 100
+                        print(f"  {quality}: {stats['total']} samples ({percentage:.2f}%)")
+
+                # Print accuracy by chord quality
+                print("\nAccuracy by chord quality:")
+                for quality, accuracy_val in sorted(ind_acc.items(), key=lambda x: x[1], reverse=True):
+                    if quality_stats[quality]['total'] >= 10:  # Only show meaningful stats
+                        print(f"  {quality}: {accuracy_val:.4f}")
             else:
                 print("\nNo individual chord accuracy data computed despite having labels.")
                 print("This may indicate a problem with the chord format.")

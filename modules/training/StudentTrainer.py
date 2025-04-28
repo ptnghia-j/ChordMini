@@ -11,6 +11,7 @@ from modules.utils.logger import info, warning, error, debug, logging_verbosity,
 from modules.training.Trainer import BaseTrainer
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, OneCycleLR, CosineAnnealingWarmRestarts
 from collections import Counter
+from modules.utils.teacher_utils import extract_logits_from_teacher
 
 # Import visualization functions including chord quality mapping
 from modules.utils.visualize import (
@@ -338,29 +339,21 @@ class StudentTrainer(BaseTrainer):
         # Store model prefix for later use
         self.model_prefix = model_prefix
 
-        # Check if checkpoint_dir is already an external path
-        is_external_path = checkpoint_dir.startswith('/mnt/storage')
+        # Always prioritize the external path in /mnt/storage/checkpoints
+        # Construct external path
+        external_dir = f"/mnt/storage/checkpoints/{model_prefix}"
 
-        # If checkpoint_dir is not an external path, prioritize external path
-        if not is_external_path:
-            # Construct external path
-            external_dir = f"/mnt/storage/checkpoints/{model_prefix}"
-
-            # Check if external directory exists or can be created
-            try:
-                os.makedirs(external_dir, exist_ok=True)
-                # Use external path as primary checkpoint directory
-                self.primary_checkpoint_dir = external_dir
-                # Keep original path as fallback
-                self.fallback_checkpoint_dir = checkpoint_dir
-                info(f"Using external checkpoint directory: {external_dir}")
-            except Exception as e:
-                # If external directory can't be created, use original path
-                info(f"Could not use external directory {external_dir}: {e}")
-                self.primary_checkpoint_dir = checkpoint_dir
-                self.fallback_checkpoint_dir = None
-        else:
-            # If checkpoint_dir is already an external path, use it directly
+        # Check if external directory exists or can be created
+        try:
+            os.makedirs(external_dir, exist_ok=True)
+            # Use external path as primary checkpoint directory
+            self.primary_checkpoint_dir = external_dir
+            # Keep original path as fallback
+            self.fallback_checkpoint_dir = checkpoint_dir
+            info(f"Using external checkpoint directory: {external_dir}")
+        except Exception as e:
+            # If external directory can't be created, use original path
+            info(f"Could not use external directory {external_dir}: {e}")
             self.primary_checkpoint_dir = checkpoint_dir
             self.fallback_checkpoint_dir = None
 
@@ -409,15 +402,29 @@ class StudentTrainer(BaseTrainer):
         if self.use_kd_loss:
             # Check if teacher_model is available for on-the-fly logits
             if self.teacher_model is not None:
-                with torch.no_grad():
-                    # Extract logits from teacher model
-                    teacher_logits = extract_logits_from_teacher(
-                        self.teacher_model,
-                        spectro,
-                        self.teacher_normalization['mean'],
-                        self.teacher_normalization['std'],
-                        self.device
-                    )
+                try:
+                    with torch.no_grad():
+                        # Extract logits from teacher model using the improved function
+                        teacher_logits = extract_logits_from_teacher(
+                            self.teacher_model,
+                            spectro,
+                            self.teacher_normalization['mean'],
+                            self.teacher_normalization['std'],
+                            self.device
+                        )
+
+                        # Log teacher logits shape for debugging (only once)
+                        if not hasattr(self, '_teacher_logits_logged'):
+                            info(f"Successfully extracted teacher logits with shape: {teacher_logits.shape}")
+                            self._teacher_logits_logged = True
+
+                        # Verify teacher logits are valid
+                        if teacher_logits is None or torch.isnan(teacher_logits).any() or not torch.isfinite(teacher_logits).all():
+                            warning("Teacher logits contain NaN or non-finite values, will not use for KD")
+                            teacher_logits = None
+                except Exception as e:
+                    warning(f"Error extracting teacher logits: {e}")
+                    teacher_logits = None
             else:
                 # Look for pre-computed logits in teacher_predictions or batch
                 if 'song_id' in batch and self.teacher_predictions:
@@ -477,6 +484,12 @@ class StudentTrainer(BaseTrainer):
                 kd_loss = self.knowledge_distillation_loss(
                     logits, teacher_logits, self.temperature
                 )
+
+                # Log KD loss details (only once)
+                if not hasattr(self, '_kd_loss_details_logged'):
+                    info(f"KD loss: {kd_loss.item():.4f}, standard loss: {standard_loss.item():.4f}")
+                    info(f"Using temperature: {self.temperature}, alpha: {self.kd_alpha}")
+                    self._kd_loss_details_logged = True
             else:
                 # This should ideally not happen if flattening logic above is correct
                 warning(f"Shape mismatch before KD loss calculation: student {logits.shape}, teacher {teacher_logits.shape}. Skipping KD for this batch.")

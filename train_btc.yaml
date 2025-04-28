@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: btc-mini-0 # Changed name for BTC small job
+  name: btc-mini-test # Changed name for BTC small job
   namespace: csuf-titans
   labels:
     app: btc-training # Changed label for BTC
@@ -208,7 +208,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never", "required"
             - name: SUB_DIR
-              value: "btc-fma-0" # Subdirectory for BTC checkpoints (adjust based on DATASET_TYPE)
+              value: "btc-fma-test" # Subdirectory for BTC checkpoints (adjust based on DATASET_TYPE)
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint
@@ -219,7 +219,7 @@ spec:
             - name: LAZY_INIT
               value: "false" # Controls dataset lazy initialization
             - name: SMALL_DATASET
-              value: ""   # Set percentage of dataset to use (0.1 = 10%, null = full)
+              value: "0.01"   # Set percentage of dataset to use (0.1 = 10%, null = full)
             - name: METADATA_CACHE
               value: "false" # Use metadata-only caching
           command:

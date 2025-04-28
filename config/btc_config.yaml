@@ -8,7 +8,8 @@ feature:
   bins_per_octave: 24
   hop_length: 2048
   large_voca: True
-#  large_voca: True
+  sample_rate: 22050
+  hop_duration: 0.09288  # hop_length / sample_rate
 
 experiment:
   learning_rate : 0.0001
@@ -24,8 +25,10 @@ model:
   stride: 108
   num_chords : 170
   frame_duration: 0.09288
+  timestep: 108
+  input_features: 144
 
-#  num_chords : 170
+  # Transformer parameters
   input_dropout : 0.2
   layer_dropout : 0.2
   attention_dropout : 0.2
@@ -37,7 +40,7 @@ model:
   total_value_depth : 128
   filter_size : 128
   loss : 'ce'
-  probs_out : False
+  probs_out : True  # Changed to True to match the successful implementation
 
 path:
   ckpt_path : 'model'
