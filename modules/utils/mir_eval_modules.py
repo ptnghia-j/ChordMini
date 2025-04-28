@@ -389,6 +389,7 @@ def compute_individual_chord_accuracy(reference_labels, prediction_labels):
     """
     Compute accuracy for individual chord qualities.
     Uses a robust approach to extract chord qualities from different formats.
+    Maps chord qualities to broader categories to match validation reporting.
 
     Args:
         reference_labels: List of reference chord labels
@@ -400,10 +401,52 @@ def compute_individual_chord_accuracy(reference_labels, prediction_labels):
     """
     from collections import defaultdict
 
+    # Import the map_chord_to_quality function from visualize.py if available
+    try:
+        from modules.utils.visualize import map_chord_to_quality
+        use_quality_mapping = True
+        print("Using quality mapping from visualize.py for consistent reporting")
+    except ImportError:
+        use_quality_mapping = False
+        print("Quality mapping from visualize.py not available, using raw qualities")
+
     total_processed = 0
     malformed_chords = 0
 
-    stats = defaultdict(lambda: {'correct': 0, 'total': 0})
+    # Use two sets of statistics - one for raw qualities and one for mapped qualities
+    raw_stats = defaultdict(lambda: {'correct': 0, 'total': 0})
+    mapped_stats = defaultdict(lambda: {'correct': 0, 'total': 0})
+
+    # Quality mapping for consistent reporting with validation
+    quality_mapping = {
+        # Major family
+        "maj": "Major", "": "Major", "M": "Major", "major": "Major",
+        # Minor family
+        "min": "Minor", "m": "Minor", "minor": "Minor",
+        # Dominant seventh family
+        "7": "Dom7", "dom7": "Dom7", "dominant": "Dom7",
+        # Major seventh family
+        "maj7": "Maj7", "M7": "Maj7", "major7": "Maj7",
+        # Minor seventh family
+        "min7": "Min7", "m7": "Min7", "minor7": "Min7",
+        # Diminished family
+        "dim": "Dim", "°": "Dim", "o": "Dim", "diminished": "Dim",
+        # Diminished seventh family
+        "dim7": "Dim7", "°7": "Dim7", "o7": "Dim7", "diminished7": "Dim7",
+        # Half-diminished family
+        "hdim7": "Half-Dim", "m7b5": "Half-Dim", "ø": "Half-Dim", "half-diminished": "Half-Dim",
+        # Augmented family
+        "aug": "Aug", "+": "Aug", "augmented": "Aug",
+        # Suspended family
+        "sus2": "Sus", "sus4": "Sus", "sus": "Sus", "suspended": "Sus",
+        # Additional common chord qualities
+        "min6": "Min6", "m6": "Min6",
+        "maj6": "Maj6", "6": "Maj6",
+        "minmaj7": "Min-Maj7", "mmaj7": "Min-Maj7", "min-maj7": "Min-Maj7",
+        # Special cases
+        "N": "No Chord",
+        "X": "Unknown",
+    }
 
     for ref, pred in zip(reference_labels, prediction_labels):
         total_processed += 1
@@ -414,26 +457,75 @@ def compute_individual_chord_accuracy(reference_labels, prediction_labels):
 
         try:
             # Extract chord qualities using the robust method
-            q_ref = extract_chord_quality(ref)
-            q_pred = extract_chord_quality(pred)
+            q_ref_raw = extract_chord_quality(ref)
+            q_pred_raw = extract_chord_quality(pred)
 
-            # Update statistics
-            stats[q_ref]['total'] += 1
-            if q_ref == q_pred:
-                stats[q_ref]['correct'] += 1
+            # Map to broader categories for consistent reporting with validation
+            if use_quality_mapping:
+                # Use the imported function if available
+                q_ref_mapped = map_chord_to_quality(ref)
+                q_pred_mapped = map_chord_to_quality(pred)
+            else:
+                # Use our local mapping
+                q_ref_mapped = quality_mapping.get(q_ref_raw, "Other")
+                q_pred_mapped = quality_mapping.get(q_pred_raw, "Other")
+
+            # Update raw statistics
+            raw_stats[q_ref_raw]['total'] += 1
+            if q_ref_raw == q_pred_raw:
+                raw_stats[q_ref_raw]['correct'] += 1
+
+            # Update mapped statistics
+            mapped_stats[q_ref_mapped]['total'] += 1
+            if q_ref_mapped == q_pred_mapped:
+                mapped_stats[q_ref_mapped]['correct'] += 1
+
         except Exception as e:
             malformed_chords += 1
             continue
 
-    # Calculate accuracy for each quality
-    acc = {}
-    for quality, vals in stats.items():
+    # Calculate accuracy for each quality (both raw and mapped)
+    raw_acc = {}
+    for quality, vals in raw_stats.items():
         if vals['total'] > 0:
-            acc[quality] = vals['correct'] / vals['total']
+            raw_acc[quality] = vals['correct'] / vals['total']
         else:
-            acc[quality] = 0.0
+            raw_acc[quality] = 0.0
 
-    return acc, stats
+    mapped_acc = {}
+    for quality, vals in mapped_stats.items():
+        if vals['total'] > 0:
+            mapped_acc[quality] = vals['correct'] / vals['total']
+        else:
+            mapped_acc[quality] = 0.0
+
+    # Print both raw and mapped statistics for comparison
+    print("\nRaw Chord Quality Distribution:")
+    total_raw = sum(stats['total'] for stats in raw_stats.values())
+    for quality, stats in sorted(raw_stats.items(), key=lambda x: x[1]['total'], reverse=True):
+        if stats['total'] > 0:
+            percentage = (stats['total'] / total_raw) * 100
+            print(f"  {quality}: {stats['total']} samples ({percentage:.2f}%)")
+
+    print("\nMapped Chord Quality Distribution (matches validation):")
+    total_mapped = sum(stats['total'] for stats in mapped_stats.values())
+    for quality, stats in sorted(mapped_stats.items(), key=lambda x: x[1]['total'], reverse=True):
+        if stats['total'] > 0:
+            percentage = (stats['total'] / total_mapped) * 100
+            print(f"  {quality}: {stats['total']} samples ({percentage:.2f}%)")
+
+    print("\nRaw Accuracy by chord quality:")
+    for quality, accuracy_val in sorted(raw_acc.items(), key=lambda x: x[1], reverse=True):
+        if raw_stats[quality]['total'] >= 10:  # Only show meaningful stats
+            print(f"  {quality}: {accuracy_val:.4f}")
+
+    print("\nMapped Accuracy by chord quality (matches validation):")
+    for quality, accuracy_val in sorted(mapped_acc.items(), key=lambda x: x[1], reverse=True):
+        if mapped_stats[quality]['total'] >= 10:  # Only show meaningful stats
+            print(f"  {quality}: {accuracy_val:.4f}")
+
+    # Return the mapped statistics for consistency with validation
+    return mapped_acc, mapped_stats
 
 def root_majmin_score_calculation(valid_dataset, config, mean, std, device, model, model_type, verbose=False):
     """
@@ -979,29 +1071,10 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
             pred_sample = collected_preds[:min_len]
 
             # Now compute accuracy using our improved function
+            # This will print both raw and mapped statistics for comparison
             ind_acc, quality_stats = compute_individual_chord_accuracy(ref_sample, pred_sample)
-            if ind_acc:
-                print("\nIndividual Chord Quality Accuracy:")
-                print("---------------------------------")
 
-                # Sort by total count first to show most common qualities
-                sorted_qualities = sorted(quality_stats.items(), key=lambda x: x[1]['total'], reverse=True)
-
-                # Print chord quality distribution
-                print("\nChord quality distribution:")
-                total_chords = sum(stats['total'] for stats in quality_stats.values())
-
-                for quality, stats in sorted_qualities:
-                    if stats['total'] > 0:
-                        percentage = (stats['total'] / total_chords) * 100
-                        print(f"  {quality}: {stats['total']} samples ({percentage:.2f}%)")
-
-                # Print accuracy by chord quality
-                print("\nAccuracy by chord quality:")
-                for quality, accuracy_val in sorted(ind_acc.items(), key=lambda x: x[1], reverse=True):
-                    if quality_stats[quality]['total'] >= 10:  # Only show meaningful stats
-                        print(f"  {quality}: {accuracy_val:.4f}")
-            else:
+            if not ind_acc:
                 print("\nNo individual chord accuracy data computed despite having labels.")
                 print("This may indicate a problem with the chord format.")
     else:

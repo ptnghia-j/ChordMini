@@ -416,35 +416,113 @@ def extract_chord_quality(chord):
     """
     Extract chord quality from a chord label, handling different formats.
     Supports both colon format (C:maj) and direct format (Cmaj).
+
+    Args:
+        chord: A chord label string
+
+    Returns:
+        The chord quality as a string
     """
+    # Handle None or empty strings
+    if not chord:
+        return "N"  # Default to "N" for empty chords
+
+    # Handle special cases
+    if chord in ["N", "None", "NC"]:
+        return "N"  # No chord
+    if chord in ["X", "Unknown"]:
+        return "X"  # Unknown chord
+
+    # Handle colon format (e.g., "C:min")
     if ':' in chord:
-        return chord.split(':')[1]
+        parts = chord.split(':')
+        if len(parts) > 1:
+            # Handle bass notes (e.g., "C:min/G")
+            quality = parts[1].split('/')[0] if '/' in parts[1] else parts[1]
+            return quality
 
-    if chord in ["N", "X"]:
-        return chord
-
+    # Handle direct format without colon (e.g., "Cmin")
     import re
     root_pattern = r'^[A-G][#b]?'
-
     match = re.match(root_pattern, chord)
     if match:
         quality = chord[match.end():]
         if quality:
-            return quality
+            # Handle bass notes (e.g., "Cmin/G")
+            return quality.split('/')[0] if '/' in quality else quality
 
+    # Default to major if we couldn't extract a quality
     return "maj"
+
+def map_chord_to_quality(chord_name):
+    """
+    Map a chord name to its quality group.
+
+    Args:
+        chord_name (str): The chord name (e.g., "C:maj", "A:min", "G:7", "N")
+
+    Returns:
+        str: The chord quality group name
+    """
+    # Handle non-string input
+    if not isinstance(chord_name, str):
+        return "Other"
+
+    # Handle special cases
+    if chord_name in ["N", "X", "None", "Unknown", "NC"]:
+        return "No Chord"
+
+    # Extract quality using extract_chord_quality function
+    quality = extract_chord_quality(chord_name)
+
+    # Map extracted quality to broader categories
+    quality_mapping = {
+        # Major family
+        "maj": "Major", "": "Major", "M": "Major", "major": "Major",
+        # Minor family
+        "min": "Minor", "m": "Minor", "minor": "Minor",
+        # Dominant seventh family
+        "7": "Dom7", "dom7": "Dom7", "dominant": "Dom7",
+        # Major seventh family
+        "maj7": "Maj7", "M7": "Maj7", "major7": "Maj7",
+        # Minor seventh family
+        "min7": "Min7", "m7": "Min7", "minor7": "Min7",
+        # Diminished family
+        "dim": "Dim", "°": "Dim", "o": "Dim", "diminished": "Dim",
+        # Diminished seventh family
+        "dim7": "Dim7", "°7": "Dim7", "o7": "Dim7", "diminished7": "Dim7",
+        # Half-diminished family
+        "hdim7": "Half-Dim", "m7b5": "Half-Dim", "ø": "Half-Dim", "half-diminished": "Half-Dim",
+        # Augmented family
+        "aug": "Aug", "+": "Aug", "augmented": "Aug",
+        # Suspended family
+        "sus2": "Sus", "sus4": "Sus", "sus": "Sus", "suspended": "Sus",
+        # Additional common chord qualities
+        "min6": "Min6", "m6": "Min6",
+        "maj6": "Maj6", "6": "Maj6",
+        "minmaj7": "Min-Maj7", "mmaj7": "Min-Maj7", "min-maj7": "Min-Maj7",
+        # Special cases
+        "N": "No Chord",
+        "X": "Unknown",
+    }
+
+    # Return mapped quality or "Other" if not found
+    return quality_mapping.get(quality, "Other")
 
 def compute_chord_quality_accuracy(reference_labels, prediction_labels):
     """
     Compute accuracy for individual chord qualities.
     Returns a dictionary mapping quality (e.g. maj, min, min7, etc.) to accuracy.
+    Also returns mapped quality accuracy for consistency with validation.
     """
     from collections import defaultdict
 
     total_processed = 0
     malformed_chords = 0
 
-    stats = defaultdict(lambda: {'correct': 0, 'total': 0})
+    # Use two sets of statistics - one for raw qualities and one for mapped qualities
+    raw_stats = defaultdict(lambda: {'correct': 0, 'total': 0})
+    mapped_stats = defaultdict(lambda: {'correct': 0, 'total': 0})
 
     for ref, pred in zip(reference_labels, prediction_labels):
         total_processed += 1
@@ -454,44 +532,72 @@ def compute_chord_quality_accuracy(reference_labels, prediction_labels):
             continue
 
         try:
-            q_ref = extract_chord_quality(ref)
-            q_pred = extract_chord_quality(pred)
+            # Extract chord qualities using the robust method
+            q_ref_raw = extract_chord_quality(ref)
+            q_pred_raw = extract_chord_quality(pred)
 
-            stats[q_ref]['total'] += 1
-            if q_ref == q_pred:
-                stats[q_ref]['correct'] += 1
+            # Map to broader categories for consistent reporting with validation
+            q_ref_mapped = map_chord_to_quality(ref)
+            q_pred_mapped = map_chord_to_quality(pred)
+
+            # Update raw statistics
+            raw_stats[q_ref_raw]['total'] += 1
+            if q_ref_raw == q_pred_raw:
+                raw_stats[q_ref_raw]['correct'] += 1
+
+            # Update mapped statistics
+            mapped_stats[q_ref_mapped]['total'] += 1
+            if q_ref_mapped == q_pred_mapped:
+                mapped_stats[q_ref_mapped]['correct'] += 1
         except Exception as e:
             malformed_chords += 1
             continue
 
     logger.debug(f"Processed {total_processed} chord pairs, {malformed_chords} were malformed or caused errors")
-    logger.debug(f"Found {len(stats)} unique chord qualities in the reference labels")
+    logger.debug(f"Found {len(raw_stats)} unique raw chord qualities and {len(mapped_stats)} mapped qualities")
 
-    top_qualities = sorted(stats.items(), key=lambda x: x[1]['total'], reverse=True)
-
-    meaningful_qualities = [q for q, v in top_qualities if v['total'] >= 10 or (v['total'] > 0 and v['correct'] > 0)]
-    logger.debug(f"Found {len(meaningful_qualities)} meaningful chord qualities (appear ≥10 times or have >0% accuracy)")
-
-    try:
-        is_debug = logger.is_debug() if hasattr(logger, 'is_debug') else False
-        if is_debug:
-            count = 0
-            for quality, counts in top_qualities:
-                if counts['total'] >= 10 or (counts['total'] > 0 and counts['correct'] > 0):
-                    logger.debug(f"  {quality}: {counts['total']} instances ({counts['correct']} correct)")
-                    count += 1
-                    if count >= 10:
-                        break
-    except Exception:
-        pass
-
-    acc = {}
-    for quality, vals in stats.items():
+    # Calculate accuracy for each quality (both raw and mapped)
+    raw_acc = {}
+    for quality, vals in raw_stats.items():
         if vals['total'] > 0:
-            acc[quality] = vals['correct'] / vals['total']
+            raw_acc[quality] = vals['correct'] / vals['total']
         else:
-            acc[quality] = 0.0
-    return acc, stats
+            raw_acc[quality] = 0.0
+
+    mapped_acc = {}
+    for quality, vals in mapped_stats.items():
+        if vals['total'] > 0:
+            mapped_acc[quality] = vals['correct'] / vals['total']
+        else:
+            mapped_acc[quality] = 0.0
+
+    # Print both raw and mapped statistics for comparison
+    logger.info("\nRaw Chord Quality Distribution:")
+    total_raw = sum(stats['total'] for stats in raw_stats.values())
+    for quality, stats in sorted(raw_stats.items(), key=lambda x: x[1]['total'], reverse=True):
+        if stats['total'] > 0:
+            percentage = (stats['total'] / total_raw) * 100
+            logger.info(f"  {quality}: {stats['total']} samples ({percentage:.2f}%)")
+
+    logger.info("\nMapped Chord Quality Distribution (matches validation):")
+    total_mapped = sum(stats['total'] for stats in mapped_stats.values())
+    for quality, stats in sorted(mapped_stats.items(), key=lambda x: x[1]['total'], reverse=True):
+        if stats['total'] > 0:
+            percentage = (stats['total'] / total_mapped) * 100
+            logger.info(f"  {quality}: {stats['total']} samples ({percentage:.2f}%)")
+
+    logger.info("\nRaw Accuracy by chord quality:")
+    for quality, accuracy_val in sorted(raw_acc.items(), key=lambda x: x[1], reverse=True):
+        if raw_stats[quality]['total'] >= 10:  # Only show meaningful stats
+            logger.info(f"  {quality}: {accuracy_val:.4f}")
+
+    logger.info("\nMapped Accuracy by chord quality (matches validation):")
+    for quality, accuracy_val in sorted(mapped_acc.items(), key=lambda x: x[1], reverse=True):
+        if mapped_stats[quality]['total'] >= 10:  # Only show meaningful stats
+            logger.info(f"  {quality}: {accuracy_val:.4f}")
+
+    # Return both raw and mapped statistics
+    return mapped_acc, mapped_stats
 
 def evaluate_dataset(dataset, config, model, device, mean, std):
     """
