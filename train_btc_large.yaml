@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: btc-large # Changed name
+  name: btc-large-combined # Changed name
   namespace: csuf-titans
   labels:
     app: btc-training # Changed label
@@ -24,7 +24,7 @@ spec:
               - key: kubernetes.io/hostname      # new host pin
                 operator: In
                 values:
-                - gpu-05.nrp.mghpcc.org
+                - gpu-03.nrp.mghpcc.org
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -238,12 +238,12 @@ spec:
               value: "6"     # Prefetch batches for better throughput
             # Add dataset type environment variable with combined option
             - name: DATASET_TYPE
-              value: "dali_synth"  # Options: "fma", "maestro", "dali_synth", "combined", "fma+maestro", "fma+dali_synth", or "maestro+dali_synth"
+              value: "combined"  # Options: "fma", "maestro", "dali_synth", "combined", "fma+maestro", "fma+dali_synth", or "maestro+dali_synth"
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never", "required"
             - name: SUB_DIR
-              value: "btc-dali-fma" # Subdirectory for BTC checkpoints
+              value: "btc-combined" # Subdirectory for BTC checkpoints
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint
@@ -472,12 +472,12 @@ spec:
             requests:
               cpu: "4"
               #memory: "196Gi"
-              memory: "24Gi"
+              memory: "128Gi"
               nvidia.com/gpu: "2"
             limits:
               cpu: "18"
               #memory: "296Gi"
-              memory: "64Gi"
+              memory: "160Gi"
               nvidia.com/gpu: "2"
           volumeMounts:
             - name: storage

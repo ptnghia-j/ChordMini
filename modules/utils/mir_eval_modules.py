@@ -220,86 +220,110 @@ class metrics():
         score = mir_eval.chord.weighted_accuracy(comparisons, durations)
         return score
 
+def standardize_chord_label(chord_label):
+    """
+    Standardize a single chord label to ensure compatibility with mir_eval.
+
+    Args:
+        chord_label: A single chord label string to standardize
+
+    Returns:
+        Standardized chord label string
+    """
+    # Skip empty or None labels
+    if not chord_label:
+        return "N"  # Map empty to NO_CHORD
+
+    # Handle special cases but preserve X vs N distinction
+    if chord_label in ["N", "None", "NC"]:
+        return "N"  # NO_CHORD
+
+    if chord_label in ["X", "Unknown"]:
+        return "X"  # UNKNOWN_CHORD - preserve distinction from NO_CHORD
+
+    # Fix common format issues
+    if chord_label.endswith(':4'):
+        chord_label = chord_label.replace(':4', ':sus4')
+    elif chord_label.endswith(':6'):
+        chord_label = chord_label.replace(':6', ':maj6')
+    elif chord_label.endswith(':6/2'):
+        chord_label = chord_label.replace(':6/2', ':maj6/2')
+    elif chord_label == 'Emin/4':
+        chord_label = 'E:min/4'
+    elif chord_label == 'A7/3':
+        chord_label = 'A:7/3'
+    elif chord_label == 'Bb7/3':
+        chord_label = 'Bb:7/3'
+    elif chord_label == 'Bb7/5':
+        chord_label = 'Bb:7/5'
+
+    # Handle root-only chords (e.g., "C", "G#")
+    root_notes = ["A", "B", "C", "D", "E", "F", "G"]
+    if chord_label in root_notes or (len(chord_label) == 2 and chord_label[0] in root_notes and chord_label[1] in ['#', 'b']):
+        chord_label = chord_label + ":maj"
+
+    # Handle chords without colon separator
+    elif ':' not in chord_label:
+        # Handle minor chords
+        if 'min' in chord_label:
+            idx = chord_label.find('min')
+            chord_label = chord_label[:idx] + ':' + chord_label[idx:]
+        # Handle dominant 7th chords
+        elif '7' in chord_label and 'maj7' not in chord_label and 'min7' not in chord_label:
+            idx = chord_label.find('7')
+            chord_label = chord_label[:idx] + ':7' + chord_label[idx+1:]
+        # Handle major 7th chords
+        elif 'maj7' in chord_label:
+            idx = chord_label.find('maj7')
+            chord_label = chord_label[:idx] + ':maj7' + chord_label[idx+4:]
+        # Handle minor 7th chords
+        elif 'min7' in chord_label:
+            idx = chord_label.find('min7')
+            chord_label = chord_label[:idx] + ':min7' + chord_label[idx+4:]
+        # Handle diminished chords
+        elif 'dim' in chord_label:
+            idx = chord_label.find('dim')
+            chord_label = chord_label[:idx] + ':dim' + chord_label[idx+3:]
+        # Handle augmented chords
+        elif 'aug' in chord_label:
+            idx = chord_label.find('aug')
+            chord_label = chord_label[:idx] + ':aug' + chord_label[idx+3:]
+        # Handle sus chords
+        elif 'sus' in chord_label:
+            idx = chord_label.find('sus')
+            chord_label = chord_label[:idx] + ':sus' + chord_label[idx+3:]
+        # Default to major for other root-only chords
+        elif any(chord_label.startswith(note) for note in root_notes):
+            # Check if there's a flat or sharp
+            if len(chord_label) > 1 and chord_label[1] in ['b', '#']:
+                if len(chord_label) == 2:  # Just a root note with accidental
+                    chord_label = chord_label + ":maj"
+            else:
+                if len(chord_label) == 1:  # Just a root note
+                    chord_label = chord_label + ":maj"
+
+    return chord_label
+
 def lab_file_error_modify(ref_labels):
     """
     Standardize chord labels to ensure compatibility with mir_eval.
 
     Args:
-        ref_labels: List of chord labels to standardize
+        ref_labels: List of chord labels to standardize or a single chord label
 
     Returns:
-        List of standardized chord labels
+        List of standardized chord labels or a single standardized chord label
     """
-    for i in range(len(ref_labels)):
-        # Skip empty or None labels
-        if not ref_labels[i]:
-            ref_labels[i] = "N"  # Map empty to NO_CHORD
-            continue
+    # Handle single string case
+    if isinstance(ref_labels, str):
+        return standardize_chord_label(ref_labels)
 
-        # Handle special cases but preserve X vs N distinction
-        if ref_labels[i] in ["N", "None", "NC"]:
-            ref_labels[i] = "N"  # NO_CHORD
-            continue
+    # Handle list case
+    standardized_labels = []
+    for label in ref_labels:
+        standardized_labels.append(standardize_chord_label(label))
 
-        if ref_labels[i] in ["X", "Unknown"]:
-            ref_labels[i] = "X"  # UNKNOWN_CHORD - preserve distinction from NO_CHORD
-            continue
-
-        # Fix common format issues
-        if ref_labels[i][-2:] == ':4':
-            ref_labels[i] = ref_labels[i].replace(':4', ':sus4')
-        elif ref_labels[i][-2:] == ':6':
-            ref_labels[i] = ref_labels[i].replace(':6', ':maj6')
-        elif ref_labels[i][-4:] == ':6/2':
-            ref_labels[i] = ref_labels[i].replace(':6/2', ':maj6/2')
-        elif ref_labels[i] == 'Emin/4':
-            ref_labels[i] = 'E:min/4'
-        elif ref_labels[i] == 'A7/3':
-            ref_labels[i] = 'A:7/3'
-        elif ref_labels[i] == 'Bb7/3':
-            ref_labels[i] = 'Bb:7/3'
-        elif ref_labels[i] == 'Bb7/5':
-            ref_labels[i] = 'Bb:7/5'
-
-        # Handle root-only chords (e.g., "C", "G#")
-        root_notes = ["A", "B", "C", "D", "E", "F", "G"]
-        if ref_labels[i] in root_notes or (len(ref_labels[i]) == 2 and ref_labels[i][0] in root_notes and ref_labels[i][1] in ['#', 'b']):
-            ref_labels[i] = ref_labels[i] + ":maj"
-
-        # Handle chords without colon separator
-        elif ref_labels[i].find(':') == -1:
-            # Handle minor chords
-            if ref_labels[i].find('min') != -1:
-                ref_labels[i] = ref_labels[i][:ref_labels[i].find('min')] + ':' + ref_labels[i][ref_labels[i].find('min'):]
-            # Handle dominant 7th chords
-            elif ref_labels[i].find('7') != -1 and ref_labels[i].find('maj7') == -1 and ref_labels[i].find('min7') == -1:
-                ref_labels[i] = ref_labels[i][:ref_labels[i].find('7')] + ':7' + ref_labels[i][ref_labels[i].find('7')+1:]
-            # Handle major 7th chords
-            elif ref_labels[i].find('maj7') != -1:
-                ref_labels[i] = ref_labels[i][:ref_labels[i].find('maj7')] + ':maj7' + ref_labels[i][ref_labels[i].find('maj7')+4:]
-            # Handle minor 7th chords
-            elif ref_labels[i].find('min7') != -1:
-                ref_labels[i] = ref_labels[i][:ref_labels[i].find('min7')] + ':min7' + ref_labels[i][ref_labels[i].find('min7')+4:]
-            # Handle diminished chords
-            elif ref_labels[i].find('dim') != -1:
-                ref_labels[i] = ref_labels[i][:ref_labels[i].find('dim')] + ':dim' + ref_labels[i][ref_labels[i].find('dim')+3:]
-            # Handle augmented chords
-            elif ref_labels[i].find('aug') != -1:
-                ref_labels[i] = ref_labels[i][:ref_labels[i].find('aug')] + ':aug' + ref_labels[i][ref_labels[i].find('aug')+3:]
-            # Handle sus chords
-            elif ref_labels[i].find('sus') != -1:
-                ref_labels[i] = ref_labels[i][:ref_labels[i].find('sus')] + ':sus' + ref_labels[i][ref_labels[i].find('sus')+3:]
-            # Default to major for other root-only chords
-            elif any(ref_labels[i].startswith(note) for note in root_notes):
-                # Check if there's a flat or sharp
-                if len(ref_labels[i]) > 1 and ref_labels[i][1] in ['b', '#']:
-                    if len(ref_labels[i]) == 2:  # Just a root note with accidental
-                        ref_labels[i] = ref_labels[i] + ":maj"
-                else:
-                    if len(ref_labels[i]) == 1:  # Just a root note
-                        ref_labels[i] = ref_labels[i] + ":maj"
-
-    return ref_labels
+    return standardized_labels
 
 def extract_chord_quality(chord):
     """

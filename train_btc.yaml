@@ -219,7 +219,7 @@ spec:
             - name: LAZY_INIT
               value: "false" # Controls dataset lazy initialization
             - name: SMALL_DATASET
-              value: "0.1"   # Set percentage of dataset to use (0.1 = 10%, null = full)
+              value: "0.4"   # Set percentage of dataset to use (0.1 = 10%, null = full)
             - name: METADATA_CACHE
               value: "false" # Use metadata-only caching
           command:
