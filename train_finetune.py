@@ -1158,6 +1158,57 @@ def main():
 
                             # Get the reference labels
                             reference_labels = sample.get('chord_label', [])
+
+                            # If reference_labels is empty, try to load them from the label file
+                            if not reference_labels:
+                                label_path = sample.get('label_path')
+                                if label_path and os.path.exists(label_path):
+                                    logger.info(f"Attempting to load reference labels from {label_path}")
+                                    try:
+                                        # Use the mir_eval module to load the labels
+                                        from mir_eval.io import load_labeled_intervals
+                                        from modules.utils.mir_eval_modules import lab_file_error_modify
+
+                                        # Load the intervals and labels
+                                        ref_intervals, ref_labels = load_labeled_intervals(label_path)
+                                        ref_labels = lab_file_error_modify(ref_labels)
+
+                                        if ref_labels:
+                                            logger.info(f"Successfully loaded {len(ref_labels)} reference labels from {label_path}")
+
+                                            # Check if we need to convert to frame-level representation
+                                            # If feature is available, we can convert to frame-level
+                                            feature = sample.get('feature')
+                                            if feature is not None:
+                                                # Get frame rate from config or use default
+                                                frame_duration = config.feature.get('hop_duration', 0.1)
+                                                feature_per_second = 1.0 / frame_duration
+
+                                                # Convert intervals to timestamps
+                                                timestamps = [(start, end) for start, end in ref_intervals]
+
+                                                # Import the function to convert to frame-level
+                                                from modules.data.LabeledDataset import LabeledDataset
+
+                                                # Create a temporary dataset object to use its methods
+                                                temp_dataset = LabeledDataset(feature_config=config)
+
+                                                # Convert to frame-level
+                                                num_frames = feature.shape[0] if hasattr(feature, 'shape') else len(feature)
+                                                frame_level_chords = temp_dataset._chord_labels_to_frames(
+                                                    ref_labels, timestamps, num_frames, feature_per_second)
+
+                                                logger.info(f"Converted {len(ref_labels)} chord labels to {len(frame_level_chords)} frame-level labels")
+                                                reference_labels = frame_level_chords
+                                            else:
+                                                # If no feature, just use the chord labels as is
+                                                reference_labels = ref_labels
+                                        else:
+                                            logger.warning(f"No valid labels found in {label_path}")
+                                    except Exception as e:
+                                        logger.warning(f"Error loading reference labels from {label_path}: {e}")
+
+                            # If still no reference labels, skip this sample
                             if not reference_labels:
                                 logger.warning(f"Skipping sample {sample.get('song_id', 'unknown')}: missing reference labels")
                                 continue
@@ -1355,8 +1406,47 @@ def main():
                 x_count_pred = sum(1 for label in all_prediction_labels if label == 'X')
 
                 logger.info(f"\nChord label statistics:")
-                logger.info(f"Reference labels: {len(all_reference_labels)} total, {n_count_ref} 'N' ({n_count_ref/len(all_reference_labels)*100:.1f}%), {x_count_ref} 'X' ({x_count_ref/len(all_reference_labels)*100:.1f}%)")
-                logger.info(f"Predicted labels: {len(all_prediction_labels)} total, {n_count_pred} 'N' ({n_count_pred/len(all_prediction_labels)*100:.1f}%), {x_count_pred} 'X' ({x_count_pred/len(all_prediction_labels)*100:.1f}%)")
+
+                # Check if we have any reference labels to avoid division by zero
+                if all_reference_labels:
+                    logger.info(f"Reference labels: {len(all_reference_labels)} total, {n_count_ref} 'N' ({n_count_ref/len(all_reference_labels)*100:.1f}%), {x_count_ref} 'X' ({x_count_ref/len(all_reference_labels)*100:.1f}%)")
+                else:
+                    logger.warning("No reference labels were collected during evaluation!")
+                    # Debug information to help diagnose the issue
+                    logger.warning("This could be due to:")
+                    logger.warning("1. Label files not found at the expected paths")
+                    logger.warning("2. Label files exist but couldn't be parsed correctly")
+                    logger.warning("3. All samples were skipped due to other errors")
+
+                    # Check if test samples exist
+                    if test_samples:
+                        # Log information about the first few test samples to help diagnose
+                        logger.warning(f"Test samples exist ({len(test_samples)} samples), but no labels were processed.")
+                        for i, sample in enumerate(test_samples[:3]):
+                            logger.warning(f"Sample {i+1} info:")
+                            logger.warning(f"  song_id: {sample.get('song_id', 'unknown')}")
+                            logger.warning(f"  audio_path: {sample.get('audio_path', 'unknown')}")
+                            logger.warning(f"  label_path: {sample.get('label_path', 'unknown')}")
+
+                            # Check if the label file exists
+                            label_path = sample.get('label_path')
+                            if label_path and os.path.exists(label_path):
+                                logger.warning(f"  Label file exists at: {label_path}")
+                                # Try to read the first few lines of the label file
+                                try:
+                                    with open(label_path, 'r', encoding='utf-8', errors='replace') as f:
+                                        first_lines = [line.strip() for line in f.readlines()[:5]]
+                                    logger.warning(f"  First few lines of label file: {first_lines}")
+                                except Exception as e:
+                                    logger.warning(f"  Error reading label file: {e}")
+                            else:
+                                logger.warning(f"  Label file does not exist at: {label_path}")
+
+                # Check if we have any prediction labels to avoid division by zero
+                if all_prediction_labels:
+                    logger.info(f"Predicted labels: {len(all_prediction_labels)} total, {n_count_pred} 'N' ({n_count_pred/len(all_prediction_labels)*100:.1f}%), {x_count_pred} 'X' ({x_count_pred/len(all_prediction_labels)*100:.1f}%)")
+                else:
+                    logger.warning("No prediction labels were collected during evaluation!")
 
             # Save MIR-eval metrics
             try:
