@@ -1149,20 +1149,35 @@ def main():
                         try:
                             # Get the feature and label data
                             feature = sample.get('feature')
+                            song_id = sample.get('song_id', 'unknown')
+
                             if feature is None:
                                 # If feature is not cached, load it from the audio file
                                 audio_path = sample.get('audio_path')
                                 if audio_path and os.path.exists(audio_path):
-                                    from modules.utils.mir_eval_modules import audio_file_to_features
-                                    feature, _, _ = audio_file_to_features(audio_path, config)
-                                    feature = feature.T  # Transpose to [time, features]
+                                    try:
+                                        from modules.utils.mir_eval_modules import audio_file_to_features
+                                        logger.info(f"Loading features from audio file: {audio_path}")
+                                        feature, _, _ = audio_file_to_features(audio_path, config)
+
+                                        # Check if feature was loaded successfully
+                                        if feature is None:
+                                            logger.warning(f"Failed to load features from audio file: {audio_path}")
+                                            continue
+
+                                        # Transpose to [time, features]
+                                        feature = feature.T
+                                        logger.info(f"Successfully loaded features with shape: {feature.shape}")
+                                    except Exception as audio_error:
+                                        logger.warning(f"Error loading features from audio file {audio_path}: {audio_error}")
+                                        logger.warning(traceback.format_exc())
+                                        continue
                                 else:
-                                    logger.warning(f"Skipping sample {sample.get('song_id', 'unknown')}: missing feature and audio")
+                                    logger.warning(f"Skipping sample {song_id}: missing feature and audio")
                                     continue
 
                             # Get the reference labels
                             reference_labels = sample.get('chord_label', [])
-                            song_id = sample.get('song_id', 'unknown')
 
                             # Skip if we've already tried to process this sample
                             sample_key = f"{song_id}_{sample.get('start_frame', 0)}"
@@ -1387,6 +1402,11 @@ def main():
                                 logger.warning(f"Skipping sample {song_id}: missing reference labels")
                                 continue
 
+                            # Check if feature is None
+                            if feature is None:
+                                logger.warning(f"Skipping sample {song_id}: feature is None after loading")
+                                continue
+
                             # Normalize the feature
                             if isinstance(mean, torch.Tensor):
                                 mean_np = mean.cpu().numpy()
@@ -1398,10 +1418,23 @@ def main():
                             else:
                                 std_np = std
 
-                            feature_norm = (feature - mean_np) / std_np
+                            try:
+                                # Check feature type and shape
+                                logger.debug(f"Feature type: {type(feature)}, shape: {feature.shape if hasattr(feature, 'shape') else 'no shape'}")
+                                logger.debug(f"Mean type: {type(mean_np)}, shape: {mean_np.shape if hasattr(mean_np, 'shape') else 'no shape'}")
+                                logger.debug(f"Std type: {type(std_np)}, shape: {std_np.shape if hasattr(std_np, 'shape') else 'no shape'}")
 
-                            # Convert to tensor and move to device
-                            feature_tensor = torch.tensor(feature_norm, dtype=torch.float32).unsqueeze(0).to(device)
+                                # Normalize the feature
+                                feature_norm = (feature - mean_np) / std_np
+
+                                # Convert to tensor and move to device
+                                feature_tensor = torch.tensor(feature_norm, dtype=torch.float32).unsqueeze(0).to(device)
+                            except Exception as norm_error:
+                                logger.warning(f"Error normalizing feature for sample {song_id}: {norm_error}")
+                                logger.warning(f"Feature shape: {feature.shape if hasattr(feature, 'shape') else 'unknown'}")
+                                logger.warning(f"Mean shape: {mean_np.shape if hasattr(mean_np, 'shape') else 'unknown'}")
+                                logger.warning(f"Std shape: {std_np.shape if hasattr(std_np, 'shape') else 'unknown'}")
+                                continue
 
                             # Get model predictions
                             model.eval()
