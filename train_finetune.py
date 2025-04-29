@@ -633,19 +633,21 @@ def main():
     logger.info(f"Using model type: {model_type}")
 
     # Check for BTC checkpoint if model_type is BTC
-    if model_type == 'BTC' and args.btc_checkpoint:
-        logger.info(f"\n=== Loading BTC model from {args.btc_checkpoint} ===")
-        pretrained_path = args.btc_checkpoint
-    elif args.pretrained:
-        # Use the standard pretrained path
-        pretrained_path = args.pretrained
-        logger.info(f"\n=== Loading pretrained model from {pretrained_path} ===")
-    else:
-        # No pretrained model specified
-        if model_type == 'BTC':
-            logger.error("No BTC checkpoint specified. Please provide --btc_checkpoint")
+    if model_type == 'BTC':
+        if args.btc_checkpoint:
+            logger.info(f"\n=== Loading BTC model from {args.btc_checkpoint} ===")
+            pretrained_path = args.btc_checkpoint
         else:
-            logger.error("No pretrained model specified. Please provide --pretrained for ChordNet model")
+            # For BTC model, we can proceed without a checkpoint (will initialize a fresh model)
+            logger.info("\n=== No BTC checkpoint specified, will initialize a fresh BTC model ===")
+            pretrained_path = None
+    elif args.pretrained:
+        # Use the standard pretrained path for ChordNet
+        pretrained_path = args.pretrained
+        logger.info(f"\n=== Loading ChordNet model from {pretrained_path} ===")
+    else:
+        # No pretrained model specified for ChordNet
+        logger.error("No pretrained model specified. Please provide --pretrained for ChordNet model")
         return
 
     try:
@@ -719,32 +721,47 @@ def main():
         model.idx_to_chord = master_mapping
         logger.info("Attached chord mapping to model for correct MIR evaluation")
 
-        # Load pretrained weights
-        checkpoint = torch.load(args.pretrained, map_location=device)
+        # Load pretrained weights if available
+        if pretrained_path:
+            try:
+                checkpoint = torch.load(pretrained_path, map_location=device)
 
-        # Check if the checkpoint contains model dimensions info
-        if 'n_classes' in checkpoint:
-            pretrained_classes = checkpoint['n_classes']
-            logger.info(f"Pretrained model has {pretrained_classes} output classes")
+                # Check if the checkpoint contains model dimensions info
+                if 'n_classes' in checkpoint:
+                    pretrained_classes = checkpoint['n_classes']
+                    logger.info(f"Pretrained model has {pretrained_classes} output classes")
 
-            # Warn if there's a mismatch
-            if pretrained_classes != n_classes:
-                logger.warning(f"Mismatch in class count: pretrained={pretrained_classes}, current={n_classes}")
+                    # Warn if there's a mismatch
+                    if pretrained_classes != n_classes:
+                        logger.warning(f"Mismatch in class count: pretrained={pretrained_classes}, current={n_classes}")
 
-                if not args.partial_loading:
-                    logger.warning("Loading may fail. Use --partial_loading to attempt partial weights loading.")
+                        if not args.partial_loading:
+                            logger.warning("Loading may fail. Use --partial_loading to attempt partial weights loading.")
 
-        # Extract the state dict
-        if 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        elif 'model' in checkpoint:
-            state_dict = checkpoint['model']
+                # Extract the state dict
+                if 'model_state_dict' in checkpoint:
+                    state_dict = checkpoint['model_state_dict']
+                elif 'model' in checkpoint:
+                    state_dict = checkpoint['model']
+                else:
+                    state_dict = checkpoint
+
+                # Load weights with partial loading option
+                model.load_state_dict(state_dict, strict=not args.partial_loading)
+                logger.info("Successfully loaded pretrained weights")
+            except Exception as e:
+                logger.error(f"Error loading pretrained model from {pretrained_path}: {e}")
+                if model_type == 'BTC':
+                    logger.info("Continuing with freshly initialized BTC model")
+                else:
+                    logger.error("Cannot continue without pretrained weights for ChordNet model")
+                    return
         else:
-            state_dict = checkpoint
-
-        # Load weights with partial loading option
-        model.load_state_dict(state_dict, strict=not args.partial_loading)
-        logger.info("Successfully loaded pretrained weights")
+            if model_type == 'BTC':
+                logger.info("No pretrained weights provided. Using freshly initialized BTC model.")
+            else:
+                logger.error("Cannot continue without pretrained weights for ChordNet model")
+                return
 
         # Freeze feature extraction layers if requested
         if args.freeze_feature_extractor:
