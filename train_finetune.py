@@ -1131,6 +1131,10 @@ def main():
                 # Process each test sample
                 logger.info(f"Evaluating {dataset_length} test samples...")
 
+                # Reset the processed samples tracking for each evaluation run
+                if hasattr(evaluate_batch, 'processed_samples'):
+                    evaluate_batch.processed_samples = set()
+
                 # Create a function to process a batch of samples and return their scores
                 def evaluate_batch(samples):
                     batch_scores = {
@@ -1158,12 +1162,111 @@ def main():
 
                             # Get the reference labels
                             reference_labels = sample.get('chord_label', [])
+                            song_id = sample.get('song_id', 'unknown')
 
-                            # If reference_labels is empty, try to load them from the label file
+                            # Track processed samples to avoid duplicates
+                            if not hasattr(evaluate_batch, 'processed_samples'):
+                                evaluate_batch.processed_samples = set()
+
+                            # Skip if we've already tried to process this sample
+                            sample_key = f"{song_id}_{sample.get('start_frame', 0)}"
+                            if sample_key in evaluate_batch.processed_samples:
+                                logger.debug(f"Already attempted to process sample {song_id}, skipping duplicate")
+                                continue
+
+                            # Mark as processed
+                            evaluate_batch.processed_samples.add(sample_key)
+
+                            # If reference_labels is empty, try multiple approaches to load them
                             if not reference_labels:
+                                # Get the label path from the sample
                                 label_path = sample.get('label_path')
+
+                                # Try alternative paths if the primary path is missing or doesn't exist
+                                if not label_path or not os.path.exists(label_path):
+                                    # Try to construct alternative paths
+                                    audio_path = sample.get('audio_path', '')
+                                    if audio_path:
+                                        # Extract the base name without extension
+                                        audio_basename = os.path.splitext(os.path.basename(audio_path))[0]
+
+                                        # Log the audio basename for debugging
+                                        logger.info(f"Looking for label files for audio: {audio_basename}")
+
+                                        # Try to find label files in standard locations
+                                        potential_paths = []
+
+                                        # Check if we're in a standard directory structure
+                                        for label_dir in ['/mnt/storage/data/LabeledDataset/Labels/billboardLabels',
+                                                         '/mnt/storage/data/LabeledDataset/Labels/caroleKingLabels',
+                                                         '/mnt/storage/data/LabeledDataset/Labels/queenLabels',
+                                                         '/mnt/storage/data/LabeledDataset/Labels/theBeatlesLabels']:
+                                            # Check if the directory exists
+                                            if not os.path.exists(label_dir):
+                                                logger.info(f"Label directory does not exist: {label_dir}")
+                                                continue
+
+                                            # Try with .lab extension
+                                            lab_path = os.path.join(label_dir, f"{audio_basename}.lab")
+                                            if os.path.exists(lab_path):
+                                                potential_paths.append(lab_path)
+                                                logger.info(f"Found label file: {lab_path}")
+
+                                            # Try with .txt extension
+                                            txt_path = os.path.join(label_dir, f"{audio_basename}.txt")
+                                            if os.path.exists(txt_path):
+                                                potential_paths.append(txt_path)
+                                                logger.info(f"Found label file: {txt_path}")
+
+                                            # Try with different naming conventions
+                                            # Sometimes files have different naming patterns
+                                            for ext in ['.lab', '.txt']:
+                                                # Try with underscores instead of hyphens
+                                                alt_basename = audio_basename.replace('-', '_')
+                                                alt_path = os.path.join(label_dir, f"{alt_basename}{ext}")
+                                                if os.path.exists(alt_path):
+                                                    potential_paths.append(alt_path)
+                                                    logger.info(f"Found label file with alternate naming: {alt_path}")
+
+                                                # Try with hyphens instead of underscores
+                                                alt_basename = audio_basename.replace('_', '-')
+                                                alt_path = os.path.join(label_dir, f"{alt_basename}{ext}")
+                                                if os.path.exists(alt_path):
+                                                    potential_paths.append(alt_path)
+                                                    logger.info(f"Found label file with alternate naming: {alt_path}")
+
+                                            # Try searching in subdirectories (limit depth to avoid excessive searching)
+                                            for root, _, files in os.walk(label_dir, topdown=True, followlinks=False):
+                                                # Skip if we're too deep in the directory structure
+                                                rel_path = os.path.relpath(root, label_dir)
+                                                if rel_path.count(os.sep) > 2:  # Limit depth
+                                                    continue
+
+                                                for file in files:
+                                                    if (file.startswith(audio_basename) or
+                                                        audio_basename.lower() in file.lower()) and (
+                                                        file.endswith('.lab') or file.endswith('.txt')):
+                                                        potential_paths.append(os.path.join(root, file))
+                                                        logger.info(f"Found label file in subdirectory: {os.path.join(root, file)}")
+
+                                        if potential_paths:
+                                            logger.info(f"Found {len(potential_paths)} potential label files for {audio_basename}")
+                                            # Use the first one
+                                            label_path = potential_paths[0]
+                                            logger.info(f"Using alternative label path: {label_path}")
+
+                                # Try to load labels if we have a valid path
                                 if label_path and os.path.exists(label_path):
                                     logger.info(f"Attempting to load reference labels from {label_path}")
+
+                                    # Print the first few lines of the file for debugging
+                                    try:
+                                        with open(label_path, 'r', encoding='utf-8', errors='replace') as f:
+                                            first_lines = [line.strip() for line in f.readlines()[:5]]
+                                        logger.info(f"First few lines of label file: {first_lines}")
+                                    except Exception as e:
+                                        logger.warning(f"Error reading label file for debugging: {e}")
+
                                     try:
                                         # Use the mir_eval module to load the labels
                                         from mir_eval.io import load_labeled_intervals
@@ -1205,12 +1308,87 @@ def main():
                                                 reference_labels = ref_labels
                                         else:
                                             logger.warning(f"No valid labels found in {label_path}")
+
+                                            # Try a more direct approach as fallback
+                                            try:
+                                                logger.info("Trying direct file parsing as fallback")
+                                                with open(label_path, 'r', encoding='utf-8', errors='replace') as f:
+                                                    lines = f.readlines()
+
+                                                # Parse lines directly
+                                                parsed_labels = []
+                                                for line in lines:
+                                                    parts = line.strip().split()
+                                                    if len(parts) >= 3:
+                                                        # Extract the chord label (third column)
+                                                        chord_label = parts[2]
+                                                        parsed_labels.append(chord_label)
+
+                                                if parsed_labels:
+                                                    logger.info(f"Successfully parsed {len(parsed_labels)} labels directly from file")
+                                                    reference_labels = parsed_labels
+                                            except Exception as direct_error:
+                                                logger.warning(f"Direct parsing also failed: {direct_error}")
                                     except Exception as e:
                                         logger.warning(f"Error loading reference labels from {label_path}: {e}")
 
+                                        # Try a more direct approach as fallback
+                                        try:
+                                            logger.info("Trying direct file parsing as fallback after exception")
+                                            with open(label_path, 'r', encoding='utf-8', errors='replace') as f:
+                                                lines = f.readlines()
+
+                                            # Parse lines directly
+                                            parsed_labels = []
+                                            parsed_intervals = []
+                                            for line in lines:
+                                                parts = line.strip().split()
+                                                if len(parts) >= 3:
+                                                    # Extract start time, end time, and chord label
+                                                    start_time = float(parts[0])
+                                                    end_time = float(parts[1])
+                                                    chord_label = parts[2]
+
+                                                    parsed_labels.append(chord_label)
+                                                    parsed_intervals.append((start_time, end_time))
+
+                                            if parsed_labels:
+                                                logger.info(f"Successfully parsed {len(parsed_labels)} labels directly from file")
+
+                                                # Try to convert to frame-level if possible
+                                                feature = sample.get('feature')
+                                                if feature is not None:
+                                                    # Get frame rate from config or use default
+                                                    frame_duration = config.feature.get('hop_duration', 0.1)
+                                                    feature_per_second = 1.0 / frame_duration
+
+                                                    # Import the function to convert to frame-level
+                                                    from modules.data.LabeledDataset import LabeledDataset
+
+                                                    # Create a temporary dataset object to use its methods
+                                                    temp_dataset = LabeledDataset(feature_config=config)
+
+                                                    # Convert to frame-level
+                                                    num_frames = feature.shape[0] if hasattr(feature, 'shape') else len(feature)
+                                                    frame_level_chords = temp_dataset._chord_labels_to_frames(
+                                                        parsed_labels, parsed_intervals, num_frames, feature_per_second)
+
+                                                    logger.info(f"Converted {len(parsed_labels)} chord labels to {len(frame_level_chords)} frame-level labels")
+                                                    reference_labels = frame_level_chords
+                                                else:
+                                                    # If no feature, just use the chord labels as is
+                                                    reference_labels = parsed_labels
+                                        except Exception as direct_error:
+                                            logger.warning(f"Direct parsing also failed: {direct_error}")
+                                else:
+                                    if label_path:
+                                        logger.warning(f"Label file does not exist: {label_path}")
+                                    else:
+                                        logger.warning(f"No label path available for sample {song_id}")
+
                             # If still no reference labels, skip this sample
                             if not reference_labels:
-                                logger.warning(f"Skipping sample {sample.get('song_id', 'unknown')}: missing reference labels")
+                                logger.warning(f"Skipping sample {song_id}: missing reference labels")
                                 continue
 
                             # Normalize the feature

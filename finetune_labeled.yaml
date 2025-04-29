@@ -251,7 +251,7 @@ spec:
               value: "false"  # Set to "true" to preprocess and generate features
             # Small dataset percentage for quick testing
             - name: SMALL_DATASET
-              value: "0.1"  # Set to a value like "0.1" to use only 10% of the dataset
+              value: "0.4"  # Set to a value like "0.1" to use only 10% of the dataset
           command:
             - sh
             - -c
