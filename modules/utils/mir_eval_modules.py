@@ -1011,26 +1011,21 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                         # Already an integer or other hashable type
                         pred_chords.append(idx_to_chord.get(pred, "N"))
 
-                # Standardize chord labels for consistent evaluation with validation
-                # standardized_refs = [lab_file_error_modify(ref) for ref in reference_labels]
-                # standardized_preds = [lab_file_error_modify(pred) for pred in pred_chords]
-                standardized_refs = reference_labels
-                standardized_preds = pred_chords
 
                 # Collect raw chord label lists for individual chord accuracy
-                collected_refs.extend(standardized_refs)
-                collected_preds.extend(standardized_preds)
+                collected_refs.extend(reference_labels)
+                collected_preds.extend(pred_chords)
 
                 # Debug first few predicted chords to verify format (only for the first song)
                 if i == 0 and not hasattr(large_voca_score_calculation, '_first_chords_logged'):
-                    print(f"First 5 predicted chords: {standardized_preds[:5]}")
-                    print(f"First 5 reference chords: {standardized_refs[:5]}")
+                    print(f"First 5 predicted chords: {pred_chords[:5]}")
+                    print(f"First 5 reference chords: {reference_labels[:5]}")
                     large_voca_score_calculation._first_chords_logged = True
 
                 # Calculate scores using the refactored function
                 # durations = np.diff(np.append(timestamps, [timestamps[-1] + frame_duration])) # Duration calculation moved inside calculate_chord_scores
                 root_score, thirds_score, triads_score, sevenths_score, tetrads_score, majmin_score, mirex_score = calculate_chord_scores(
-                    timestamps, frame_duration, standardized_refs, standardized_preds) # Pass frame_duration instead of pre-calculated durations
+                    timestamps, frame_duration, reference_labels, pred_chords) # Pass frame_duration instead of pre-calculated durations
 
                 # Store scores
                 score_list_dict['root'].append(root_score)

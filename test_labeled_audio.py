@@ -353,26 +353,11 @@ def custom_calculate_chord_scores(timestamps, durations, reference_labels, predi
     est_intervals[:, 0] = timestamps
     est_intervals[:, 1] = timestamps + durations
 
-    # Standardize labels before evaluation (using the function from mir_eval_modules)
-    # try:
-    #     from modules.utils.mir_eval_modules import lab_file_error_modify
-    #     standardized_refs = [lab_file_error_modify(ref) for ref in reference_labels]
-    #     standardized_preds = [lab_file_error_modify(pred) for pred in prediction_labels]
-    # except ImportError:
-    #     logger.warning("Could not import lab_file_error_modify. Using raw labels.")
-    standardized_refs = reference_labels
-    standardized_preds = prediction_labels
-    # except Exception as e:
-    #      logger.error(f"Error standardizing labels: {e}. Using raw labels.")
-    #      standardized_refs = reference_labels
-    #      standardized_preds = prediction_labels
-
-
-    # Use mir_eval.chord.evaluate for robust calculation
+    # why standardize here result in worse results?
     scores = {}
     try:
         # mir_eval.chord.evaluate handles merging, weighting, and calculates all metrics
-        scores = mir_eval.chord.evaluate(ref_intervals, standardized_refs, est_intervals, standardized_preds)
+        scores = mir_eval.chord.evaluate(ref_intervals, reference_labels, est_intervals, prediction_labels)
 
         # Extract scores safely, defaulting to 0.0 if a metric is missing
         root_score = float(scores.get('root', 0.0))
