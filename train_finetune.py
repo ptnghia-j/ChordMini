@@ -746,6 +746,18 @@ def main():
                 else:
                     state_dict = checkpoint
 
+                # Handle the case where the model was saved with DataParallel or DistributedDataParallel
+                # which adds 'module.' prefix to all keys
+                if model_type == 'BTC' and all(k.startswith('module.') for k in state_dict.keys()):
+                    logger.info("Detected 'module.' prefix in state dict keys. Removing prefix for compatibility.")
+                    # Create a new state dict with the 'module.' prefix removed from all keys
+                    new_state_dict = {}
+                    for k, v in state_dict.items():
+                        # Remove the 'module.' prefix
+                        name = k[7:] if k.startswith('module.') else k
+                        new_state_dict[name] = v
+                    state_dict = new_state_dict
+
                 # Load weights with partial loading option
                 model.load_state_dict(state_dict, strict=not args.partial_loading)
                 logger.info("Successfully loaded pretrained weights")
