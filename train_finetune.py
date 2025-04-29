@@ -156,8 +156,8 @@ def main():
                         help='Random seed (overrides config value)')
     parser.add_argument('--save_dir', type=str, default=None,
                         help='Directory to save checkpoints (overrides config value)')
-    parser.add_argument('--pretrained', type=str, required=True,
-                        help='Path to pretrained model checkpoint')
+    parser.add_argument('--pretrained', type=str, required=False,
+                        help='Path to pretrained model checkpoint (required for ChordNet, optional for BTC)')
     parser.add_argument('--storage_root', type=str, default=None,
                         help='Root directory for data storage (overrides config value)')
     parser.add_argument('--use_warmup', action='store_true',
@@ -636,10 +636,17 @@ def main():
     if model_type == 'BTC' and args.btc_checkpoint:
         logger.info(f"\n=== Loading BTC model from {args.btc_checkpoint} ===")
         pretrained_path = args.btc_checkpoint
-    else:
+    elif args.pretrained:
         # Use the standard pretrained path
         pretrained_path = args.pretrained
         logger.info(f"\n=== Loading pretrained model from {pretrained_path} ===")
+    else:
+        # No pretrained model specified
+        if model_type == 'BTC':
+            logger.error("No BTC checkpoint specified. Please provide --btc_checkpoint")
+        else:
+            logger.error("No pretrained model specified. Please provide --pretrained for ChordNet model")
+        return
 
     try:
         # Get frequency dimension

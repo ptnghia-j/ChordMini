@@ -156,13 +156,13 @@ spec:
               value: "1.0"  # Default scale: 1.0 = base model
             # Model type - ChordNet or BTC
             - name: MODEL_TYPE
-              value: "ChordNet"  # Default model type: ChordNet
+              value: "BTC"  # Default model type: ChordNet
             # BTC model checkpoint path (only used if MODEL_TYPE=BTC)
             - name: BTC_CHECKPOINT
               value: "/mnt/storage/checkpoints/btc/btc_model_best.pth"
             # Learning rate parameters
             - name: LEARNING_RATE
-              value: "0.00001"  # Lower base learning rate for fine-tuning
+              value: "0.00005"  # Lower base learning rate for fine-tuning
             - name: MIN_LEARNING_RATE
               value: "0.000001"  # Minimum learning rate
             # Knowledge distillation settings
@@ -173,9 +173,6 @@ spec:
             # -------------------------------------------------------------------------
             - name: USE_KD_LOSS
               value: "false"  # Set to "true" to enable KD loss
-            # Add explicit note about KD status
-            - name: KD_STATUS_CHECK
-              value: "disabled_explicitly"  # For debugging purposes
             # Teacher model path - if not specified, will try to find btc_model_large_voca.pt
             - name: TEACHER_MODEL
               value: "/mnt/storage/checkpoints/btc/btc_model_large_voca.pt"
@@ -208,7 +205,7 @@ spec:
               value: "4"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
-              value: "0.4"  # Set dropout probability (0-1)
+              value: "0.2"  # Set dropout probability (0-1)
             # Data paths
             - name: DATA_ROOT
               value: "/mnt/storage/data"
@@ -225,7 +222,7 @@ spec:
             - name: EPOCHS
               value: "100"  # Number of fine-tuning epochs
             - name: BATCH_SIZE
-              value: "32"  # Batch size for training
+              value: "64"  # Batch size for training
             # LR schedule
             - name: LR_SCHEDULE
               value: "validation"  # LR schedule type
@@ -254,7 +251,7 @@ spec:
               value: "false"  # Set to "true" to preprocess and generate features
             # Small dataset percentage for quick testing
             - name: SMALL_DATASET
-              value: ""  # Set to a value like "0.1" to use only 10% of the dataset
+              value: "0.1"  # Set to a value like "0.1" to use only 10% of the dataset
           command:
             - sh
             - -c
@@ -374,7 +371,9 @@ spec:
                 SMALL_DATASET_ARG=""
                 if [ "${SMALL_DATASET}" != "" ]; then
                   # Validate that SMALL_DATASET is a number between 0 and 1
-                  if [[ "${SMALL_DATASET}" =~ ^0*([.][0-9]+|1[.]0*|0|1)$ ]]; then
+                  # Use a simpler validation approach compatible with sh
+                  SMALL_DATASET_VALUE=$(echo "${SMALL_DATASET}" | awk '{if ($1 >= 0 && $1 <= 1) print "valid"; else print "invalid"}')
+                  if [ "${SMALL_DATASET_VALUE}" = "valid" ]; then
                     echo "Using only ${SMALL_DATASET} fraction of dataset for quick testing"
                     SMALL_DATASET_ARG="--small_dataset ${SMALL_DATASET}"
                   else
@@ -396,22 +395,43 @@ spec:
                   echo "Using ChordNet model"
                 fi
 
-                python train_finetune.py --config ./config/student_config.yaml \
-                  --pretrained ${PRETRAINED_MODEL} \
-                  --use_voca \
-                  --save_dir ${SAVE_DIR} \
-                  --audio_dirs ${AUDIO_DIRS} \
-                  --label_dirs ${LABEL_DIRS} \
-                  --cache_dir ${CACHE_DIR} \
-                  --learning_rate ${LEARNING_RATE} \
-                  --min_learning_rate ${MIN_LEARNING_RATE} \
-                  --model_scale ${MODEL_SCALE} \
-                  --dropout ${DROPOUT} \
-                  --epochs ${EPOCHS} \
-                  --batch_size ${BATCH_SIZE} \
-                  --lr_schedule ${LR_SCHEDULE} \
-                  --gpu_memory_fraction ${GPU_MEMORY_FRACTION} \
-                  ${MODEL_TYPE_ARGS} ${WARMUP_ARGS} ${KD_ARGS} ${FOCAL_ARGS} ${FREEZE_ARGS} ${CACHE_ARGS} ${SMALL_DATASET_ARG}
+                # Prepare the command with conditional arguments based on model type
+                if [ "${MODEL_TYPE}" = "BTC" ]; then
+                  # For BTC model, we don't need the --pretrained argument
+                  python train_finetune.py --config ./config/student_config.yaml \
+                    --use_voca \
+                    --save_dir ${SAVE_DIR} \
+                    --audio_dirs ${AUDIO_DIRS} \
+                    --label_dirs ${LABEL_DIRS} \
+                    --cache_dir ${CACHE_DIR} \
+                    --learning_rate ${LEARNING_RATE} \
+                    --min_learning_rate ${MIN_LEARNING_RATE} \
+                    --model_scale ${MODEL_SCALE} \
+                    --dropout ${DROPOUT} \
+                    --epochs ${EPOCHS} \
+                    --batch_size ${BATCH_SIZE} \
+                    --lr_schedule ${LR_SCHEDULE} \
+                    --gpu_memory_fraction ${GPU_MEMORY_FRACTION} \
+                    ${MODEL_TYPE_ARGS} ${WARMUP_ARGS} ${KD_ARGS} ${FOCAL_ARGS} ${FREEZE_ARGS} ${CACHE_ARGS} ${SMALL_DATASET_ARG}
+                else
+                  # For ChordNet model, we need the --pretrained argument
+                  python train_finetune.py --config ./config/student_config.yaml \
+                    --pretrained ${PRETRAINED_MODEL} \
+                    --use_voca \
+                    --save_dir ${SAVE_DIR} \
+                    --audio_dirs ${AUDIO_DIRS} \
+                    --label_dirs ${LABEL_DIRS} \
+                    --cache_dir ${CACHE_DIR} \
+                    --learning_rate ${LEARNING_RATE} \
+                    --min_learning_rate ${MIN_LEARNING_RATE} \
+                    --model_scale ${MODEL_SCALE} \
+                    --dropout ${DROPOUT} \
+                    --epochs ${EPOCHS} \
+                    --batch_size ${BATCH_SIZE} \
+                    --lr_schedule ${LR_SCHEDULE} \
+                    --gpu_memory_fraction ${GPU_MEMORY_FRACTION} \
+                    ${MODEL_TYPE_ARGS} ${WARMUP_ARGS} ${KD_ARGS} ${FOCAL_ARGS} ${FREEZE_ARGS} ${CACHE_ARGS} ${SMALL_DATASET_ARG}
+                fi
               fi
 
               echo "=== Training complete ==="
