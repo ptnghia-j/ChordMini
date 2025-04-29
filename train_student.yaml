@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-mini
+  name: chord-full
   namespace: csuf-titans
   labels:
     app: chord-student-training
@@ -175,7 +175,7 @@ spec:
               value: /mnt/storage/ChordMini
             # Model scale - overrides student_config.yaml
             - name: MODEL_SCALE
-              value: "1.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
+              value: "2.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
             # Learning rate scheduling options - overrides student_config.yaml settings
             - name: LR_SCHEDULE
               value: "cosine"  # Changed from empty string to 'validation'
@@ -230,7 +230,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
             - name: SUB_DIR
-              value: "student-fma"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
+              value: "student-full"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
@@ -430,39 +430,50 @@ spec:
                 CACHE_ARGS="${CACHE_ARGS} --cache_fraction ${CACHE_FRACTION}"
               fi
 
-              # Handle KD paths when KD is enabled with more flexible configuration
+              # Handle data paths regardless of KD setting
+              DATA_ARGS=""
+              if [ -d "${DATA_ROOT}/logits/synth" ]; then
+                echo "Using data from: ${DATA_ROOT}/logits/synth"
+
+                # Define paths based on directory structure
+                if [ -d "${DATA_ROOT}/logits/synth/spectrograms" ] && [ -d "${DATA_ROOT}/logits/synth/labels" ] && [ -d "${DATA_ROOT}/logits/synth/logits" ]; then
+                  # Standard structure with separate directories
+                  echo "Found complete directory structure with spectrograms, labels, and logits"
+                  DATA_ARGS="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms --label_dir ${DATA_ROOT}/logits/synth/labels"
+                  echo "Using spectrograms and labels from the logits directory"
+                else
+                  # All files might be in the root directory
+                  DATA_ARGS="--spec_dir ${DATA_ROOT}/logits/synth --label_dir ${DATA_ROOT}/logits/synth"
+                  echo "Using flat directory structure"
+                fi
+
+                # Log the actual paths being used
+                echo "Data path arguments: ${DATA_ARGS}"
+              else
+                echo "WARNING: Data directory does not exist: ${DATA_ROOT}/logits/synth"
+                echo "Attempting to use default paths"
+              fi
+
+              # Handle KD paths when KD is enabled
+              KD_ARGS=""
               if [ "${USE_KD_LOSS}" = "true" ]; then
                 echo "Knowledge distillation enabled - using teacher logits"
 
                 # Check if KD_DATA_ROOT exists
-                if [ -d "${DATA_ROOT}/logits/synth" ]; then
-                  echo "Using KD data from: ${DATA_ROOT}/logits/synth"
-
-                  # Define paths based on directory structure
-                  if [ -d "${DATA_ROOT}/logits/synth/spectrograms" ] && [ -d "${DATA_ROOT}/logits/synth/labels" ] && [ -d "${DATA_ROOT}/logits/synth/logits" ]; then
-                    # Standard structure with separate directories
-                    # MODIFIED: Always use the logits directory for KD if it has the proper structure
-                    echo "Found complete KD directory structure with spectrograms, labels, and logits"
-                    KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth/spectrograms --label_dir ${DATA_ROOT}/logits/synth/labels --logits_dir ${DATA_ROOT}/logits/synth/logits"
-                    echo "Using spectrograms, labels, and logits from the logits directory"
-                  else
-                    # All files might be in the root directory
-                    KD_ARGS="--spec_dir ${DATA_ROOT}/logits/synth --label_dir ${DATA_ROOT}/logits/synth --logits_dir ${DATA_ROOT}/logits/synth"
-                    echo "Using flat KD directory structure"
-                  fi
-
-                  # Log the actual paths being used
-                  echo "KD arguments: ${KD_ARGS}"
+                if [ -d "${DATA_ROOT}/logits/synth/logits" ]; then
+                  echo "Using KD logits from: ${DATA_ROOT}/logits/synth/logits"
+                  KD_ARGS="--logits_dir ${DATA_ROOT}/logits/synth/logits"
                 else
-                  echo "WARNING: KD_DATA_ROOT does not exist: ${DATA_ROOT}/logits/synth"
+                  echo "WARNING: Logits directory does not exist: ${DATA_ROOT}/logits/synth/logits"
                   echo "Attempting to use default paths"
                   KD_ARGS="--logits_dir /mnt/storage/data/logits/synth/logits"
 
                   # Create parent directories to avoid errors later
                   mkdir -p "/mnt/storage/data/logits/synth/logits"
                 fi
-              else
-                KD_ARGS=""
+
+                # Log the actual paths being used
+                echo "KD arguments: ${KD_ARGS}"
               fi
 
               # GPU acceleration options
@@ -566,7 +577,7 @@ spec:
               # Run the student training script with all options (without --best_model_dir flag)
               echo "Starting student training with GPU optimization and all options..."
               python train_student.py $DATASET_ARG --config ./config/student_config.yaml --save_dir ${CHECKPOINTS_DIR}/${SUB_DIR} \
-                ${LR_SCHEDULE_ARG} ${WARMUP_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} \
+                ${LR_SCHEDULE_ARG} ${WARMUP_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${DATA_ARGS} ${KD_ARGS} \
                 ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS}
 
               echo "=== Student model training complete ==="

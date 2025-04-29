@@ -1023,9 +1023,9 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                     large_voca_score_calculation._first_chords_logged = True
 
                 # Calculate scores using the refactored function
-                # durations = np.diff(np.append(timestamps, [timestamps[-1] + frame_duration])) # Duration calculation moved inside calculate_chord_scores
+                # Use the durations we already calculated earlier
                 root_score, thirds_score, triads_score, sevenths_score, tetrads_score, majmin_score, mirex_score = calculate_chord_scores(
-                    timestamps, frame_duration, reference_labels, pred_chords) # Pass frame_duration instead of pre-calculated durations
+                    timestamps, frame_duration, reference_labels, pred_chords) # frame_duration is used to calculate durations inside the function
 
                 # Store scores
                 score_list_dict['root'].append(root_score)
@@ -1154,7 +1154,7 @@ def calculate_chord_scores(timestamps, frame_duration, reference_labels, predict
 
     Args:
         timestamps: Array of frame start timestamps.
-        frame_duration: Duration of a single frame.
+        frame_duration: Duration of a single frame (used to calculate the end of the last frame).
         reference_labels: List of reference chord labels (already standardized).
         prediction_labels: List of predicted chord labels (already standardized).
 
@@ -1175,14 +1175,17 @@ def calculate_chord_scores(timestamps, frame_duration, reference_labels, predict
     reference_labels = reference_labels[:min_len]
     prediction_labels = prediction_labels[:min_len]
 
-    # Create intervals for mir_eval from timestamps and frame_duration
+    # Calculate durations from timestamps (same approach as test_labeled_audio.py)
+    durations = np.diff(np.append(timestamps, [timestamps[-1] + frame_duration]))
+
+    # Create intervals using variable durations to avoid overlaps
     ref_intervals = np.zeros((min_len, 2))
     ref_intervals[:, 0] = timestamps
-    ref_intervals[:, 1] = timestamps + frame_duration
+    ref_intervals[:, 1] = timestamps + durations
 
     est_intervals = np.zeros((min_len, 2))
     est_intervals[:, 0] = timestamps
-    est_intervals[:, 1] = timestamps + frame_duration
+    est_intervals[:, 1] = timestamps + durations
 
     # Use mir_eval.chord.evaluate for robust calculation
     scores = {}
