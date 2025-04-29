@@ -1131,12 +1131,12 @@ def main():
                 # Process each test sample
                 logger.info(f"Evaluating {dataset_length} test samples...")
 
-                # Reset the processed samples tracking for each evaluation run
-                if hasattr(evaluate_batch, 'processed_samples'):
-                    evaluate_batch.processed_samples = set()
-
                 # Create a function to process a batch of samples and return their scores
                 def evaluate_batch(samples):
+                    # Initialize processed samples tracking for this evaluation run
+                    if not hasattr(evaluate_batch, 'processed_samples'):
+                        evaluate_batch.processed_samples = set()
+
                     batch_scores = {
                         'root': [], 'thirds': [], 'triads': [], 'sevenths': [],
                         'tetrads': [], 'majmin': [], 'mirex': []
@@ -1163,10 +1163,6 @@ def main():
                             # Get the reference labels
                             reference_labels = sample.get('chord_label', [])
                             song_id = sample.get('song_id', 'unknown')
-
-                            # Track processed samples to avoid duplicates
-                            if not hasattr(evaluate_batch, 'processed_samples'):
-                                evaluate_batch.processed_samples = set()
 
                             # Skip if we've already tried to process this sample
                             sample_key = f"{song_id}_{sample.get('start_frame', 0)}"

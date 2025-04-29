@@ -162,9 +162,9 @@ spec:
               value: "/mnt/storage/checkpoints/btc/btc_model_best.pth"
             # Learning rate parameters
             - name: LEARNING_RATE
-              value: "0.00005"  # Lower base learning rate for fine-tuning
+              value: "0.00001"  # Lower base learning rate for fine-tuning
             - name: MIN_LEARNING_RATE
-              value: "0.000001"  # Minimum learning rate
+              value: "0.0000001"  # Minimum learning rate
             # Knowledge distillation settings
             # -------------------------------------------------------------------------
             # Knowledge Distillation (KD) allows the model to learn from a teacher model
@@ -251,7 +251,7 @@ spec:
               value: "false"  # Set to "true" to preprocess and generate features
             # Small dataset percentage for quick testing
             - name: SMALL_DATASET
-              value: "0.4"  # Set to a value like "0.1" to use only 10% of the dataset
+              value: "0.3"  # Set to a value like "0.1" to use only 10% of the dataset
           command:
             - sh
             - -c
