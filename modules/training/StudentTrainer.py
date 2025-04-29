@@ -934,7 +934,7 @@ class StudentTrainer(BaseTrainer):
             # Increment counter for consecutive epochs without improvement
             self.consecutive_no_improve += 1
 
-            if self.consecutive_no_improve >= 2:
+            if self.consecutive_no_improve >= 1:
                 # Only reduce learning rate after 2 consecutive epochs without improvement
                 old_lr = self.optimizer.param_groups[0]['lr']
                 new_lr = self._reduce_lr(self.optimizer, self.lr_decay_factor, self.min_lr)
@@ -1095,8 +1095,14 @@ class StudentTrainer(BaseTrainer):
         is_last_epoch = current_epoch == self.num_epochs
         is_print_epoch = current_epoch % 5 == 0 or current_epoch == 1 or is_last_epoch
 
-        # The calculate_confusion_matrix function now handles the printing logic internally
-        # based on the current_epoch value
+        # Log whether we're generating the full confusion matrix this epoch
+        # The full confusion matrix (all 170 classes) is generated every 10 epochs
+        # This is controlled by the calculate_confusion_matrix function in visualize.py
+        if current_epoch is not None and (current_epoch % 10 == 0 or is_last_epoch):
+            info(f"Generating full confusion matrix (all 170 classes) for epoch {current_epoch}")
+
+        # The calculate_confusion_matrix function handles the printing logic internally
+        # based on the current_epoch value. It will generate the full matrix every 10 epochs.
         calculate_confusion_matrix(all_preds, all_targets, self.idx_to_chord, self.primary_checkpoint_dir, current_epoch)
 
         self.model.train()

@@ -28,7 +28,7 @@ training:
   focal_gamma: 2.0
   focal_alpha: 0.25
   # Knowledge distillation parameters (can be overridden by USE_KD_LOSS env var)
-  use_kd_loss: true
+  use_kd_loss: false # default to false, to turn this on set the environment arguments
   kd_alpha: 0.9
   temperature: 3.0
 

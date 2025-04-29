@@ -154,6 +154,12 @@ spec:
             # Model scale - overrides student_config.yaml
             - name: MODEL_SCALE
               value: "1.0"  # Default scale: 1.0 = base model
+            # Model type - ChordNet or BTC
+            - name: MODEL_TYPE
+              value: "ChordNet"  # Default model type: ChordNet
+            # BTC model checkpoint path (only used if MODEL_TYPE=BTC)
+            - name: BTC_CHECKPOINT
+              value: "/mnt/storage/checkpoints/btc/btc_model_best.pth"
             # Learning rate parameters
             - name: LEARNING_RATE
               value: "0.00001"  # Lower base learning rate for fine-tuning
@@ -378,6 +384,18 @@ spec:
 
                 # Run the standard fine-tuning script with all options
                 echo "Starting fine-tuning with all options..."
+
+                # Add model type arguments
+                MODEL_TYPE_ARGS="--model_type ${MODEL_TYPE}"
+
+                # Add BTC checkpoint if model type is BTC
+                if [ "${MODEL_TYPE}" = "BTC" ]; then
+                  MODEL_TYPE_ARGS="${MODEL_TYPE_ARGS} --btc_checkpoint ${BTC_CHECKPOINT}"
+                  echo "Using BTC model with checkpoint: ${BTC_CHECKPOINT}"
+                else
+                  echo "Using ChordNet model"
+                fi
+
                 python train_finetune.py --config ./config/student_config.yaml \
                   --pretrained ${PRETRAINED_MODEL} \
                   --use_voca \
@@ -393,7 +411,7 @@ spec:
                   --batch_size ${BATCH_SIZE} \
                   --lr_schedule ${LR_SCHEDULE} \
                   --gpu_memory_fraction ${GPU_MEMORY_FRACTION} \
-                  ${WARMUP_ARGS} ${KD_ARGS} ${FOCAL_ARGS} ${FREEZE_ARGS} ${CACHE_ARGS} ${SMALL_DATASET_ARG}
+                  ${MODEL_TYPE_ARGS} ${WARMUP_ARGS} ${KD_ARGS} ${FOCAL_ARGS} ${FREEZE_ARGS} ${CACHE_ARGS} ${SMALL_DATASET_ARG}
               fi
 
               echo "=== Training complete ==="

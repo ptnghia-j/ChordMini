@@ -20,6 +20,7 @@ from modules.utils.mir_eval_modules import large_voca_score_calculation
 from modules.utils.device import get_device, is_cuda_available, is_gpu_available, clear_gpu_cache
 from modules.data.LabeledDataset import LabeledDataset
 from modules.models.Transformer.ChordNet import ChordNet
+from modules.models.Transformer.btc_model import BTC_model  # Import BTC model
 from modules.training.StudentTrainer import StudentTrainer
 from modules.utils import logger
 from modules.utils.hparams import HParams
@@ -259,6 +260,14 @@ def main():
     # Add option for large vocabulary
     parser.add_argument('--use_voca', action='store_true',
                         help='Use large vocabulary (170 chord types instead of standard 25)')
+
+    # Add model type argument
+    parser.add_argument('--model_type', type=str, choices=['ChordNet', 'BTC'], default='ChordNet',
+                        help='Type of model to use (ChordNet or BTC)')
+
+    # Add BTC model checkpoint path
+    parser.add_argument('--btc_checkpoint', type=str, default=None,
+                        help='Path to BTC model checkpoint for finetuning (if model_type=BTC)')
 
     # Add detailed chord logging argument
     parser.add_argument('--log_chord_details', action='store_true',
@@ -615,37 +624,89 @@ def main():
         n_classes = 25   # Standard number for small vocabulary (major/minor only)
         logger.info(f"Using small vocabulary with {n_classes} output classes")
 
-    # Load pretrained model
-    logger.info(f"\n=== Loading pretrained model from {args.pretrained} ===")
+    # Determine model type
+    model_type = args.model_type
+    if model_type not in ['ChordNet', 'BTC']:
+        logger.warning(f"Unknown model type: {model_type}. Defaulting to ChordNet.")
+        model_type = 'ChordNet'
+
+    logger.info(f"Using model type: {model_type}")
+
+    # Check for BTC checkpoint if model_type is BTC
+    if model_type == 'BTC' and args.btc_checkpoint:
+        logger.info(f"\n=== Loading BTC model from {args.btc_checkpoint} ===")
+        pretrained_path = args.btc_checkpoint
+    else:
+        # Use the standard pretrained path
+        pretrained_path = args.pretrained
+        logger.info(f"\n=== Loading pretrained model from {pretrained_path} ===")
+
     try:
         # Get frequency dimension
         n_freq = getattr(config.feature, 'freq_bins', 144)
         logger.info(f"Using frequency dimension: {n_freq}")
 
-        # Apply model scale factor
-        if model_scale != 1.0:
-            n_group = max(1, int(32 * model_scale))
-            logger.info(f"Using n_group={n_group}, resulting in feature dimension: {n_freq // n_group}")
+        # Apply model scale factor (only for ChordNet)
+        if model_type == 'ChordNet':
+            if model_scale != 1.0:
+                n_group = max(1, int(32 * model_scale))
+                logger.info(f"Using n_group={n_group}, resulting in feature dimension: {n_freq // n_group}")
+            else:
+                n_group = config.model.get('n_group', 32)
         else:
-            n_group = config.model.get('n_group', 32)
+            # For BTC, n_group is not used
+            n_group = None
+            logger.info("n_group parameter not used for BTC model")
 
         # Get dropout value
         dropout_rate = args.dropout if args.dropout is not None else config.model.get('dropout', 0.3)
         logger.info(f"Using dropout rate: {dropout_rate}")
 
-        # Create fresh model instance
-        model = ChordNet(
-            n_freq=n_freq,
-            n_classes=n_classes,  # Use determined number of classes
-            n_group=n_group,
-            f_layer=config.model.get('base_config', {}).get('f_layer', 3),
-            f_head=config.model.get('base_config', {}).get('f_head', 6),
-            t_layer=config.model.get('base_config', {}).get('t_layer', 3),
-            t_head=config.model.get('base_config', {}).get('t_head', 6),
-            d_layer=config.model.get('base_config', {}).get('d_layer', 3),
-            d_head=config.model.get('base_config', {}).get('d_head', 6),
-            dropout=dropout_rate
-        ).to(device)
+        # Create fresh model instance based on model type
+        model_type = args.model_type
+        if model_type not in ['ChordNet', 'BTC']:
+            logger.warning(f"Unknown model type: {model_type}. Defaulting to ChordNet.")
+            model_type = 'ChordNet'
+
+        logger.info(f"Creating {model_type} model with {n_classes} output classes")
+
+        if model_type == 'ChordNet':
+            model = ChordNet(
+                n_freq=n_freq,
+                n_classes=n_classes,  # Use determined number of classes
+                n_group=n_group,
+                f_layer=config.model.get('base_config', {}).get('f_layer', 3),
+                f_head=config.model.get('base_config', {}).get('f_head', 6),
+                t_layer=config.model.get('base_config', {}).get('t_layer', 3),
+                t_head=config.model.get('base_config', {}).get('t_head', 6),
+                d_layer=config.model.get('base_config', {}).get('d_layer', 3),
+                d_head=config.model.get('base_config', {}).get('d_head', 6),
+                dropout=dropout_rate
+            ).to(device)
+        else:  # BTC model
+            # BTC specific parameters
+            # Create a config dictionary for BTC model
+            btc_config = {
+                'feature_size': n_freq,
+                'hidden_size': config.model.get('hidden_size', 128),
+                'num_layers': config.model.get('num_layers', 8),
+                'num_heads': config.model.get('num_heads', 4),
+                'total_key_depth': config.model.get('total_key_depth', 128),
+                'total_value_depth': config.model.get('total_value_depth', 128),
+                'filter_size': config.model.get('filter_size', 128),
+                'seq_len': config.model.get('timestep', 108),
+                'input_dropout': config.model.get('input_dropout', 0.2),
+                'layer_dropout': config.model.get('layer_dropout', 0.2),
+                'attention_dropout': config.model.get('attention_dropout', 0.2),
+                'relu_dropout': config.model.get('relu_dropout', 0.2),
+                'num_chords': n_classes
+            }
+
+            logger.info(f"Using BTC model with parameters:")
+            for key, value in btc_config.items():
+                logger.info(f"  {key}: {value}")
+
+            model = BTC_model(config=btc_config).to(device)
 
         # Attach chord mapping to model
         model.idx_to_chord = master_mapping

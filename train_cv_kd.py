@@ -15,6 +15,7 @@ from modules.utils.mir_eval_modules import large_voca_score_calculation
 from modules.utils.device import get_device, is_cuda_available, clear_gpu_cache
 from modules.data.CrossValidationDataset import CrossValidationDataset
 from modules.models.Transformer.ChordNet import ChordNet
+from modules.models.Transformer.btc_model import BTC_model  # Import BTC model
 from modules.training.StudentTrainer import StudentTrainer
 from modules.utils import logger
 from modules.utils.hparams import HParams
@@ -39,6 +40,10 @@ def main():
                         help='Root directory for data storage')
     parser.add_argument('--use_voca', action='store_true',
                        help='Use large vocabulary (170 chord types)')
+    parser.add_argument('--model_type', type=str, choices=['ChordNet', 'BTC'], default='ChordNet',
+                        help='Type of model to use (ChordNet or BTC)')
+    parser.add_argument('--btc_checkpoint', type=str, default=None,
+                        help='Path to BTC model checkpoint for finetuning (if model_type=BTC)')
     parser.add_argument('--teacher_model', type=str, default=None,
                         help='Path to teacher model for knowledge distillation')
     parser.add_argument('--use_kd_loss', action='store_true',
@@ -403,25 +408,60 @@ def main():
     # Create model
     logger.info(f"Creating model with {n_classes} output classes")
 
+    # Get model type from args or config
+    model_type = args.model_type
+    if model_type not in ['ChordNet', 'BTC']:
+        logger.warning(f"Unknown model type: {model_type}. Defaulting to ChordNet.")
+        model_type = 'ChordNet'
+
+    logger.info(f"Using model type: {model_type}")
+
     # Log additional information about feature dimensions
     n_freq = config.feature.get('n_bins', 144)
-    n_group = config.model.get('n_group', 32)
-    feature_dim = n_freq // n_group if n_group > 0 else n_freq
-    heads = config.model.get('f_head', 6)
-    logger.info(f"Using feature dimensions: n_freq={n_freq}, n_group={n_group}, feature_dim={feature_dim}, heads={heads}")
 
-    model = ChordNet(
-        n_freq=config.feature.get('n_bins', 144),
-        n_classes=n_classes,
-        n_group=config.model.get('n_group', 32),
-        f_layer=config.model.get('f_layer', 3),
-        f_head=config.model.get('f_head', 6),
-        t_layer=config.model.get('t_layer', 3),
-        t_head=config.model.get('t_head', 6),
-        d_layer=config.model.get('d_layer', 3),
-        d_head=config.model.get('d_head', 6),
-        dropout=config.model.get('dropout', 0.3)
-    ).to(device)
+    if model_type == 'ChordNet':
+        # ChordNet specific parameters
+        n_group = config.model.get('n_group', 32)
+        feature_dim = n_freq // n_group if n_group > 0 else n_freq
+        heads = config.model.get('f_head', 6)
+        logger.info(f"Using ChordNet feature dimensions: n_freq={n_freq}, n_group={n_group}, feature_dim={feature_dim}, heads={heads}")
+
+        model = ChordNet(
+            n_freq=n_freq,
+            n_classes=n_classes,
+            n_group=n_group,
+            f_layer=config.model.get('f_layer', 3),
+            f_head=heads,
+            t_layer=config.model.get('t_layer', 3),
+            t_head=config.model.get('t_head', 6),
+            d_layer=config.model.get('d_layer', 3),
+            d_head=config.model.get('d_head', 6),
+            dropout=config.model.get('dropout', 0.3)
+        ).to(device)
+    else:  # BTC model
+        # BTC specific parameters
+        # Create a config dictionary for BTC model
+        btc_config = {
+            'feature_size': n_freq,
+            'hidden_size': config.model.get('hidden_size', 128),
+            'num_layers': config.model.get('num_layers', 8),
+            'num_heads': config.model.get('num_heads', 4),
+            'total_key_depth': config.model.get('total_key_depth', 128),
+            'total_value_depth': config.model.get('total_value_depth', 128),
+            'filter_size': config.model.get('filter_size', 128),
+            'seq_len': config.model.get('timestep', 108),
+            'input_dropout': config.model.get('input_dropout', 0.2),
+            'layer_dropout': config.model.get('layer_dropout', 0.2),
+            'attention_dropout': config.model.get('attention_dropout', 0.2),
+            'relu_dropout': config.model.get('relu_dropout', 0.2),
+            'num_chords': n_classes
+        }
+
+        logger.info(f"Using BTC model with parameters:")
+        for key, value in btc_config.items():
+            logger.info(f"  {key}: {value}")
+
+        model = BTC_model(config=btc_config).to(device)
 
     # Create optimizer
     optimizer = torch.optim.Adam(
@@ -592,7 +632,7 @@ def main():
                 if dataset_length > 0:
                      logger.info(f"Evaluating model on all {dataset_length} validation samples for fold {args.kfold}...")
                      score_list_dict, song_length_list, average_score_dict = large_voca_score_calculation(
-                         valid_dataset=validation_samples, config=config, model=model, model_type='ChordNet',
+                         valid_dataset=validation_samples, config=config, model=model, model_type=model_type,
                          mean=mean, std=std, device=device)
                      mir_eval_results = average_score_dict # Store the single result
                      logger.info(f"MIR evaluation results for fold {args.kfold} (all samples): {mir_eval_results}")
@@ -609,17 +649,17 @@ def main():
                 # Evaluate each split
                 logger.info(f"Evaluating model on {len(valid_dataset1)} validation samples in split 1 (Fold {args.kfold})...")
                 score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
-                    valid_dataset=valid_dataset1, config=config, model=model, model_type='ChordNet',
+                    valid_dataset=valid_dataset1, config=config, model=model, model_type=model_type,
                     mean=mean, std=std, device=device)
 
                 logger.info(f"Evaluating model on {len(valid_dataset2)} validation samples in split 2 (Fold {args.kfold})...")
                 score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
-                    valid_dataset=valid_dataset2, config=config, model=model, model_type='ChordNet',
+                    valid_dataset=valid_dataset2, config=config, model=model, model_type=model_type,
                     mean=mean, std=std, device=device)
 
                 logger.info(f"Evaluating model on {len(valid_dataset3)} validation samples in split 3 (Fold {args.kfold})...")
                 score_list_dict3, song_length_list3, average_score_dict3 = large_voca_score_calculation(
-                    valid_dataset=valid_dataset3, config=config, model=model, model_type='ChordNet',
+                    valid_dataset=valid_dataset3, config=config, model=model, model_type=model_type,
                     mean=mean, std=std, device=device)
 
                 # Calculate weighted averages

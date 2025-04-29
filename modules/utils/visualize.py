@@ -711,12 +711,14 @@ def calculate_confusion_matrix(predictions, targets, idx_to_chord, checkpoint_di
                     # Report counts for 'N' and 'X'
                     if n_chord_idx is not None:
                         n_count = quality_counts.get(n_chord_idx, 0)
-                        n_accuracy = quality_accuracy.get(n_chord_idx, 0.0)
+                        # Use the quality name "No Chord" as the key, not the index
+                        n_accuracy = quality_accuracy.get("No Chord", 0.0)
                         info(f"  'N' (No Chord): {n_count} samples, accuracy: {n_accuracy:.4f}")
 
                     if x_chord_idx is not None:
                         x_count = quality_counts.get(x_chord_idx, 0)
-                        x_accuracy = quality_accuracy.get(x_chord_idx, 0.0)
+                        # Use the quality name "Unknown" as the key, not the index
+                        x_accuracy = quality_accuracy.get("Unknown", 0.0)
                         info(f"  'X' (Unknown Chord): {x_count} samples, accuracy: {x_accuracy:.4f}")
 
                 # Create and save chord quality confusion matrix
@@ -749,8 +751,9 @@ def calculate_confusion_matrix(predictions, targets, idx_to_chord, checkpoint_di
                 error(traceback.format_exc())
 
         # Create and save the full confusion matrix every 10 epochs (less frequently)
+        # Also save on the last epoch
         if current_epoch is None or current_epoch % 10 == 0:
-            info(f"\nSaving full class confusion matrix for epoch {current_epoch}")
+            info(f"\nSaving full class confusion matrix (all 170 classes) for epoch {current_epoch}")
 
             try:
                 # Create a mapping that includes ALL possible chord indices
