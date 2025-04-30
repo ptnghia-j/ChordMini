@@ -512,10 +512,20 @@ def main():
     # Create a reverse mapping for dataset initialization if needed
     chord_mapping = {chord: idx for idx, chord in master_mapping.items()}
 
-    # Initialize Chords class (optional, if needed elsewhere, but mapping is key)
+    # Initialize Chords class for proper chord processing
     chord_processor = Chords()
-    chord_processor.set_chord_mapping(chord_mapping) # Use the reverse mapping here
-    chord_processor.initialize_chord_mapping() # Initialize variants
+    # Set the chord mapping in the processor
+    chord_processor.set_chord_mapping(chord_mapping)
+    # Initialize extended mappings for variants, enharmonic equivalents, etc.
+    chord_processor.initialize_chord_mapping()
+
+    # Log some examples of chord processing
+    example_chords = ["C", "Dm", "G7", "Fmaj7", "Emin/4", "A7/3", "Bb:min"]
+    logger.info("Testing chord processing with example chords:")
+    for chord in example_chords:
+        processed = chord_processor.label_error_modify(chord)
+        idx = chord_processor.get_chord_idx(processed)
+        logger.info(f"  {chord} -> {processed} -> idx: {idx} -> {master_mapping.get(idx, 'Unknown')}")
 
     # Log mapping info
     logger.info(f"\nUsing idx->chord mapping from idx2voca_chord with {len(master_mapping)} entries")
@@ -1282,17 +1292,23 @@ def main():
                                         # Use the mir_eval module to load the labels
                                         from mir_eval.io import load_labeled_intervals
                                         from modules.utils.mir_eval_modules import lab_file_error_modify
+                                        from modules.utils.chords import Chords
+
+                                        # Initialize Chords processor for proper chord handling
+                                        chord_processor = Chords()
 
                                         # Load the intervals and labels
                                         ref_intervals, ref_labels = load_labeled_intervals(label_path)
-                                        ref_labels = lab_file_error_modify(ref_labels)
+
+                                        # Apply error modifications using Chords class
+                                        ref_labels = [chord_processor.label_error_modify(label) for label in ref_labels]
 
                                         if ref_labels:
                                             logger.info(f"Successfully loaded {len(ref_labels)} reference labels from {label_path}")
 
                                             # Check if we need to convert to frame-level representation
                                             # If feature is available, we can convert to frame-level
-                                            feature = sample.get('feature')
+                                            # Don't overwrite the feature variable that was loaded earlier
                                             if feature is not None:
                                                 # Get frame rate from config or use default
                                                 frame_duration = config.feature.get('hop_duration', 0.1)
@@ -1305,7 +1321,9 @@ def main():
                                                 from modules.data.LabeledDataset import LabeledDataset
 
                                                 # Create a temporary dataset object to use its methods
-                                                temp_dataset = LabeledDataset(feature_config=config)
+                                                # Convert config to a dictionary to avoid 'HParams' object is not iterable error
+                                                config_dict = config.__dict__ if hasattr(config, '__dict__') else {}
+                                                temp_dataset = LabeledDataset(feature_config=config_dict)
 
                                                 # Convert to frame-level
                                                 num_frames = feature.shape[0] if hasattr(feature, 'shape') else len(feature)
@@ -1326,6 +1344,11 @@ def main():
                                                 with open(label_path, 'r', encoding='utf-8', errors='replace') as f:
                                                     lines = f.readlines()
 
+                                                # Initialize Chords processor if not already done
+                                                if 'chord_processor' not in locals():
+                                                    from modules.utils.chords import Chords
+                                                    chord_processor = Chords()
+
                                                 # Parse lines directly
                                                 parsed_labels = []
                                                 for line in lines:
@@ -1333,6 +1356,8 @@ def main():
                                                     if len(parts) >= 3:
                                                         # Extract the chord label (third column)
                                                         chord_label = parts[2]
+                                                        # Process the chord label using Chords class
+                                                        chord_label = chord_processor.label_error_modify(chord_label)
                                                         parsed_labels.append(chord_label)
 
                                                 if parsed_labels:
@@ -1349,6 +1374,11 @@ def main():
                                             with open(label_path, 'r', encoding='utf-8', errors='replace') as f:
                                                 lines = f.readlines()
 
+                                            # Initialize Chords processor if not already done
+                                            if 'chord_processor' not in locals():
+                                                from modules.utils.chords import Chords
+                                                chord_processor = Chords()
+
                                             # Parse lines directly
                                             parsed_labels = []
                                             parsed_intervals = []
@@ -1360,6 +1390,9 @@ def main():
                                                     end_time = float(parts[1])
                                                     chord_label = parts[2]
 
+                                                    # Process the chord label using Chords class
+                                                    chord_label = chord_processor.label_error_modify(chord_label)
+
                                                     parsed_labels.append(chord_label)
                                                     parsed_intervals.append((start_time, end_time))
 
@@ -1367,7 +1400,7 @@ def main():
                                                 logger.info(f"Successfully parsed {len(parsed_labels)} labels directly from file")
 
                                                 # Try to convert to frame-level if possible
-                                                feature = sample.get('feature')
+                                                # Don't overwrite the feature variable that was loaded earlier
                                                 if feature is not None:
                                                     # Get frame rate from config or use default
                                                     frame_duration = config.feature.get('hop_duration', 0.1)
@@ -1377,7 +1410,9 @@ def main():
                                                     from modules.data.LabeledDataset import LabeledDataset
 
                                                     # Create a temporary dataset object to use its methods
-                                                    temp_dataset = LabeledDataset(feature_config=config)
+                                                    # Convert config to a dictionary to avoid 'HParams' object is not iterable error
+                                                    config_dict = config.__dict__ if hasattr(config, '__dict__') else {}
+                                                    temp_dataset = LabeledDataset(feature_config=config_dict)
 
                                                     # Convert to frame-level
                                                     num_frames = feature.shape[0] if hasattr(feature, 'shape') else len(feature)
@@ -1450,9 +1485,10 @@ def main():
                                 # Get predicted class indices
                                 predictions = logits.argmax(dim=-1).squeeze().cpu().numpy()
 
-                            # Convert predictions to chord labels
+                            # Convert predictions to chord labels using the master mapping
                             pred_labels = []
                             for pred_idx in predictions:
+                                # Use the master mapping to convert indices to chord labels
                                 chord = master_mapping.get(pred_idx, "N")
                                 pred_labels.append(chord)
 

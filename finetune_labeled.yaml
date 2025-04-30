@@ -164,7 +164,7 @@ spec:
             - name: LEARNING_RATE
               value: "0.00001"  # Lower base learning rate for fine-tuning
             - name: MIN_LEARNING_RATE
-              value: "0.0000001"  # Minimum learning rate
+              value: "0.000001"  # Minimum learning rate
             # Knowledge distillation settings
             # -------------------------------------------------------------------------
             # Knowledge Distillation (KD) allows the model to learn from a teacher model
@@ -222,7 +222,7 @@ spec:
             - name: EPOCHS
               value: "100"  # Number of fine-tuning epochs
             - name: BATCH_SIZE
-              value: "64"  # Batch size for training
+              value: "128"  # Batch size for training
             # LR schedule
             - name: LR_SCHEDULE
               value: "validation"  # LR schedule type
