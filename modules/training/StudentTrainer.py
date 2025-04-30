@@ -218,7 +218,7 @@ class StudentTrainer(BaseTrainer):
                  lr_decay_factor=0.95, min_lr=5e-6,
                  use_warmup=False, warmup_epochs=5, warmup_start_lr=None, warmup_end_lr=None,
                  lr_schedule_type=None, use_focal_loss=False, focal_gamma=2.0, focal_alpha=None,
-                 use_kd_loss=False, kd_alpha=0.3, temperature=2.0,
+                 use_kd_loss=False, kd_alpha=0.5, temperature=2.0,
                  teacher_model=None, teacher_normalization=None, teacher_predictions=None,
                  timeout_minutes=30):
 

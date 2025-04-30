@@ -185,8 +185,8 @@ def main():
     # Add knowledge distillation arguments
     parser.add_argument('--use_kd_loss', action='store_true',
                        help='Use knowledge distillation loss (teacher logits must be in batch data)')
-    parser.add_argument('--kd_alpha', type=float, default=0.3,
-                       help='Weight for knowledge distillation loss (default: 0.3)')
+    parser.add_argument('--kd_alpha', type=float, default=0.5,
+                       help='Weight for knowledge distillation loss (default: 0.5)')
     parser.add_argument('--temperature', type=float, default=2.0,
                        help='Temperature for softening distributions (default: 2.0)')
     parser.add_argument('--teacher_model', type=str, default=None,
@@ -385,8 +385,8 @@ def main():
         logger.info("Feature extraction layers will be frozen during fine-tuning")
 
     # Log knowledge distillation settings with proper type handling
-    # Use the same defaults as in finetune_labeled.yaml (0.3 and 2.0)
-    kd_alpha = float(args.kd_alpha) if args.kd_alpha is not None else float(config.training.get('kd_alpha', 0.3))
+    # Use the same defaults as in finetune_labeled.yaml (0.5 and 2.0)
+    kd_alpha = float(args.kd_alpha) if args.kd_alpha is not None else float(config.training.get('kd_alpha', 0.5))
     temperature = float(args.temperature) if args.temperature is not None else float(config.training.get('temperature', 2.0))
 
     if use_kd_loss:
