@@ -1,67 +1,41 @@
-import json # Add json import if not already present
-import traceback # Add traceback import if not already present
-import multiprocessing # Add multiprocessing import
-import sys # Add sys import
-import os # Add os import
-import torch # Add torch import
-import numpy as np # Add numpy import
-import argparse # Add argparse import
-import glob # Add glob import
-import gc # Add gc import
-import random # Add random import
+#!/usr/bin/env python3
+"""
+train_finetune.py - Fine-tune a pretrained chord recognition model on labeled data.
+
+This script provides a simplified interface for fine-tuning either ChordNet or BTC models
+on real-world labeled audio data. It supports knowledge distillation, focal loss,
+and various learning rate scheduling options.
+"""
+
+import json
+import traceback
+import os
+import glob
+import torch
+import numpy as np
+import argparse
+import gc
+import random
+import multiprocessing
 from pathlib import Path
 from collections import Counter
 
-# Define the standard pitch classes for chord notation
-PITCH_CLASS = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-
 # Project imports
+import mir_eval.chord
 from modules.utils.mir_eval_modules import large_voca_score_calculation
-from modules.utils.device import get_device, is_cuda_available, is_gpu_available, clear_gpu_cache
+from modules.utils.device import get_device, is_cuda_available
 from modules.data.LabeledDataset import LabeledDataset
 from modules.models.Transformer.ChordNet import ChordNet
-from modules.models.Transformer.btc_model import BTC_model  # Import BTC model
+from modules.models.Transformer.btc_model import BTC_model
 from modules.training.StudentTrainer import StudentTrainer
 from modules.utils import logger
 from modules.utils.hparams import HParams
 from modules.utils.chords import idx2voca_chord, Chords
 from modules.training.Tester import Tester
-from modules.utils.teacher_utils import load_btc_model, extract_logits_from_teacher
+from modules.utils.teacher_utils import load_btc_model
 
-def count_files_in_subdirectories(directory, file_pattern):
-    """Count files in a directory and all its subdirectories matching a pattern."""
-    if not os.path.exists(directory):
-        return 0
-
-    count = 0
-    # Count files directly in the directory
-    for file in glob.glob(os.path.join(directory, file_pattern)):
-        if os.path.isfile(file):
-            count += 1
-
-    # Count files in subdirectories
-    for root, dirs, files in os.walk(directory):
-        for file in files:
-            if file.endswith(file_pattern.replace("*", "")):
-                count += 1
-
-    return count
-
-def find_sample_files(directory, file_pattern, max_samples=5):
-    """Find sample files in a directory and all its subdirectories matching a pattern."""
-    if not os.path.exists(directory):
-        return []
-
-    samples = []
-    # Find files in all subdirectories
-    for root, dirs, files in os.walk(directory):
-        for file in files:
-            if file.endswith(file_pattern.replace("*", "")):
-                samples.append(os.path.join(root, file))
-                if len(samples) >= max_samples:
-                    return samples
-
-    return samples
+# Define pitch class constant for chord conversion
+PITCH_CLASS = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
 def resolve_path(path, storage_root=None, project_root=None):
     """
@@ -101,23 +75,43 @@ def resolve_path(path, storage_root=None, project_root=None):
     # Otherwise default to project_root resolution
     return os.path.join(project_root, path) if project_root else path
 
-def get_quick_dataset_stats(data_loader, device, max_batches=10):
-    """Calculate statistics from a small subset of data without blocking."""
+
+def count_files_in_subdirectories(directory, file_pattern):
+    """Count files in a directory and all its subdirectories matching a pattern."""
+    if not os.path.exists(directory):
+        return 0
+
+    count = 0
+    # Count files directly in the directory
+    for file in glob.glob(os.path.join(directory, file_pattern)):
+        if os.path.isfile(file):
+            count += 1
+
+    # Count files in subdirectories
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith(file_pattern.replace("*", "")):
+                count += 1
+
+    return count
+
+
+def get_dataset_stats(data_loader, max_batches=10):
+    """Calculate mean and standard deviation from a subset of data."""
     try:
-        # Process in chunks with progress
         mean_sum = 0.0
         square_sum = 0.0
         sample_count = 0
 
-        logger.info(f"Processing subset of data for quick statistics...")
+        logger.info(f"Calculating dataset statistics from {max_batches} batches...")
         for i, batch in enumerate(data_loader):
-            if i >= max_batches:  # Limit batches processed
+            if i >= max_batches:
                 break
 
-            # Move to CPU explicitly
+            # Get features from batch and move to CPU for calculation
             features = batch['spectro'].to('cpu')
 
-            # Calculate stats
+            # Calculate batch statistics
             batch_mean = torch.mean(features).item()
             batch_square_mean = torch.mean(features.pow(2)).item()
 
@@ -128,9 +122,7 @@ def get_quick_dataset_stats(data_loader, device, max_batches=10):
 
             # Free memory
             del features
-
-            # Clear GPU cache periodically
-            if i % 2 == 0 and torch.cuda.is_available():
+            if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
         # Calculate final statistics
@@ -138,149 +130,226 @@ def get_quick_dataset_stats(data_loader, device, max_batches=10):
             mean = mean_sum / sample_count
             square_mean = square_sum / sample_count
             std = np.sqrt(square_mean - mean**2)
-            logger.info(f"Quick stats from {sample_count} batches: mean={mean:.4f}, std={std:.4f}")
+            logger.info(f"Dataset statistics: mean={mean:.4f}, std={std:.4f}")
             return mean, std
         else:
             logger.warning("No samples processed for statistics")
             return 0.0, 1.0
     except Exception as e:
-        logger.error(f"Error in quick stats calculation: {e}")
+        logger.error(f"Error calculating dataset statistics: {e}")
         return 0.0, 1.0
 
-def main():
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Fine-tune a pretrained chord recognition model on real labeled data")
+def parse_arguments():
+    """Parse command line arguments for fine-tuning."""
+    parser = argparse.ArgumentParser(description="Fine-tune a chord recognition model on labeled data")
+
+    # Basic configuration
     parser.add_argument('--config', type=str, default='./config/student_config.yaml',
                         help='Path to the configuration file')
     parser.add_argument('--seed', type=int, default=None,
-                        help='Random seed (overrides config value)')
+                        help='Random seed for reproducibility')
     parser.add_argument('--save_dir', type=str, default=None,
-                        help='Directory to save checkpoints (overrides config value)')
-    parser.add_argument('--pretrained', type=str, required=False,
-                        help='Path to pretrained model checkpoint (required for ChordNet, optional for BTC)')
+                        help='Directory to save checkpoints')
     parser.add_argument('--storage_root', type=str, default=None,
-                        help='Root directory for data storage (overrides config value)')
-    parser.add_argument('--use_warmup', action='store_true',
-                       help='Use warm-up learning rate scheduling')
-    parser.add_argument('--warmup_epochs', type=int, default=None,
-                       help='Number of warm-up epochs (default: from config)')
-    parser.add_argument('--warmup_start_lr', type=float, default=None,
-                       help='Initial learning rate for warm-up (default: 1/10 of base LR)')
+                        help='Root directory for data storage')
+
+    # Model configuration
+    parser.add_argument('--model_type', type=str, choices=['ChordNet', 'BTC'], default='ChordNet',
+                        help='Type of model to use (ChordNet or BTC)')
+    parser.add_argument('--pretrained', type=str, default=None,
+                        help='Path to pretrained ChordNet model checkpoint')
+    parser.add_argument('--btc_checkpoint', type=str, default=None,
+                        help='Path to BTC model checkpoint (if model_type=BTC)')
+    parser.add_argument('--model_scale', type=float, default=None,
+                        help='Scaling factor for model capacity (0.5=half, 1.0=base, 2.0=double)')
+    parser.add_argument('--dropout', type=float, default=None,
+                        help='Dropout probability (0-1)')
+    parser.add_argument('--use_voca', action='store_true',
+                        help='Use large vocabulary (170 chord types)')
+    parser.add_argument('--force_num_classes', type=int, default=None,
+                        help='Force model to use specific number of output classes')
+    parser.add_argument('--partial_loading', action='store_true',
+                        help='Allow partial loading when model sizes differ')
+    parser.add_argument('--freeze_feature_extractor', action='store_true',
+                        help='Freeze feature extraction layers during fine-tuning')
+
+    # Training parameters
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='Number of fine-tuning epochs')
+    parser.add_argument('--batch_size', type=int, default=None,
+                        help='Batch size for training')
+    parser.add_argument('--learning_rate', type=float, default=None,
+                        help='Base learning rate')
+    parser.add_argument('--min_learning_rate', type=float, default=None,
+                        help='Minimum learning rate for schedulers')
     parser.add_argument('--lr_schedule', type=str,
                         choices=['cosine', 'linear_decay', 'one_cycle', 'cosine_warm_restarts', 'validation', 'none'],
                         default=None,
-                        help='Learning rate schedule type (default: validation-based)')
+                        help='Learning rate schedule type')
 
-    # Add focal loss arguments
-    parser.add_argument('--use_focal_loss', action='store_true',
-                       help='Use focal loss to handle class imbalance')
-    parser.add_argument('--focal_gamma', type=float, default=2.0,
-                       help='Gamma parameter for focal loss (default: 2.0)')
-    parser.add_argument('--focal_alpha', type=float, default=None,
-                       help='Alpha parameter for focal loss (default: None)')
-
-    # Add knowledge distillation arguments
-    parser.add_argument('--use_kd_loss', action='store_true',
-                       help='Use knowledge distillation loss (teacher logits must be in batch data)')
-    parser.add_argument('--kd_alpha', type=float, default=0.5,
-                       help='Weight for knowledge distillation loss (default: 0.5)')
-    parser.add_argument('--temperature', type=float, default=1.0,
-                       help='Temperature for softening distributions (default: 1.0)')
-    parser.add_argument('--teacher_model', type=str, default=None,
-                       help='Path to teacher model for knowledge distillation')
-    parser.add_argument('--kd_debug_mode', action='store_true',
-                       help='Enable debug mode for teacher logit extraction')
-
-    # Add model scale argument
-    parser.add_argument('--model_scale', type=float, default=None,
-                       help='Scaling factor for model capacity (0.5=half, 1.0=base, 2.0=double)')
-
-    # Add dropout argument
-    parser.add_argument('--dropout', type=float, default=None,
-                       help='Dropout probability (0-1)')
-
-    # Dataset caching behavior
-    parser.add_argument('--disable_cache', action='store_true',
-                      help='Disable dataset caching to reduce memory usage')
-    parser.add_argument('--metadata_cache', action='store_true',
-                      help='Only cache metadata (not spectrograms) to reduce memory usage')
-    parser.add_argument('--cache_fraction', type=float, default=0.1,
-                      help='Fraction of dataset to cache (default: 0.1 = 10%%)')
-
-    # Data directories for LabeledDataset
-    parser.add_argument('--audio_dirs', type=str, nargs='+', default=None,
-                      help='Directories containing audio files')
-    parser.add_argument('--label_dirs', type=str, nargs='+', default=None,
-                      help='Directories containing label files')
-    parser.add_argument('--cache_dir', type=str, default=None,
-                      help='Directory to cache extracted features')
-
-    # GPU acceleration options
-    parser.add_argument('--gpu_memory_fraction', type=float, default=0.9,
-                      help='Fraction of GPU memory to use (default: 0.9)')
-    parser.add_argument('--batch_gpu_cache', action='store_true',
-                      help='Cache batches on GPU for repeated access patterns')
-    parser.add_argument('--prefetch_factor', type=int, default=2,
-                      help='Number of batches to prefetch (default: 2)')
-
-    # Small dataset percentage
-    parser.add_argument('--small_dataset', type=float, default=None,
-                      help='Use only a small percentage of dataset for quick testing (e.g., 0.01 for 1%%)')
-
-    # Learning rate arguments
-    parser.add_argument('--learning_rate', type=float, default=None,
-                        help='Base learning rate (overrides config value)')
-    parser.add_argument('--min_learning_rate', type=float, default=None,
-                        help='Minimum learning rate for schedulers (overrides config value)')
+    # Warmup parameters
+    parser.add_argument('--use_warmup', action='store_true',
+                        help='Use warm-up learning rate scheduling')
+    parser.add_argument('--warmup_epochs', type=int, default=None,
+                        help='Number of warm-up epochs')
+    parser.add_argument('--warmup_start_lr', type=float, default=None,
+                        help='Initial learning rate for warm-up')
     parser.add_argument('--warmup_end_lr', type=float, default=None,
-                       help='Target learning rate at the end of warm-up (default: base LR)')
+                        help='Target learning rate at the end of warm-up')
 
-    # Fine-tuning specific options
-    parser.add_argument('--freeze_feature_extractor', action='store_true',
-                       help='Freeze the feature extraction part of the model')
-    parser.add_argument('--epochs', type=int, default=None,
-                       help='Number of fine-tuning epochs')
-    parser.add_argument('--batch_size', type=int, default=None,
-                       help='Batch size for training (overrides config value)')
+    # Loss function options
+    parser.add_argument('--use_focal_loss', action='store_true',
+                        help='Use focal loss to handle class imbalance')
+    parser.add_argument('--focal_gamma', type=float, default=2.0,
+                        help='Gamma parameter for focal loss')
+    parser.add_argument('--focal_alpha', type=float, default=None,
+                        help='Alpha parameter for focal loss')
 
-    # Checkpoint loading
-    parser.add_argument('--reset_epoch', action='store_true',
-                      help='Start from epoch 1 when loading pretrained model')
-    parser.add_argument('--reset_scheduler', action='store_true',
-                      help='Reset learning rate scheduler when loading pretrained model')
-    parser.add_argument('--timeout_minutes', type=int, default=30,
-                      help='Timeout in minutes for distributed operations (default: 30)')
+    # Knowledge distillation options
+    parser.add_argument('--use_kd_loss', action='store_true',
+                        help='Use knowledge distillation loss')
+    parser.add_argument('--kd_alpha', type=float, default=0.5,
+                        help='Weight for knowledge distillation loss')
+    parser.add_argument('--temperature', type=float, default=1.0,
+                        help='Temperature for softening distributions')
+    parser.add_argument('--teacher_model', type=str, default=None,
+                        help='Path to teacher model for knowledge distillation')
+    parser.add_argument('--kd_debug_mode', action='store_true',
+                        help='Enable debug mode for teacher logit extraction')
 
-    # Add parameters to handle model loading/saving
-    parser.add_argument('--force_num_classes', type=int, default=None,
-                        help='Force the model to use this number of output classes (e.g., 170 or 205)')
-    parser.add_argument('--partial_loading', action='store_true',
-                        help='Allow partial loading of output layer when model sizes differ')
+    # Dataset options
+    parser.add_argument('--audio_dirs', type=str, nargs='+', default=None,
+                        help='Directories containing audio files')
+    parser.add_argument('--label_dirs', type=str, nargs='+', default=None,
+                        help='Directories containing label files')
+    parser.add_argument('--cache_dir', type=str, default=None,
+                        help='Directory to cache extracted features')
+    parser.add_argument('--disable_cache', action='store_true',
+                        help='Disable dataset caching')
+    parser.add_argument('--small_dataset', type=float, default=None,
+                        help='Use only a percentage of dataset (0.0-1.0)')
 
-    # Add option for large vocabulary
-    parser.add_argument('--use_voca', action='store_true',
-                        help='Use large vocabulary (170 chord types instead of standard 25)')
-
-    # Add model type argument
-    parser.add_argument('--model_type', type=str, choices=['ChordNet', 'BTC'], default='ChordNet',
-                        help='Type of model to use (ChordNet or BTC)')
-
-    # Add BTC model checkpoint path
-    parser.add_argument('--btc_checkpoint', type=str, default=None,
-                        help='Path to BTC model checkpoint for finetuning (if model_type=BTC)')
-
-    # Add detailed chord logging argument
+    # Miscellaneous
     parser.add_argument('--log_chord_details', action='store_true',
-                       help='Enable detailed logging of chords during MIR evaluation')
+                        help='Enable detailed chord logging during evaluation')
+    parser.add_argument('--timeout_minutes', type=int, default=30,
+                        help='Timeout in minutes for operations')
 
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    # Load configuration from YAML first
+
+def main():
+    """Main function for fine-tuning a chord recognition model."""
+    # Parse command line arguments
+    args = parse_arguments()
+
+    # Set up logging
+    logger.info("=== ChordMini Fine-tuning ===")
+    logger.info(f"Loading configuration from {args.config}")
+
+    # Load configuration from YAML
     config = HParams.load(args.config)
 
-    # --- REMOVED Environment variable override block ---
+    # Override configuration with command line arguments
+    logger.info("Applying command line overrides to configuration...")
 
-    # Override with command line args
+    # Basic overrides
+    if args.seed is not None:
+        config.experiment['seed'] = args.seed
+        logger.info(f"Setting random seed to {args.seed}")
+
+    if args.save_dir is not None:
+        config.experiment['save_dir'] = args.save_dir
+        logger.info(f"Setting save directory to {args.save_dir}")
+
+    if args.storage_root is not None:
+        config.experiment['storage_root'] = args.storage_root
+        logger.info(f"Setting storage root to {args.storage_root}")
+
+    # Training parameter overrides
+    if args.epochs is not None:
+        config.training['epochs'] = args.epochs
+        logger.info(f"Setting training epochs to {args.epochs}")
+
+    if args.batch_size is not None:
+        config.training['batch_size'] = args.batch_size
+        logger.info(f"Setting batch size to {args.batch_size}")
+
+    if args.learning_rate is not None:
+        config.training['learning_rate'] = args.learning_rate
+        logger.info(f"Setting learning rate to {args.learning_rate}")
+
+    if args.min_learning_rate is not None:
+        config.training['min_learning_rate'] = args.min_learning_rate
+        logger.info(f"Setting minimum learning rate to {args.min_learning_rate}")
+
+    # Model parameter overrides
+    if args.model_scale is not None:
+        config.model['scale'] = args.model_scale
+        logger.info(f"Setting model scale to {args.model_scale}")
+
+    if args.dropout is not None:
+        config.model['dropout'] = args.dropout
+        logger.info(f"Setting dropout to {args.dropout}")
+
+    # Learning rate schedule override
+    if args.lr_schedule is not None:
+        config.training['lr_schedule'] = args.lr_schedule
+        logger.info(f"Setting learning rate schedule to {args.lr_schedule}")
+
+    # Warmup parameters
+    if args.use_warmup:
+        config.training['use_warmup'] = True
+        logger.info("Enabling learning rate warmup")
+
+        if args.warmup_epochs is not None:
+            config.training['warmup_epochs'] = args.warmup_epochs
+            logger.info(f"Setting warmup epochs to {args.warmup_epochs}")
+
+        if args.warmup_start_lr is not None:
+            config.training['warmup_start_lr'] = args.warmup_start_lr
+            logger.info(f"Setting warmup start learning rate to {args.warmup_start_lr}")
+
+        if args.warmup_end_lr is not None:
+            config.training['warmup_end_lr'] = args.warmup_end_lr
+            logger.info(f"Setting warmup end learning rate to {args.warmup_end_lr}")
+
+    # Loss function parameters
+    if args.use_focal_loss:
+        config.training['use_focal_loss'] = True
+        logger.info("Enabling focal loss")
+
+        if args.focal_gamma is not None:
+            config.training['focal_gamma'] = args.focal_gamma
+            logger.info(f"Setting focal loss gamma to {args.focal_gamma}")
+
+        if args.focal_alpha is not None:
+            config.training['focal_alpha'] = args.focal_alpha
+            logger.info(f"Setting focal loss alpha to {args.focal_alpha}")
+
+    # Knowledge distillation parameters
+    if args.use_kd_loss:
+        config.training['use_kd_loss'] = True
+        logger.info("Enabling knowledge distillation loss")
+
+        if args.kd_alpha is not None:
+            config.training['kd_alpha'] = args.kd_alpha
+            logger.info(f"Setting KD loss alpha to {args.kd_alpha}")
+
+        if args.temperature is not None:
+            config.training['temperature'] = args.temperature
+            logger.info(f"Setting KD temperature to {args.temperature}")
+
+        if args.teacher_model is not None:
+            config.training['teacher_model'] = args.teacher_model
+            logger.info(f"Setting teacher model path to {args.teacher_model}")
+
+        if args.kd_debug_mode:
+            config.training['kd_debug_mode'] = True
+            logger.info("Enabling KD debug mode")
+    else:
+        # Explicitly disable KD loss if not specified
+        config.training['use_kd_loss'] = False
     if args.log_chord_details:
         if 'misc' not in config: config['misc'] = {}
         config.misc['log_chord_details'] = True
@@ -505,6 +574,31 @@ def main():
         logger.info(f"Found {audio_count} audio files in {audio_dir}")
         logger.info(f"Found {label_count} label files in {label_dir}")
 
+    # Define a utility function for processing chord files
+    def process_chord_file(label_path, use_voca=True):
+        """
+        Process a chord label file using the Chords class.
+
+        Args:
+            label_path: Path to the label file
+            use_voca: Whether to use the 170-class vocabulary (True) or the 25-class vocabulary (False)
+
+        Returns:
+            DataFrame with columns 'start', 'end', and 'chord_id', or None if processing fails
+        """
+        try:
+            # Use the appropriate method based on vocabulary size
+            if use_voca:
+                chord_info = chord_processor.get_converted_chord_voca(label_path)
+            else:
+                chord_info = chord_processor.get_converted_chord(label_path)
+
+            return chord_info
+
+        except Exception as e:
+            logger.error(f"Error processing chord labels from {label_path}: {e}")
+            return None
+
     # Set up chord processing using the Chords class
     logger.info("\n=== Setting up chord mapping ===")
     # Get the mapping from idx2voca_chord - THIS IS THE SOURCE OF TRUTH
@@ -524,8 +618,20 @@ def main():
     logger.info("Testing chord processing with example chords:")
     for chord in example_chords:
         processed = chord_processor.label_error_modify(chord)
-        idx = chord_processor.get_chord_idx(processed)
-        logger.info(f"  {chord} -> {processed} -> idx: {idx} -> {master_mapping.get(idx, 'Unknown')}")
+        # For demonstration, show both vocabulary conversions
+        idx_small = chord_processor.convert_to_id(
+            root=chord_processor.pitch(processed.split(':')[0]) if ':' in processed and processed.split(':')[0] != 'N' else -1,
+            is_major='min' not in processed
+        )
+        # Parse the chord for large vocabulary
+        if processed != 'N' and processed != 'X':
+            root, quality, _, _ = mir_eval.chord.split(processed, reduce_extended_chords=True)
+            root_idx = chord_processor.pitch(root) if root != 'N' else -1
+            idx_large = chord_processor.convert_to_id_voca(root=root_idx, quality=quality)
+        else:
+            idx_large = 169  # N chord in large vocabulary
+
+        logger.info(f"  {chord} -> {processed} -> small idx: {idx_small}, large idx: {idx_large}")
 
     # Log mapping info
     logger.info(f"\nUsing idx->chord mapping from idx2voca_chord with {len(master_mapping)} entries")
@@ -903,7 +1009,7 @@ def main():
             pin_memory=False
         )
 
-        mean, std = get_quick_dataset_stats(stats_loader, device)
+        mean, std = get_dataset_stats(stats_loader)
         logger.info(f"Using statistics: mean={mean:.4f}, std={std:.4f}")
     except Exception as e:
         logger.error(f"Error calculating statistics: {e}")
@@ -1289,19 +1395,42 @@ def main():
                                         logger.warning(f"Error reading label file for debugging: {e}")
 
                                     try:
-                                        # Use the mir_eval module to load the labels
-                                        from mir_eval.io import load_labeled_intervals
-                                        from modules.utils.mir_eval_modules import lab_file_error_modify
-                                        from modules.utils.chords import Chords
+                                        # Process the chord file using our utility function
+                                        # First try using the large vocabulary (170 classes)
+                                        use_large_voca = args.use_voca or config.feature.get('large_voca', False)
+                                        chord_info = process_chord_file(label_path, use_voca=use_large_voca)
 
-                                        # Initialize Chords processor for proper chord handling
-                                        chord_processor = Chords()
+                                        if chord_info is not None:
+                                            # Extract intervals and labels from the processed chord info
+                                            ref_intervals = list(zip(chord_info['start'].values, chord_info['end'].values))
+                                            ref_labels = []
 
-                                        # Load the intervals and labels
-                                        ref_intervals, ref_labels = load_labeled_intervals(label_path)
+                                            # Get the chord labels based on chord_id
+                                            for chord_id in chord_info['chord_id']:
+                                                if use_large_voca:
+                                                    # For large vocabulary, use the master mapping
+                                                    chord_label = master_mapping.get(chord_id, "N")
+                                                else:
+                                                    # For small vocabulary, convert manually
+                                                    if chord_id == 24:  # No chord
+                                                        chord_label = "N"
+                                                    elif chord_id == 25:  # Unknown chord
+                                                        chord_label = "X"
+                                                    else:
+                                                        # Convert based on the algorithm in idx_to_chord
+                                                        minmaj = chord_id % 2
+                                                        root = chord_id // 2
+                                                        chord_label = PITCH_CLASS[root] + ("M" if minmaj == 0 else "m")
+                                                ref_labels.append(chord_label)
+                                        else:
+                                            # Fallback to traditional loading if process_chord_file fails
+                                            from mir_eval.io import load_labeled_intervals
 
-                                        # Apply error modifications using Chords class
-                                        ref_labels = [chord_processor.label_error_modify(label) for label in ref_labels]
+                                            # Load the intervals and labels
+                                            ref_intervals, ref_labels = load_labeled_intervals(label_path)
+
+                                            # Apply error modifications using Chords class
+                                            ref_labels = chord_processor.lab_file_error_modify(ref_labels)
 
                                         if ref_labels:
                                             logger.info(f"Successfully loaded {len(ref_labels)} reference labels from {label_path}")
@@ -1368,33 +1497,58 @@ def main():
                                     except Exception as e:
                                         logger.warning(f"Error loading reference labels from {label_path}: {e}")
 
-                                        # Try a more direct approach as fallback
+                                        # Try using our utility function as fallback
                                         try:
-                                            logger.info("Trying direct file parsing as fallback after exception")
-                                            with open(label_path, 'r', encoding='utf-8', errors='replace') as f:
-                                                lines = f.readlines()
+                                            logger.info("Trying chord processing utility as fallback after exception")
 
-                                            # Initialize Chords processor if not already done
-                                            if 'chord_processor' not in locals():
-                                                from modules.utils.chords import Chords
-                                                chord_processor = Chords()
+                                            # First try using the large vocabulary (170 classes)
+                                            use_large_voca = args.use_voca or config.feature.get('large_voca', False)
+                                            chord_info = process_chord_file(label_path, use_voca=use_large_voca)
 
-                                            # Parse lines directly
-                                            parsed_labels = []
-                                            parsed_intervals = []
-                                            for line in lines:
-                                                parts = line.strip().split()
-                                                if len(parts) >= 3:
-                                                    # Extract start time, end time, and chord label
-                                                    start_time = float(parts[0])
-                                                    end_time = float(parts[1])
-                                                    chord_label = parts[2]
+                                            if chord_info is not None:
+                                                # Extract intervals and labels from the processed chord info
+                                                parsed_intervals = list(zip(chord_info['start'].values, chord_info['end'].values))
+                                                parsed_labels = []
 
-                                                    # Process the chord label using Chords class
-                                                    chord_label = chord_processor.label_error_modify(chord_label)
-
+                                                # Get the chord labels based on chord_id
+                                                for chord_id in chord_info['chord_id']:
+                                                    if use_large_voca:
+                                                        # For large vocabulary, use the master mapping
+                                                        chord_label = master_mapping.get(chord_id, "N")
+                                                    else:
+                                                        # For small vocabulary, convert manually
+                                                        if chord_id == 24:  # No chord
+                                                            chord_label = "N"
+                                                        elif chord_id == 25:  # Unknown chord
+                                                            chord_label = "X"
+                                                        else:
+                                                            # Convert based on the algorithm in idx_to_chord
+                                                            minmaj = chord_id % 2
+                                                            root = chord_id // 2
+                                                            chord_label = PITCH_CLASS[root] + ("M" if minmaj == 0 else "m")
                                                     parsed_labels.append(chord_label)
-                                                    parsed_intervals.append((start_time, end_time))
+                                            else:
+                                                # If utility function fails, try direct parsing
+                                                logger.info("Utility function failed, trying direct file parsing")
+                                                with open(label_path, 'r', encoding='utf-8', errors='replace') as f:
+                                                    lines = f.readlines()
+
+                                                # Parse lines directly
+                                                parsed_labels = []
+                                                parsed_intervals = []
+                                                for line in lines:
+                                                    parts = line.strip().split()
+                                                    if len(parts) >= 3:
+                                                        # Extract start time, end time, and chord label
+                                                        start_time = float(parts[0])
+                                                        end_time = float(parts[1])
+                                                        chord_label = parts[2]
+
+                                                        # Process the chord label using Chords class
+                                                        chord_label = chord_processor.label_error_modify(chord_label)
+
+                                                        parsed_labels.append(chord_label)
+                                                        parsed_intervals.append((start_time, end_time))
 
                                             if parsed_labels:
                                                 logger.info(f"Successfully parsed {len(parsed_labels)} labels directly from file")
@@ -1487,9 +1641,23 @@ def main():
 
                             # Convert predictions to chord labels using the master mapping
                             pred_labels = []
+                            use_large_voca = args.use_voca or config.feature.get('large_voca', False)
+
                             for pred_idx in predictions:
-                                # Use the master mapping to convert indices to chord labels
-                                chord = master_mapping.get(pred_idx, "N")
+                                if use_large_voca:
+                                    # For large vocabulary, use the master mapping
+                                    chord = master_mapping.get(pred_idx, "N")
+                                else:
+                                    # For small vocabulary, convert manually
+                                    if pred_idx == 24:  # No chord
+                                        chord = "N"
+                                    elif pred_idx == 25:  # Unknown chord
+                                        chord = "X"
+                                    else:
+                                        # Convert based on the algorithm in idx_to_chord
+                                        minmaj = pred_idx % 2
+                                        root = pred_idx // 2
+                                        chord = PITCH_CLASS[root] + ("M" if minmaj == 0 else "m")
                                 pred_labels.append(chord)
 
                             # Calculate frame duration
@@ -1738,8 +1906,18 @@ def main():
 
 if __name__ == '__main__':
     try:
+        # Set multiprocessing start method to 'spawn' for better compatibility
         multiprocessing.set_start_method('spawn', force=True)
     except RuntimeError:
         # Start method already set
         pass
-    main()
+
+    try:
+        # Run the main function
+        main()
+    except KeyboardInterrupt:
+        logger.info("\nTraining interrupted by user. Exiting gracefully...")
+    except Exception as e:
+        logger.error(f"Unhandled exception: {e}")
+        logger.error(traceback.format_exc())
+        raise
