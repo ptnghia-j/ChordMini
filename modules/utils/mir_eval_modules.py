@@ -24,6 +24,10 @@ def audio_file_to_features(audio_file, config):
         # print("DEBUG: File size is unusually small, possibly corrupt:", audio_file)
         raise RuntimeError(f"Audio file '{audio_file}' is too small and may be corrupt.")
     try:
+        # Add a check to see if we're using a small dataset percentage
+        # If we are, we should only load audio files that are marked for evaluation
+        from modules.utils.logger import info
+        info(f"Loading features from audio file: {audio_file}")
         original_wav, sr = librosa.load(audio_file, sr=config.mp3['song_hz'], mono=True)
         # print("DEBUG: Successfully loaded audio file:", audio_file)
         # print("DEBUG: Sample rate:", sr, "Signal length:", len(original_wav))

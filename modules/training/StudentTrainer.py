@@ -3,6 +3,7 @@ import os
 import torch
 import numpy as np
 import warnings  # Add import for warnings module
+import traceback  # Add import for traceback module
 
 import torch.nn.functional as F
 import matplotlib.pyplot as plt  # Add missing matplotlib import
@@ -1316,19 +1317,99 @@ class StudentTrainer(BaseTrainer):
                 try:
                     info("Verifying teacher logits availability in first batch...")
                     first_batch = next(iter(train_loader))
+
                     if 'teacher_logits' not in first_batch:
-                        info("WARNING: KD is enabled but teacher_logits are missing from the first batch!")
-                        info("This will cause training to fall back to standard CE loss and may lead to poor results.")
+                        # Teacher logits not found in batch
+                        if self.teacher_model is not None:
+                            # We have a teacher model, so we can generate logits on-the-fly
+                            info("Teacher logits not found in batch, but teacher model is available.")
+                            info("Will generate teacher logits on-the-fly during training.")
 
-                        # NEW: Disable KD if no teacher logits available at start
-                        info("AUTOMATICALLY DISABLING KD since no teacher logits found.")
-                        self.use_kd_loss = False
+                            # Test on-the-fly generation with the first batch
+                            inputs = first_batch['spectro'].to(self.device)
 
-                        if self.use_focal_loss:
-                            info("Continuing with focal loss only.")
+                            # Apply normalization if available
+                            if self.normalization:
+                                inputs = (inputs - self.normalization['mean']) / self.normalization['std']
+
+                            # Generate teacher logits on-the-fly
+                            with torch.no_grad():
+                                self.teacher_model.eval()
+
+                                # Use the extract_logits_from_teacher function for robust extraction
+                                from modules.utils.teacher_utils import extract_logits_from_teacher
+                                teacher_logits, status = extract_logits_from_teacher(
+                                    self.teacher_model,
+                                    inputs,
+                                    self.teacher_normalization['mean'],
+                                    self.teacher_normalization['std'],
+                                    self.device
+                                )
+
+                                if status["success"]:
+                                    info(f"Successfully generated teacher logits on-the-fly with shape: {teacher_logits.shape}")
+                                    info(f"Method used: {status['method_used']}")
+                                    info("Knowledge Distillation will use on-the-fly teacher logits during training")
+
+                                    # Create a wrapper for the train_loader that adds teacher logits to each batch
+                                    self._original_train_loader = train_loader
+
+                                    # Define a generator function that adds teacher logits to each batch
+                                    def train_loader_with_teacher_logits():
+                                        for batch in self._original_train_loader:
+                                            # Extract inputs
+                                            inputs = batch['spectro'].to(self.device)
+
+                                            # Apply normalization if available
+                                            if self.normalization:
+                                                normalized_inputs = (inputs - self.normalization['mean']) / self.normalization['std']
+                                            else:
+                                                normalized_inputs = inputs
+
+                                            # Generate teacher logits on-the-fly
+                                            with torch.no_grad():
+                                                self.teacher_model.eval()
+
+                                                # Use the extract_logits_from_teacher function for robust extraction
+                                                teacher_logits, status = extract_logits_from_teacher(
+                                                    self.teacher_model,
+                                                    normalized_inputs,
+                                                    self.teacher_normalization['mean'],
+                                                    self.teacher_normalization['std'],
+                                                    self.device
+                                                )
+
+                                                if status["success"]:
+                                                    # Add teacher logits to the batch
+                                                    batch['teacher_logits'] = teacher_logits
+
+                                            yield batch
+
+                                    # Replace the train_loader with our wrapped version
+                                    train_loader = train_loader_with_teacher_logits()
+                                    info("Successfully set up on-the-fly teacher logit generation")
+                                else:
+                                    info(f"Failed to generate teacher logits: {status['message']}")
+                                    info("AUTOMATICALLY DISABLING KD since teacher logit generation failed.")
+                                    self.use_kd_loss = False
+
+                                    if self.use_focal_loss:
+                                        info("Continuing with focal loss only.")
+                                    else:
+                                        info("Continuing with standard cross-entropy loss only.")
                         else:
-                            info("Continuing with standard cross-entropy loss only.")
+                            # No teacher model available
+                            info("WARNING: KD is enabled but teacher_logits are missing from the first batch!")
+                            info("This will cause training to fall back to standard CE loss and may lead to poor results.")
+                            info("AUTOMATICALLY DISABLING KD since no teacher logits found and no teacher model available.")
+                            self.use_kd_loss = False
+
+                            if self.use_focal_loss:
+                                info("Continuing with focal loss only.")
+                            else:
+                                info("Continuing with standard cross-entropy loss only.")
                     else:
+                        # Teacher logits found in batch
                         teacher_shape = first_batch['teacher_logits'].shape
                         info(f"Teacher logits verified with shape: {teacher_shape}")
                         # Check if we have non-zero values in teacher logits
@@ -1336,6 +1417,7 @@ class StudentTrainer(BaseTrainer):
                             info("WARNING: Teacher logits contain all zeros! Check your logits loading process.")
                 except Exception as e:
                     info(f"Error checking first batch for teacher logits: {e}")
+                    info(traceback.format_exc())
                     # NEW: Disable KD on error
                     info("AUTOMATICALLY DISABLING KD due to error checking teacher logits.")
                     self.use_kd_loss = False

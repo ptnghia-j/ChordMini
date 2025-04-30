@@ -1221,21 +1221,48 @@ def main():
             small_dataset_percentage = dataset_args.get('small_dataset_percentage', 1.0)
             original_test_count = len(test_samples)
 
+            # Create a set of song IDs that should be processed
+            # This will be used to filter out songs that aren't in the sampled subset
+            sampled_song_ids = set()
+
             if small_dataset_percentage < 1.0 and original_test_count > 0:
                 # Sample a subset of test samples for MIR evaluation
                 sample_size = max(1, int(original_test_count * small_dataset_percentage))
                 if sample_size < original_test_count:
                     # Use the same random seed for consistency
                     random.seed(seed)  # Use the same seed as elsewhere in the code
-                    indices = random.sample(range(original_test_count), sample_size)
-                    test_samples = [test_samples[i] for i in indices]
-                    logger.info(f"Using small dataset for MIR evaluation: sampled {len(test_samples)}/{original_test_count} test samples ({small_dataset_percentage:.1%})")
 
-                    # Important: Only load audio files for the sampled test samples
-                    # This prevents loading all audio files when only a subset is needed
+                    # Get unique song IDs from the test samples
+                    song_ids = []
+                    song_id_to_samples = {}
+
                     for sample in test_samples:
-                        # Mark this sample as needing feature loading during evaluation
-                        sample['_load_feature_during_eval'] = True
+                        song_id = sample.get('song_id', '')
+                        if song_id:
+                            if song_id not in song_id_to_samples:
+                                song_ids.append(song_id)
+                                song_id_to_samples[song_id] = []
+                            song_id_to_samples[song_id].append(sample)
+
+                    # Sample a subset of song IDs
+                    num_songs = len(song_ids)
+                    num_songs_to_sample = max(1, int(num_songs * small_dataset_percentage))
+                    sampled_song_ids = set(random.sample(song_ids, num_songs_to_sample))
+
+                    # Filter test samples to only include those from sampled songs
+                    filtered_test_samples = []
+                    for sample in test_samples:
+                        song_id = sample.get('song_id', '')
+                        if song_id in sampled_song_ids:
+                            # Mark this sample as needing feature loading during evaluation
+                            sample['_load_feature_during_eval'] = True
+                            filtered_test_samples.append(sample)
+
+                    # Update test_samples to only include samples from sampled songs
+                    test_samples = filtered_test_samples
+
+                    logger.info(f"Using small dataset for MIR evaluation: sampled {len(sampled_song_ids)}/{num_songs} songs ({small_dataset_percentage:.1%})")
+                    logger.info(f"This results in {len(test_samples)}/{original_test_count} test samples")
 
             dataset_length = len(test_samples)
 
@@ -1260,6 +1287,10 @@ def main():
                     # This fixes the infinite loop issue by not sharing the set between calls
                     processed_samples = set()
 
+                    # Log the number of sampled song IDs for debugging
+                    if small_dataset_percentage < 1.0:
+                        logger.info(f"Using {len(sampled_song_ids)} sampled song IDs for filtering")
+
                     batch_scores = {
                         'root': [], 'thirds': [], 'triads': [], 'sevenths': [],
                         'tetrads': [], 'majmin': [], 'mirex': []
@@ -1280,9 +1311,11 @@ def main():
 
                         # Check if this sample should be processed
                         # If we're using a small dataset percentage, only process samples that are marked
-                        if small_dataset_percentage < 1.0 and not sample.get('_load_feature_during_eval', False):
-                            logger.debug(f"Skipping sample {sample.get('song_id', 'unknown')}: not in sampled subset")
-                            continue
+                        song_id = sample.get('song_id', '')
+                        if small_dataset_percentage < 1.0:
+                            if not sample.get('_load_feature_during_eval', False) and song_id not in sampled_song_ids:
+                                logger.info(f"Skipping sample {song_id}: not in sampled subset")
+                                continue
 
                         try:
                             # Get the feature and label data
