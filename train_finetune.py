@@ -185,10 +185,10 @@ def main():
     # Add knowledge distillation arguments
     parser.add_argument('--use_kd_loss', action='store_true',
                        help='Use knowledge distillation loss (teacher logits must be in batch data)')
-    parser.add_argument('--kd_alpha', type=float, default=0.5,
-                       help='Weight for knowledge distillation loss (default: 0.5)')
-    parser.add_argument('--temperature', type=float, default=1.0,
-                       help='Temperature for softening distributions (default: 1.0)')
+    parser.add_argument('--kd_alpha', type=float, default=0.3,
+                       help='Weight for knowledge distillation loss (default: 0.3)')
+    parser.add_argument('--temperature', type=float, default=2.0,
+                       help='Temperature for softening distributions (default: 2.0)')
     parser.add_argument('--teacher_model', type=str, default=None,
                        help='Path to teacher model for knowledge distillation')
     parser.add_argument('--kd_debug_mode', action='store_true',
@@ -824,8 +824,8 @@ def main():
             if not use_kd_loss:
                 use_kd_loss = True
                 logger.info("Automatically enabling knowledge distillation with found teacher model")
-                kd_alpha = args.kd_alpha if args.kd_alpha is not None else float(config.training.get('kd_alpha', 0.5))
-                temperature = args.temperature if args.temperature is not None else float(config.training.get('temperature', 1.0))
+                kd_alpha = args.kd_alpha if args.kd_alpha is not None else float(config.training.get('kd_alpha', 0.3))
+                temperature = args.temperature if args.temperature is not None else float(config.training.get('temperature', 2.0))
                 logger.info(f"Using KD alpha: {kd_alpha}, temperature: {temperature}")
 
     if teacher_model_path:
@@ -851,8 +851,8 @@ def main():
                 if not use_kd_loss:
                     use_kd_loss = True
                     logger.info("Automatically enabling knowledge distillation with loaded teacher model")
-                    kd_alpha = args.kd_alpha if args.kd_alpha is not None else float(config.training.get('kd_alpha', 0.5))
-                    temperature = args.temperature if args.temperature is not None else float(config.training.get('temperature', 1.0))
+                    kd_alpha = args.kd_alpha if args.kd_alpha is not None else float(config.training.get('kd_alpha', 0.3))
+                    temperature = args.temperature if args.temperature is not None else float(config.training.get('temperature', 2.0))
                     logger.info(f"Using KD alpha: {kd_alpha}, temperature: {temperature}")
 
                 # Check if we have mean/std for normalization
@@ -1226,9 +1226,16 @@ def main():
                 sample_size = max(1, int(original_test_count * small_dataset_percentage))
                 if sample_size < original_test_count:
                     # Use the same random seed for consistency
+                    random.seed(seed)  # Use the same seed as elsewhere in the code
                     indices = random.sample(range(original_test_count), sample_size)
                     test_samples = [test_samples[i] for i in indices]
                     logger.info(f"Using small dataset for MIR evaluation: sampled {len(test_samples)}/{original_test_count} test samples ({small_dataset_percentage:.1%})")
+
+                    # Important: Only load audio files for the sampled test samples
+                    # This prevents loading all audio files when only a subset is needed
+                    for sample in test_samples:
+                        # Mark this sample as needing feature loading during evaluation
+                        sample['_load_feature_during_eval'] = True
 
             dataset_length = len(test_samples)
 
@@ -1270,6 +1277,12 @@ def main():
                         # Log progress periodically
                         if sample_idx % 10 == 0:
                             logger.info(f"Processing sample {sample_idx}/{total_samples} ({sample_idx/total_samples*100:.1f}%)")
+
+                        # Check if this sample should be processed
+                        # If we're using a small dataset percentage, only process samples that are marked
+                        if small_dataset_percentage < 1.0 and not sample.get('_load_feature_during_eval', False):
+                            logger.debug(f"Skipping sample {sample.get('song_id', 'unknown')}: not in sampled subset")
+                            continue
 
                         try:
                             # Get the feature and label data
