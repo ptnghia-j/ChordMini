@@ -179,7 +179,7 @@ spec:
             # KD loss weight - controls balance between KD loss and standard loss
             # Higher values give more weight to matching teacher outputs vs ground truth
             - name: KD_ALPHA
-              value: "0.3"  # Weight for KD loss (0-1) - only used if KD is enabled
+              value: "0.5"  # Weight for KD loss (0-1) - only used if KD is enabled
             # Temperature for softening probability distributions
             # Higher values make distributions softer, emphasizing knowledge transfer
             - name: TEMPERATURE

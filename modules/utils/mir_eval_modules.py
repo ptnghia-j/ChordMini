@@ -732,7 +732,7 @@ def root_majmin_score_calculation(valid_dataset, config, mean, std, device, mode
     return metrics_.score_list_dict, song_length_list, metrics_.average_score
 
 
-def large_voca_score_calculation(valid_dataset, config, model, model_type, mean, std, device=None):
+def large_voca_score_calculation(valid_dataset, config, model, model_type, mean, std, device=None, sampled_song_ids=None):
     """
     Calculate MIR evaluation scores using the model on a validation dataset.
 
@@ -744,6 +744,7 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
         mean: Mean value for normalization
         std: Standard deviation for normalization
         device: Device to run evaluation on (default: None, will use model's device)
+        sampled_song_ids: Set of song IDs to include in evaluation (for small dataset percentage)
 
     Returns:
         score_list_dict: Dictionary of score lists for each metric
@@ -752,6 +753,10 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
     """
 
     print(f"Processing list of {len(valid_dataset)} samples for evaluation")
+
+    # Log if we're using a subset of songs
+    if sampled_song_ids:
+        print(f"Using only {len(sampled_song_ids)} sampled song IDs for evaluation")
 
     # Ensure model is in evaluation mode
     model.eval()
