@@ -209,9 +209,9 @@ spec:
             - name: USE_WARMUP
               value: "true"  # Set to "true" to enable learning rate warm-up
             - name: WARMUP_START_LR
-              value: "0.0004" # Starting learning rate for warm-up
+              value: "0.0001" # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.0005"  # Final learning rate after warm-up (matches base LR)
+              value: "0.0002"  # Final learning rate after warm-up (matches base LR)
             - name: WARMUP_EPOCHS
               value: "5"      # Number of epochs for warm-up
             # Dropout setting (can override btc_config.yaml)

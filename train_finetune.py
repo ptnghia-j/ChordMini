@@ -1027,21 +1027,50 @@ def main():
                 # Get a sample batch
                 sample_batch = next(iter(train_loader))
 
-                # Process the batch through the trainer's training step
-                # This will extract teacher logits and compute KD loss
-                loss = trainer.training_step(sample_batch, 0)
+                # Extract inputs and targets from the batch
+                inputs = sample_batch['spectro'].to(device)
+                targets = sample_batch['chord_idx'].to(device)
 
-                # Check if KD is working
-                if hasattr(trainer, '_kd_loss_logged') or hasattr(trainer, '_kd_loss_details_logged'):
+                # Apply normalization if available
+                if normalization and 'mean' in normalization and 'std' in normalization:
+                    inputs = (inputs - normalization['mean']) / normalization['std']
+
+                # Generate teacher logits on-the-fly
+                with torch.no_grad():
+                    teacher_model.eval()
+                    teacher_outputs = teacher_model(inputs)
+
+                    # Handle different output formats
+                    if isinstance(teacher_outputs, tuple):
+                        teacher_logits = teacher_outputs[0]
+                    else:
+                        teacher_logits = teacher_outputs
+
+                # Add teacher logits to the batch
+                sample_batch['teacher_logits'] = teacher_logits
+
+                # Process the batch through the trainer's train_batch method
+                # This will extract teacher logits and compute KD loss
+                batch_metrics = trainer.train_batch(sample_batch)
+
+                # Check if KD loss is non-zero
+                if batch_metrics['kd_loss'] > 0:
                     logger.info("✅ Knowledge distillation is working properly!")
+                    logger.info(f"KD loss: {batch_metrics['kd_loss']:.4f}, standard loss: {batch_metrics['standard_loss']:.4f}")
                     logger.info("Starting training with KD enabled")
                 else:
-                    logger.warning("⚠️ Knowledge distillation may not be working properly.")
+                    logger.warning("⚠️ Knowledge distillation loss is zero.")
                     logger.warning("Training will continue, but KD might not be effective.")
             except Exception as e:
                 logger.error(f"Error verifying KD setup: {e}")
                 logger.error(traceback.format_exc())
                 logger.warning("Continuing with training, but KD might not work properly")
+
+        # Log the final KD parameters being used
+        if use_kd_loss:
+            logger.info(f"Starting training with Knowledge Distillation:")
+            logger.info(f"  KD alpha: {kd_alpha} (from {'command line' if args.kd_alpha is not None else 'config file'})")
+            logger.info(f"  Temperature: {temperature} (from {'command line' if args.temperature is not None else 'config file'})")
 
         # Start training
         trainer.train(train_loader, val_loader)
