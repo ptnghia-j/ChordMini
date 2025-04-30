@@ -12,20 +12,40 @@ import torch
 from tqdm import tqdm
 from modules.utils.chords import idx2voca_chord
 
-def audio_file_to_features(audio_file, config):
+def audio_file_to_features(audio_file, config, timeout=60):
+    """
+    Extract features from an audio file with timeout protection.
+
+    Args:
+        audio_file: Path to the audio file
+        config: Configuration object
+        timeout: Maximum time in seconds to spend loading the audio file (default: 60)
+
+    Returns:
+        feature: Extracted features
+        frame_duration: Duration of each frame in seconds
+        song_length_second: Total length of the song in seconds
+    """
     import os
+    import time
+    import signal
+
+    # Define a timeout handler
+    class TimeoutError(Exception):
+        pass
+
+    def timeout_handler(signum, frame):
+        raise TimeoutError(f"Audio loading timed out after {timeout} seconds")
+
     if not os.path.isfile(audio_file):
         raise FileNotFoundError(f"Audio file not found: {audio_file}")
+
     # Debug info: file exists, log its size
     file_size = os.path.getsize(audio_file)
-    # print("DEBUG: Audio file found:", audio_file, "Size:", file_size, "bytes")
-    # If file is unusually small, it might be corrupt – add debug and skip
     if file_size < 5000:
-        # print("DEBUG: File size is unusually small, possibly corrupt:", audio_file)
         raise RuntimeError(f"Audio file '{audio_file}' is too small and may be corrupt.")
+
     try:
-        # Add a check to see if we're using a small dataset percentage
-        # If we are, we should only load audio files that are marked for evaluation
         from modules.utils.logger import info
         info(f"Loading features from audio file: {audio_file}")
 
@@ -43,15 +63,28 @@ def audio_file_to_features(audio_file, config):
                     info(f"Error loading cached features: {e}")
                     # Continue with normal loading
 
-        # Load the audio file
-        original_wav, sr = librosa.load(audio_file, sr=config.mp3['song_hz'], mono=True)
+        # Set up timeout for audio loading
+        original_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(timeout)
 
-        # print("DEBUG: Successfully loaded audio file:", audio_file)
-        # print("DEBUG: Sample rate:", sr, "Signal length:", len(original_wav))
+        try:
+            # Load the audio file with timeout protection
+            info(f"Loading audio file with {timeout}s timeout: {audio_file}")
+            start_time = time.time()
+            original_wav, sr = librosa.load(audio_file, sr=config.mp3['song_hz'], mono=True)
+            load_time = time.time() - start_time
+            info(f"Audio loaded in {load_time:.2f}s: {audio_file}")
+
+            # Cancel the alarm
+            signal.alarm(0)
+        except TimeoutError as e:
+            info(f"WARNING: {str(e)} - {audio_file}")
+            raise RuntimeError(f"Audio loading timed out: {audio_file}")
+        finally:
+            # Restore the original signal handler
+            signal.signal(signal.SIGALRM, original_handler)
+
     except Exception as e:
-        # print("DEBUG: Exception occurred while loading audio file:", audio_file)
-        # print("DEBUG: Exception details:", e)
-        # print("DEBUG: Available audioread backends:", audioread.available_backends())
         raise RuntimeError(f"Failed to load audio file '{audio_file}': {e}")
 
     # Get FFT size from config or use default
@@ -1202,20 +1235,74 @@ def calculate_chord_scores(timestamps, frame_duration, reference_labels, predict
     prediction_labels = prediction_labels[:min_len]
 
     # Calculate durations from timestamps (same approach as test_labeled_audio.py)
+    # Ensure durations array has the same length as timestamps
     durations = np.diff(np.append(timestamps, [timestamps[-1] + frame_duration]))
+
+    # Check if durations length matches timestamps length
+    if len(durations) != len(timestamps):
+        print(f"Warning: Durations length ({len(durations)}) doesn't match timestamps length ({len(timestamps)})")
+        # Truncate or pad durations to match timestamps length
+        if len(durations) > len(timestamps):
+            durations = durations[:len(timestamps)]
+        else:
+            # Pad with the last duration value
+            last_duration = durations[-1] if len(durations) > 0 else frame_duration
+            durations = np.append(durations, [last_duration] * (len(timestamps) - len(durations)))
 
     # Create intervals using variable durations to avoid overlaps
     ref_intervals = np.zeros((min_len, 2))
     ref_intervals[:, 0] = timestamps
-    ref_intervals[:, 1] = timestamps + durations
 
-    est_intervals = np.zeros((min_len, 2))
-    est_intervals[:, 0] = timestamps
-    est_intervals[:, 1] = timestamps + durations
+    # Safely add durations to timestamps
+    if len(durations) == len(timestamps):
+        ref_intervals[:, 1] = timestamps + durations
+    else:
+        # Fallback: use constant frame duration if lengths still don't match
+        print(f"Warning: Using constant frame duration as fallback")
+        ref_intervals[:, 1] = timestamps + frame_duration
+
+    # Use the same intervals for estimated chords
+    est_intervals = np.copy(ref_intervals)
 
     # Use mir_eval.chord.evaluate for robust calculation
     scores = {}
     try:
+        # Verify inputs before calling mir_eval
+        if len(ref_intervals) != len(reference_labels) or len(est_intervals) != len(prediction_labels):
+            print(f"Error: Mismatched lengths - ref_intervals: {len(ref_intervals)}, reference_labels: {len(reference_labels)}, "
+                  f"est_intervals: {len(est_intervals)}, prediction_labels: {len(prediction_labels)}")
+            # Ensure all arrays have the same minimum length
+            min_eval_len = min(len(ref_intervals), len(reference_labels), len(est_intervals), len(prediction_labels))
+            ref_intervals = ref_intervals[:min_eval_len]
+            reference_labels = reference_labels[:min_eval_len]
+            est_intervals = est_intervals[:min_eval_len]
+            prediction_labels = prediction_labels[:min_eval_len]
+            print(f"Truncated all arrays to length {min_eval_len}")
+
+        # Check for NaN or infinite values in intervals
+        if np.isnan(ref_intervals).any() or np.isinf(ref_intervals).any():
+            print("Warning: Reference intervals contain NaN or infinite values")
+            # Replace NaN/inf with reasonable values
+            ref_intervals = np.nan_to_num(ref_intervals, nan=0.0, posinf=1e6, neginf=0.0)
+
+        if np.isnan(est_intervals).any() or np.isinf(est_intervals).any():
+            print("Warning: Estimated intervals contain NaN or infinite values")
+            # Replace NaN/inf with reasonable values
+            est_intervals = np.nan_to_num(est_intervals, nan=0.0, posinf=1e6, neginf=0.0)
+
+        # Ensure intervals are properly ordered (start < end)
+        for i in range(len(ref_intervals)):
+            if ref_intervals[i, 0] >= ref_intervals[i, 1]:
+                print(f"Warning: Reference interval {i} has start >= end: {ref_intervals[i]}")
+                # Fix by adding a small duration
+                ref_intervals[i, 1] = ref_intervals[i, 0] + frame_duration
+
+        for i in range(len(est_intervals)):
+            if est_intervals[i, 0] >= est_intervals[i, 1]:
+                print(f"Warning: Estimated interval {i} has start >= end: {est_intervals[i]}")
+                # Fix by adding a small duration
+                est_intervals[i, 1] = est_intervals[i, 0] + frame_duration
+
         # mir_eval.chord.evaluate handles merging, weighting, and calculates all metrics
         scores = mir_eval.chord.evaluate(ref_intervals, reference_labels, est_intervals, prediction_labels)
 
@@ -1229,7 +1316,11 @@ def calculate_chord_scores(timestamps, frame_duration, reference_labels, predict
         mirex_score = float(scores.get('mirex', 0.0))
 
     except Exception as e:
+        import traceback
         print(f"Error during mir_eval.chord.evaluate: {e}")
+        print(traceback.format_exc())
+        print(f"Input shapes - ref_intervals: {ref_intervals.shape}, est_intervals: {est_intervals.shape}")
+        print(f"Reference labels length: {len(reference_labels)}, Prediction labels length: {len(prediction_labels)}")
         # Return default zero scores on error
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 

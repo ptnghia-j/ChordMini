@@ -1713,21 +1713,32 @@ def main():
                             frame_duration = config.feature.get('hop_duration', 0.1)
                             feature_length = len(reference_labels)
                             timestamps = np.arange(feature_length) * frame_duration
-                            durations = np.diff(np.append(timestamps, [timestamps[-1] + frame_duration]))
 
                             # Ensure reference and prediction labels have the same length
                             min_len = min(len(reference_labels), len(pred_labels))
                             reference_labels = reference_labels[:min_len]
                             pred_labels = pred_labels[:min_len]
-                            durations = durations[:min_len]
+
+                            # Ensure timestamps has the correct length
+                            if len(timestamps) > min_len:
+                                timestamps = timestamps[:min_len]
+                            elif len(timestamps) < min_len:
+                                # Extend timestamps if needed
+                                last_timestamp = timestamps[-1] if len(timestamps) > 0 else 0
+                                step = frame_duration
+                                extension = np.arange(1, min_len - len(timestamps) + 1) * step + last_timestamp
+                                timestamps = np.append(timestamps, extension)
 
                             # Add to batch collections
                             batch_refs.extend(reference_labels)
                             batch_preds.extend(pred_labels)
 
-                            # Calculate scores
+                            # Log lengths for debugging
+                            logger.debug(f"Lengths - timestamps: {len(timestamps)}, reference_labels: {len(reference_labels)}, pred_labels: {len(pred_labels)}")
+
+                            # Calculate scores - pass frame_duration instead of durations
                             root_score, thirds_score, triads_score, sevenths_score, tetrads_score, majmin_score, mirex_score = calculate_chord_scores(
-                                timestamps[:min_len], durations, reference_labels, pred_labels)
+                                timestamps, frame_duration, reference_labels, pred_labels)
 
                             # Add scores to batch results
                             batch_scores['root'].append(root_score)
