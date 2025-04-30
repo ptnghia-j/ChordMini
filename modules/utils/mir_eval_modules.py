@@ -28,7 +28,24 @@ def audio_file_to_features(audio_file, config):
         # If we are, we should only load audio files that are marked for evaluation
         from modules.utils.logger import info
         info(f"Loading features from audio file: {audio_file}")
+
+        # Check if the file is in the cache first
+        cache_path = None
+        if hasattr(config, 'cache_dir') and config.cache_dir:
+            cache_filename = f"{os.path.basename(audio_file).split('.')[0]}.npy"
+            cache_path = os.path.join(config.cache_dir, cache_filename)
+            if os.path.exists(cache_path):
+                try:
+                    info(f"Loading features from cache: {cache_path}")
+                    data = np.load(cache_path, allow_pickle=True).item()
+                    return data['feature'], data['feature_per_second'], data['song_length_second']
+                except Exception as e:
+                    info(f"Error loading cached features: {e}")
+                    # Continue with normal loading
+
+        # Load the audio file
         original_wav, sr = librosa.load(audio_file, sr=config.mp3['song_hz'], mono=True)
+
         # print("DEBUG: Successfully loaded audio file:", audio_file)
         # print("DEBUG: Sample rate:", sr, "Signal length:", len(original_wav))
     except Exception as e:

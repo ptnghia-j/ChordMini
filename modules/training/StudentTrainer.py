@@ -1385,8 +1385,59 @@ class StudentTrainer(BaseTrainer):
 
                                             yield batch
 
-                                    # Replace the train_loader with our wrapped version
-                                    train_loader = train_loader_with_teacher_logits()
+                                    # Create a list from the generator to maintain length information
+                                    # This is less memory efficient but allows us to use len() and iterate multiple times
+                                    original_train_loader_list = list(self._original_train_loader)
+
+                                    # Define a function that returns a new generator each time it's called
+                                    def get_train_loader_with_teacher_logits():
+                                        for batch in original_train_loader_list:
+                                            # Extract inputs
+                                            inputs = batch['spectro'].to(self.device)
+
+                                            # Apply normalization if available
+                                            if self.normalization:
+                                                normalized_inputs = (inputs - self.normalization['mean']) / self.normalization['std']
+                                            else:
+                                                normalized_inputs = inputs
+
+                                            # Generate teacher logits on-the-fly
+                                            with torch.no_grad():
+                                                self.teacher_model.eval()
+
+                                                # Use the extract_logits_from_teacher function for robust extraction
+                                                teacher_logits, status = extract_logits_from_teacher(
+                                                    self.teacher_model,
+                                                    normalized_inputs,
+                                                    self.teacher_normalization['mean'],
+                                                    self.teacher_normalization['std'],
+                                                    self.device
+                                                )
+
+                                                if status["success"]:
+                                                    # Add teacher logits to the batch
+                                                    batch['teacher_logits'] = teacher_logits
+
+                                            yield batch
+
+                                    # Create a custom iterable class that has a __len__ method
+                                    class TeacherLogitDataLoader:
+                                        def __init__(self, get_generator_func, length):
+                                            self.get_generator_func = get_generator_func
+                                            self.length = length
+
+                                        def __iter__(self):
+                                            return self.get_generator_func()
+
+                                        def __len__(self):
+                                            return self.length
+
+                                    # Replace the train_loader with our custom iterable
+                                    train_loader = TeacherLogitDataLoader(
+                                        get_train_loader_with_teacher_logits,
+                                        len(original_train_loader_list)
+                                    )
+
                                     info("Successfully set up on-the-fly teacher logit generation")
                                 else:
                                     info(f"Failed to generate teacher logits: {status['message']}")
