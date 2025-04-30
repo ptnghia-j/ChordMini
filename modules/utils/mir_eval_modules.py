@@ -45,6 +45,15 @@ def audio_file_to_features(audio_file, config, timeout=60):
     if file_size < 5000:
         raise RuntimeError(f"Audio file '{audio_file}' is too small and may be corrupt.")
 
+    # Check if we're in MIR evaluation mode and should skip this file
+    # This is set by train_finetune.py when using small_dataset_percentage
+    if hasattr(config, 'skip_audio_files') and isinstance(config.skip_audio_files, set):
+        audio_basename = os.path.basename(audio_file)
+        if audio_basename in config.skip_audio_files:
+            from modules.utils.logger import info
+            info(f"Skipping audio file due to small_dataset_percentage: {audio_file}")
+            raise RuntimeError(f"Audio file '{audio_file}' skipped due to small_dataset_percentage setting.")
+
     try:
         from modules.utils.logger import info
         info(f"Loading features from audio file: {audio_file}")
@@ -784,6 +793,12 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
         song_length_list: List of song lengths for weighting
         average_score_dict: Dictionary of average scores for each metric
     """
+    # Check if we're using small_dataset_percentage and have skip_audio_files set
+    if hasattr(config, 'skip_audio_files') and isinstance(config.skip_audio_files, set):
+        from modules.utils.logger import info
+        info(f"Using skip_audio_files list with {len(config.skip_audio_files)} files to skip")
+        if sampled_song_ids:
+            info(f"Using sampled_song_ids with {len(sampled_song_ids)} song IDs to include")
 
     print(f"Processing list of {len(valid_dataset)} samples for evaluation")
 
@@ -842,6 +857,23 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
                                              desc="Evaluating songs",
                                              total=len(song_groups))):
         try:
+            # Skip if we're using sampled_song_ids and this song is not in the set
+            if sampled_song_ids is not None and song_id not in sampled_song_ids:
+                continue
+
+            # Skip if any sample's audio file is in the skip_audio_files set
+            if hasattr(config, 'skip_audio_files') and isinstance(config.skip_audio_files, set):
+                should_skip = False
+                for sample in samples:
+                    audio_path = sample.get('audio_path', '')
+                    if audio_path and os.path.basename(audio_path) in config.skip_audio_files:
+                        from modules.utils.logger import info
+                        info(f"Skipping song {song_id} due to audio file {os.path.basename(audio_path)} in skip_audio_files")
+                        should_skip = True
+                        break
+                if should_skip:
+                    continue
+
             # Extract and sort samples by frame index if available
             if all('frame_idx' in sample for sample in samples):
                 samples.sort(key=lambda x: x['frame_idx'])

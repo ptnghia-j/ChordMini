@@ -346,6 +346,24 @@ def main():
     if args.warmup_epochs is not None:
         config.training['warmup_epochs'] = int(args.warmup_epochs)
 
+    # Handle use_warmup properly - command line arg takes precedence
+    if args.use_warmup:
+        config.training['use_warmup'] = True
+        logger.info("Warm-up enabled via command line argument")
+    else:
+        # Check if it's explicitly set in config
+        config_warmup = config.training.get('use_warmup', False)
+        # Handle string "true"/"false" in config
+        if isinstance(config_warmup, str):
+            config.training['use_warmup'] = config_warmup.lower() == "true"
+        else:
+            config.training['use_warmup'] = bool(config_warmup)
+
+        if config.training['use_warmup']:
+            logger.info("Warm-up enabled via config file")
+        else:
+            logger.info("Warm-up disabled")
+
     # Handle warmup_start_lr properly
     if args.warmup_start_lr is not None:
         config.training['warmup_start_lr'] = float(args.warmup_start_lr)
@@ -933,6 +951,15 @@ def main():
         lr_schedule_type = args.lr_schedule or config.training.get('lr_schedule', None)
 
     # Create trainer with KD support
+    # Use the use_warmup value from config.training that we've already processed
+    use_warmup_value = config.training.get('use_warmup', False)
+    if isinstance(use_warmup_value, str):
+        use_warmup_value = use_warmup_value.lower() == "true"
+    else:
+        use_warmup_value = bool(use_warmup_value)
+
+    logger.info(f"Creating trainer with use_warmup={use_warmup_value}")
+
     trainer = StudentTrainer(
         model=model,
         optimizer=optimizer,
@@ -946,7 +973,7 @@ def main():
         early_stopping_patience=int(config.training.get('early_stopping_patience', 5)),
         lr_decay_factor=float(config.training.get('lr_decay_factor', 0.95)),
         min_lr=float(config.training.get('min_learning_rate', 5e-6)),
-        use_warmup=args.use_warmup or bool(config.training.get('use_warmup', False)),
+        use_warmup=use_warmup_value,
         warmup_epochs=int(config.training.get('warmup_epochs')) if config.training.get('warmup_epochs') is not None else None,
         warmup_start_lr=float(config.training.get('warmup_start_lr')) if config.training.get('warmup_start_lr') is not None else None,
         warmup_end_lr=float(config.training.get('warmup_end_lr')) if config.training.get('warmup_end_lr') is not None else None,
@@ -1225,6 +1252,9 @@ def main():
             # This will be used to filter out songs that aren't in the sampled subset
             sampled_song_ids = set()
 
+            # Create a set of audio files to skip (will be added to config for audio_file_to_features)
+            skip_audio_files = set()
+
             if small_dataset_percentage < 1.0 and original_test_count > 0:
                 # Sample a subset of test samples for MIR evaluation
                 sample_size = max(1, int(original_test_count * small_dataset_percentage))
@@ -1235,9 +1265,14 @@ def main():
                     # Get unique song IDs from the test samples
                     song_ids = []
                     song_id_to_samples = {}
+                    all_audio_files = set()
 
                     for sample in test_samples:
                         song_id = sample.get('song_id', '')
+                        audio_path = sample.get('audio_path', '')
+                        if audio_path:
+                            all_audio_files.add(os.path.basename(audio_path))
+
                         if song_id:
                             if song_id not in song_id_to_samples:
                                 song_ids.append(song_id)
@@ -1253,13 +1288,22 @@ def main():
                     filtered_test_samples = []
                     for sample in test_samples:
                         song_id = sample.get('song_id', '')
+                        audio_path = sample.get('audio_path', '')
+
                         if song_id in sampled_song_ids:
                             # Mark this sample as needing feature loading during evaluation
                             sample['_load_feature_during_eval'] = True
                             filtered_test_samples.append(sample)
+                        elif audio_path:
+                            # Add to skip list if not in sampled songs
+                            skip_audio_files.add(os.path.basename(audio_path))
 
                     # Update test_samples to only include samples from sampled songs
                     test_samples = filtered_test_samples
+
+                    # Add skip_audio_files to config for audio_file_to_features
+                    config.skip_audio_files = skip_audio_files
+                    logger.info(f"Added {len(skip_audio_files)} audio files to skip list for MIR evaluation")
 
                     logger.info(f"Using small dataset for MIR evaluation: sampled {len(sampled_song_ids)}/{num_songs} songs ({small_dataset_percentage:.1%})")
                     logger.info(f"This results in {len(test_samples)}/{original_test_count} test samples")
