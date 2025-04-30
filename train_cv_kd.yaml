@@ -335,13 +335,13 @@ spec:
                 ${SMALL_DATASET_ARG}
           resources:
             limits:
-              nvidia.com/gpu: 1
+              nvidia.com/gpu: "1"
               memory: 32Gi
-              cpu: 8
+              cpu: "8"
             requests:
-              nvidia.com/gpu: 1
+              nvidia.com/gpu: "1"
               memory: 16Gi
-              cpu: 4
+              cpu: "4"
           volumeMounts:
             - name: storage
               mountPath: /mnt/storage

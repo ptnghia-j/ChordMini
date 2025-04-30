@@ -217,7 +217,7 @@ class StudentTrainer(BaseTrainer):
                  lr_decay_factor=0.95, min_lr=5e-6,
                  use_warmup=False, warmup_epochs=5, warmup_start_lr=None, warmup_end_lr=None,
                  lr_schedule_type=None, use_focal_loss=False, focal_gamma=2.0, focal_alpha=None,
-                 use_kd_loss=False, kd_alpha=0.5, temperature=1.0,
+                 use_kd_loss=False, kd_alpha=0.3, temperature=2.0,
                  teacher_model=None, teacher_normalization=None, teacher_predictions=None,
                  timeout_minutes=30):
 
@@ -406,12 +406,23 @@ class StudentTrainer(BaseTrainer):
         # --- Get teacher logits BEFORE potential flattening ---
         teacher_logits = None
         if self.use_kd_loss:
-            # Check if teacher_model is available for on-the-fly logits
-            if self.teacher_model is not None:
+            # First check if teacher_logits are already in the batch (pre-computed)
+            if 'teacher_logits' in batch and batch['teacher_logits'] is not None:
+                teacher_logits = batch['teacher_logits']
+                # Log only once
+                if not hasattr(self, '_precomputed_logits_logged'):
+                    info(f"Using pre-computed teacher logits with shape: {teacher_logits.shape}")
+                    self._precomputed_logits_logged = True
+
+            # If not in batch, check if teacher_model is available for on-the-fly extraction
+            elif self.teacher_model is not None:
                 try:
                     with torch.no_grad():
                         # Extract logits from teacher model using the improved function
-                        teacher_logits = extract_logits_from_teacher(
+                        from modules.utils.teacher_utils import extract_logits_from_teacher
+
+                        # Get the raw logits
+                        logits_result, status = extract_logits_from_teacher(
                             self.teacher_model,
                             spectro,
                             self.teacher_normalization['mean'],
@@ -419,13 +430,29 @@ class StudentTrainer(BaseTrainer):
                             self.device
                         )
 
-                        # Log teacher logits shape for debugging (only once)
-                        if not hasattr(self, '_teacher_logits_logged'):
-                            info(f"Successfully extracted teacher logits with shape: {teacher_logits.shape}")
-                            self._teacher_logits_logged = True
+                        if status["success"]:
+                            teacher_logits = logits_result
+
+                            # Log teacher logits shape for debugging (only once)
+                            if not hasattr(self, '_teacher_logits_logged'):
+                                info(f"Successfully extracted teacher logits with shape: {teacher_logits.shape}")
+                                info(f"Method used: {status['method_used']}")
+                                self._teacher_logits_logged = True
+
+                                # Count successful extractions
+                                if not hasattr(self, '_kd_success_count'):
+                                    self._kd_success_count = 0
+                                self._kd_success_count += 1
+
+                                # Log every 100 batches
+                                if self._kd_success_count % 100 == 0:
+                                    info(f"Successfully extracted teacher logits for {self._kd_success_count} batches")
+                        else:
+                            warning(f"Failed to extract teacher logits: {status['message']}")
+                            teacher_logits = None
 
                         # Verify teacher logits are valid
-                        if teacher_logits is None or torch.isnan(teacher_logits).any() or not torch.isfinite(teacher_logits).all():
+                        if teacher_logits is not None and (torch.isnan(teacher_logits).any() or not torch.isfinite(teacher_logits).all()):
                             warning("Teacher logits contain NaN or non-finite values, will not use for KD")
                             teacher_logits = None
                 except Exception as e:

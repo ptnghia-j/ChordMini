@@ -927,7 +927,12 @@ class LabeledDataset(Dataset):
         spectro = torch.tensor(sample['spectro'], dtype=torch.float32).to(self.device)
         chord_idx = torch.tensor(sample['chord_idx'], dtype=torch.long).to(self.device)
 
-        return {
+        # Check if teacher_logits are available in the sample
+        teacher_logits = None
+        if 'teacher_logits' in sample and sample['teacher_logits'] is not None:
+            teacher_logits = torch.tensor(sample['teacher_logits'], dtype=torch.float32).to(self.device)
+
+        result = {
             'spectro': spectro,
             'chord_idx': chord_idx,
             'song_id': sample['song_id'],
@@ -935,6 +940,12 @@ class LabeledDataset(Dataset):
             'audio_path': sample['audio_path'],
             'label_path': sample['label_path']
         }
+
+        # Add teacher_logits to the result if available
+        if teacher_logits is not None:
+            result['teacher_logits'] = teacher_logits
+
+        return result
 
     def get_train_iterator(self, batch_size=32, shuffle=True, num_workers=2, pin_memory=True):
         """Get data loader for training set"""
