@@ -249,6 +249,7 @@ class Chords:
         """
         Convert a string representation of a pitch class (consisting of root
         note and modifiers) to an integer representation.
+        Handles enharmonic equivalents like Cb, B#, etc.
 
         Parameters
         ----------
@@ -261,6 +262,18 @@ class Chords:
             Integer representation of a pitch class.
 
         """
+        # Handle special cases for enharmonic equivalents
+        enharmonic_map = {
+            'Cb': 11,  # B
+            'B#': 0,   # C
+            'E#': 5,   # F
+            'Fb': 4,   # E
+        }
+
+        if pitch_str in enharmonic_map:
+            return enharmonic_map[pitch_str]
+
+        # Standard processing for other notes
         return self.modify(self._chroma_id[(ord(pitch_str[0]) - ord('C')) % 7],
                       pitch_str[1:]) % 12
 
@@ -446,11 +459,18 @@ class Chords:
         ivs[maj_third & aug_fifth & ~perf_fifth] = self._shorthands['aug']
 
         if not keep_bass:
+            # Set all bass notes to 0 (root position)
             reduced_chords['bass'] = 0
         else:
-            # remove bass notes if they are not part of the intervals anymore
-            reduced_chords['bass'] *= ivs[range(len(reduced_chords)),
-                                          reduced_chords['bass']]
+            # Process each chord individually for better inversion handling
+            for i in range(len(reduced_chords)):
+                if reduced_chords['bass'][i] != -1:  # Skip no-chord
+                    # Check if the bass note is part of the chord
+                    if reduced_chords['intervals'][i, reduced_chords['bass'][i]] == 0:
+                        # Bass note is not part of the chord intervals, set to root position
+                        reduced_chords['bass'][i] = 0
+                    # Otherwise keep the bass note as is
+
         # keep -1 in bass for no chords
         reduced_chords['bass'][no_chord] = -1
 
@@ -575,12 +595,31 @@ class Chords:
 
     def label_error_modify(self, label):
         """
-        Correct common errors and inconsistencies in chord label format
+        Correct common errors and inconsistencies in chord label format.
+        Handles enharmonic equivalents and inversions.
+
+        Parameters
+        ----------
+        label : str
+            Chord label to correct.
+
+        Returns
+        -------
+        str
+            Corrected chord label.
         """
         if not label or label in ['N', 'X', 'NC']:
             return label
 
-        # Common format fixes
+        # Handle enharmonic equivalents
+        enharmonic_map = {
+            'Cb': 'B', 'B#': 'C',
+            'Db': 'C#', 'E#': 'F',
+            'Fb': 'E', 'Gb': 'F#',
+            'Ab': 'G#', 'Bb': 'A#'
+        }
+
+        # Common format fixes for specific patterns
         if label == 'Emin/4':
             return 'E:min/4'
         elif label == 'A7/3':
@@ -590,18 +629,58 @@ class Chords:
         elif label == 'Bb7/5':
             return 'Bb:7/5'
 
+        # Handle numeric inversions (e.g., C/5, D/3)
+        if '/' in label and ':' not in label:
+            parts = label.split('/')
+            if len(parts) == 2 and parts[1].isdigit():
+                # For numeric inversions, we'll standardize to root position
+                # This is a simplification - in a real system, you might want to
+                # preserve the inversion information
+                root = parts[0]
+
+                # Check for enharmonic equivalent of root
+                if root in enharmonic_map:
+                    root = enharmonic_map[root]
+
+                # Determine quality (default to major if not specified)
+                if 'min' in root or 'm' in root and not root.endswith('im'):
+                    for quality in ['min', 'm']:
+                        if quality in root:
+                            idx = root.find(quality)
+                            return root[:idx] + ':' + root[idx:]
+                else:
+                    # Assume major chord
+                    return root + ':maj'
+
         # Handle format without colon separator
         if ':' not in label:
             # Check for common quality strings and insert separator
-            for quality in ['min', 'maj', 'dim', 'aug', 'sus']:
+            for quality in ['min', 'maj', 'dim', 'aug', 'sus', 'm7', 'M7', '7']:
                 if quality in label:
                     idx = label.find(quality)
-                    return label[:idx] + ':' + label[idx:]
+                    # Make sure we're not matching part of another word
+                    if idx > 0 and not label[idx-1:idx+len(quality)].isalpha():
+                        root = label[:idx]
+                        # Check for enharmonic equivalent
+                        if root in enharmonic_map:
+                            root = enharmonic_map[root]
+                        return root + ':' + label[idx:]
 
             # Check for numeric qualities like 7, 9, etc.
             for i, c in enumerate(label):
-                if i > 0 and c.isdigit():
-                    return label[:i] + ':' + label[i:]
+                if i > 0 and c.isdigit() and not label[i-1].isdigit():
+                    root = label[:i]
+                    # Check for enharmonic equivalent
+                    if root in enharmonic_map:
+                        root = enharmonic_map[root]
+                    return root + ':' + label[i:]
+
+        # Handle enharmonic equivalents in root when format is already correct
+        if ':' in label:
+            parts = label.split(':')
+            root = parts[0]
+            if root in enharmonic_map:
+                return enharmonic_map[root] + ':' + parts[1]
 
         return label
 
@@ -872,8 +951,86 @@ class Chords:
         return df
 
     def get_converted_chord_voca(self, filename):
-        """Legacy method for compatibility"""
-        # ...existing code...
+        """
+        Load chords from a file and convert them to the large vocabulary format.
+        Handles enharmonic equivalents and inversions properly.
+
+        Parameters
+        ----------
+        filename : str
+            File containing chord segments.
+
+        Returns
+        -------
+        df : pandas DataFrame
+            DataFrame with columns 'start', 'end', and 'chord_id'.
+        """
+        # First load the original chords
+        loaded_chord = self.load_chords(filename)
+
+        # Reduce to triads (simplifies complex chords)
+        triads = self.reduce_to_triads(loaded_chord['chord'])
+        df = pd.DataFrame(data=triads[['root', 'is_major']])
+
+        # Load the original labeled intervals
+        try:
+            (ref_intervals, ref_labels) = mir_eval.io.load_labeled_intervals(filename)
+
+            # Apply error correction and standardization to all labels
+            ref_labels = [self.lab_file_error_modify(label) for label in ref_labels]
+
+            # Process each chord label to get its ID in the large vocabulary
+            idxs = []
+            unknown_chords = {}  # Track unknown chords for debugging
+
+            for i, chord_label in enumerate(ref_labels):
+                try:
+                    # Split chord into components using mir_eval
+                    chord_root, quality, scale_degrees, bass = mir_eval.chord.split(chord_label, reduce_extended_chords=True)
+
+                    # Get the root note as integer
+                    if chord_root == 'N':
+                        root = -1
+                    else:
+                        root = self.pitch(chord_root)
+
+                    # Convert to vocabulary ID
+                    chord_id = self.convert_to_id_voca(root=root, quality=quality)
+                    idxs.append(chord_id)
+
+                except Exception as e:
+                    # If parsing fails, try using the chord mapping directly
+                    chord_id = self.get_chord_idx(chord_label, use_large_voca=True)
+                    idxs.append(chord_id)
+
+                    # Track unknown chords for debugging
+                    if chord_id == 168:  # Unknown chord index
+                        unknown_chords[chord_label] = unknown_chords.get(chord_label, 0) + 1
+
+            # Log unknown chords if there are any
+            if unknown_chords:
+                most_common = sorted(unknown_chords.items(), key=lambda x: x[1], reverse=True)[:5]
+                logger.warning(f"Most common unknown chords: {most_common}")
+
+            # Set the chord IDs in the DataFrame
+            df['chord_id'] = idxs
+
+        except Exception as e:
+            logger.error(f"Error processing chord file {filename}: {e}")
+            # Fall back to basic conversion if the advanced method fails
+            df['chord_id'] = df.apply(
+                lambda row: self.convert_to_id_voca(
+                    root=row['root'],
+                    quality='maj' if row['is_major'] else 'min'
+                ),
+                axis=1
+            )
+
+        # Add start and end times
+        df['start'] = loaded_chord['start']
+        df['end'] = loaded_chord['end']
+
+        return df
 
 
 def idx2voca_chord():
