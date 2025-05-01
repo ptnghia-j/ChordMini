@@ -1,4 +1,3 @@
-import re
 import os
 import torch
 import numpy as np
@@ -12,7 +11,6 @@ from modules.utils.logger import info, warning, error, debug, logging_verbosity,
 from modules.training.Trainer import BaseTrainer
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, OneCycleLR, CosineAnnealingWarmRestarts
 from collections import Counter
-from modules.utils.teacher_utils import extract_logits_from_teacher
 
 # Import visualization functions including chord quality mapping
 from modules.utils.visualize import (
@@ -219,13 +217,12 @@ class StudentTrainer(BaseTrainer):
                  use_warmup=False, warmup_epochs=5, warmup_start_lr=None, warmup_end_lr=None,
                  lr_schedule_type=None, use_focal_loss=False, focal_gamma=2.0, focal_alpha=None,
                  use_kd_loss=False, kd_alpha=0.5, temperature=2.0,
-                 teacher_model=None, teacher_normalization=None, teacher_predictions=None,
-                 timeout_minutes=30):
+                 timeout_minutes=30, reset_epoch=False, reset_scheduler=False): # Removed teacher_model, teacher_normalization
 
         # First call the parent's __init__ to set up the logger and other attributes
         super().__init__(model, optimizer, scheduler, device, num_epochs,
                          logger, use_animator, checkpoint_dir, max_grad_norm,
-                         None, idx_to_chord, normalization)  # Pass None for class_weights initially
+                         None, idx_to_chord, normalization, reset_epoch, reset_scheduler)  # Pass None for class_weights initially
 
         # Focal loss parameters - set these first as they affect class weight handling
         self.use_focal_loss = use_focal_loss
@@ -236,17 +233,9 @@ class StudentTrainer(BaseTrainer):
         self.use_kd_loss = use_kd_loss
         self.kd_alpha = kd_alpha
         self.temperature = temperature
-        if self.use_kd_loss:
-            info(f"Using KD loss with α={kd_alpha} and temperature={temperature}")
-            info("Teacher logits expected to be provided in each batch")
 
-        if self.use_focal_loss:
-            info(f"Using Focal Loss (gamma={focal_gamma}) to handle class imbalance")
-            if self.focal_alpha is not None:
-                info(f"Using alpha={focal_alpha} for additional class weighting")
-            # When using focal loss, don't use standard class weights
-            class_weights = None
-            info("Class weights disabled as focal loss is being used")
+        # For offline KD, we only use pre-computed logits from the batch
+        # No on-the-fly extraction is needed
 
         # Now that logger is initialized, we can pad class weights
         self.weight_tensor = None
@@ -371,16 +360,9 @@ class StudentTrainer(BaseTrainer):
 
         # Add flag to track and debug scheduler stepping
         self._scheduler_step_count = 0
-
-        # Teacher model support for knowledge distillation
-        self.teacher_model = teacher_model
-        self.teacher_normalization = teacher_normalization or {'mean': 0.0, 'std': 1.0}
-        self.teacher_predictions = teacher_predictions or {}
-
-        # Timeout for distributed operations
-        self.timeout_minutes = timeout_minutes
-        if logger:
-            logger.info(f"Using timeout of {timeout_minutes} minutes for distributed operations")
+        # Add flags for reset behavior
+        self.reset_epoch = reset_epoch
+        self.reset_scheduler = reset_scheduler
 
     def train_batch(self, batch):
         """Train on a single batch."""
@@ -414,74 +396,6 @@ class StudentTrainer(BaseTrainer):
                 if not hasattr(self, '_precomputed_logits_logged'):
                     info(f"Using pre-computed teacher logits with shape: {teacher_logits.shape}")
                     self._precomputed_logits_logged = True
-
-            # If not in batch, check if teacher_model is available for on-the-fly extraction
-            elif self.teacher_model is not None:
-                try:
-                    with torch.no_grad():
-                        # Extract logits from teacher model using the improved function
-                        from modules.utils.teacher_utils import extract_logits_from_teacher
-
-                        # Get the raw logits
-                        logits_result, status = extract_logits_from_teacher(
-                            self.teacher_model,
-                            spectro,
-                            self.teacher_normalization['mean'],
-                            self.teacher_normalization['std'],
-                            self.device
-                        )
-
-                        if status["success"]:
-                            teacher_logits = logits_result
-
-                            # Log teacher logits shape for debugging (only once)
-                            if not hasattr(self, '_teacher_logits_logged'):
-                                info(f"Successfully extracted teacher logits with shape: {teacher_logits.shape}")
-                                info(f"Method used: {status['method_used']}")
-                                self._teacher_logits_logged = True
-
-                                # Count successful extractions
-                                if not hasattr(self, '_kd_success_count'):
-                                    self._kd_success_count = 0
-                                self._kd_success_count += 1
-
-                                # Log every 100 batches
-                                if self._kd_success_count % 100 == 0:
-                                    info(f"Successfully extracted teacher logits for {self._kd_success_count} batches")
-                        else:
-                            warning(f"Failed to extract teacher logits: {status['message']}")
-                            teacher_logits = None
-
-                        # Verify teacher logits are valid
-                        if teacher_logits is not None and (torch.isnan(teacher_logits).any() or not torch.isfinite(teacher_logits).all()):
-                            warning("Teacher logits contain NaN or non-finite values, will not use for KD")
-                            teacher_logits = None
-                except Exception as e:
-                    warning(f"Error extracting teacher logits: {e}")
-                    teacher_logits = None
-            else:
-                # Look for pre-computed logits in teacher_predictions or batch
-                if 'song_id' in batch and self.teacher_predictions:
-                    # Create a batch of teacher logits
-                    batch_teacher_logits = []
-                    for sample_idx, song_id in enumerate(batch['song_id']):
-                        # Create a unique key that includes song_id and possibly start_frame
-                        key = song_id
-                        if 'start_frame' in batch:
-                            key = f"{song_id}_{batch['start_frame'][sample_idx].item()}"
-
-                        if key in self.teacher_predictions:
-                            batch_teacher_logits.append(self.teacher_predictions[key])
-                        else:
-                            # If no predictions available, use a placeholder (zeros)
-                            batch_teacher_logits.append(torch.zeros_like(logits[sample_idx]))
-
-                    if batch_teacher_logits:
-                        teacher_logits = torch.stack(batch_teacher_logits, dim=0).to(self.device)
-
-                # If we still don't have teacher logits, check if they're in the batch
-                if teacher_logits is None and 'teacher_logits' in batch:
-                    teacher_logits = batch['teacher_logits'].to(self.device)
 
         # --- Flatten per-frame logits/targets AND teacher_logits consistently ---
         if logits.ndim == 3 and targets.ndim == 2:
@@ -539,7 +453,7 @@ class StudentTrainer(BaseTrainer):
         # Backward pass and optimizer step
         loss.backward()
         # Use safe clipping
-        safe_clip_grad_norm_(self.model.parameters(), self.max_grad_norm, error_if_nonfinite=False)
+        total_norm = safe_clip_grad_norm_(self.model.parameters(), self.max_grad_norm, error_if_nonfinite=False)
         self.optimizer.step()
 
         # Get predicted classes
@@ -638,25 +552,6 @@ class StudentTrainer(BaseTrainer):
             info(f"Unknown scheduler type: {self.lr_schedule_type}. Using warmup-only with validation-based adjustment")
             self.lr_schedule_type = None
 
-    def _update_smooth_scheduler(self, epoch, batch_idx, num_batches):
-        """Update learning rate scheduler with fractional epochs."""
-        if self.smooth_scheduler is None:
-            return
-
-        # Ensure we have valid inputs
-        if batch_idx is None or num_batches is None or num_batches == 0:
-            return
-
-        # Only step schedulers that support fractional epochs
-        if isinstance(self.smooth_scheduler, (OneCycleLR, CosineAnnealingWarmRestarts)):
-            # These can be stepped more frequently for smoother changes
-            if batch_idx > 0 and batch_idx % max(1, num_batches // 10) == 0:
-                # Calculate fractional epoch
-                fractional_epoch = (epoch - 1) + (batch_idx / num_batches)
-                self.smooth_scheduler.step(fractional_epoch)
-                self._scheduler_step_count += 1
-                info(f"Fractional scheduler step at epoch {epoch}, batch {batch_idx}/{num_batches}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
-
     def _update_learning_rate(self, epoch, batch_idx=None, num_batches=None):
         """
         Update learning rate combining warmup and scheduler logic.
@@ -674,7 +569,7 @@ class StudentTrainer(BaseTrainer):
 
         if in_warmup:
             # In warmup phase, use warmup-specific LR calculation
-            return self._warmup_learning_rate(epoch)
+            return self._warmup_learning_rate(epoch, batch_idx, num_batches)
         elif self.lr_schedule_type:
             # After warmup, use the selected scheduler with adjusted epoch numbering
             if self.use_warmup:
@@ -774,130 +669,6 @@ class StudentTrainer(BaseTrainer):
 
         return focal_loss.mean()
 
-    def distillation_loss(self, student_logits, teacher_logits, targets):
-        """
-        Combine a KL divergence loss between softened teacher and student predictions with
-        standard cross entropy loss on the targets.
-        Assumes student_logits and teacher_logits have the same shape.
-
-        Args:
-            student_logits (Tensor): Student raw outputs.
-            teacher_logits (Tensor): Teacher soft targets.
-            targets (Tensor): Target labels.
-        Returns:
-            Combined loss.
-        """
-        # Verify dimensions match before proceeding - Basic check, caller should ensure this.
-        if student_logits.shape != teacher_logits.shape:
-             warning(f"Dimension mismatch in distillation_loss: student {student_logits.shape}, teacher {teacher_logits.shape}. Falling back.")
-             # Fallback to standard loss if shapes mismatch unexpectedly
-             if self.use_focal_loss:
-                 return self.focal_loss(student_logits, targets, gamma=self.focal_gamma, alpha=self.focal_alpha)
-             else:
-                 return self.loss_fn(student_logits, targets)
-
-        try:
-            # Use class attributes for temperature and alpha
-            temperature = self.temperature
-            alpha = self.kd_alpha
-
-            # Apply zero-mean normalization to the logits before softmax
-            # This is important for stable knowledge distillation as suggested by research
-            student_logits_normalized = student_logits - student_logits.mean(dim=-1, keepdim=True) # Use dim=-1 for class dim
-            teacher_logits_normalized = teacher_logits - teacher_logits.mean(dim=-1, keepdim=True) # Use dim=-1 for class dim
-
-            # KL divergence loss with temperature scaling for soft targets
-            student_log_probs = F.log_softmax(student_logits_normalized / temperature, dim=-1) # Use dim=-1 for class dim
-            teacher_probs = F.softmax(teacher_logits_normalized / temperature, dim=-1) # Use dim=-1 for class dim
-
-            # Check for NaN values that could break the loss calculation
-            if torch.isnan(student_log_probs).any() or torch.isnan(teacher_probs).any():
-                info("WARNING: NaN values detected in KD loss inputs")
-                student_log_probs = torch.nan_to_num(student_log_probs)
-                teacher_probs = torch.nan_to_num(teacher_probs)
-
-            # Use batchmean reduction
-            kl_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (temperature ** 2)
-
-            # Calculate standard loss component
-            if self.use_focal_loss:
-                standard_loss = self.focal_loss(student_logits, targets, gamma=self.focal_gamma, alpha=self.focal_alpha)
-            else:
-                standard_loss = self.loss_fn(student_logits, targets)
-
-            # Combine losses with alpha weighting
-            combined_loss = alpha * kl_loss + (1 - alpha) * standard_loss
-
-            # Add logging once for diagnostics
-            if not hasattr(self, '_kd_loss_logged'):
-                info(f"KD loss breakdown - KL: {kl_loss.item():.4f}, CE/Focal: {standard_loss.item():.4f}, Combined: {combined_loss.item():.4f}")
-                info(f"Using α={alpha}, temperature={temperature} with zero-mean logit normalization")
-                self._kd_loss_logged = True
-
-            # NEW: Print teacher distribution details only once during training
-            if not hasattr(self, '_teacher_distribution_logged') and teacher_probs.size(0) > 0:
-                # Select the first sample, handle potential flattened shape
-                sample_idx = 0
-                sample_teacher = teacher_probs[sample_idx]
-
-                top_values, top_indices = torch.topk(sample_teacher, 10)
-                info("Teacher distribution for first sample in batch:")
-                for rank, (val, idx) in enumerate(zip(top_values, top_indices), start=1):
-                    chord_name = self.idx_to_chord.get(idx.item(), f"Class-{idx.item()}") if self.idx_to_chord else f"Class-{idx.item()}"
-                    info(f"  Rank {rank}: {chord_name} with probability {val.item():.4f}")
-
-                # Calculate average confidence across the batch (handle flattened shape)
-                num_classes = student_logits.size(-1)
-                if teacher_probs.dim() == 2 and student_logits.dim() == 2: # Flattened case
-                    # Reshape temporarily to [batch*time, classes] -> [batch, time, classes] if possible
-                    # This requires knowing batch_size and time_steps, which isn't directly available here.
-                    # Approximate by calculating max prob per 'frame' (row in flattened tensor)
-                    avg_confidence = teacher_probs.max(dim=-1)[0].mean().item()
-                elif teacher_probs.dim() == 3: # Original 3D case
-                     avg_confidence = teacher_probs.max(dim=-1)[0].mean().item()
-                else: # Fallback
-                     avg_confidence = teacher_probs.max(dim=-1)[0].mean().item()
-
-                info(f"Average teacher max probability in batch: {avg_confidence:.4f}")
-                # Set flag to prevent future prints
-                self._teacher_distribution_logged = True
-
-            return combined_loss
-        except Exception as e:
-            info(f"Error in distillation loss calculation: {str(e)}")
-            info("Falling back to standard cross entropy loss")
-            # Fallback to standard loss
-            if self.use_focal_loss:
-                return self.focal_loss(student_logits, targets, gamma=self.focal_gamma, alpha=self.focal_alpha)
-            else:
-                return self.loss_fn(student_logits, targets)
-
-    def label_smoothed_loss(self, logits, targets, smoothing=0.1):
-        """
-        Compute label-smoothed cross entropy loss.
-
-        Args:
-            logits (Tensor): Student predictions.
-            targets (Tensor): Pseudo-labels.
-            smoothing (float): Smoothing factor.
-
-        Returns:
-            Scalar loss.
-        """
-        try:
-            n_classes = logits.size(-1)
-            log_probs = F.log_softmax(logits, dim=-1)
-            with torch.no_grad():
-                # Construct soft targets
-                true_dist = torch.full_like(log_probs, smoothing / (n_classes - 1))
-                true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - smoothing)
-            loss = torch.mean(torch.sum(-true_dist * log_probs, dim=-1))
-            return loss
-        except Exception as e:
-            info(f"Error in label smoothed loss calculation: {str(e)}")
-            info("Falling back to standard cross entropy loss")
-            return F.cross_entropy(logits, targets)
-
     def _pad_class_weights(self, weights, expected_length):
         """Pad class weights to match the expected number of classes."""
         if len(weights) == expected_length:
@@ -933,26 +704,32 @@ class StudentTrainer(BaseTrainer):
             param_group['lr'] = new_lr
         return new_lr
 
-    def _warmup_learning_rate(self, epoch):
-        """Calculate and set learning rate during warm-up period"""
-        if epoch > self.warmup_epochs:
-            # Warm-up complete, set to end LR
-            return self._set_lr(self.warmup_end_lr)
+    def _warmup_learning_rate(self, epoch, batch_idx=None, num_batches=None):
+        """Calculate and set learning rate during warm-up period (per-step)."""
+        # Ensure we have batch info for per-step calculation
+        if batch_idx is None or num_batches is None or num_batches == 0:
+            # Fallback to epoch-based if batch info is missing (e.g., initial call)
+            warmup_progress = (epoch - 1) / max(1, self.warmup_epochs - 1) if self.warmup_epochs > 1 else 1.0
+        else:
+            # Calculate total steps in warmup phase
+            total_warmup_steps = self.warmup_epochs * num_batches
+            # Calculate current step number (0-indexed)
+            current_step = (epoch - 1) * num_batches + batch_idx
+            # Calculate progress (0.0 to 1.0)
+            warmup_progress = current_step / max(1, total_warmup_steps -1) # Avoid division by zero if total_warmup_steps is 1
 
-        # Convert 1-indexed epoch to 0-indexed for correct linear interpolation
-        # This fixes the issue where warmup wasn't properly increasing from start_lr
-        warmup_progress = (epoch - 1) / max(1, self.warmup_epochs - 1)
-
-        # Clamp to ensure we don't go below start_lr or above end_lr due to rounding
+        # Clamp progress
         warmup_progress = max(0.0, min(1.0, warmup_progress))
 
         # Linear interpolation between start_lr and end_lr
         new_lr = self.warmup_start_lr + warmup_progress * (self.warmup_end_lr - self.warmup_start_lr)
 
-        # Add more detailed logging for the first few warmup epochs to verify correct ramp-up
-        # Log only for first 3 epochs, every 100th epoch, or the final warmup epoch
-        # if epoch <= 3 or epoch == self.warmup_epochs or epoch % 100 == 0:
-        #     info(f"Warm-up epoch {epoch}/{self.warmup_epochs}: progress={warmup_progress:.4f}, LR = {new_lr:.6f}")
+        # Log LR change during warmup (less frequently to avoid spam)
+        # if batch_idx is not None and batch_idx % (num_batches // 4) == 0: # Log ~4 times per epoch
+        #     info(f"Warm-up step {current_step}/{total_warmup_steps}: progress={warmup_progress:.4f}, LR = {new_lr:.7f}")
+        # elif batch_idx is None: # Log initial epoch-based calculation
+        #      info(f"Warm-up epoch {epoch} (initial): progress={warmup_progress:.4f}, LR = {new_lr:.7f}")
+
 
         return self._set_lr(new_lr)
 
@@ -1313,165 +1090,34 @@ class StudentTrainer(BaseTrainer):
             if self.use_kd_loss:
                 info(f"Knowledge Distillation enabled: α={self.kd_alpha}, temperature={self.temperature}")
 
-                # Check first batch for teacher logits - early verification
+                # Check first batch for teacher logits - early verification for offline KD
                 try:
                     info("Verifying teacher logits availability in first batch...")
                     first_batch = next(iter(train_loader))
 
-                    if 'teacher_logits' not in first_batch:
-                        # Teacher logits not found in batch
-                        if self.teacher_model is not None:
-                            # We have a teacher model, so we can generate logits on-the-fly
-                            info("Teacher logits not found in batch, but teacher model is available.")
-                            info("Will generate teacher logits on-the-fly during training.")
-
-                            # Test on-the-fly generation with the first batch
-                            inputs = first_batch['spectro'].to(self.device)
-
-                            # Apply normalization if available
-                            if self.normalization:
-                                inputs = (inputs - self.normalization['mean']) / self.normalization['std']
-
-                            # Generate teacher logits on-the-fly
-                            with torch.no_grad():
-                                self.teacher_model.eval()
-
-                                # Use the extract_logits_from_teacher function for robust extraction
-                                from modules.utils.teacher_utils import extract_logits_from_teacher
-                                teacher_logits, status = extract_logits_from_teacher(
-                                    self.teacher_model,
-                                    inputs,
-                                    self.teacher_normalization['mean'],
-                                    self.teacher_normalization['std'],
-                                    self.device
-                                )
-
-                                if status["success"]:
-                                    info(f"Successfully generated teacher logits on-the-fly with shape: {teacher_logits.shape}")
-                                    info(f"Method used: {status['method_used']}")
-                                    info("Knowledge Distillation will use on-the-fly teacher logits during training")
-
-                                    # Create a wrapper for the train_loader that adds teacher logits to each batch
-                                    self._original_train_loader = train_loader
-
-                                    # Define a generator function that adds teacher logits to each batch
-                                    def train_loader_with_teacher_logits():
-                                        for batch in self._original_train_loader:
-                                            # Extract inputs
-                                            inputs = batch['spectro'].to(self.device)
-
-                                            # Apply normalization if available
-                                            if self.normalization:
-                                                normalized_inputs = (inputs - self.normalization['mean']) / self.normalization['std']
-                                            else:
-                                                normalized_inputs = inputs
-
-                                            # Generate teacher logits on-the-fly
-                                            with torch.no_grad():
-                                                self.teacher_model.eval()
-
-                                                # Use the extract_logits_from_teacher function for robust extraction
-                                                teacher_logits, status = extract_logits_from_teacher(
-                                                    self.teacher_model,
-                                                    normalized_inputs,
-                                                    self.teacher_normalization['mean'],
-                                                    self.teacher_normalization['std'],
-                                                    self.device
-                                                )
-
-                                                if status["success"]:
-                                                    # Add teacher logits to the batch
-                                                    batch['teacher_logits'] = teacher_logits
-
-                                            yield batch
-
-                                    # Create a list from the generator to maintain length information
-                                    # This is less memory efficient but allows us to use len() and iterate multiple times
-                                    original_train_loader_list = list(self._original_train_loader)
-
-                                    # Define a function that returns a new generator each time it's called
-                                    def get_train_loader_with_teacher_logits():
-                                        for batch in original_train_loader_list:
-                                            # Extract inputs
-                                            inputs = batch['spectro'].to(self.device)
-
-                                            # Apply normalization if available
-                                            if self.normalization:
-                                                normalized_inputs = (inputs - self.normalization['mean']) / self.normalization['std']
-                                            else:
-                                                normalized_inputs = inputs
-
-                                            # Generate teacher logits on-the-fly
-                                            with torch.no_grad():
-                                                self.teacher_model.eval()
-
-                                                # Use the extract_logits_from_teacher function for robust extraction
-                                                teacher_logits, status = extract_logits_from_teacher(
-                                                    self.teacher_model,
-                                                    normalized_inputs,
-                                                    self.teacher_normalization['mean'],
-                                                    self.teacher_normalization['std'],
-                                                    self.device
-                                                )
-
-                                                if status["success"]:
-                                                    # Add teacher logits to the batch
-                                                    batch['teacher_logits'] = teacher_logits
-
-                                            yield batch
-
-                                    # Create a custom iterable class that has a __len__ method
-                                    class TeacherLogitDataLoader:
-                                        def __init__(self, get_generator_func, length):
-                                            self.get_generator_func = get_generator_func
-                                            self.length = length
-
-                                        def __iter__(self):
-                                            return self.get_generator_func()
-
-                                        def __len__(self):
-                                            return self.length
-
-                                    # Replace the train_loader with our custom iterable
-                                    train_loader = TeacherLogitDataLoader(
-                                        get_train_loader_with_teacher_logits,
-                                        len(original_train_loader_list)
-                                    )
-
-                                    info("Successfully set up on-the-fly teacher logit generation")
-                                else:
-                                    info(f"Failed to generate teacher logits: {status['message']}")
-                                    info("AUTOMATICALLY DISABLING KD since teacher logit generation failed.")
-                                    self.use_kd_loss = False
-
-                                    if self.use_focal_loss:
-                                        info("Continuing with focal loss only.")
-                                    else:
-                                        info("Continuing with standard cross-entropy loss only.")
-                        else:
-                            # No teacher model available
-                            info("WARNING: KD is enabled but teacher_logits are missing from the first batch!")
-                            info("This will cause training to fall back to standard CE loss and may lead to poor results.")
-                            info("AUTOMATICALLY DISABLING KD since no teacher logits found and no teacher model available.")
-                            self.use_kd_loss = False
-
-                            if self.use_focal_loss:
-                                info("Continuing with focal loss only.")
-                            else:
-                                info("Continuing with standard cross-entropy loss only.")
-                    else:
+                    if 'teacher_logits' in first_batch and first_batch['teacher_logits'] is not None:
                         # Teacher logits found in batch
                         teacher_shape = first_batch['teacher_logits'].shape
                         info(f"Teacher logits verified with shape: {teacher_shape}")
                         # Check if we have non-zero values in teacher logits
                         if first_batch['teacher_logits'].abs().sum().item() == 0:
                             info("WARNING: Teacher logits contain all zeros! Check your logits loading process.")
+                    else:
+                        # Teacher logits not found in batch
+                        info("WARNING: KD is enabled but teacher_logits are missing from the first batch!")
+                        info("Ensure your dataset provides 'teacher_logits' in each batch for offline KD.")
+                        # Optionally disable KD if verification fails critically
+                        # info("AUTOMATICALLY DISABLING KD due to missing teacher logits in first batch.")
+                        # self.use_kd_loss = False
+
+                except StopIteration:
+                    info("WARNING: Train loader is empty, cannot verify teacher logits.")
                 except Exception as e:
                     info(f"Error checking first batch for teacher logits: {e}")
                     info(traceback.format_exc())
-                    # NEW: Disable KD on error
-                    info("AUTOMATICALLY DISABLING KD due to error checking teacher logits.")
-                    self.use_kd_loss = False
+                    # Optionally disable KD on error
+                    # info("AUTOMATICALLY DISABLING KD due to error checking teacher logits.")
+                    # self.use_kd_loss = False
             else:
                 if self.use_focal_loss:
                     info("Knowledge Distillation disabled, using focal loss")
@@ -1549,7 +1195,9 @@ class StudentTrainer(BaseTrainer):
                     # Update learning rate with batch info for smooth updates
                     if self.lr_schedule_type or self.use_warmup:
                         # Allow fractional epoch updates after warmup phase
+                        # This call handles fractional updates internally now
                         self._update_learning_rate(epoch, batch_idx, num_batches)
+                        # Removed redundant call to _update_smooth_scheduler
 
                     # Regular training step
                     inputs, targets = self._process_batch(batch)
