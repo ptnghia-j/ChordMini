@@ -224,7 +224,7 @@ spec:
             - name: METADATA_CACHE
               value: "false" # Cache full features if possible
             - name: LAZY_INIT
-              value: "true" # Use lazy init to save startup memory
+              value: "false" # Use lazy init to save startup memory
             - name: BATCH_GPU_CACHE
               value: "false" # Usually false unless specific pattern benefits
             # Checkpoint settings
@@ -232,7 +232,7 @@ spec:
               value: "/mnt/storage/checkpoints/finetune_synthlike" # Updated save directory
             # Small dataset percentage for quick testing
             - name: SMALL_DATASET
-              value: "" # Set to e.g., "0.1" for 10% dataset, empty for full dataset
+              value: "0.3" # Set to e.g., "0.1" for 10% dataset, empty for full dataset
           command:
             - sh
             - -c
@@ -349,9 +349,9 @@ spec:
 
               # Caching
               if [ "${DISABLE_CACHE}" = "true" ]; then CMD_ARGS="${CMD_ARGS} --disable_cache"; fi
-              if [ "${METADATA_CACHE}" = "true" ]; then CMD_ARGS="${CMD_ARGS} --metadata_cache true"; fi # Pass string true
-              if [ "${LAZY_INIT}" = "true" ]; then CMD_ARGS="${CMD_ARGS} --lazy_init true"; fi # Pass string true
-              if [ "${BATCH_GPU_CACHE}" = "true" ]; then CMD_ARGS="${CMD_ARGS} --batch_gpu_cache true"; fi # Pass string true
+              if [ "${METADATA_CACHE}" = "true" ]; then CMD_ARGS="${CMD_ARGS} --metadata_cache"; fi # Boolean flag, don't pass value
+              if [ "${LAZY_INIT}" = "true" ]; then CMD_ARGS="${CMD_ARGS} --lazy_init"; fi # Boolean flag, don't pass value
+              if [ "${BATCH_GPU_CACHE}" = "true" ]; then CMD_ARGS="${CMD_ARGS} --batch_gpu_cache"; fi # Boolean flag, don't pass value
 
               # Small Dataset
               if [ -n "${SMALL_DATASET}" ]; then

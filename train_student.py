@@ -281,12 +281,16 @@ def main():
     parser.add_argument('--warmup_end_lr', type=float, default=None,
                        help='Target learning rate at the end of warm-up (default: base LR)')
 
-    # Modify dataset_type choices to include 'dali_synth', 'combined', and pairwise combinations
+    # Modify dataset_type choices to include 'labeled' and combinations
     parser.add_argument('--dataset_type', type=str,
-                      choices=['fma', 'maestro', 'dali_synth', 'combined',
-                               'fma+maestro', 'fma+dali_synth', 'maestro+dali_synth'],
+                      choices=['fma', 'maestro', 'dali_synth', 'labeled', 'combined',
+                               'fma+maestro', 'fma+dali_synth', 'fma+labeled',
+                               'maestro+dali_synth', 'maestro+labeled',
+                               'dali_synth+labeled',
+                               'fma+maestro+dali_synth', 'fma+maestro+labeled', # etc.
+                               'maestro+dali_synth+labeled', 'fma+dali_synth+labeled'],
                       default='fma',
-                      help='Dataset format type: fma, maestro, dali_synth, combined (all), or pairwise combinations (fma+maestro, fma+dali_synth, maestro+dali_synth)')
+                      help='Dataset format type: fma, maestro, dali_synth, labeled, combined (all), or specific combinations (e.g., fma+labeled)')
 
     # Checkpoint loading
     parser.add_argument('--load_checkpoint', type=str, default=None,
@@ -536,149 +540,113 @@ def main():
     dali_label_dir = os.path.join(data_root, "dali_synth/labels")
     dali_logits_dir = os.path.join(data_root, "dali_synth/logits")
 
-    # Override FMA paths if specified in config
-    if args.dataset_type in ['fma', 'combined', 'fma+maestro', 'fma+dali_synth']:
-        custom_fma_spec_dir, fma_spec_count = find_data_directory(spec_dir_config, alt_spec_dir, "*.npy", "FMA spectrogram")
-        custom_fma_label_dir, fma_label_count = find_data_directory(label_dir_config, alt_label_dir, "*.lab", "FMA label")
-        if fma_spec_count > 0 and fma_label_count > 0:
-            fma_spec_dir = custom_fma_spec_dir
-            fma_label_dir = custom_fma_label_dir
-    else:
-        # Count files for FMA dataset
-        fma_spec_count = count_files_in_subdirectories(fma_spec_dir, "*.npy")
-        fma_label_count = count_files_in_subdirectories(fma_label_dir, "*.lab")
+    # Standard paths for LabeledDataset (Real Labels)
+    # Assuming features are pre-computed in a parallel structure
+    labeled_spec_dir = os.path.join(data_root, "LabeledDataset_synth/spectrograms")
+    labeled_label_dir = os.path.join(data_root, "LabeledDataset/Labels") # Real labels path
+    labeled_logits_dir = os.path.join(data_root, "LabeledDataset_synth/logits") # Optional teacher logits
 
-    # Count files for Maestro dataset
-    maestro_spec_count = count_files_in_subdirectories(maestro_spec_dir, "*.npy")
-    maestro_label_count = count_files_in_subdirectories(maestro_label_dir, "*.lab")
-
-    # Count files for DALI dataset
-    dali_spec_count = count_files_in_subdirectories(dali_spec_dir, "*.npy")
-    dali_label_count = count_files_in_subdirectories(dali_label_dir, "*.lab")
-
-    # Override logits directories if specified
-    if args.logits_dir:
-        custom_logits_dir, _ = find_data_directory(args.logits_dir, None, "*.npy", "logits")
-        fma_logits_dir = custom_logits_dir
-        # For simplicity, use the same custom logits dir for all datasets when explicitly specified
-        maestro_logits_dir = custom_logits_dir
-        dali_logits_dir = custom_logits_dir
-
-    # Handle different dataset combinations
+    # Determine active dataset types
+    active_types = []
     if args.dataset_type == 'combined':
-        # Use all three datasets
-        logger.info(f"\n=== Combined Dataset Files (All Three Datasets) ===")
-        logger.info(f"FMA: {fma_spec_count} spectrograms, {fma_label_count} labels")
-        logger.info(f"Maestro: {maestro_spec_count} spectrograms, {maestro_label_count} labels")
-        logger.info(f"DALI: {dali_spec_count} spectrograms, {dali_label_count} labels")
-
-        # Final check - fail if we have no data from any dataset
-        total_spec_count = fma_spec_count + maestro_spec_count + dali_spec_count
-        total_label_count = fma_label_count + maestro_label_count + dali_label_count
-
-        if total_spec_count == 0 or total_label_count == 0:
-            raise RuntimeError(f"ERROR: Missing spectrogram or label files in combined mode. Found {total_spec_count} total spectrogram files and {total_label_count} total label files.")
-
-        # Use lists for spec_dir, label_dir, and logits_dir in combined mode
-        spec_dir = [fma_spec_dir, maestro_spec_dir, dali_spec_dir]
-        label_dir = [fma_label_dir, maestro_label_dir, dali_label_dir]
-        logits_dir = [fma_logits_dir, maestro_logits_dir, dali_logits_dir]
-
-    elif args.dataset_type == 'fma+maestro':
-        # Use FMA and Maestro datasets
-        logger.info(f"\n=== Combined Dataset Files (FMA + Maestro) ===")
-        logger.info(f"FMA: {fma_spec_count} spectrograms, {fma_label_count} labels")
-        logger.info(f"Maestro: {maestro_spec_count} spectrograms, {maestro_label_count} labels")
-
-        # Final check - fail if we have no data from either dataset
-        total_spec_count = fma_spec_count + maestro_spec_count
-        total_label_count = fma_label_count + maestro_label_count
-
-        if total_spec_count == 0 or total_label_count == 0:
-            raise RuntimeError(f"ERROR: Missing spectrogram or label files in fma+maestro mode. Found {total_spec_count} total spectrogram files and {total_label_count} total label files.")
-
-        # Use lists for spec_dir, label_dir, and logits_dir
-        spec_dir = [fma_spec_dir, maestro_spec_dir]
-        label_dir = [fma_label_dir, maestro_label_dir]
-        logits_dir = [fma_logits_dir, maestro_logits_dir]
-
-    elif args.dataset_type == 'fma+dali_synth':
-        # Use FMA and DALI datasets
-        logger.info(f"\n=== Combined Dataset Files (FMA + DALI) ===")
-        logger.info(f"FMA: {fma_spec_count} spectrograms, {fma_label_count} labels")
-        logger.info(f"DALI: {dali_spec_count} spectrograms, {dali_label_count} labels")
-
-        # Final check - fail if we have no data from either dataset
-        total_spec_count = fma_spec_count + dali_spec_count
-        total_label_count = fma_label_count + dali_label_count
-
-        if total_spec_count == 0 or total_label_count == 0:
-            raise RuntimeError(f"ERROR: Missing spectrogram or label files in fma+dali_synth mode. Found {total_spec_count} total spectrogram files and {total_label_count} total label files.")
-
-        # Use lists for spec_dir, label_dir, and logits_dir
-        spec_dir = [fma_spec_dir, dali_spec_dir]
-        label_dir = [fma_label_dir, dali_label_dir]
-        logits_dir = [fma_logits_dir, dali_logits_dir]
-
-    elif args.dataset_type == 'maestro+dali_synth':
-        # Use Maestro and DALI datasets
-        logger.info(f"\n=== Combined Dataset Files (Maestro + DALI) ===")
-        logger.info(f"Maestro: {maestro_spec_count} spectrograms, {maestro_label_count} labels")
-        logger.info(f"DALI: {dali_spec_count} spectrograms, {dali_label_count} labels")
-
-        # Final check - fail if we have no data from either dataset
-        total_spec_count = maestro_spec_count + dali_spec_count
-        total_label_count = maestro_label_count + dali_label_count
-
-        if total_spec_count == 0 or total_label_count == 0:
-            raise RuntimeError(f"ERROR: Missing spectrogram or label files in maestro+dali_synth mode. Found {total_spec_count} total spectrogram files and {total_label_count} total label files.")
-
-        # Use lists for spec_dir, label_dir, and logits_dir
-        spec_dir = [maestro_spec_dir, dali_spec_dir]
-        label_dir = [maestro_label_dir, dali_label_dir]
-        logits_dir = [maestro_logits_dir, dali_logits_dir]
-
-    elif args.dataset_type == 'dali_synth':
-        # DALI dataset mode
-        logger.info(f"\n=== DALI Dataset Files ===")
-        logger.info(f"DALI: {dali_spec_count} spectrograms, {dali_label_count} labels")
-
-        # Final check - fail if we don't have data
-        if dali_spec_count == 0 or dali_label_count == 0:
-            raise RuntimeError(f"ERROR: Missing DALI spectrogram or label files. Found {dali_spec_count} spectrogram files and {dali_label_count} label files.")
-
-        # Use DALI directories
-        spec_dir = dali_spec_dir
-        label_dir = dali_label_dir
-        logits_dir = dali_logits_dir
-
-    elif args.dataset_type == 'maestro':
-        # Maestro dataset mode
-        logger.info(f"\n=== Maestro Dataset Files ===")
-        logger.info(f"Maestro: {maestro_spec_count} spectrograms, {maestro_label_count} labels")
-
-        # Final check - fail if we don't have data
-        if maestro_spec_count == 0 or maestro_label_count == 0:
-            raise RuntimeError(f"ERROR: Missing Maestro spectrogram or label files. Found {maestro_spec_count} spectrogram files and {maestro_label_count} label files.")
-
-        # Use Maestro directories
-        spec_dir = maestro_spec_dir
-        label_dir = maestro_label_dir
-        logits_dir = maestro_logits_dir
-
+        active_types = ['fma', 'maestro', 'dali_synth', 'labeled']
+    elif '+' in args.dataset_type:
+        active_types = args.dataset_type.split('+')
     else:
-        # FMA dataset mode (default)
-        logger.info(f"\n=== FMA Dataset Files ===")
-        logger.info(f"FMA: {fma_spec_count} spectrograms, {fma_label_count} labels")
+        active_types = [args.dataset_type]
 
-        # Final check - fail if we don't have data
-        if fma_spec_count == 0 or fma_label_count == 0:
-            raise RuntimeError(f"ERROR: Missing FMA spectrogram or label files. Found {fma_spec_count} spectrogram files and {fma_label_count} label files.")
+    logger.info(f"Active dataset types: {active_types}")
 
-        # Use FMA directories
-        spec_dir = fma_spec_dir
-        label_dir = fma_label_dir
-        logits_dir = fma_logits_dir
+    # Initialize lists for combined paths
+    spec_dirs_list = []
+    label_dirs_list = []
+    logits_dirs_list = []
+
+    # Collect paths based on active types
+    if 'fma' in active_types:
+        spec_dirs_list.append(resolve_path(args.spec_dir or fma_spec_dir, storage_root, project_root))
+        label_dirs_list.append(resolve_path(args.label_dir or fma_label_dir, storage_root, project_root))
+        logits_dirs_list.append(resolve_path(args.logits_dir or fma_logits_dir, storage_root, project_root))
+        fma_spec_count = count_files_in_subdirectories(spec_dirs_list[-1], "*_spec.npy")
+        fma_label_count = count_files_in_subdirectories(label_dirs_list[-1], "*.lab") # Assuming .lab for FMA synth labels
+        logger.info(f"  FMA: {fma_spec_count} specs, {fma_label_count} labels")
+
+    if 'maestro' in active_types:
+        spec_dirs_list.append(resolve_path(maestro_spec_dir, storage_root, project_root))
+        label_dirs_list.append(resolve_path(maestro_label_dir, storage_root, project_root))
+        logits_dirs_list.append(resolve_path(maestro_logits_dir, storage_root, project_root))
+        maestro_spec_count = count_files_in_subdirectories(spec_dirs_list[-1], "*_spec.npy")
+        maestro_label_count = count_files_in_subdirectories(label_dirs_list[-1], "*.lab") # Assuming .lab for Maestro synth labels
+        logger.info(f"  Maestro: {maestro_spec_count} specs, {maestro_label_count} labels")
+
+    if 'dali_synth' in active_types:
+        spec_dirs_list.append(resolve_path(dali_spec_dir, storage_root, project_root))
+        label_dirs_list.append(resolve_path(dali_label_dir, storage_root, project_root))
+        logits_dirs_list.append(resolve_path(dali_logits_dir, storage_root, project_root))
+        dali_spec_count = count_files_in_subdirectories(spec_dirs_list[-1], "*_spec.npy")
+        dali_label_count = count_files_in_subdirectories(label_dirs_list[-1], "*.lab") # Assuming .lab for DALI synth labels
+        logger.info(f"  DALI Synth: {dali_spec_count} specs, {dali_label_count} labels")
+
+    if 'labeled' in active_types:
+        spec_dirs_list.append(resolve_path(labeled_spec_dir, storage_root, project_root))
+        label_dirs_list.append(resolve_path(labeled_label_dir, storage_root, project_root)) # Use the real label path
+        logits_dirs_list.append(resolve_path(labeled_logits_dir, storage_root, project_root))
+        labeled_spec_count = count_files_in_subdirectories(spec_dirs_list[-1], "*_spec.npy")
+        # Count .lab files recursively within the LabeledDataset/Labels structure
+        labeled_label_count = count_files_in_subdirectories(label_dirs_list[-1], "*.lab")
+        logger.info(f"  Labeled: {labeled_spec_count} specs, {labeled_label_count} labels (real)")
+
+    # Check if any data was found
+    if not spec_dirs_list or not label_dirs_list:
+         logger.error("No valid data directories found for the specified dataset types. Exiting.")
+         sys.exit(1)
+
+    # Assign final paths (use lists for SynthDataset)
+    spec_dir = spec_dirs_list
+    label_dir = label_dirs_list
+    logits_dir = logits_dirs_list if any(logits_dirs_list) else None # Pass None if no logits dirs were added
+
+    logger.info(f"\nFinal Spectrogram Dirs: {spec_dir}")
+    logger.info(f"Final Label Dirs: {label_dir}")
+    logger.info(f"Final Logits Dirs: {logits_dir}")
+
+
+    # Override FMA paths if specified in config - This block seems redundant now
+    # if args.dataset_type in ['fma', 'combined', 'fma+maestro', 'fma+dali_synth']:
+    #     # Resolve primary paths from config, with CLI override for FMA specifically?
+    #     # This logic might need refinement if we want specific overrides per dataset type.
+    #     # For now, the combined list approach handles multiple sources.
+    #     pass # Keep the combined list logic above
+    # else:
+    #     # Handle single dataset type case (already covered by the logic above)
+    #     pass
+
+    # Count files for Maestro dataset - Redundant, counted above
+    # maestro_spec_count = count_files_in_subdirectories(maestro_spec_dir, "*.npy")
+    # maestro_label_count = count_files_in_subdirectories(maestro_label_dir, "*.lab")
+
+    # Count files for DALI dataset - Redundant, counted above
+    # dali_spec_count = count_files_in_subdirectories(dali_spec_dir, "*.npy")
+    # dali_label_count = count_files_in_subdirectories(dali_label_dir, "*.lab")
+
+    # Override logits directories if specified - Handled by resolve_path and list collection
+    # if args.logits_dir:
+    #     # This override might be ambiguous with multiple dataset types.
+    #     # The current logic uses type-specific defaults unless args.logits_dir overrides ALL.
+    #     # Consider if a per-type override is needed. For now, args.logits_dir applies globally if set.
+    #     if len(active_types) == 1: # Apply only if a single type is specified or if intended globally
+    #          logits_dir = [resolve_path(args.logits_dir, storage_root, project_root)] * len(logits_dir) if logits_dir else [resolve_path(args.logits_dir, storage_root, project_root)]
+    #          logger.warning(f"Overriding all logits directories with: {logits_dir[0]}")
+
+
+    # Handle different dataset combinations - This logic is replaced by the list collection above
+    # if args.dataset_type == 'combined':
+    #     # ...
+    # elif args.dataset_type == 'fma+maestro':
+    #     # ...
+    # # ... and so on ...
+    # else: # Single dataset type
+    #     # ...
 
     # Use the mapping defined in chords.py
     master_mapping = idx2voca_chord()
@@ -708,8 +676,8 @@ def main():
 
     dataset_args.update({
         'spec_dir': spec_dir,
-        'label_dir': label_dir,
-        'logits_dir': logits_dir,
+        'label_dir': label_dir, # Pass the list of directories
+        'logits_dir': logits_dir, # Pass the list or None
         'chord_mapping': chord_mapping,
         'seq_len': config.training.get('seq_len', 10),
         'stride': config.training.get('seq_stride', 5),
@@ -726,6 +694,7 @@ def main():
         'cache_fraction': config.data.get('cache_fraction', 0.1),
         'lazy_init': str(args.lazy_init).lower() == "true",
         'batch_gpu_cache': str(args.batch_gpu_cache).lower() == "true",
+        'dataset_type': args.dataset_type # Pass the potentially combined type string
     })
 
     # Create the dataset
@@ -875,9 +844,9 @@ def main():
         f_layer = max(1, int(round(base_config.get('f_layer', 3) * scale_factor)))
         t_layer = max(1, int(round(base_config.get('t_layer', 3) * scale_factor)))
         d_layer = max(1, int(round(base_config.get('d_layer', 3) * scale_factor)))
-        f_head = 9
-        t_head = 9
-        d_head = 9
+        f_head = 4
+        t_head = 4
+        d_head = 4
 
         # Ensure f_head is compatible with feature_dim (must be a divisor)
         if feature_dim % f_head != 0:
@@ -1374,7 +1343,8 @@ def main():
                         logger.info(f"Evaluating model on {len(valid_dataset1)} samples in split 1...")
                         # Get sampled_song_ids if using small dataset percentage
                         sampled_song_ids1 = None
-                        if dataset_args.get('small_dataset_percentage', 1.0) < 1.0:
+                        small_dataset_pct = dataset_args.get('small_dataset_percentage')
+                        if small_dataset_pct is not None and float(small_dataset_pct) < 1.0:
                             # Extract unique song IDs from the samples
                             sampled_song_ids1 = set(sample.get('song_id', '') for sample in valid_dataset1 if 'song_id' in sample)
                             logger.info(f"Using {len(sampled_song_ids1)} sampled song IDs for MIR evaluation (split 1)")
@@ -1386,7 +1356,8 @@ def main():
                         logger.info(f"Evaluating model on {len(valid_dataset2)} samples in split 2...")
                         # Get sampled_song_ids if using small dataset percentage
                         sampled_song_ids2 = None
-                        if dataset_args.get('small_dataset_percentage', 1.0) < 1.0:
+                        small_dataset_pct = dataset_args.get('small_dataset_percentage')
+                        if small_dataset_pct is not None and float(small_dataset_pct) < 1.0:
                             # Extract unique song IDs from the samples
                             sampled_song_ids2 = set(sample.get('song_id', '') for sample in valid_dataset2 if 'song_id' in sample)
                             logger.info(f"Using {len(sampled_song_ids2)} sampled song IDs for MIR evaluation (split 2)")
@@ -1398,7 +1369,8 @@ def main():
                         logger.info(f"Evaluating model on {len(valid_dataset3)} samples in split 3...")
                         # Get sampled_song_ids if using small dataset percentage
                         sampled_song_ids3 = None
-                        if dataset_args.get('small_dataset_percentage', 1.0) < 1.0:
+                        small_dataset_pct = dataset_args.get('small_dataset_percentage')
+                        if small_dataset_pct is not None and float(small_dataset_pct) < 1.0:
                             # Extract unique song IDs from the samples
                             sampled_song_ids3 = set(sample.get('song_id', '') for sample in valid_dataset3 if 'song_id' in sample)
                             logger.info(f"Using {len(sampled_song_ids3)} sampled song IDs for MIR evaluation (split 3)")

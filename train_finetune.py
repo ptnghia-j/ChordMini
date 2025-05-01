@@ -223,27 +223,27 @@ def main():
                        help='Dropout probability (0-1)')
     parser.add_argument('--disable_cache', action='store_true',
                       help='Disable dataset caching to reduce memory usage')
-    parser.add_argument('--metadata_cache', type=str, default="false", # Changed to string for easier env var handling
+    parser.add_argument('--metadata_cache', action='store_true', # Changed from type=str
                       help='Only cache metadata (not spectrograms) to reduce memory usage')
     parser.add_argument('--cache_fraction', type=float, default=0.1,
                       help='Fraction of dataset to cache (default: 0.1 = 10%%)')
-    parser.add_argument('--lazy_init', type=str, default="false", # Changed to string
+    parser.add_argument('--lazy_init', action='store_true', # Changed from type=str
                       help='Lazily initialize dataset components to save memory')
 
     # Data directories for SynthDataset (using real labels)
-    parser.add_argument('--spectrograms_dir', type=str, required=True,
+    parser.add_argument('--spectrograms_dir', type=str, required=False, # Make optional, rely on ENV/config
                       help='Directory containing pre-computed spectrograms (e.g., from LabeledDataset_synth)')
-    parser.add_argument('--logits_dir', type=str, required=True,
+    parser.add_argument('--logits_dir', type=str, required=False, # Make optional, rely on ENV/config
                       help='Directory containing pre-computed teacher logits (e.g., from LabeledDataset_synth)')
-    parser.add_argument('--label_dirs', type=str, nargs='+', required=True,
-                      help='List of directories containing REAL ground truth label files (.lab, .txt)')
+    parser.add_argument('--label_dirs', type=str, nargs='+', required=False, # Make optional, rely on ENV/config
+                      help='List of directories containing REAL ground truth label files (.lab, .txt). For LabeledDataset, point to the root Labels dir (e.g., /mnt/storage/data/LabeledDataset/Labels)')
     parser.add_argument('--cache_dir', type=str, default=None,
                       help='Directory to cache dataset metadata/features')
 
     # GPU acceleration options
     parser.add_argument('--gpu_memory_fraction', type=float, default=0.9,
                       help='Fraction of GPU memory to use (default: 0.9)')
-    parser.add_argument('--batch_gpu_cache', type=str, default="false", # Changed to string
+    parser.add_argument('--batch_gpu_cache', action='store_true', # Changed from type=str
                       help='Cache batches on GPU for repeated access patterns')
     parser.add_argument('--prefetch_factor', type=int, default=2,
                       help='Number of batches to prefetch (default: 2)')
@@ -316,9 +316,13 @@ def main():
     if 'FREEZE_FEATURE_EXTRACTOR' in os.environ: args.freeze_feature_extractor = os.environ['FREEZE_FEATURE_EXTRACTOR'].lower() == 'true'
     if 'SMALL_DATASET' in os.environ: args.small_dataset = float(os.environ['SMALL_DATASET'])
     if 'DISABLE_CACHE' in os.environ: args.disable_cache = os.environ['DISABLE_CACHE'].lower() == 'true'
-    if 'METADATA_CACHE' in os.environ: args.metadata_cache = os.environ['METADATA_CACHE'].lower() == 'true'
-    if 'LAZY_INIT' in os.environ: args.lazy_init = os.environ['LAZY_INIT'].lower() == 'true'
-    if 'BATCH_GPU_CACHE' in os.environ: args.batch_gpu_cache = os.environ['BATCH_GPU_CACHE'].lower() == 'true'
+    # Correctly handle boolean flags from ENV vars after argparse
+    if 'METADATA_CACHE' in os.environ and os.environ['METADATA_CACHE'].lower() == 'true':
+        args.metadata_cache = True
+    if 'LAZY_INIT' in os.environ and os.environ['LAZY_INIT'].lower() == 'true':
+        args.lazy_init = True
+    if 'BATCH_GPU_CACHE' in os.environ and os.environ['BATCH_GPU_CACHE'].lower() == 'true':
+        args.batch_gpu_cache = True
 
     logger.info(f"Config after potential ENV overrides - use_warmup: {config.training.get('use_warmup')}")
     # --- END Environment variable override block ---
@@ -454,7 +458,11 @@ def main():
     # Resolve data paths
     spec_dir = resolve_path(args.spectrograms_dir, storage_root, project_root)
     logits_dir = resolve_path(args.logits_dir, storage_root, project_root)
-    label_dirs = [resolve_path(d, storage_root, project_root) for d in args.label_dirs]
+    # Ensure label_dirs is a list even if only one is provided via ENV or default
+    label_dirs_arg = args.label_dirs or config.paths.get('label_dirs') # Get from args or config
+    if isinstance(label_dirs_arg, str): label_dirs_arg = [label_dirs_arg] # Convert single string to list
+    label_dirs = [resolve_path(d, storage_root, project_root) for d in label_dirs_arg] if label_dirs_arg else []
+
     cache_dir = resolve_path(args.cache_dir or config.paths.get('cache_dir'), storage_root, project_root)
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
@@ -505,11 +513,22 @@ def main():
     # Initialize SynthDataset with optimized settings
     logger.info("\n=== Creating dataset using SynthDataset ===")
 
+    # Determine dataset_type for SynthDataset based on paths
+    # If label_dirs points to LabeledDataset/Labels, assume 'labeled' type primarily
+    dataset_type_for_synth = 'labeled' # Default for finetuning
+    if spec_dir and 'labeleddataset_synth' not in str(spec_dir).lower():
+         # If spec dir doesn't look like the synth parallel structure, maybe it's fma/maestro?
+         if 'fma' in str(spec_dir).lower(): dataset_type_for_synth = 'fma'
+         elif 'maestro' in str(spec_dir).lower(): dataset_type_for_synth = 'maestro'
+         # Add more heuristics if needed
+         logger.info(f"Inferring dataset type as '{dataset_type_for_synth}' based on spectrogram path.")
+
+
     dataset_args = {
-        'samples_dir': spec_dir,
-        'labels_dirs': label_dirs, # Pass the list of real label dirs
+        'spec_dir': spec_dir,
+        'label_dir': label_dirs, # Pass the list
         'logits_dir': logits_dir,
-        'chord_to_idx': chord_mapping,
+        'chord_mapping': chord_mapping, # Renamed from 'chord_to_idx'
         'seq_len': config.training.get('seq_len', 10),
         'stride': config.training.get('seq_stride', 5),
         'frame_duration': config.feature.get('hop_duration', 0.09288),
@@ -520,16 +539,17 @@ def main():
         'num_workers': 12, # Adjust as needed
         'require_teacher_logits': use_kd_loss,
         'use_cache': not args.disable_cache,
-        'cache_dir': cache_dir,
-        'metadata_only': str(args.metadata_cache).lower() == "true",
+        'metadata_only': args.metadata_cache, # Pass boolean directly
         'cache_fraction': config.data.get('cache_fraction', args.cache_fraction),
-        'lazy_init': str(args.lazy_init).lower() == "true",
-        'batch_gpu_cache': str(args.batch_gpu_cache).lower() == "true",
+        'lazy_init': args.lazy_init, # Pass boolean directly
+        'batch_gpu_cache': args.batch_gpu_cache, # Pass boolean directly
         'small_dataset_percentage': args.small_dataset,
-        'random_seed': seed, # Pass seed for consistent splitting
-        'train_ratio': 0.7, # Default split ratios
-        'val_ratio': 0.15,
-        'test_ratio': 0.15
+        'dataset_type': dataset_type_for_synth # Pass inferred or default type
+        # Removed unsupported parameters:
+        # 'random_seed': seed,
+        # 'train_ratio': 0.7,
+        # 'val_ratio': 0.15,
+        # 'test_ratio': 0.15
     }
 
     # Create the dataset
