@@ -190,6 +190,9 @@ spec:
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
+            # Add teacher checkpoint path for normalization
+            - name: TEACHER_CHECKPOINT
+              value: "/mnt/storage/checkpoints/btc/btc_model_large_voca.pt" # Example path, adjust as needed
             # GPU memory utilization optimization
             - name: GPU_MEMORY_FRACTION
               value: "0.95"  # Use 95% of available GPU memory
@@ -337,6 +340,15 @@ spec:
               DROPOUT_ARG=""
               if [ "${DROPOUT}" != "" ]; then DROPOUT_ARG="--dropout ${DROPOUT}"; fi
 
+              # Get teacher checkpoint argument
+              TEACHER_CHECKPOINT_ARG=""
+              if [ "${TEACHER_CHECKPOINT}" != "" ]; then
+                echo "Using teacher checkpoint for normalization: ${TEACHER_CHECKPOINT}"
+                TEACHER_CHECKPOINT_ARG="--teacher_checkpoint ${TEACHER_CHECKPOINT}"
+              else
+                echo "WARNING: No teacher checkpoint specified for normalization, using defaults."
+              fi
+
               # Define checkpoint directory for BTC
               CHECKPOINTS_DIR="/mnt/storage/checkpoints/btc" # Centralized checkpoint directory
 
@@ -400,7 +412,7 @@ spec:
                 $DATASET_ARG $SPEC_DIR_ARG $LABEL_DIR_ARG \
                 ${LR_SCHEDULE_ARG} ${WARMUP_ARG} ${FOCAL_LOSS_ARG} ${KD_ARGS} \
                 ${CACHE_ARGS} ${GPU_ARGS} ${DROPOUT_ARG} ${LR_ARGS} \
-                ${CHECKPOINT_ARG} ${SMALL_DATASET_ARG}
+                ${CHECKPOINT_ARG} ${SMALL_DATASET_ARG} ${TEACHER_CHECKPOINT_ARG} # Add teacher checkpoint arg
 
               echo "=== BTC model training complete ==="
           resources:

@@ -253,6 +253,9 @@ spec:
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
+            # Add teacher checkpoint path for normalization
+            - name: TEACHER_CHECKPOINT
+              value: "/mnt/storage/BTC/test/btc_model_large_voca.pt" # Path to the teacher model for norm stats
             # GPU memory utilization optimization
             - name: GPU_MEMORY_FRACTION
               value: "0.95"  # Use 95% of available GPU memory
@@ -645,6 +648,15 @@ spec:
                 LABEL_DIR_ARG="--label_dir ${DATA_ROOT}/logits/synth/labels"
               fi
 
+              # Add teacher checkpoint argument
+              TEACHER_CHECKPOINT_ARG=""
+              if [ -n "${TEACHER_CHECKPOINT}" ]; then
+                echo "Loading normalization from teacher checkpoint: ${TEACHER_CHECKPOINT}"
+                TEACHER_CHECKPOINT_ARG="--teacher_checkpoint ${TEACHER_CHECKPOINT}"
+              else
+                echo "WARNING: No teacher checkpoint specified for normalization. Trainer might calculate its own or use defaults."
+              fi
+
               # Run the student training script with all options and simplified paths
               echo "Starting student training with GPU optimization and all options..."
               # Run with distributed training enabled
@@ -661,7 +673,7 @@ spec:
                 ${LR_SCHEDULE_ARG} ${WARMUP_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} \
                 ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${KD_ARGS} \
                 ${GPU_ARGS} ${DROPOUT_ARG} ${LR_ARGS} \
-                ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS}
+                ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS} ${TEACHER_CHECKPOINT_ARG} # Added teacher checkpoint arg
 
               echo "=== Student model training complete ==="
           resources:

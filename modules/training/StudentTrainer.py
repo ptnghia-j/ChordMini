@@ -210,7 +210,7 @@ class StudentTrainer(BaseTrainer):
     and validation-based learning rate adjustment.
     """
     def __init__(self, model, optimizer, scheduler=None, device=None, num_epochs=100,
-                 logger=None, use_animator=True, checkpoint_dir="checkpoints",
+                 logger=None, use_animator=True, checkpoint_dir="checkpoints", # checkpoint_dir is the intended SAVE_DIR
                  max_grad_norm=1.0, class_weights=None, idx_to_chord=None,
                  normalization=None, early_stopping_patience=5,
                  lr_decay_factor=0.95, min_lr=5e-6,
@@ -221,8 +221,12 @@ class StudentTrainer(BaseTrainer):
 
         # First call the parent's __init__ to set up the logger and other attributes
         super().__init__(model, optimizer, scheduler, device, num_epochs,
-                         logger, use_animator, checkpoint_dir, max_grad_norm,
-                         None, idx_to_chord, normalization, reset_epoch, reset_scheduler)  # Pass None for class_weights initially
+                         logger, use_animator, checkpoint_dir, max_grad_norm, # Pass checkpoint_dir to parent
+                         None, idx_to_chord, normalization)  # Pass None for class_weights initially
+
+        # Store reset flags separately
+        self.reset_epoch = reset_epoch
+        self.reset_scheduler = reset_scheduler
 
         # Focal loss parameters - set these first as they affect class weight handling
         self.use_focal_loss = use_focal_loss
@@ -330,33 +334,33 @@ class StudentTrainer(BaseTrainer):
         # Store model prefix for later use
         self.model_prefix = model_prefix
 
-        # Always prioritize the external path in /mnt/storage/checkpoints
-        # Construct external path
-        external_dir = f"/mnt/storage/checkpoints/{model_prefix}"
+        # --- Corrected Checkpoint Directory Logic ---
+        # The 'checkpoint_dir' passed to __init__ is the primary save location (SAVE_DIR from YAML)
+        self.primary_checkpoint_dir = checkpoint_dir
+        self.fallback_checkpoint_dir = None # No fallback needed if primary is correctly set
 
-        # Check if external directory exists or can be created
+        # Ensure the primary directory exists
         try:
-            os.makedirs(external_dir, exist_ok=True)
-            # Use external path as primary checkpoint directory
-            self.primary_checkpoint_dir = external_dir
-            # Keep original path as fallback
-            self.fallback_checkpoint_dir = checkpoint_dir
-            info(f"Using external checkpoint directory: {external_dir}")
+            os.makedirs(self.primary_checkpoint_dir, exist_ok=True)
+            info(f"Using primary checkpoint directory: {self.primary_checkpoint_dir}")
         except Exception as e:
-            # If external directory can't be created, use original path
-            info(f"Could not use external directory {external_dir}: {e}")
-            self.primary_checkpoint_dir = checkpoint_dir
-            self.fallback_checkpoint_dir = None
+            # If the specified directory can't be created, log an error
+            error(f"Could not create primary checkpoint directory {self.primary_checkpoint_dir}: {e}")
+            # Fallback to a default local directory as a last resort
+            self.primary_checkpoint_dir = f"./checkpoints_fallback/{model_prefix}"
+            os.makedirs(self.primary_checkpoint_dir, exist_ok=True)
+            info(f"Using fallback local checkpoint directory: {self.primary_checkpoint_dir}")
+        # --- End Correction ---
+
 
         # Set best model path using primary checkpoint directory
-        self.best_model_path = os.path.join(self.primary_checkpoint_dir, f"{model_prefix}_model_best.pth")
+        self.best_model_path = os.path.join(self.primary_checkpoint_dir, f"{self.model_prefix}_model_best.pth")
         self.chord_mapping = None
 
         # Log the best model path for debugging
         if logger:
             logger.info(f"Best model will be saved to: {self.best_model_path}")
-            if self.fallback_checkpoint_dir:
-                logger.info(f"Fallback checkpoint directory: {self.fallback_checkpoint_dir}")
+            # Removed fallback logging as it's not used in the corrected logic
 
         # Add flag to track and debug scheduler stepping
         self._scheduler_step_count = 0
@@ -785,40 +789,25 @@ class StudentTrainer(BaseTrainer):
                 'std': self.normalization['std'] if self.normalization else None
             }
 
-            # Ensure primary checkpoint directory exists
+            # Ensure primary checkpoint directory exists (redundant check, but safe)
             os.makedirs(self.primary_checkpoint_dir, exist_ok=True)
 
             # Save to primary path
-            primary_save_success = False
+            save_success = False
             try:
                 torch.save(checkpoint_data, self.best_model_path)
                 info(f"Saved best model to primary path: {self.best_model_path}")
-                primary_save_success = True
+                save_success = True
             except Exception as e:
-                info(f"Error saving model to primary path: {str(e)}")
+                info(f"Error saving best model to primary path: {str(e)}")
 
-            # Save to fallback path if it exists
-            fallback_save_success = False
-            if self.fallback_checkpoint_dir:
-                try:
-                    # Ensure fallback directory exists
-                    os.makedirs(self.fallback_checkpoint_dir, exist_ok=True)
+            # Removed fallback saving logic
 
-                    # Construct fallback path
-                    fallback_path = os.path.join(self.fallback_checkpoint_dir, f"{self.model_prefix}_model_best.pth")
-
-                    # Save the checkpoint
-                    torch.save(checkpoint_data, fallback_path)
-                    info(f"Saved best model to fallback path: {fallback_path}")
-                    fallback_save_success = True
-                except Exception as e:
-                    info(f"Error saving model to fallback path: {str(e)}")
-
-            if primary_save_success or fallback_save_success:
+            if save_success:
                 info(f"Saved best model with validation accuracy: {val_acc:.4f}")
                 return True
             else:
-                info("Failed to save model to both primary and fallback paths")
+                info("Failed to save best model")
                 return False
         else:
             self.early_stop_counter += 1
@@ -1393,25 +1382,18 @@ class StudentTrainer(BaseTrainer):
                     }
 
                     # Save to primary checkpoint directory
-                    primary_checkpoint_path = os.path.join(self.primary_checkpoint_dir, f"{self.model_prefix}_model_epoch_{epoch}.pth")
-                    primary_save_success = False
+                    checkpoint_path = os.path.join(self.primary_checkpoint_dir, f"{self.model_prefix}_model_epoch_{epoch}.pth")
+                    save_success = False
                     try:
-                        torch.save(checkpoint_data, primary_checkpoint_path)
-                        info(f"Saved checkpoint to primary path: {primary_checkpoint_path}")
-                        primary_save_success = True
+                        torch.save(checkpoint_data, checkpoint_path)
+                        info(f"Saved checkpoint to primary path: {checkpoint_path}")
+                        save_success = True
                     except Exception as e:
                         info(f"Error saving checkpoint to primary path: {str(e)}")
 
-                    # Save to fallback checkpoint directory if it exists
-                    if self.fallback_checkpoint_dir:
-                        fallback_checkpoint_path = os.path.join(self.fallback_checkpoint_dir, f"{self.model_prefix}_model_epoch_{epoch}.pth")
-                        try:
-                            torch.save(checkpoint_data, fallback_checkpoint_path)
-                            info(f"Saved checkpoint to fallback path: {fallback_checkpoint_path}")
-                        except Exception as e:
-                            info(f"Error saving checkpoint to fallback path: {str(e)}")
+                    # Removed fallback saving logic
 
-                    if primary_save_success:
+                    if save_success:
                         info(f"Saved checkpoint at epoch {epoch}")
                     else:
                         info(f"Failed to save checkpoint at epoch {epoch}")
@@ -1436,22 +1418,11 @@ class StudentTrainer(BaseTrainer):
             except Exception as e1:
                 info(f"Failed to save emergency checkpoint to primary path: {str(e1)}")
 
-                # Try fallback path if available
-                if self.fallback_checkpoint_dir:
-                    try:
-                        fallback_emergency_path = os.path.join(self.fallback_checkpoint_dir, f"{self.model_prefix}_emergency_checkpoint.pth")
-                        torch.save({
-                            'model_state_dict': self.model.state_dict(),
-                            'optimizer_state_dict': self.optimizer.state_dict(),
-                            'error': str(e)
-                        }, fallback_emergency_path)
-                        info(f"Saved emergency checkpoint to fallback path: {fallback_emergency_path}")
-                    except Exception as e2:
-                        info(f"Failed to save emergency checkpoint to fallback path: {str(e2)}")
+                # Removed fallback emergency save logic
 
     def load_best_model(self):
         """Load the best model saved during training."""
-        # First try the primary path (which should be the external path if available)
+        # Only try the primary path
         if os.path.exists(self.best_model_path):
             try:
                 checkpoint = torch.load(self.best_model_path)
@@ -1460,30 +1431,12 @@ class StudentTrainer(BaseTrainer):
                 return True
             except Exception as e:
                 info(f"Error loading best model from primary path: {str(e)}")
-                # Continue to try fallback path
-        else:
-            info(f"No best model found at primary path: {self.best_model_path}")
-
-        # Try fallback path if it exists and primary path failed
-        if self.fallback_checkpoint_dir:
-            fallback_path = os.path.join(self.fallback_checkpoint_dir, f"{self.model_prefix}_model_best.pth")
-
-            if os.path.exists(fallback_path):
-                try:
-                    info(f"Trying to load model from fallback path: {fallback_path}")
-                    checkpoint = torch.load(fallback_path)
-                    self.model.load_state_dict(checkpoint['model_state_dict'])
-                    info(f"Loaded best model from fallback path (epoch {checkpoint['epoch']}) with validation accuracy {checkpoint['accuracy']:.4f}")
-                    return True
-                except Exception as e:
-                    info(f"Error loading best model from fallback path: {str(e)}")
-                    return False
-            else:
-                info(f"No best model found at fallback path: {fallback_path}")
                 return False
         else:
-            # No fallback path available
+            info(f"No best model found at primary path: {self.best_model_path}")
             return False
+
+        # Removed fallback loading logic
 
     def _plot_loss_history(self):
         """Plot and save the loss history."""

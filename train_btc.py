@@ -26,6 +26,43 @@ from modules.utils.hparams import HParams
 from modules.utils.chords import idx2voca_chord
 from modules.training.Tester import Tester
 
+# Add this function
+def load_normalization_from_checkpoint(path, storage_root=None, project_root=None):
+    """
+    Load normalization statistics (mean, std) from a PyTorch checkpoint file.
+
+    Args:
+        path (str): Path to the checkpoint file.
+        storage_root (str): Optional storage root path.
+        project_root (str): Optional project root path.
+
+    Returns:
+        tuple: (mean, std) or (None, None) if not found or error occurs.
+    """
+    resolved_path = resolve_path(path, storage_root, project_root)
+    if not resolved_path or not os.path.exists(resolved_path):
+        logger.error(f"Teacher checkpoint for normalization not found at: {resolved_path}")
+        return None, None
+
+    try:
+        logger.info(f"Loading normalization stats from teacher checkpoint: {resolved_path}")
+        checkpoint = torch.load(resolved_path, map_location='cpu') # Load to CPU to avoid GPU memory issues
+        mean = checkpoint.get('mean')
+        std = checkpoint.get('std')
+
+        if mean is not None and std is not None:
+            logger.info(f"Loaded normalization: mean={mean}, std={std}")
+            # Ensure they are floats or numpy arrays, not tensors
+            if isinstance(mean, torch.Tensor): mean = mean.item()
+            if isinstance(std, torch.Tensor): std = std.item()
+            return float(mean), float(std)
+        else:
+            logger.warning("Normalization stats (mean, std) not found in the checkpoint.")
+            return None, None
+    except Exception as e:
+        logger.error(f"Error loading normalization from checkpoint {resolved_path}: {e}")
+        return None, None
+
 class ListSampler:
     def __init__(self, indices):
         self.indices = indices
@@ -135,62 +172,6 @@ def find_data_directory(primary_path, alt_path, file_type, description):
             return path, count
 
     return paths_to_check[0] if paths_to_check else None, 0
-
-def get_quick_dataset_stats(data_loader, device, max_batches=10):
-    """Calculate statistics from a small subset of data without blocking."""
-    try:
-        # Process in chunks with progress
-        mean_sum = 0.0
-        square_sum = 0.0
-        sample_count = 0
-
-        logger.info(f"Processing subset of data for quick statistics...")
-        for i, batch in enumerate(data_loader):
-            if i >= max_batches:  # Limit batches processed
-                break
-
-            # Move to CPU explicitly
-            # Handle both dict and tuple batch formats
-            if isinstance(batch, dict):
-                features = batch.get('spectro')
-            else:
-                features = batch[0] # Assume features are the first element
-
-            if features is None:
-                logger.warning(f"Skipping batch {i} due to missing features.")
-                continue
-
-            features = features.to('cpu')
-
-            # Calculate stats
-            batch_mean = torch.mean(features).item()
-            batch_square_mean = torch.mean(features.pow(2)).item()
-
-            # Update running sums
-            mean_sum += batch_mean
-            square_sum += batch_square_mean
-            sample_count += 1
-
-            # Free memory
-            del features
-
-            # Clear GPU cache periodically
-            if i % 2 == 0 and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        # Calculate final statistics
-        if sample_count > 0:
-            mean = mean_sum / sample_count
-            square_mean = square_sum / sample_count
-            std = np.sqrt(square_mean - mean**2)
-            logger.info(f"Quick stats from {sample_count} batches: mean={mean:.4f}, std={std:.4f}")
-            return mean, std
-        else:
-            logger.warning("No samples processed for statistics")
-            return 0.0, 1.0
-    except Exception as e:
-        logger.error(f"Error in quick stats calculation: {e}")
-        return 0.0, 1.0
 
 def main():
     # Parse command line arguments
@@ -305,8 +286,12 @@ def main():
                       help='Start from epoch 1 even when loading from checkpoint')
     parser.add_argument('--reset_scheduler', action='store_true',
                       help='Reset learning rate scheduler when --reset_epoch is used')
-    parser.add_argument('--timeout_minutes', type=int, default=30,
-                      help='Timeout in minutes for distributed operations (default: 30)')
+    parser.add_argument('--timeout_minutes', type=int, default=90,
+                      help='Timeout in minutes for distributed operations (default: 90)')
+    # Add teacher checkpoint argument
+    parser.add_argument('--teacher_checkpoint', type=str, default=None,
+                        help='Path to the teacher model checkpoint for loading normalization stats')
+
 
     args = parser.parse_args()
 
@@ -912,35 +897,24 @@ def main():
         reserved = torch.cuda.memory_reserved() / (1024 * 1024 * 1024)
         logger.info(f"CUDA memory stats (GB): allocated={allocated:.2f}, reserved={reserved:.2f}")
 
+    # --- Remove normalization recalculation ---
     # Calculate dataset statistics efficiently
-    try:
-        logger.info("Calculating global mean and std for normalization...")
+    mean, std = None, None
+    if args.teacher_checkpoint:
+        mean, std = load_normalization_from_checkpoint(args.teacher_checkpoint, storage_root, project_root)
 
-        # Create stats loader
-        stats_batch_size = min(16, batch_size) # Use calculated batch_size
-        stats_loader = torch.utils.data.DataLoader(
-            synth_dataset,
-            batch_size=stats_batch_size,
-            sampler=torch.utils.data.RandomSampler(
-                synth_dataset,
-                replacement=True,
-                num_samples=min(1000, len(synth_dataset))
-            ),
-            num_workers=0,
-            pin_memory=False
-        )
-
-        mean, std = get_quick_dataset_stats(stats_loader, device)
-        logger.info(f"Using statistics: mean={mean:.4f}, std={std:.4f}")
-    except Exception as e:
-        logger.error(f"Error calculating statistics: {e}")
+    if mean is None or std is None:
+        logger.warning("Could not load normalization from teacher checkpoint or path not provided.")
+        # Fallback to default values if loading fails or no checkpoint is given
         mean, std = 0.0, 1.0
-        logger.warning("Using default mean=0.0, std=1.0 due to calculation error")
+        logger.warning(f"Using default normalization: mean={mean}, std={std}")
+    else:
+        logger.info(f"Using normalization loaded from teacher: mean={mean:.4f}, std={std:.4f}")
 
     # Create normalized tensors on device
-    mean = torch.tensor(mean, device=device)
-    std = torch.tensor(std, device=device)
-    normalization = {'mean': mean, 'std': std}
+    mean_tensor = torch.tensor(mean, device=device)
+    std_tensor = torch.tensor(std, device=device)
+    normalization = {'mean': mean_tensor, 'std': std_tensor}
 
     # Final memory cleanup before training
     if torch.cuda.is_available():

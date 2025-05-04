@@ -16,6 +16,7 @@ from collections import Counter
 # Project imports
 from modules.utils.mir_eval_modules import large_voca_score_calculation
 from modules.utils.device import get_device, is_cuda_available, is_gpu_available, clear_gpu_cache
+# Removed unused get_quick_dataset_stats
 from modules.data.SynthDataset import SynthDataset, SynthSegmentSubset
 from modules.models.Transformer.ChordNet import ChordNet
 from modules.training.StudentTrainer import StudentTrainer
@@ -24,16 +25,6 @@ from modules.utils import logger
 from modules.utils.hparams import HParams
 from modules.utils.chords import idx2voca_chord
 from modules.training.Tester import Tester
-
-class ListSampler:
-    def __init__(self, indices):
-        self.indices = indices
-
-    def __iter__(self):
-        return iter(self.indices)
-
-    def __len__(self):
-        return len(self.indices)
 
 def count_files_in_subdirectories(directory, file_pattern):
     """Count files in a directory and all its subdirectories matching a pattern."""
@@ -53,22 +44,6 @@ def count_files_in_subdirectories(directory, file_pattern):
                 count += 1
 
     return count
-
-def find_sample_files(directory, file_pattern, max_samples=5):
-    """Find sample files in a directory and all its subdirectories matching a pattern."""
-    if not os.path.exists(directory):
-        return []
-
-    samples = []
-    # Find files in all subdirectories
-    for root, dirs, files in os.walk(directory):
-        for file in files:
-            if file.endswith(file_pattern.replace("*", "")):
-                samples.append(os.path.join(root, file))
-                if len(samples) >= max_samples:
-                    return samples
-
-    return samples
 
 def resolve_path(path, storage_root=None, project_root=None):
     """
@@ -108,80 +83,32 @@ def resolve_path(path, storage_root=None, project_root=None):
     # Otherwise default to project_root resolution
     return os.path.join(project_root, path) if project_root else path
 
-def find_data_directory(primary_path, alt_path, file_type, description):
-    """Find directories containing data files with comprehensive fallback options."""
-    paths_to_check = [
-        primary_path,                          # Primary path from config/args
-        alt_path,                              # Alternative path from config
-        f"/mnt/storage/data/synth/{description}s",  # Common fallback location
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), f"data/synth/{description}s")  # Project fallback
-    ]
-
-    # Filter out None paths
-    paths_to_check = [p for p in paths_to_check if p]
-
-    for path in paths_to_check:
-        # Create directory if it doesn't exist
-        os.makedirs(path, exist_ok=True)
-
-        # Count files
-        count = count_files_in_subdirectories(path, file_type)
-        if count > 0:
-            sample_files = find_sample_files(path, file_type, 3)
-            logger.info(f"  {description.capitalize()}: {path} ({count} files)")
-            if sample_files:
-                logger.info(f"  Example files: {sample_files}")
-            return path, count
-
-    return paths_to_check[0] if paths_to_check else None, 0
-
-def get_quick_dataset_stats(data_loader, device, max_batches=10):
-    """Calculate statistics from a small subset of data without blocking."""
+def load_normalization_from_checkpoint(path, storage_root=None, project_root=None):
+    """Load mean and std from a teacher checkpoint, or return (0.0, 1.0) if unavailable."""
+    if not path:
+        logger.warning("No teacher checkpoint specified for normalization. Using defaults (0.0, 1.0).")
+        return 0.0, 1.0
+    resolved_path = resolve_path(path, storage_root, project_root)
+    if not os.path.exists(resolved_path):
+        logger.warning(f"Teacher checkpoint for normalization not found at {resolved_path}. Using defaults (0.0, 1.0).")
+        return 0.0, 1.0
     try:
-        # Process in chunks with progress
-        mean_sum = 0.0
-        square_sum = 0.0
-        sample_count = 0
-
-        logger.info(f"Processing subset of data for quick statistics...")
-        for i, batch in enumerate(data_loader):
-            if i >= max_batches:  # Limit batches processed
-                break
-
-            # Move to CPU explicitly
-            features = batch['spectro'].to('cpu')
-
-            # Calculate stats
-            batch_mean = torch.mean(features).item()
-            batch_square_mean = torch.mean(features.pow(2)).item()
-
-            # Update running sums
-            mean_sum += batch_mean
-            square_sum += batch_square_mean
-            sample_count += 1
-
-            # Free memory
-            del features
-
-            # Clear GPU cache periodically
-            if i % 2 == 0 and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        # Calculate final statistics
-        if sample_count > 0:
-            mean = mean_sum / sample_count
-            square_mean = square_sum / sample_count
-            std = np.sqrt(square_mean - mean**2)
-            logger.info(f"Quick stats from {sample_count} batches: mean={mean:.4f}, std={std:.4f}")
-            return mean, std
-        else:
-            logger.warning("No samples processed for statistics")
-            return 0.0, 1.0
+        checkpoint = torch.load(resolved_path, map_location='cpu')
+        mean = checkpoint.get('mean', 0.0)
+        std = checkpoint.get('std', 1.0)
+        mean = float(mean.item()) if hasattr(mean, 'item') else float(mean)
+        std = float(std.item()) if hasattr(std, 'item') else float(std)
+        if std == 0:
+            logger.warning("Teacher checkpoint std is zero, using 1.0 instead.")
+            std = 1.0
+        logger.info(f"Loaded normalization from teacher checkpoint: mean={mean:.4f}, std={std:.4f}")
+        return mean, std
     except Exception as e:
-        logger.error(f"Error in quick stats calculation: {e}")
+        logger.error(f"Error loading normalization from teacher checkpoint: {e}")
+        logger.warning("Using default normalization parameters (mean=0.0, std=1.0).")
         return 0.0, 1.0
 
-def main():
+def main(rank=0, world_size=1):
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Train a chord recognition student model using synthesized data")
     parser.add_argument('--config', type=str, default='./config/student_config.yaml',
@@ -262,8 +189,6 @@ def main():
                       help='Directory containing labels (overrides config value)')
 
     # GPU acceleration options
-    parser.add_argument('--gpu_memory_fraction', type=float, default=0.9,
-                      help='Fraction of GPU memory to use (default: 0.9)')
     parser.add_argument('--batch_gpu_cache', action='store_true',
                       help='Cache batches on GPU for repeated access patterns')
     parser.add_argument('--prefetch_factor', type=int, default=2,
@@ -299,8 +224,12 @@ def main():
                       help='Start from epoch 1 even when loading from checkpoint')
     parser.add_argument('--reset_scheduler', action='store_true',
                       help='Reset learning rate scheduler when --reset_epoch is used')
-    parser.add_argument('--timeout_minutes', type=int, default=30,
-                      help='Timeout in minutes for distributed operations (default: 30)')
+    parser.add_argument('--timeout_minutes', type=int, default=90,
+                      help='Timeout in minutes for distributed operations (default: 90)')
+
+    # New argument for teacher checkpoint
+    parser.add_argument('--teacher_checkpoint', type=str, default=None,
+                        help='Path to the teacher model checkpoint to load normalization parameters (mean, std)')
 
     args = parser.parse_args()
 
@@ -510,15 +439,26 @@ def main():
     logger.info(f"Project root: {project_root}")
     logger.info(f"Storage root: {storage_root}")
 
+    # --- Load Normalization from Teacher Checkpoint ---
+    mean_val, std_val = load_normalization_from_checkpoint(
+        args.teacher_checkpoint or config.paths.get('teacher_checkpoint'),
+        storage_root, project_root
+    )
+    mean_tensor = torch.tensor(mean_val, device=device, dtype=torch.float32)
+    std_tensor = torch.tensor(std_val, device=device, dtype=torch.float32)
+    normalization = {'mean': mean_tensor, 'std': std_tensor}
+    logger.info(f"Using normalization parameters FOR TRAINING (from teacher checkpoint): mean={mean_val:.4f}, std={std_val:.4f}")
+
+
     # Resolve primary paths from config, with CLI override
-    spec_dir_config = resolve_path(args.spec_dir or config.paths.get('spec_dir', 'data/logits/synth/spectrograms'),
-                                  storage_root, project_root)
-    label_dir_config = resolve_path(args.label_dir or config.paths.get('label_dir', 'data/logits/synth/labels'),
-                                   storage_root, project_root)
+    # spec_dir_config = resolve_path(args.spec_dir or config.paths.get('spec_dir', 'data/logits/synth/spectrograms'),
+    #                               storage_root, project_root)
+    # label_dir_config = resolve_path(args.label_dir or config.paths.get('label_dir', 'data/logits/synth/labels'),
+    #                                storage_root, project_root)
 
     # Resolve alternative paths if available
-    alt_spec_dir = resolve_path(config.paths.get('alt_spec_dir'), storage_root, project_root) if config.paths.get('alt_spec_dir') else None
-    alt_label_dir = resolve_path(config.paths.get('alt_label_dir'), storage_root, project_root) if config.paths.get('alt_label_dir') else None
+    # alt_spec_dir = resolve_path(config.paths.get('alt_spec_dir'), storage_root, project_root) if config.paths.get('alt_spec_dir') else None
+    # alt_label_dir = resolve_path(config.paths.get('alt_label_dir'), storage_root, project_root) if config.paths.get('alt_label_dir') else None
 
     logger.info(f"Looking for data files:")
 
@@ -646,7 +586,7 @@ def main():
     #     # ...
     # # ... and so on ...
     # else: # Single dataset type
-    #     # ...
+    #     ...
 
     # Use the mapping defined in chords.py
     master_mapping = idx2voca_chord()
@@ -952,35 +892,38 @@ def main():
         reserved = torch.cuda.memory_reserved() / (1024 * 1024 * 1024)
         logger.info(f"CUDA memory stats (GB): allocated={allocated:.2f}, reserved={reserved:.2f}")
 
-    # Calculate dataset statistics efficiently
-    try:
-        logger.info("Calculating global mean and std for normalization...")
-
-        # Create stats loader
-        stats_batch_size = min(16, config.training['batch_size'])
-        stats_loader = torch.utils.data.DataLoader(
-            synth_dataset,
-            batch_size=stats_batch_size,
-            sampler=torch.utils.data.RandomSampler(
-                synth_dataset,
-                replacement=True,
-                num_samples=min(1000, len(synth_dataset))
-            ),
-            num_workers=0,
-            pin_memory=False
-        )
-
-        mean, std = get_quick_dataset_stats(stats_loader, device)
-        logger.info(f"Using statistics: mean={mean:.4f}, std={std:.4f}")
-    except Exception as e:
-        logger.error(f"Error calculating statistics: {e}")
-        mean, std = 0.0, 1.0
-        logger.warning("Using default mean=0.0, std=1.0 due to calculation error")
-
-    # Create normalized tensors on device
-    mean = torch.tensor(mean, device=device)
-    std = torch.tensor(std, device=device)
-    normalization = {'mean': mean, 'std': std}
+    # --- REMOVE REDUNDANT NORMALIZATION CALCULATION ---
+    # The normalization dictionary is already created earlier using values from the teacher checkpoint.
+    # This block is redundant and overrides the intended values.
+    # try:
+    #     logger.info("Calculating global mean and std for normalization...")
+    #
+    #     # Create stats loader
+    #     stats_batch_size = min(16, config.training['batch_size'])
+    #     stats_loader = torch.utils.data.DataLoader(
+    #         synth_dataset,
+    #         batch_size=stats_batch_size,
+    #         sampler=torch.utils.data.RandomSampler(
+    #             synth_dataset,
+    #             replacement=True,
+    #             num_samples=min(1000, len(synth_dataset))
+    #         ),
+    #         num_workers=0,
+    #         pin_memory=False
+    #     )
+    #
+    #     mean, std = get_quick_dataset_stats(stats_loader, device) # This recalculates mean/std
+    #     logger.info(f"Using statistics: mean={mean:.4f}, std={std:.4f}")
+    # except Exception as e:
+    #     logger.error(f"Error calculating statistics: {e}")
+    #     mean, std = 0.0, 1.0
+    #     logger.warning("Using default mean=0.0, std=1.0 due to calculation error")
+    #
+    # # Create normalized tensors on device
+    # mean = torch.tensor(mean, device=device)
+    # std = torch.tensor(std, device=device)
+    # normalization = {'mean': mean, 'std': std} # This overrides the previously loaded normalization
+    # --- END REMOVAL ---
 
     # Final memory cleanup before training
     if torch.cuda.is_available():
@@ -1008,7 +951,7 @@ def main():
             checkpoint_dir=checkpoints_dir,
             class_weights=None,
             idx_to_chord=master_mapping,
-            normalization=normalization,
+            normalization=normalization, # Use the normalization loaded from teacher checkpoint
             early_stopping_patience=config.training.get('early_stopping_patience', 5),
             lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
             min_lr=config.training.get('min_learning_rate', 5e-6),
@@ -1038,7 +981,7 @@ def main():
             checkpoint_dir=checkpoints_dir,
             class_weights=None,
             idx_to_chord=master_mapping,
-            normalization=normalization,
+            normalization=normalization, # Use the normalization loaded from teacher checkpoint
             #max_grad_norm=0.5,
             early_stopping_patience=config.training.get('early_stopping_patience', 5),
             lr_decay_factor=config.training.get('lr_decay_factor', 0.95),
@@ -1285,7 +1228,8 @@ def main():
                         # Each rank evaluates only its assigned split
                         # Get sampled_song_ids if using small dataset percentage
                         sampled_song_ids = None
-                        if dataset_args.get('small_dataset_percentage', 1.0) < 1.0:
+                        small_dataset_pct = dataset_args.get('small_dataset_percentage')
+                        if small_dataset_pct is not None and small_dataset_pct != '' and float(small_dataset_pct) < 1.0:
                             # Extract unique song IDs from the samples
                             sampled_song_ids = set(sample.get('song_id', '') for sample in split_samples if 'song_id' in sample)
                             logger.info(f"Using {len(sampled_song_ids)} sampled song IDs for MIR evaluation")
@@ -1344,7 +1288,7 @@ def main():
                         # Get sampled_song_ids if using small dataset percentage
                         sampled_song_ids1 = None
                         small_dataset_pct = dataset_args.get('small_dataset_percentage')
-                        if small_dataset_pct is not None and float(small_dataset_pct) < 1.0:
+                        if small_dataset_pct is not None and small_dataset_pct != '' and float(small_dataset_pct) < 1.0:
                             # Extract unique song IDs from the samples
                             sampled_song_ids1 = set(sample.get('song_id', '') for sample in valid_dataset1 if 'song_id' in sample)
                             logger.info(f"Using {len(sampled_song_ids1)} sampled song IDs for MIR evaluation (split 1)")
@@ -1357,7 +1301,7 @@ def main():
                         # Get sampled_song_ids if using small dataset percentage
                         sampled_song_ids2 = None
                         small_dataset_pct = dataset_args.get('small_dataset_percentage')
-                        if small_dataset_pct is not None and float(small_dataset_pct) < 1.0:
+                        if small_dataset_pct is not None and small_dataset_pct != '' and float(small_dataset_pct) < 1.0:
                             # Extract unique song IDs from the samples
                             sampled_song_ids2 = set(sample.get('song_id', '') for sample in valid_dataset2 if 'song_id' in sample)
                             logger.info(f"Using {len(sampled_song_ids2)} sampled song IDs for MIR evaluation (split 2)")
@@ -1370,7 +1314,7 @@ def main():
                         # Get sampled_song_ids if using small dataset percentage
                         sampled_song_ids3 = None
                         small_dataset_pct = dataset_args.get('small_dataset_percentage')
-                        if small_dataset_pct is not None and float(small_dataset_pct) < 1.0:
+                        if small_dataset_pct is not None and small_dataset_pct != '' and float(small_dataset_pct) < 1.0:
                             # Extract unique song IDs from the samples
                             sampled_song_ids3 = set(sample.get('song_id', '') for sample in valid_dataset3 if 'song_id' in sample)
                             logger.info(f"Using {len(sampled_song_ids3)} sampled song IDs for MIR evaluation (split 3)")

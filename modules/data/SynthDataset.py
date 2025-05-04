@@ -1,13 +1,13 @@
-import torch
-import numpy as np
-import os
-import re
-import time
-import pickle
-import warnings
-import hashlib
-import traceback
-import glob # Import glob
+import os # Ensure os is imported
+import warnings # Ensure warnings is imported
+import torch # Ensure torch is imported
+import numpy as np # Ensure numpy is imported
+import pickle # Ensure pickle is imported
+import hashlib # Ensure hashlib is imported
+import re # Ensure re is imported
+import time # Ensure time is imported
+import traceback # Ensure traceback is imported
+import glob # Ensure glob is imported
 from torch.utils.data import Dataset, DataLoader
 from collections import Counter
 from pathlib import Path
@@ -16,13 +16,41 @@ from functools import partial
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from modules.utils.device import get_device, to_device, clear_gpu_cache
+from modules.utils.chords import Chords # Ensure Chords is imported
+
+# --- ADDITIONAL IMPORTS ---
+from typing import List, Tuple, Dict, Optional
+# --- END ADDITIONAL IMPORTS ---
 
 # Define a wrapper function for multiprocessing
 def process_file_wrapper(args):
     """Wrapper function for multiprocessing file processing"""
-    dataset_instance, spec_file, file_id, label_files_dict, logit_files_dict, return_skip_reason = args # Added logit_files_dict
+    # Unpack arguments, including the dataset_type for the specific file
+    dataset_instance, spec_file, file_id, label_files_dict, logit_files_dict, current_dataset_type, return_skip_reason = args
     # Pass dataset type to _process_file
-    return dataset_instance._process_file(spec_file, file_id, label_files_dict, logit_files_dict, dataset_instance.dataset_type, return_skip_reason) # Pass logit_files_dict and dataset_type
+    return dataset_instance._process_file(spec_file, file_id, label_files_dict, logit_files_dict, current_dataset_type, return_skip_reason)
+
+# --- Add ID Normalization Helper ---
+def _normalize_id(id_string):
+    """Replace spaces and hyphens with underscores for consistent IDs."""
+    if not isinstance(id_string, str):
+        return id_string # Return as is if not a string
+    # Replace multiple spaces/hyphens with single underscore, then strip leading/trailing
+    # Also handle potential multiple underscores resulting from replacements
+    normalized = re.sub(r'[\s-]+', '_', id_string)
+    normalized = re.sub(r'_+', '_', normalized).strip('_') # Consolidate multiple underscores
+    # --- REMOVED LOWERCASE ---
+    return normalized
+# --- End Helper ---
+
+def get_rel_id(file_path: Path, root_dir: Path, suffix_to_remove: str = '', ext_to_remove: str = '') -> str:
+    """Get the relative path from root_dir, remove suffix and extension, and convert to posix string."""
+    rel = file_path.relative_to(root_dir)
+    rel = rel.with_suffix('')  # remove extension
+    rel_str = str(rel)
+    if suffix_to_remove and rel_str.endswith(suffix_to_remove):
+        rel_str = rel_str[:-len(suffix_to_remove)]
+    return rel_str.replace("\\", "/")
 
 class SynthDataset(Dataset):
     """
@@ -35,37 +63,37 @@ class SynthDataset(Dataset):
     - 'labeled': Uses real ground truth labels from LabeledDataset structure (e.g., LabeledDataset/Labels/Artist/Album/file.lab) with corresponding features (e.g., LabeledDataset_synth/spectrograms/Artist/Album/file_spec.npy)
     - 'combined': Loads 'fma', 'maestro', 'dali_synth', and 'labeled' datasets simultaneously
     """
-    def __init__(self, spec_dir, label_dir, chord_mapping=None, seq_len=10, stride=None,
-                 frame_duration=0.1, num_workers=0, cache_file=None, verbose=True,
-                 use_cache=True, metadata_only=True, cache_fraction=0.1, logits_dir=None,
-                 lazy_init=False, require_teacher_logits=False, device=None,
-                 pin_memory=False, prefetch_factor=2, batch_gpu_cache=False,
-                 small_dataset_percentage=None, dataset_type='fma'):
+    def __init__(self, spec_dir, label_dir, logits_dir, chord_mapping, seq_len, stride, frame_duration,
+                 verbose=False, device=None, pin_memory=False, prefetch_factor=1, num_workers=0,
+                 require_teacher_logits=False, use_cache=True, metadata_only=False, cache_fraction=0.1,
+                 lazy_init=False, batch_gpu_cache=False, small_dataset_percentage=None, dataset_type='fma',
+                 cache_dir=None, return_skip_reason=False): # Added return_skip_reason
         """
         Initialize the dataset with optimized settings for GPU acceleration.
 
         Args:
             spec_dir: Directory containing spectrograms (or list of directories for 'combined' type)
             label_dir: Directory containing labels (or list of directories for 'combined' type)
+            logits_dir: Directory containing teacher logits (or list of directories for 'combined' type)
             chord_mapping: Mapping of chord names to indices
             seq_len: Sequence length for segmentation
             stride: Stride for segmentation (default: same as seq_len)
             frame_duration: Duration of each frame in seconds
-            num_workers: Number of workers for data loading
-            cache_file: Path to cache file
             verbose: Whether to print verbose output
-            use_cache: Whether to use caching
-            metadata_only: Whether to cache only metadata
-            cache_fraction: Fraction of samples to cache
-            logits_dir: Directory containing teacher logits (or list of directories for 'combined' type)
-            lazy_init: Whether to use lazy initialization
-            require_teacher_logits: Whether to require teacher logits
             device: Device to use (default: auto-detect)
             pin_memory: Whether to pin memory for faster GPU transfer
             prefetch_factor: Number of batches to prefetch (for DataLoader)
+            num_workers: Number of workers for data loading
+            require_teacher_logits: Whether to require teacher logits
+            use_cache: Whether to use caching
+            metadata_only: Whether to cache only metadata
+            cache_fraction: Fraction of samples to cache
+            lazy_init: Whether to use lazy initialization
             batch_gpu_cache: Whether to cache batches on GPU for repeated access patterns
             small_dataset_percentage: Optional percentage of the dataset to use (0-1.0)
             dataset_type: Type of dataset format ('fma', 'maestro', or 'combined')
+            cache_dir: Directory to save cache files
+            return_skip_reason: Whether to return the reason for skipping files
         """
         # First, log initialization time start to track potential timeout issues
         import time
@@ -101,6 +129,24 @@ class SynthDataset(Dataset):
         # Force num_workers to 0 for GPU compatibility
         self.num_workers = num_workers
 
+        # --- Moved Cache File Logic Earlier ---
+        # Generate a safer cache file name using hashing if cache_dir is provided
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_key_parts = [str(p) for p in self.spec_dirs + self.label_dirs]
+            if self.logits_dirs: cache_key_parts.extend([str(p) for p in self.logits_dirs])
+            cache_key_parts.extend([str(seq_len), str(stride), str(frame_duration), dataset_type])
+            cache_key = "_".join(cache_key_parts)
+            cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
+            self.cache_file = os.path.join(cache_dir, f"dataset_cache_{dataset_type}_{cache_hash}.pkl")
+            if verbose:
+                print(f"Using cache file: {self.cache_file}")
+        else:
+            self.cache_file = None # No cache file if cache_dir is not provided
+            if verbose:
+                print("Cache directory not specified, caching disabled.")
+        # --- End Moved Cache File Logic ---
+
         # Initialize basic parameters
         self.chord_mapping = chord_mapping
         self.seq_len = seq_len
@@ -109,7 +155,8 @@ class SynthDataset(Dataset):
         self.samples = []
         self.segment_indices = []
         self.verbose = verbose
-        self.use_cache = use_cache and cache_file is not None
+        # Use self.cache_file which is now defined
+        self.use_cache = use_cache and self.cache_file is not None
         self.metadata_only = metadata_only  # Only cache metadata, not full spectrograms
         self.cache_fraction = cache_fraction  # Fraction of samples to cache (default: 10%)
         self.lazy_init = lazy_init
@@ -117,12 +164,35 @@ class SynthDataset(Dataset):
         self.dataset_type = dataset_type  # Dataset format type
 
         # Add 'dali_synth' and 'labeled' to valid types
-        valid_types = ['fma', 'maestro', 'dali_synth', 'labeled', 'combined']
-        if '+' in self.dataset_type: # Handle combined types like fma+labeled
-             valid_types.extend(self.dataset_type.split('+'))
-        if self.dataset_type not in valid_types and not all(t in valid_types for t in self.dataset_type.split('+')):
-             warnings.warn(f"Unknown dataset_type '{dataset_type}', defaulting to 'fma'")
-             self.dataset_type = 'fma'
+        # Define known types
+        self.known_types = ['fma', 'maestro', 'dali_synth', 'labeled']
+        valid_types = self.known_types + ['combined'] # Add 'combined' as a valid meta-type
+
+        # Determine types to load
+        self.types_to_load = []
+        raw_types = []
+        if self.dataset_type == 'combined':
+            raw_types = self.known_types # Load all known types
+        elif '+' in self.dataset_type:
+            raw_types = self.dataset_type.split('+')
+        else:
+            raw_types = [self.dataset_type]
+
+        # Validate and store types to load
+        for t in raw_types:
+            if t in self.known_types:
+                self.types_to_load.append(t)
+            else:
+                warnings.warn(f"Unknown dataset type '{t}' specified, ignoring.")
+
+        if not self.types_to_load:
+             warnings.warn(f"No valid dataset types specified ('{dataset_type}'). Defaulting to 'fma'.")
+             self.types_to_load = ['fma']
+             self.dataset_type = 'fma' # Update main type if defaulted
+
+        if verbose:
+            print(f"Attempting to load dataset types: {self.types_to_load}")
+
 
         # Disable pin_memory since we're using a single worker
         self.pin_memory = True
@@ -157,7 +227,7 @@ class SynthDataset(Dataset):
         # Set up regex patterns - always define all patterns regardless of dataset type
         # For Maestro/DALI: Match hex ID or general filename before _spec/_logits or .lab
         self.file_pattern = re.compile(r'([0-9a-fA-F]{32}|.+?)(?:_spec|_logits)?\.(?:npy|lab)$')
-        # For FMA: 6-digit numeric ID pattern
+        # For FMA: 6-digit numeric ID pattern (match anywhere in filename for flexibility)
         self.numeric_id_pattern = re.compile(r'(\d{6})')
         # For DALI prefix: 3 alphanumeric chars
         self.dali_prefix_pattern = re.compile(r'^[0-9a-zA-Z]{3}$')
@@ -196,16 +266,6 @@ class SynthDataset(Dataset):
         # Initialize zero tensor caches
         self._zero_spec_cache = {}
         self._zero_logit_cache = {}
-
-        # Generate a safer cache file name using hashing if none provided
-        if cache_file is None:
-            cache_key = f"{spec_dir}_{label_dir}_{seq_len}_{stride}_{frame_duration}_{dataset_type}"
-            cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
-            self.cache_file = f"dataset_cache_{dataset_type}_{cache_hash}.pkl"
-            if verbose:
-                print(f"Using cache file: {self.cache_file}")
-        else:
-            self.cache_file = cache_file
 
         # Only load data if not using lazy initialization
         if not self.lazy_init:
@@ -332,6 +392,7 @@ class SynthDataset(Dataset):
     def _load_data(self):
         """Load data from files or cache with optimized memory usage and error handling"""
         start_time = time.time()
+        logger = self.verbose # Use self.verbose for logging control
 
         # Try to load data from cache first
         if self.use_cache and os.path.exists(self.cache_file):
@@ -364,187 +425,351 @@ class SynthDataset(Dataset):
 
         # Create mappings of label and logit files for quick lookup
         label_files_dict = {}
-        logit_files_dict = {} # Added for logits
-        label_counts = {'fma': 0, 'maestro': 0, 'dali_synth': 0, 'labeled': 0} # Added labeled
-        logit_counts = {'fma': 0, 'maestro': 0, 'dali_synth': 0, 'labeled': 0} # Added labeled
+        logit_files_dict = {}
+        # Initialize counts for all potential types, even if not used in this run
+        label_counts = {t: 0 for t in self.known_types}
+        logit_counts = {t: 0 for t in self.known_types}
+        spec_counts = {t: 0 for t in self.known_types}
+        valid_spec_files: List[Tuple[Path, str, str]] = [] # (path, normalized_id, type)
 
-        # Scan label directories
+        # --- Scan Files Based on Types to Load ---
+        if logger: print(f"\n--- Scanning Files for Types: {self.types_to_load} ---")
+
+        # --- Scan Label Directories ---
+        if logger: print("\nScanning Label Directories...")
         for label_dir_base in self.label_dirs:
-            current_type = 'fma' # Default
-            label_dir_str = str(label_dir_base).lower()
-            if "maestro" in label_dir_str:
-                current_type = 'maestro'
-            elif "dali_synth" in label_dir_str:
-                current_type = 'dali_synth'
-            elif "labeleddataset/labels" in label_dir_str.replace("\\", "/"): # Check for LabeledDataset structure
-                current_type = 'labeled'
+            if not label_dir_base.exists():
+                warnings.warn(f"Label directory does not exist: {label_dir_base}")
+                continue
+            if logger: print(f"Scanning: {label_dir_base}")
 
-            if self.verbose:
-                print(f"Scanning {current_type.upper()} labels from: {label_dir_base}")
+            # Labeled Type Logic
+            if 'labeled' in self.types_to_load:
+                label_root_parent = label_dir_base.parent
+                if logger: print(f"  Checking for 'labeled' structure (root: {label_root_parent})")
+                files_found, ids_added = 0, 0
+                try:
+                    for label_path in label_dir_base.rglob("*.lab"):
+                        files_found += 1
+                        try:
+                            rel_id_raw = get_rel_id(label_path, label_root_parent, ext_to_remove=".lab")
+                            modified_id_raw = rel_id_raw
+                            if '/' in rel_id_raw:
+                                parts = rel_id_raw.split('/', 1)
+                                if parts[0].lower().endswith('labels'):
+                                    modified_id_raw = f"{parts[0][:-len('Labels')]}/{parts[1]}"
 
-            # Use rglob for potentially nested structures like LabeledDataset
-            # Find only .lab files
-            for label_path in label_dir_base.rglob("*.lab"):
-                file_id = None
-                if current_type == 'labeled':
-                    # For labeled, use relative path from label_dir_base as ID (without extension)
-                    try:
-                        relative_path = label_path.relative_to(label_dir_base)
-                        file_id = str(relative_path.with_suffix('')) # e.g., "artist/album/song_name"
-                    except ValueError: # If label_path is not inside label_dir_base (shouldn't happen with rglob)
-                        file_id = label_path.stem # Fallback to filename stem
-                else:
-                    # Use existing logic for other types
-                    match = self.file_pattern.search(label_path.name)
-                    if match:
-                        file_id = match.group(1)
+                            file_id = _normalize_id(modified_id_raw)
+                            if file_id not in label_files_dict: # Avoid overwriting if found by other types
+                                label_files_dict[file_id] = label_path
+                                label_counts['labeled'] += 1
+                                ids_added += 1
+                            elif logger and ids_added < 5: # Log if already exists
+                                 print(f"    [Labeled Scan] ID '{file_id}' already exists, skipping.")
 
-                if file_id:
-                    label_files_dict[file_id] = label_path
-                    label_counts[current_type] += 1
-                elif self.verbose:
-                     print(f"Could not determine file_id for label: {label_path}")
+                        except ValueError: continue # Skip if not relative to root_parent
+                        except Exception as e_gen:
+                             if logger: print(f"    Error processing labeled label {label_path}: {e_gen}")
+                    if logger: print(f"    -> Found {files_found} .lab, added {ids_added} 'labeled' entries.")
+                except Exception as e:
+                     if logger: print(f"    Error during 'labeled' scan in {label_dir_base}: {e}")
 
 
-        # Scan logit directories (only if KD is potentially used)
+            # FMA Type Logic
+            if 'fma' in self.types_to_load:
+                if logger: print("  Checking for 'fma' structure (ddd/*.lab)")
+                files_found, ids_added = 0, 0
+                try:
+                    for prefix_dir in label_dir_base.glob("**/"): # Check subdirs
+                        if re.fullmatch(r'\d{3}', prefix_dir.name):
+                            for label_path in prefix_dir.glob("*.lab"):
+                                files_found += 1
+                                numeric_match = self.numeric_id_pattern.search(label_path.name)
+                                if numeric_match:
+                                    file_id_raw = numeric_match.group(1)
+                                    file_id = _normalize_id(file_id_raw)
+                                    if file_id not in label_files_dict:
+                                        label_files_dict[file_id] = label_path
+                                        label_counts['fma'] += 1
+                                        ids_added += 1
+                                    elif logger and ids_added < 5:
+                                         print(f"    [FMA Scan] ID '{file_id}' already exists, skipping.")
+                    if logger: print(f"    -> Found {files_found} .lab, added {ids_added} 'fma' entries.")
+                except Exception as e:
+                     if logger: print(f"    Error during 'fma' scan in {label_dir_base}: {e}")
+
+            # Maestro & DALI Type Logic (General Pattern)
+            other_types = [t for t in ['maestro', 'dali_synth'] if t in self.types_to_load]
+            if other_types:
+                if logger: print(f"  Checking for {'/'.join(other_types)} structure (*.lab)")
+                files_found, ids_added_m, ids_added_d = 0, 0, 0
+                try:
+                    for label_path in label_dir_base.rglob("*.lab"):
+                        files_found += 1
+                        match = self.file_pattern.search(label_path.name)
+                        if match:
+                            file_id_raw = match.group(1)
+                            file_id = _normalize_id(file_id_raw)
+                            current_type = None
+                            # Heuristic: Check if ID looks like DALI hex
+                            if 'dali_synth' in other_types and re.fullmatch(r'[0-9a-fA-F]{32}', file_id_raw):
+                                current_type = 'dali_synth'
+                            elif 'maestro' in other_types: # Assume maestro otherwise
+                                current_type = 'maestro'
+
+                            if current_type and file_id not in label_files_dict:
+                                label_files_dict[file_id] = label_path
+                                label_counts[current_type] += 1
+                                if current_type == 'maestro': ids_added_m += 1
+                                else: ids_added_d += 1
+                            elif logger and (ids_added_m + ids_added_d < 5):
+                                 print(f"    [M/D Scan] ID '{file_id}' already exists or type mismatch, skipping.")
+                    if logger: print(f"    -> Found {files_found} .lab, added {ids_added_m} 'maestro', {ids_added_d} 'dali_synth' entries.")
+                except Exception as e:
+                     if logger: print(f"    Error during 'maestro/dali' scan in {label_dir_base}: {e}")
+
+
+        # --- Scan Logit Directories ---
+        if logger: print("\nScanning Logit Directories...")
         if self.logits_dirs:
             for logit_dir_base in self.logits_dirs:
-                current_type = 'fma' # Default
-                logit_dir_str = str(logit_dir_base).lower()
-                # Assume logits for LabeledDataset are in a parallel structure like LabeledDataset_synth/logits
-                if "maestro" in logit_dir_str:
-                    current_type = 'maestro'
-                elif "dali_synth" in logit_dir_str:
-                    current_type = 'dali_synth'
-                elif "labeleddataset_synth/logits" in logit_dir_str.replace("\\", "/"):
-                    current_type = 'labeled'
+                if not logit_dir_base.exists():
+                    warnings.warn(f"Logit directory does not exist: {logit_dir_base}")
+                    continue
+                if logger: print(f"Scanning: {logit_dir_base}")
 
-                if self.verbose:
-                    print(f"Scanning {current_type.upper()} logits from: {logit_dir_base}")
+                # Labeled Type Logic
+                if 'labeled' in self.types_to_load:
+                    logit_root = logit_dir_base # Assume this is the root like LabeledDataset_synth/logits
+                    if logger: print(f"  Checking for 'labeled' structure (root: {logit_root})")
+                    files_found, ids_added = 0, 0
+                    try:
+                        for logit_path in logit_dir_base.rglob("*_logits.npy"):
+                            files_found += 1
+                            try:
+                                rel_id_raw = get_rel_id(logit_path, logit_root, suffix_to_remove="_logits", ext_to_remove=".npy")
+                                file_id = _normalize_id(rel_id_raw)
+                                if file_id not in logit_files_dict:
+                                    logit_files_dict[file_id] = logit_path
+                                    logit_counts['labeled'] += 1
+                                    ids_added += 1
+                                elif logger and ids_added < 5:
+                                     print(f"    [Labeled Scan] Logit ID '{file_id}' already exists, skipping.")
+                            except ValueError: continue
+                            except Exception as e_gen:
+                                 if logger: print(f"    Error processing labeled logit {logit_path}: {e_gen}")
+                        if logger: print(f"    -> Found {files_found} logits, added {ids_added} 'labeled' entries.")
+                    except Exception as e:
+                         if logger: print(f"    Error during 'labeled' logit scan in {logit_dir_base}: {e}")
 
-                # Use rglob for potentially nested structures
-                for logit_path in logit_dir_base.rglob("*_logits.npy"):
-                    file_id = None
-                    if current_type == 'labeled':
-                        # For labeled, use relative path from logit_dir_base as ID (without _logits.npy)
-                        try:
-                            relative_path = logit_path.relative_to(logit_dir_base)
-                            # Remove the suffix '_logits.npy'
-                            file_id = str(relative_path).replace('_logits.npy', '') # e.g., "artist/album/song_name"
-                        except ValueError:
-                            match = self.labeled_logit_pattern.search(logit_path.name)
-                            if match: file_id = match.group(1) # Fallback
-                    else:
-                        # Use a regex that specifically looks for _logits.npy
-                        match = re.search(r'([0-9a-fA-F]{32}|.+?)_logits\.npy$', logit_path.name)
-                        if match:
-                            file_id = match.group(1)
+                # FMA Type Logic
+                if 'fma' in self.types_to_load:
+                    if logger: print("  Checking for 'fma' structure (ddd/*_logits.npy)")
+                    files_found, ids_added = 0, 0
+                    try:
+                        for prefix_dir in logit_dir_base.glob("**/"):
+                            if re.fullmatch(r'\d{3}', prefix_dir.name):
+                                for logit_path in prefix_dir.glob("*_logits.npy"):
+                                    files_found += 1
+                                    # Match ID before _logits.npy
+                                    match = re.search(r'(\d{6})_logits\.npy$', logit_path.name)
+                                    if match:
+                                        file_id_raw = match.group(1)
+                                        file_id = _normalize_id(file_id_raw)
+                                        if file_id not in logit_files_dict:
+                                            logit_files_dict[file_id] = logit_path
+                                            logit_counts['fma'] += 1
+                                            ids_added += 1
+                                        elif logger and ids_added < 5:
+                                             print(f"    [FMA Scan] Logit ID '{file_id}' already exists, skipping.")
+                        if logger: print(f"    -> Found {files_found} logits, added {ids_added} 'fma' entries.")
+                    except Exception as e:
+                        if logger: print(f"    Error during 'fma' logit scan in {logit_dir_base}: {e}")
 
-                    if file_id:
-                        logit_files_dict[file_id] = logit_path
-                        logit_counts[current_type] += 1
-                    elif self.verbose:
-                         print(f"Could not determine file_id for logit: {logit_path}")
+                # Maestro & DALI Type Logic
+                other_types = [t for t in ['maestro', 'dali_synth'] if t in self.types_to_load]
+                if other_types:
+                    if logger: print(f"  Checking for {'/'.join(other_types)} structure (*_logits.npy)")
+                    files_found, ids_added_m, ids_added_d = 0, 0, 0
+                    try:
+                        for logit_path in logit_dir_base.rglob("*_logits.npy"):
+                            files_found += 1
+                            # Match ID before _logits.npy
+                            match = re.search(r'([0-9a-fA-F]{32}|.+?)_logits\.npy$', logit_path.name)
+                            if match:
+                                file_id_raw = match.group(1)
+                                file_id = _normalize_id(file_id_raw)
+                                current_type = None
+                                if 'dali_synth' in other_types and re.fullmatch(r'[0-9a-fA-F]{32}', file_id_raw):
+                                    current_type = 'dali_synth'
+                                elif 'maestro' in other_types:
+                                    current_type = 'maestro'
+
+                                if current_type and file_id not in logit_files_dict:
+                                    logit_files_dict[file_id] = logit_path
+                                    logit_counts[current_type] += 1
+                                    if current_type == 'maestro': ids_added_m += 1
+                                    else: ids_added_d += 1
+                                elif logger and (ids_added_m + ids_added_d < 5):
+                                     print(f"    [M/D Scan] Logit ID '{file_id}' already exists or type mismatch, skipping.")
+                        if logger: print(f"    -> Found {files_found} logits, added {ids_added_m} 'maestro', {ids_added_d} 'dali_synth' entries.")
+                    except Exception as e:
+                        if logger: print(f"    Error during 'maestro/dali' logit scan in {logit_dir_base}: {e}")
+        elif self.require_teacher_logits:
+             raise ValueError("require_teacher_logits=True but no logits_dirs provided.")
 
 
-        if self.verbose:
-            print(f"Found {len(label_files_dict)} label files across all directories:")
-            for k, v in label_counts.items(): print(f"  {k.upper()}: {v}")
-            if self.logits_dirs:
-                print(f"Found {len(logit_files_dict)} logit files across all directories:")
-                for k, v in logit_counts.items(): print(f"  {k.upper()}: {v}")
-
-        # Find all spectrogram files from all spectrogram directories
-        valid_spec_files = []
-        spec_counts = {'fma': 0, 'maestro': 0, 'dali_synth': 0, 'labeled': 0} # Added labeled
+        # --- Scan Spectrogram Directories ---
+        if logger: print("\nScanning Spectrogram Directories...")
+        temp_spec_dict: Dict[str, Tuple[Path, str]] = {} # Use dict to handle potential duplicates across scans: {norm_id: (path, type)}
 
         for spec_dir_base in self.spec_dirs:
-            current_type = 'fma' # Default
-            use_maestro_logic = False
-            use_dali_logic = False
-            use_labeled_logic = False
-            spec_dir_str = str(spec_dir_base).lower()
+            if not spec_dir_base.exists():
+                warnings.warn(f"Spectrogram directory does not exist: {spec_dir_base}")
+                continue
+            if logger: print(f"Scanning: {spec_dir_base}")
 
-            if "maestro" in spec_dir_str:
-                current_type = 'maestro'
-                use_maestro_logic = True
-            elif "dali_synth" in spec_dir_str:
-                current_type = 'dali_synth'
-                use_dali_logic = True
-            # Assume specs for LabeledDataset are in a parallel structure like LabeledDataset_synth/spectrograms
-            elif "labeleddataset_synth/spectrograms" in spec_dir_str.replace("\\", "/"):
-                current_type = 'labeled'
-                use_labeled_logic = True
-
-            if self.verbose:
-                print(f"Scanning {current_type.upper()} spectrograms from: {spec_dir_base}")
-
-            # Use recursive glob for Maestro, DALI, and Labeled
-            if use_maestro_logic or use_dali_logic or use_labeled_logic:
-                for spec_path in spec_dir_base.rglob("*_spec.npy"):
-                    file_id = None
-                    if use_labeled_logic:
-                        # For labeled, use relative path from spec_dir_base as ID (without _spec.npy)
+            # Labeled Type Logic
+            if 'labeled' in self.types_to_load:
+                spec_root = spec_dir_base # Assume this is the root like LabeledDataset_synth/spectrograms
+                if logger: print(f"  Checking for 'labeled' structure (root: {spec_root})")
+                files_found, ids_added = 0, 0
+                try:
+                    for spec_path in spec_dir_base.rglob("*_spec.npy"):
+                        files_found += 1
                         try:
-                            relative_path = spec_path.relative_to(spec_dir_base)
-                            file_id = str(relative_path).replace('_spec.npy', '') # e.g., "artist/album/song_name"
-                        except ValueError:
-                            match = self.labeled_spec_pattern.search(spec_path.name)
-                            if match: file_id = match.group(1) # Fallback
-                    else:
-                        # Extract ID using the general pattern, preferring hex if possible
-                        match = self.file_pattern.search(spec_path.name)
+                            rel_id_raw = get_rel_id(spec_path, spec_root, suffix_to_remove="_spec", ext_to_remove=".npy")
+                            file_id = _normalize_id(rel_id_raw)
+                            if file_id not in temp_spec_dict:
+                                temp_spec_dict[file_id] = (spec_path, 'labeled')
+                                spec_counts['labeled'] += 1
+                                ids_added += 1
+                            elif logger and ids_added < 5:
+                                 print(f"    [Labeled Scan] Spec ID '{file_id}' already exists, skipping.")
+                        except ValueError: continue
+                        except Exception as e_gen:
+                             if logger: print(f"    Error processing labeled spec {spec_path}: {e_gen}")
+                    if logger: print(f"    -> Found {files_found} specs, added {ids_added} 'labeled' entries.")
+                except Exception as e:
+                     if logger: print(f"    Error during 'labeled' spec scan in {spec_dir_base}: {e}")
+
+            # FMA Type Logic
+            if 'fma' in self.types_to_load:
+                if logger: print("  Checking for 'fma' structure (ddd/*_spec.npy)")
+                files_found, ids_added = 0, 0
+                try:
+                    for prefix_dir in spec_dir_base.glob("**/"):
+                        if re.fullmatch(r'\d{3}', prefix_dir.name):
+                            for spec_path in prefix_dir.glob("*_spec.npy"):
+                                files_found += 1
+                                match = re.search(r'(\d{6})_spec\.npy$', spec_path.name)
+                                if match:
+                                    file_id_raw = match.group(1)
+                                    file_id = _normalize_id(file_id_raw)
+                                    if file_id not in temp_spec_dict:
+                                        temp_spec_dict[file_id] = (spec_path, 'fma')
+                                        spec_counts['fma'] += 1
+                                        ids_added += 1
+                                    elif logger and ids_added < 5:
+                                         print(f"    [FMA Scan] Spec ID '{file_id}' already exists, skipping.")
+                    if logger: print(f"    -> Found {files_found} specs, added {ids_added} 'fma' entries.")
+                except Exception as e:
+                     if logger: print(f"    Error during 'fma' spec scan in {spec_dir_base}: {e}")
+
+            # Maestro & DALI Type Logic
+            other_types = [t for t in ['maestro', 'dali_synth'] if t in self.types_to_load]
+            if other_types:
+                if logger: print(f"  Checking for {'/'.join(other_types)} structure (*_spec.npy)")
+                files_found, ids_added_m, ids_added_d = 0, 0, 0
+                try:
+                    for spec_path in spec_dir_base.rglob("*_spec.npy"):
+                        files_found += 1
+                        match = re.search(r'([0-9a-fA-F]{32}|.+?)_spec\.npy$', spec_path.name)
                         if match:
-                            file_id = match.group(1)
-                            # Basic validation for DALI ID format (32 hex chars)
-                            if use_dali_logic and not re.fullmatch(r'[0-9a-fA-F]{32}', file_id):
-                                 if self.verbose: print(f"Skipping potential DALI file with non-hex ID: {spec_path.name}")
-                                 continue
+                            file_id_raw = match.group(1)
+                            file_id = _normalize_id(file_id_raw)
+                            current_type = None
+                            if 'dali_synth' in other_types and re.fullmatch(r'[0-9a-fA-F]{32}', file_id_raw):
+                                current_type = 'dali_synth'
+                            elif 'maestro' in other_types:
+                                current_type = 'maestro'
 
-                    if file_id:
-                        valid_spec_files.append((spec_path, file_id, current_type)) # Store type
-                        spec_counts[current_type] += 1
-                    elif self.verbose:
-                        print(f"Could not extract ID from {current_type.upper()} file: {spec_path.name}")
-            else: # FMA logic (numeric ID)
-                for prefix_dir in spec_dir_base.glob("**/"):
-                    # Check if prefix_dir name matches the 3-digit FMA pattern
-                    if re.fullmatch(r'\d{3}', prefix_dir.name):
-                        for spec_path in prefix_dir.glob("*_spec.npy"):
-                            numeric_match = self.numeric_id_pattern.search(spec_path.name)
-                            if numeric_match:
-                                file_id = numeric_match.group(1)
-                                valid_spec_files.append((spec_path, file_id, current_type)) # Store type
+                            if current_type and file_id not in temp_spec_dict:
+                                temp_spec_dict[file_id] = (spec_path, current_type)
                                 spec_counts[current_type] += 1
-                            elif self.verbose:
-                                print(f"Could not extract numeric ID from FMA file: {spec_path.name}")
+                                if current_type == 'maestro': ids_added_m += 1
+                                else: ids_added_d += 1
+                            elif logger and (ids_added_m + ids_added_d < 5):
+                                 print(f"    [M/D Scan] Spec ID '{file_id}' already exists or type mismatch, skipping.")
+                    if logger: print(f"    -> Found {files_found} specs, added {ids_added_m} 'maestro', {ids_added_d} 'dali_synth' entries.")
+                except Exception as e:
+                     if logger: print(f"    Error during 'maestro/dali' spec scan in {spec_dir_base}: {e}")
 
+        # Convert temp_spec_dict to valid_spec_files list
+        valid_spec_files = [(path, norm_id, type) for norm_id, (path, type) in temp_spec_dict.items()]
+        # --- END REPLACEMENT ---
+
+        # --- Logging and further processing ---
+        if logger:
+            print(f"\nFound {len(label_files_dict)} label files across all directories:")
+            # Filter counts for active types or non-zero counts
+            active_label_counts = {k: v for k, v in label_counts.items() if v > 0} # Show only non-zero counts
+            for k, v in active_label_counts.items(): print(f"  {k.upper()}: {v}")
+            if len(label_files_dict) > 0:
+                print("Sample label file paths (ID -> Path):")
+                # Now the ID should match the feature IDs, e.g., 'billboard/artist/album/song'
+                for i, (file_id, label_path) in enumerate(list(label_files_dict.items())[:3]):
+                    print(f"  ID: '{file_id}' -> Path: {label_path}")
+            if self.logits_dirs:
+                print(f"\nFound {len(logit_files_dict)} logit files across all directories:")
+                active_logit_counts = {k: v for k, v in logit_counts.items() if v > 0} # Show only non-zero counts
+                for k, v in active_logit_counts.items(): print(f"  {k.upper()}: {v}")
+                if len(logit_files_dict) > 0:
+                    print("Sample logit file paths (ID -> Path):")
+                    for i, (file_id, logit_path) in enumerate(list(logit_files_dict.items())[:3]):
+                         print(f"  ID: '{file_id}' -> Path: {logit_path}")
+
+        # --- Process found spectrogram files ---
         if not valid_spec_files:
-            warnings.warn(f"No valid spectrogram files found for dataset type '{self.dataset_type}'. Check data paths.")
+            warnings.warn(f"No valid spectrogram files found for dataset type(s) '{self.types_to_load}'. Check data paths.")
+            self.samples = []
+            self.segment_indices = []
             return
 
         if self.verbose:
-            print(f"Found {len(valid_spec_files)} valid spectrogram files:")
-            for k, v in spec_counts.items(): print(f"  {k.upper()}: {v}")
+            print(f"\nFound {len(valid_spec_files)} valid spectrogram files:")
+            active_spec_counts = {k: v for k, v in spec_counts.items() if v > 0} # Show only non-zero counts
+            for k, v in active_spec_counts.items(): print(f"  {k.upper()}: {v}")
             if valid_spec_files:
                 print("Sample spectrogram paths:")
-                for i, (path, _, type) in enumerate(valid_spec_files[:3]):
-                    print(f"  ({type.upper()}) {path}")
+                for i, (path, file_id, type) in enumerate(valid_spec_files[:3]):
+                    print(f"  ({type.upper()}) ID: '{file_id}' -> Path: {path}")
 
         # Handle small dataset percentage option
         if self.small_dataset_percentage is not None:
             np.random.seed(42) # Ensure consistent sampling
 
             # Group files by type ('fma', 'maestro', 'dali_synth', 'labeled')
-            dataset_files = {'fma': [], 'maestro': [], 'dali_synth': [], 'labeled': []}
+            dataset_files = {t: [] for t in self.known_types}
             for spec_path, file_id, file_type in valid_spec_files:
-                dataset_files[file_type].append((spec_path, file_id, file_type))
+                 if file_type in dataset_files: # Should always be true now
+                     dataset_files[file_type].append((spec_path, file_id, file_type))
+                 else: # Fallback just in case
+                      if logger: print(f"Warning: Encountered unexpected file_type '{file_type}' during sampling.")
+
 
             sampled_files = []
             total_sampled_count = 0
-            for file_type, files in dataset_files.items():
-                if not files: continue
+            # Use the actual types found in valid_spec_files keys
+            active_file_types = [ft for ft in dataset_files if dataset_files[ft]]
+            if not active_file_types and self.verbose:
+                print("No files found to sample from.")
+
+            for file_type in active_file_types:
+                files = dataset_files[file_type]
+                # Calculate sample size based on the number of files of this specific type
                 type_sample_size = max(1, int(len(files) * self.small_dataset_percentage))
+
                 if type_sample_size < len(files):
                     indices = np.random.choice(len(files), type_sample_size, replace=False)
                     sampled_subset = [files[i] for i in indices]
@@ -558,9 +783,10 @@ class SynthDataset(Dataset):
                 sampled_files.extend(sampled_subset)
                 total_sampled_count += len(sampled_subset)
 
-            valid_spec_files = sampled_files
+            valid_spec_files = sampled_files # Update valid_spec_files with the sampled list
             if self.verbose:
                 print(f"Total files after sampling: {total_sampled_count}")
+
 
         self.samples = []
         self.total_processed = 0
@@ -574,36 +800,56 @@ class SynthDataset(Dataset):
 
         num_cpus = max(1, self.num_workers)
 
-        if len(valid_spec_files) < num_cpus * 4:
-            num_cpus = max(1, len(valid_spec_files) // 2)
+        # Reduce workers if dataset is very small compared to worker count
+        if len(valid_spec_files) > 0 and len(valid_spec_files) < num_cpus * 4:
+            num_cpus = max(1, len(valid_spec_files) // 2) # Adjust num_cpus based on actual file count
             if self.verbose:
-                print(f"Small dataset detected, reducing worker count to {num_cpus}")
+                print(f"Small dataset detected ({len(valid_spec_files)} files), reducing worker count to {num_cpus}")
 
-        args_list = [(self, spec_file, file_id, label_files_dict, logit_files_dict, True)
-                     for spec_file, file_id, _ in valid_spec_files] # Pass file_id correctly
+        # Prepare arguments for parallel processing
+        # Pass the dataset type ('labeled' in this case) to _process_file
+        current_dataset_type = self.dataset_type # Or determine based on file if combined
+        # Pass the specific type determined during scanning
+        args_list = [(self, spec_file, file_id, label_files_dict, logit_files_dict, file_type, True)
+                     for spec_file, file_id, file_type in valid_spec_files] # Use file_id and file_type from valid_spec_files
 
         if self.verbose:
             print(f"Processing {len(args_list)} files with {num_cpus} parallel workers")
 
         try:
+            # Use multiprocessing Pool
             with Pool(processes=num_cpus) as pool:
+                # Use imap for potentially better memory usage with large iterables
                 process_results = list(tqdm(
                     pool.imap(process_file_wrapper, args_list),
                     total=len(args_list),
                     desc=f"Loading data (parallel {'lazy' if self.lazy_init else 'full'})",
-                    disable=not self.verbose
+                    disable=not self.verbose # Disable tqdm if not verbose
                 ))
 
-            for samples, skip_reason in process_results:
-                self.total_processed += 1
-                if samples:
-                    self.samples.extend(samples)
-                else:
-                    self.total_skipped += 1
-                    if skip_reason in self.skipped_reasons:
-                        self.skipped_reasons[skip_reason] += 1
+            # Process results from the pool
+            for result in process_results:
+                 # Check if the result is the expected tuple (samples, skip_reason)
+                 if isinstance(result, tuple) and len(result) == 2:
+                     samples, skip_reason = result
+                     self.total_processed += 1
+                     if samples: # If samples were successfully processed
+                         self.samples.extend(samples)
+                     else: # If processing resulted in skipping the file
+                         self.total_skipped += 1
+                         if skip_reason in self.skipped_reasons:
+                             self.skipped_reasons[skip_reason] += 1
+                         # Optional: Log skip reason if needed, even if return_skip_reason handled it
+                         # elif self.verbose:
+                         #     print(f"File skipped, reason: {skip_reason}")
+                 else:
+                     # Handle unexpected result format if necessary
+                     if self.verbose:
+                         print(f"Warning: Unexpected result format from process_file_wrapper: {result}")
+
 
         except Exception as e:
+            # Fallback to sequential processing if multiprocessing fails
             import traceback
             error_msg = traceback.format_exc()
             if self.verbose:
@@ -611,367 +857,508 @@ class SynthDataset(Dataset):
                 print(f"Traceback:\n{error_msg}")
                 print(f"Attempting fallback to sequential processing...")
 
+            # Sequential processing loop
             process_results = []
-            for args in tqdm(args_list, desc="Loading data (sequential fallback)"):
-                process_results.append(process_file_wrapper(args))
+            for args in tqdm(args_list, desc="Loading data (sequential fallback)", disable=not self.verbose):
+                try:
+                    # Call the wrapper function directly
+                    result = process_file_wrapper(args)
+                    process_results.append(result)
+                except Exception as seq_e:
+                    if self.verbose:
+                        print(f"Error during sequential processing of {args[1]}: {seq_e}") # Log error for specific file
+                    # Append a skip result to maintain structure
+                    process_results.append(([], 'load_error')) # Assume load error
 
-            for samples, skip_reason in process_results:
-                self.total_processed += 1
-                if samples:
-                    self.samples.extend(samples)
-                else:
-                    self.total_skipped += 1
-                    if skip_reason in self.skipped_reasons:
-                        self.skipped_reasons[skip_reason] += 1
+            # Process results from sequential execution
+            for result in process_results:
+                 if isinstance(result, tuple) and len(result) == 2:
+                     samples, skip_reason = result
+                     self.total_processed += 1 # Increment even if skipped
+                     if samples:
+                         self.samples.extend(samples)
+                     else:
+                         self.total_skipped += 1
+                         if skip_reason in self.skipped_reasons:
+                             self.skipped_reasons[skip_reason] += 1
+                         elif skip_reason: # Add reason if it's new
+                             # Check if key exists before creating
+                             if skip_reason not in self.skipped_reasons:
+                                 self.skipped_reasons[skip_reason] = 0
+                             self.skipped_reasons[skip_reason] += 1
+                 else:
+                     if self.verbose:
+                         print(f"Warning: Unexpected result format during sequential fallback: {result}")
 
+
+        # --- Post-processing statistics ---
         if hasattr(self, 'total_processed') and self.total_processed > 0:
-            skip_percentage = (self.total_skipped / self.total_processed) * 100
+            skip_percentage = (self.total_skipped / self.total_processed) * 100 if self.total_processed > 0 else 0
             if self.verbose:
                 print(f"\nFile processing statistics:")
-                print(f"  Total processed: {self.total_processed}")
+                print(f"  Total files attempted: {self.total_processed}")
+                print(f"  Successfully processed: {self.total_processed - self.total_skipped}")
                 print(f"  Skipped: {self.total_skipped} ({skip_percentage:.1f}%)")
-                if hasattr(self, 'skipped_reasons'):
-                    for reason, count in self.skipped_reasons.items():
+                if hasattr(self, 'skipped_reasons') and self.total_skipped > 0:
+                    print("  Reasons for skipping:")
+                    # Sort reasons by count for clarity
+                    sorted_reasons = sorted(self.skipped_reasons.items(), key=lambda item: item[1], reverse=True)
+                    for reason, count in sorted_reasons:
                         if count > 0:
-                            reason_pct = (count / self.total_skipped) * 100 if self.total_skipped > 0 else 0
+                            reason_pct = (count / self.total_skipped) * 100
                             print(f"    - {reason}: {count} ({reason_pct:.1f}%)")
 
-        if self.samples and self.use_cache:
+        # --- Caching ---
+        if self.samples and self.use_cache and self.cache_file:
             try:
                 cache_dir = os.path.dirname(self.cache_file)
-                if cache_dir and not os.path.exists(cache_dir):
-                    os.makedirs(cache_dir, exist_ok=True)
+                if cache_dir: # Ensure cache_dir is not empty
+                    os.makedirs(cache_dir, exist_ok=True) # Create cache directory if it doesn't exist
 
-                samples_to_cache = self.samples
+                samples_to_cache = self.samples # Use the final list of samples
 
+                # --- Metadata Caching Logic ---
                 if self.metadata_only:
                     samples_meta = []
                     for sample in samples_to_cache:
-                        meta = {k: sample[k] for k in sample if k != 'spectro'}
-                        spec_path = os.path.join(self.spec_dir, f"{sample['song_id']}.npy")
-                        if os.path.exists(spec_path):
-                            meta['spec_path'] = spec_path
+                        # Create a copy excluding 'spectro' if present
+                        meta = {k: v for k, v in sample.items() if k != 'spectro'}
+                        # Ensure 'spec_path' exists, potentially deriving it if needed (though it should be there from processing)
+                        if 'spec_path' not in meta and 'song_id' in sample:
+                             # This fallback might be needed if _process_file didn't add spec_path in some case
+                             # Reconstruct potential path (this depends heavily on consistent ID structure)
+                             # Example assumes spec_root is defined and file_id matches relative structure
+                             # --- This reconstruction is complex with multiple types, rely on spec_path being present ---
+                             # if spec_root and 'song_id' in sample:
+                             #     potential_path = spec_root / f"{sample['song_id']}_spec.npy"
+                             #     if potential_path.exists():
+                             #         meta['spec_path'] = str(potential_path)
+                             #     elif self.verbose:
+                             #         print(f"Warning: Could not confirm spec_path for metadata caching: {sample.get('song_id')}")
+                             if self.verbose:
+                                 print(f"Warning: 'spec_path' missing in metadata for sample ID {sample.get('song_id')}, cannot cache path.")
+                        elif 'spec_path' in meta and not Path(meta['spec_path']).exists():
+                             if self.verbose:
+                                 print(f"Warning: spec_path in metadata does not exist: {meta['spec_path']}")
+
                         samples_meta.append(meta)
 
+                    cache_content = {
+                        'samples': samples_meta,
+                        'chord_to_idx': self.chord_to_idx,
+                        'metadata_only': True,
+                        'cache_fraction': self.cache_fraction, # Store cache fraction used
+                        'small_dataset_percentage': self.small_dataset_percentage # Store percentage used
+                    }
                     with open(self.cache_file, 'wb') as f:
-                        pickle.dump({
-                            'samples': samples_meta,
-                            'chord_to_idx': self.chord_to_idx,
-                            'metadata_only': True,
-                            'is_partial_cache': self.cache_fraction < 1.0,
-                            'small_dataset_percentage': self.small_dataset_percentage
-                        }, f)
-                else:
-                    with open(self.cache_file, 'wb') as f:
-                        pickle.dump({
-                            'samples': samples_to_cache,
-                            'chord_to_idx': self.chord_to_idx,
-                            'metadata_only': False,
-                            'is_partial_cache': self.cache_fraction < 1.0,
-                            'small_dataset_percentage': self.small_dataset_percentage
-                        }, f)
+                        pickle.dump(cache_content, f)
+                    if self.verbose:
+                        print(f"Saved METADATA cache ({len(samples_meta)} items) to {self.cache_file}")
 
+                # --- Full Data Caching Logic ---
+                else:
+                    # Optionally apply cache_fraction here if needed (e.g., random sample)
+                    # Currently, it caches all processed samples if metadata_only is False
+                    cache_content = {
+                        'samples': samples_to_cache,
+                        'chord_to_idx': self.chord_to_idx,
+                        'metadata_only': False,
+                        'cache_fraction': self.cache_fraction,
+                        'small_dataset_percentage': self.small_dataset_percentage
+                    }
+                    with open(self.cache_file, 'wb') as f:
+                        pickle.dump(cache_content, f)
+                    if self.verbose:
+                        print(f"Saved FULL dataset cache ({len(samples_to_cache)} items) to {self.cache_file}")
+
+                # Log cache details
                 if self.verbose:
-                    print(f"Saved dataset cache to {self.cache_file}")
                     if self.small_dataset_percentage is not None:
-                        print(f"Cache includes small_dataset_percentage={self.small_dataset_percentage}")
+                        print(f"Cache reflects small_dataset_percentage={self.small_dataset_percentage}")
+                    if self.cache_fraction < 1.0:
+                         print(f"Cache fraction applied: {self.cache_fraction}") # Add if fraction logic is implemented
+
             except Exception as e:
                 if self.verbose:
-                    print(f"Error saving cache (will continue without caching): {e}")
+                    print(f"Error saving cache (continuing without caching): {e}")
+                    print(traceback.format_exc()) # Print full traceback for cache saving error
 
+
+        # --- Final Sample Analysis ---
         if self.samples:
             first_sample = self.samples[0]
+            freq_dim = 144 # Default frequency dimension
 
+            # Determine frequency dimension from the first sample
             if 'spectro' in first_sample:
-                first_spec = first_sample['spectro']
-            elif 'spec_path' in first_sample and os.path.exists(first_sample['spec_path']):
+                # If spectrogram is loaded in memory
+                spec_data = first_sample['spectro']
+                if hasattr(spec_data, 'shape') and len(spec_data.shape) > 0:
+                    freq_dim = spec_data.shape[-1] # Get last dimension size
+            elif 'spec_path' in first_sample and Path(first_sample['spec_path']).exists():
+                # If only path is stored (metadata or lazy loading)
                 try:
-                    first_spec = np.load(first_sample['spec_path'])
-                    if 'frame_idx' in first_sample and len(first_spec.shape) > 1:
-                        first_spec = first_spec[first_sample['frame_idx']]
+                    # Load just the shape using mmap_mode if possible, or load the first frame
+                    spec_info = np.load(first_sample['spec_path'], mmap_mode='r')
+                    if len(spec_info.shape) > 1: # Multi-frame spec
+                        freq_dim = spec_info.shape[-1]
+                    elif len(spec_info.shape) == 1: # Single-frame spec
+                        freq_dim = spec_info.shape[0]
                 except Exception as e:
                     if self.verbose:
-                        print(f"Error loading first spectrogram: {e}")
-                    first_spec = np.zeros((144,))
+                        print(f"Warning: Error loading first spectrogram shape from {first_sample['spec_path']}: {e}")
+                        print("Using default frequency dimension of 144")
             else:
-                first_spec = np.zeros((144,))
                 if self.verbose:
-                    print("WARNING: Could not determine spectrogram shape from first sample")
+                    print("WARNING: Could not determine spectrogram shape from first sample (no 'spectro' or valid 'spec_path').")
                     print("Using default frequency dimension of 144")
 
-            freq_dim = first_spec.shape[-1] if hasattr(first_spec, 'shape') and len(first_spec.shape) > 0 else 144
             spec_type = "CQT (Constant-Q Transform)" if freq_dim <= 256 else "STFT"
 
             if self.verbose:
-                print(f"Loaded {len(self.samples)} valid samples")
+                print(f"\nLoaded {len(self.samples)} valid samples")
                 print(f"Spectrogram frequency dimension: {freq_dim} (likely {spec_type})")
 
+                # Analyze chord distribution
                 chord_counter = Counter(sample['chord_label'] for sample in self.samples)
                 print(f"Found {len(chord_counter)} unique chord classes")
 
-                # Add detailed chord distribution analysis
-                from modules.utils.chords import get_chord_quality
+                # Chord quality analysis (requires utility function)
+                try:
+                    from modules.utils.chords import get_chord_quality
+                    quality_counter = Counter()
+                    for sample in self.samples:
+                        quality = get_chord_quality(sample['chord_label'])
+                        quality_counter[quality] += 1
 
-                # Count samples by chord quality
-                quality_counter = Counter()
-                for sample in self.samples:
-                    chord_label = sample['chord_label']
-                    quality = get_chord_quality(chord_label)
-                    quality_counter[quality] += 1
+                    total_samples = len(self.samples)
+                    print(f"\nChord quality distribution:")
+                    for quality, count in quality_counter.most_common():
+                        percentage = (count / total_samples) * 100
+                        print(f"  {quality}: {count} samples ({percentage:.2f}%)")
+                except ImportError:
+                    if self.verbose:
+                        print("\nNote: 'get_chord_quality' not found, skipping quality distribution analysis.")
+                except Exception as e:
+                     if self.verbose:
+                         print(f"\nError during chord quality analysis: {e}")
 
-                # Sort qualities by count for better reporting
-                total_samples = len(self.samples)
-                print(f"Dataset loading completed in {time.time() - start_time:.2f} seconds")
-                print(f"Chord quality distribution:")
-                for quality, count in quality_counter.most_common():
-                    percentage = (count / total_samples) * 100
-                    print(f"  {quality}: {count} samples ({percentage:.2f}%)")
 
-                # Print the most common chord types to see what we have
-                print("\nMost common chord types:")
+                # Print most common chords
+                print("\nMost common chord types (Top 20):")
+                total_samples = len(self.samples) # Recalculate or ensure it's available
                 for chord, count in chord_counter.most_common(20):
                     percentage = (count / total_samples) * 100
                     print(f"  {chord}: {count} samples ({percentage:.2f}%)")
 
-                # List some less common chord types to see what unusual chords exist
-                print("\nSome less common chord types:")
-                less_common = [item for item in chord_counter.most_common()[100:120]]
-                for chord, count in less_common:
-                    percentage = (count / total_samples) * 100
-                    print(f"  {chord}: {count} samples ({percentage:.2f}%)")
+                # Print some less common chords (e.g., 100th to 120th)
+                print("\nSome less common chord types (100-120):")
+                less_common = chord_counter.most_common()[100:120]
+                if less_common:
+                    for chord, count in less_common:
+                        percentage = (count / total_samples) * 100
+                        print(f"  {chord}: {count} samples ({percentage:.2f}%)")
+                else:
+                    print("  (Not enough unique chords to show less common ones in this range)")
 
-                end_time = time.time()
-                print(f"Dataset loading completed in {end_time - start_time:.2f} seconds")
 
-                # Add additional metrics at the end of loading
-                if self.samples and hasattr(self, 'is_combined_mode') and self.is_combined_mode:
-                    # Create a breakdown of samples by dataset (based on file path)
-                    dataset_sample_counts = {}
-                    for sample in self.samples:
-                        if 'spec_path' in sample:
-                            path = sample['spec_path']
-                            dataset_key = "unknown"
-                            if "maestro" in str(path).lower():
-                                dataset_key = "maestro"
-                            elif "dali_synth" in str(path).lower():
-                                dataset_key = "dali_synth"
-                            else:
-                                dataset_key = "fma"
+                # Sample distribution by dataset source (if combined mode was used - adapt if needed)
+                # This part might need adjustment based on how types are tracked with the new logic
+                # if hasattr(self, 'is_combined_mode') and self.is_combined_mode:
+                #     dataset_sample_counts = Counter()
+                #     # Need a way to determine source type for each sample, e.g., store 'type' in sample dict
+                #     for sample in self.samples:
+                #         # Assuming 'type' was added during processing or can be inferred from path/ID
+                #         sample_type = sample.get('dataset_type', 'unknown') # Example key
+                #         dataset_sample_counts[sample_type] += 1
+                #
+                #     if self.verbose:
+                #         print("\nSample distribution by dataset source:")
+                #         for dataset_key, count in dataset_sample_counts.items():
+                #             percentage = (count / total_samples) * 100
+                #             print(f"  {dataset_key}: {count} samples ({percentage:.2f}%)")
 
-                            if dataset_key not in dataset_sample_counts:
-                                dataset_sample_counts[dataset_key] = 0
-                            dataset_sample_counts[dataset_key] += 1
-
-                    if self.verbose:
-                        print("\nSample distribution by dataset source:")
-                        for dataset_key, count in dataset_sample_counts.items():
-                            percentage = (count / total_samples) * 100
-                            print(f"  {dataset_key}: {count} samples ({percentage:.2f}%)")
         else:
-            warnings.warn("No samples loaded. Check your data paths and structure.")
+            # Warning if no samples were loaded at all
+            warnings.warn("No samples loaded after processing. Check data paths, file formats, and filtering criteria.")
+
+        # Initialize the internal chord processor (if needed elsewhere)
+        self.chord_processor = Chords()
+        if self.chord_mapping:
+            self.chord_processor.set_chord_mapping(self.chord_mapping)
+
+        end_time = time.time()
+        if self.verbose:
+             print(f"\nDataset loading process completed in {end_time - start_time:.2f} seconds")
+
+    # ... rest of the class methods (_process_file, _generate_segments, __len__, __getitem__, etc.) ...
+    # Ensure _process_file uses the correct lookup_key and handles potential errors gracefully.
+    # The _process_file method provided in the original code seems mostly compatible,
+    # but double-check the dir_prefix logic for 'labeled' type.
+
     def _process_file(self, spec_file, file_id, label_files_dict, logit_files_dict, current_dataset_type, return_skip_reason=False):
         """Process a single spectrogram file based on dataset type"""
         samples = []
         skip_reason = None
+        lookup_key = file_id # Use the normalized ID generated from spec scan
+
+        # --- Minimal Debugging ---
+        # Add a counter to limit verbose logging per file ID
+        log_count_attr = f'_log_count_{lookup_key}'
+        log_count = getattr(self, log_count_attr, 0)
+
+        if self.verbose and log_count < 1: # Log only once per unique lookup_key attempt
+             print(f"\n--- Processing spec: {spec_file.name} ---")
+             print(f"  Lookup ID (from spec): '{lookup_key}'")
+             if lookup_key in label_files_dict:
+                 print(f"  ✅ Match found in label_files_dict.")
+             else:
+                 print(f"  ❌ Match NOT found in label_files_dict.")
+                 # Log a few label keys for comparison
+                 label_keys_sample = list(label_files_dict.keys())
+                 print(f"     Sample label keys: {label_keys_sample[:5]}...") # Show more samples
+             if self.logits_dirs:
+                 if lookup_key in logit_files_dict:
+                     print(f"  ✅ Match found in logit_files_dict.")
+                 else:
+                     print(f"  ❌ Match NOT found in logit_files_dict.")
+                     logit_keys_sample = list(logit_files_dict.keys())
+                     print(f"     Sample logit keys: {logit_keys_sample[:5]}...") # Show more samples
+             setattr(self, log_count_attr, log_count + 1) # Increment log count
+        # --- End Minimal Debugging ---
 
         try:
-            # Determine dir_prefix based on type - less relevant for 'labeled' if using relative path ID
+            # Determine dir_prefix based on type - adjust for 'labeled'
             dir_prefix = None
-            if current_dataset_type == 'maestro':
-                dir_prefix = spec_file.parent.name # Or derive from file_id if it contains path info
-            elif current_dataset_type == 'dali_synth':
+            # Use the directory part of the file_id (relative path) for 'labeled'
+            if current_dataset_type == 'labeled':
+                 # file_id for labeled is like 'billboard/artist/album/song'
+                 dir_prefix = str(Path(lookup_key).parent) if '/' in lookup_key or '\\' in lookup_key else ''
+            # Keep logic for other types if this function is used for them
+            elif current_dataset_type == 'maestro':
+                # Maestro IDs might not have inherent directory structure in the ID itself
+                # Use parent dir of the spec file as a fallback, but might not be reliable if structure varies
                 dir_prefix = spec_file.parent.name
-                if not self.dali_prefix_pattern.match(dir_prefix):
-                    dir_prefix = file_id[:3] if len(file_id) >= 3 else file_id
-            elif current_dataset_type == 'labeled':
-                 # Use the directory part of the file_id (relative path)
-                 dir_prefix = str(Path(file_id).parent) if '/' in file_id or '\\' in file_id else ''
-            else: # FMA
+            elif current_dataset_type == 'dali_synth':
+                 # DALI IDs are hex, prefix is usually parent dir name (e.g., '00a') or first 3 chars of ID
+                 dir_prefix = spec_file.parent.name
+                 # Fallback using file_id if parent name doesn't match pattern
+                 if not hasattr(self, 'dali_prefix_pattern') or not self.dali_prefix_pattern.match(dir_prefix):
+                     dir_prefix = file_id[:3] if len(file_id) >= 3 else file_id # Use first 3 chars of hex ID
+            elif current_dataset_type == 'fma': # FMA
+                # FMA uses first 3 digits of the 6-digit ID
                 dir_prefix = file_id[:3] if len(file_id) >= 3 else file_id
+            else: # Fallback/Unknown
+                 dir_prefix = ''
 
-            # Find corresponding label file using the file_id
-            label_file = label_files_dict.get(file_id)
+
+            # Find corresponding label file using the lookup_key
+            label_file = label_files_dict.get(lookup_key)
             if not label_file or not os.path.exists(str(label_file)):
-                if hasattr(self, 'skipped_reasons'):
-                    self.skipped_reasons['missing_label'] += 1
-                skip_reason = 'missing_label'
+                # Check if the reason is already set to avoid redundant logging/counting
+                if skip_reason != 'missing_label':
+                    # if self.verbose: # Reduced verbosity for skips
+                    #     print(f"  [SKIP] Label lookup failed for ID '{lookup_key}'. Label file path resolved to: {label_file}")
+                    if hasattr(self, 'skipped_reasons'): # Ensure attribute exists
+                        # Safely increment counter
+                        self.skipped_reasons['missing_label'] = self.skipped_reasons.get('missing_label', 0) + 1
+                    skip_reason = 'missing_label'
                 if return_skip_reason:
                     return [], skip_reason
-                return []
+                return [] # Return empty list, not None
 
-            # Find corresponding logit file if needed, using file_id
+            # Find corresponding logit file if needed, using lookup_key
             logit_file = None
             if self.logits_dirs is not None:
-                logit_file = logit_files_dict.get(file_id) # Directly use the pre-computed mapping
+                logit_file = logit_files_dict.get(lookup_key)
 
                 if self.require_teacher_logits and (not logit_file or not os.path.exists(str(logit_file))):
-                    if hasattr(self, 'skipped_reasons'):
-                        self.skipped_reasons['missing_logits'] += 1
-                    skip_reason = 'missing_logits'
+                    if skip_reason != 'missing_logits': # Avoid double counting if label also missing
+                        # if self.verbose: # Reduced verbosity for skips
+                        #      print(f"  [SKIP] Required Logit lookup failed for ID '{lookup_key}'. Logit file path resolved to: {logit_file}")
+                        if hasattr(self, 'skipped_reasons'):
+                            self.skipped_reasons['missing_logits'] = self.skipped_reasons.get('missing_logits', 0) + 1
+                        skip_reason = 'missing_logits'
                     if return_skip_reason:
                         return [], skip_reason
-                    return []
+                    return [] # Return empty list
 
+            # --- Metadata Only Logic ---
             if self.metadata_only:
                 if os.path.exists(spec_file):
-                    spec_info = np.load(spec_file, mmap_mode='r')
-                    spec_shape = spec_info.shape
-                    chord_labels = self._parse_label_file(label_file)
-                    for t in range(spec_shape[0] if len(spec_shape) > 1 else 1):
-                        frame_time = t * self.frame_duration
-                        chord_label = self._find_chord_at_time(chord_labels, frame_time)
+                    try:
+                        # Use mmap_mode for potentially faster shape reading without loading full data
+                        spec_info = np.load(spec_file, mmap_mode='r')
+                        spec_shape = spec_info.shape
+                        # Ensure spec_shape is usable
+                        if not spec_shape: raise ValueError("Spectrogram shape is empty")
 
-                        if self.chord_mapping is None:
-                            if chord_label not in self.chord_to_idx:
-                                self.chord_to_idx[chord_label] = len(self.chord_to_idx)
-                        elif chord_label not in self.chord_mapping:
-                            # Handle basic chord labels (C, G, etc.) by treating them as major chords
-                            # This is a common convention in chord notation
-                            if chord_label in ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']:
-                                major_chord = f"{chord_label}:maj"
-                                if major_chord in self.chord_mapping:
-                                    chord_label = major_chord
+                        chord_labels = self._parse_label_file(label_file)
+                        num_frames = spec_shape[0] if len(spec_shape) > 1 else 1
+
+                        for t in range(num_frames):
+                            frame_time = t * self.frame_duration
+                            chord_label = self._find_chord_at_time(chord_labels, frame_time)
+                            chord_label_mapped = chord_label # Keep original for now
+
+                            # Map chord label using chord_mapping if available
+                            if self.chord_mapping is not None:
+                                if chord_label not in self.chord_mapping:
+                                    # Handle plain root notes as major chords
+                                    if chord_label in ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']:
+                                        major_chord = f"{chord_label}:maj"
+                                        if major_chord in self.chord_mapping:
+                                            chord_label_mapped = major_chord
+                                        else:
+                                            # warnings.warn(f"Unknown chord label {chord_label} (even as major), using 'N'")
+                                            chord_label_mapped = "N" # Map unknown to 'N'
+                                    else:
+                                        # warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
+                                        chord_label_mapped = "N" # Map unknown to 'N'
                                 else:
-                                    warnings.warn(f"Unknown chord label {chord_label} (even as major), using 'N'")
-                                    chord_label = "N"
-                            else:
-                                warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
-                                chord_label = "N"
+                                     chord_label_mapped = chord_label # Already in mapping
 
-                        # Determine expected spec path based on type
-                        expected_spec_path = None
-                        if current_dataset_type == 'maestro':
-                            expected_spec_path = str(spec_file) # Maestro paths can be complex
-                        elif current_dataset_type == 'dali_synth':
-                            # Assumes spec_dir points to the base dali_synth/spectrograms
-                            expected_spec_path = str(self.spec_dir / dir_prefix / f"{file_id}_spec.npy")
-                        elif current_dataset_type == 'labeled':
-                             # Assumes spec_dir points to LabeledDataset_synth/spectrograms
-                             # file_id already contains the relative path like 'artist/album/song'
-                             expected_spec_path = str(self.spec_dir / f"{file_id}_spec.npy")
-                        else: # FMA
-                            expected_spec_path = str(self.spec_dir / dir_prefix / f"{file_id}_spec.npy")
+                            # If no chord mapping provided, build one dynamically (less common now)
+                            elif chord_label not in self.chord_to_idx:
+                                self.chord_to_idx[chord_label] = len(self.chord_to_idx)
+                                chord_label_mapped = chord_label # Use original label
 
-                        samples.append({
-                            'spec_path': str(spec_file),
-                            'expected_spec_path': expected_spec_path,
-                            'chord_label': chord_label,
-                            'song_id': file_id,
-                            'frame_idx': t,
-                            'dir_prefix': dir_prefix
-                        })
+                            sample_meta = {
+                                'spec_path': str(spec_file), # Store the actual path to the spec file
+                                'chord_label': chord_label_mapped, # Store the potentially mapped label
+                                'song_id': lookup_key, # Use normalized key
+                                'frame_idx': t,
+                                'dir_prefix': dir_prefix # Keep for potential use
+                            }
+                            # Add logit path if available
+                            if logit_file is not None:
+                                sample_meta['logit_path'] = str(logit_file)
 
-                        if logit_file is not None:
-                            samples[-1]['logit_path'] = str(logit_file)
+                            samples.append(sample_meta)
+
+                    except Exception as meta_e:
+                         # Handle errors during metadata processing for this file
+                         if skip_reason not in ['format_error', 'load_error']: # Avoid double counting
+                             if hasattr(self, 'skipped_reasons'):
+                                 self.skipped_reasons['format_error'] = self.skipped_reasons.get('format_error', 0) + 1
+                             skip_reason = 'format_error'
+                         # warnings.warn(f"Error processing metadata for {spec_file}: {meta_e}") # Reduce verbosity
+                         if return_skip_reason: return [], skip_reason
+                         return []
+
+            # --- Full Data Logic ---
             else:
-                spec = np.load(spec_file)
+                try:
+                    spec = np.load(spec_file)
+                    # Check for NaN values after loading
+                    if np.isnan(spec).any():
+                        # warnings.warn(f"NaN values found in {spec_file}, replacing with zeros")
+                        spec = np.nan_to_num(spec, nan=0.0) # Replace NaNs
 
-                if np.isnan(spec).any():
-                    warnings.warn(f"NaN values found in {spec_file}, replacing with zeros")
-                    spec = np.nan_to_num(spec, nan=0.0)
+                    chord_labels = self._parse_label_file(label_file)
+                    num_frames = spec.shape[0] if len(spec.shape) > 1 else 1
 
-                chord_labels = self._parse_label_file(label_file)
-
-                if len(spec.shape) <= 1:
-                    chord_label = self._find_chord_at_time(chord_labels, 0.0)
-
-                    if self.chord_mapping is None:
-                        if chord_label not in self.chord_to_idx:
-                            self.chord_to_idx[chord_label] = len(self.chord_to_idx)
-                    elif chord_label not in self.chord_mapping:
-                        # Handle basic chord labels (C, G, etc.) by treating them as major chords
-                        if chord_label in ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']:
-                            major_chord = f"{chord_label}:maj"
-                            if major_chord in self.chord_mapping:
-                                chord_label = major_chord
-                            else:
-                                warnings.warn(f"Unknown chord label {chord_label} (even as major) found in {label_file}")
-                                return []
-                        else:
-                            warnings.warn(f"Unknown chord label {chord_label} found in {label_file}")
-                            return []
-
-                    sample_dict = {
-                        'spectro': spec,
-                        'chord_label': chord_label,
-                        'song_id': file_id,
-                        'dir_prefix': dir_prefix
-                    }
-
+                    # Load teacher logits once if needed and available
+                    teacher_logits_full = None
                     if logit_file is not None:
-                        try:
-                            teacher_logits = self._load_logits_file(logit_file)
-                            if teacher_logits is not None:
-                                sample_dict['teacher_logits'] = teacher_logits
-                        except Exception as e:
-                            warnings.warn(f"Error loading logits file {logit_file}: {e}")
-                            return []
+                        teacher_logits_full = self._load_logits_file(logit_file)
+                        # If loading failed and logits are required, _load_logits_file might raise error or return None
+                        if teacher_logits_full is None and self.require_teacher_logits:
+                             # This case should ideally be caught earlier, but double-check
+                             if skip_reason != 'missing_logits':
+                                 if hasattr(self, 'skipped_reasons'):
+                                     self.skipped_reasons['missing_logits'] = self.skipped_reasons.get('missing_logits', 0) + 1
+                                 skip_reason = 'missing_logits'
+                             if return_skip_reason: return [], skip_reason
+                             return []
 
-                    samples.append(sample_dict)
-                else:
-                    teacher_logits = None
-                    if logit_file is not None:
-                        try:
-                            teacher_logits = self._load_logits_file(logit_file)
-                        except Exception as e:
-                            warnings.warn(f"Error loading logits file {logit_file}: {e}")
-                            return []
 
-                    for t in range(spec.shape[0]):
+                    for t in range(num_frames):
                         frame_time = t * self.frame_duration
                         chord_label = self._find_chord_at_time(chord_labels, frame_time)
+                        chord_label_mapped = chord_label
 
-                        if self.chord_mapping is None:
-                            if chord_label not in self.chord_to_idx:
-                                self.chord_to_idx[chord_label] = len(self.chord_to_idx)
-                        elif chord_label not in self.chord_mapping:
-                            # Handle basic chord labels (C, G, etc.) by treating them as major chords
-                            if chord_label in ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']:
-                                major_chord = f"{chord_label}:maj"
-                                if major_chord in self.chord_mapping:
-                                    chord_label = major_chord
+                        # Map chord label using chord_mapping
+                        if self.chord_mapping is not None:
+                            if chord_label not in self.chord_mapping:
+                                if chord_label in ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']:
+                                    major_chord = f"{chord_label}:maj"
+                                    if major_chord in self.chord_mapping:
+                                        chord_label_mapped = major_chord
+                                    else:
+                                        chord_label_mapped = "N"
                                 else:
-                                    warnings.warn(f"Unknown chord label {chord_label} (even as major), using 'N'")
-                                    chord_label = "N"
-                            else:
-                                warnings.warn(f"Unknown chord label {chord_label}, using 'N'")
-                                chord_label = "N"
+                                    chord_label_mapped = "N"
+                            # else: chord_label_mapped remains chord_label
 
+                        elif chord_label not in self.chord_to_idx: # Dynamic mapping
+                            self.chord_to_idx[chord_label] = len(self.chord_to_idx)
+                            # chord_label_mapped remains chord_label
+
+                        # Prepare sample dictionary
                         sample_dict = {
-                            'spectro': spec[t],
-                            'chord_label': chord_label,
-                            'song_id': file_id,
+                            'spectro': spec[t] if num_frames > 1 else spec, # Get frame or full spec
+                            'chord_label': chord_label_mapped,
+                            'song_id': lookup_key,
                             'dir_prefix': dir_prefix,
                             'frame_idx': t
                         }
 
-                        if teacher_logits is not None:
-                            if isinstance(teacher_logits, np.ndarray):
-                                if len(teacher_logits.shape) > 1 and t < teacher_logits.shape[0]:
-                                    sample_dict['teacher_logits'] = teacher_logits[t]
-                                else:
-                                    sample_dict['teacher_logits'] = teacher_logits
+                        # Add teacher logits for the current frame if available
+                        if teacher_logits_full is not None:
+                            if isinstance(teacher_logits_full, np.ndarray):
+                                # Handle multi-frame or single-frame logits array
+                                if len(teacher_logits_full.shape) > 1 and t < teacher_logits_full.shape[0]:
+                                    sample_dict['teacher_logits'] = teacher_logits_full[t]
+                                elif len(teacher_logits_full.shape) == 1 and num_frames == 1: # Single logit vector for single spec frame
+                                     sample_dict['teacher_logits'] = teacher_logits_full
+                                elif len(teacher_logits_full.shape) > 0 and num_frames > 1: # Need to decide how to handle mismatch
+                                     # Option 1: Use first logit frame?
+                                     # sample_dict['teacher_logits'] = teacher_logits_full[0]
+                                     # Option 2: Skip or use zeros? For now, let's assume shape matches or use first frame if possible
+                                     if teacher_logits_full.shape[0] > 0:
+                                         sample_dict['teacher_logits'] = teacher_logits_full[0] # Fallback: use first logit frame
+                                     # else: log warning?
+                            # else: Logits might be in unexpected format
 
                         samples.append(sample_dict)
 
-        except Exception as e:
-            if hasattr(self, 'skipped_reasons'):
-                if "format" in str(e).lower() or "corrupt" in str(e).lower():
-                    self.skipped_reasons['format_error'] += 1
-                    skip_reason = 'format_error'
-                else:
-                    self.skipped_reasons['load_error'] += 1
-                    skip_reason = 'load_error'
+                except Exception as full_data_e:
+                     # Handle errors during full data loading/processing for this file
+                     if skip_reason not in ['format_error', 'load_error']:
+                         if hasattr(self, 'skipped_reasons'):
+                             # Prioritize format_error if applicable
+                             err_str = str(full_data_e).lower()
+                             if "format" in err_str or "corrupt" in err_str or "cannot load" in err_str:
+                                 self.skipped_reasons['format_error'] = self.skipped_reasons.get('format_error', 0) + 1
+                                 skip_reason = 'format_error'
+                             else:
+                                 self.skipped_reasons['load_error'] = self.skipped_reasons.get('load_error', 0) + 1
+                                 skip_reason = 'load_error'
+                     # warnings.warn(f"Error processing full data for {spec_file}: {full_data_e}") # Reduce verbosity
+                     if return_skip_reason: return [], skip_reason
+                     return []
 
-            warnings.warn(f"Error processing file {spec_file}: {str(e)}")
+
+        except Exception as e:
+            # Catch-all for unexpected errors during file processing setup
+            if skip_reason not in ['format_error', 'load_error']: # Avoid double counting
+                if hasattr(self, 'skipped_reasons'):
+                    self.skipped_reasons['load_error'] = self.skipped_reasons.get('load_error', 0) + 1
+                skip_reason = 'load_error'
+
+            # warnings.warn(f"Unexpected error processing file {spec_file}: {str(e)}") # Reduce verbosity
+            # print(traceback.format_exc()) # Optionally print traceback for debugging
 
             if return_skip_reason:
                 return [], skip_reason
-            return []
+            return [] # Return empty list
 
+        # Return processed samples and the final skip reason (None if successful)
         if return_skip_reason:
             return samples, skip_reason
-        return samples
+        # Ensure samples is always a list, even if empty
+        return samples if samples else []
 
     def _parse_label_file(self, label_file):
         """Parse a label file into a list of (start_time, end_time, chord) tuples"""
@@ -1234,6 +1621,7 @@ class SynthDataset(Dataset):
                         normalized = torch.zeros(fixed_num_classes, dtype=torch.float, device=self.device)
                         # Copy as much data as possible
                         copy_len = min(logits_tensor.shape[0], fixed_num_classes)
+                       
                         normalized[:copy_len] = logits_tensor[:copy_len]
 
                     else:  # Multi-dimensional tensor

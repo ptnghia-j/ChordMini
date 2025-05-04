@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-full-lr
+  name: chord-temporal
   namespace: csuf-titans
   labels:
     app: chord-student-training
@@ -175,7 +175,7 @@ spec:
               value: /mnt/storage/ChordMini
             # Model scale - overrides student_config.yaml
             - name: MODEL_SCALE
-              value: "2.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
+              value: "1.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
             # Learning rate scheduling options - overrides student_config.yaml settings
             - name: LR_SCHEDULE
               value: "cosine"  # Changed from empty string to 'validation'
@@ -213,6 +213,9 @@ spec:
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
+            # Add teacher checkpoint path for normalization
+            - name: TEACHER_CHECKPOINT
+              value: "/mnt/storage/BTC/test/btc_model_large_voca.pt" # Path to the teacher model for norm stats
             # GPU memory utilization optimization
             - name: GPU_MEMORY_FRACTION
               value: "0.95"  # Use 95% of available GPU memory
@@ -230,7 +233,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
             - name: SUB_DIR
-              value: "student-full-lr"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
+              value: "student-temporal"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
@@ -241,7 +244,7 @@ spec:
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: ""  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: "0.01"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
           command:
@@ -574,11 +577,20 @@ spec:
                 fi
               fi
 
+              # Add teacher checkpoint argument
+              TEACHER_CHECKPOINT_ARG=""
+              if [ -n "${TEACHER_CHECKPOINT}" ]; then
+                echo "Loading normalization from teacher checkpoint: ${TEACHER_CHECKPOINT}"
+                TEACHER_CHECKPOINT_ARG="--teacher_checkpoint ${TEACHER_CHECKPOINT}"
+              else
+                echo "WARNING: No teacher checkpoint specified for normalization. Trainer might calculate its own or use defaults."
+              fi
+
               # Run the student training script with all options (without --best_model_dir flag)
               echo "Starting student training with GPU optimization and all options..."
               python train_student.py $DATASET_ARG --config ./config/student_config.yaml --save_dir ${CHECKPOINTS_DIR}/${SUB_DIR} \
                 ${LR_SCHEDULE_ARG} ${WARMUP_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${DATA_ARGS} ${KD_ARGS} \
-                ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS}
+                ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS} ${TEACHER_CHECKPOINT_ARG} # Added teacher checkpoint arg
 
               echo "=== Student model training complete ==="
           resources:

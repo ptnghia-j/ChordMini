@@ -16,6 +16,7 @@ import numpy as np
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 import torch.nn.functional as F # Add F for padding
+import matplotlib.pyplot as plt # Import matplotlib
 
 # Project imports
 from modules.utils.device import get_device, is_cuda_available, is_gpu_available, clear_gpu_cache
@@ -149,35 +150,29 @@ def resolve_path(path, storage_root=None, project_root=None):
         return os.path.join(storage_root, path)
     return os.path.join(project_root, path) if project_root else path
 
-def get_quick_dataset_stats(data_loader, device, max_batches=10):
-    """Calculate statistics from a small subset of data without blocking."""
+def load_normalization_from_checkpoint(path, storage_root=None, project_root=None):
+    """Load mean and std from a teacher checkpoint, or return (0.0, 1.0) if unavailable."""
+    if not path:
+        logger.warning("No teacher checkpoint specified for normalization. Using defaults (0.0, 1.0).")
+        return 0.0, 1.0
+    resolved_path = resolve_path(path, storage_root, project_root)
+    if not os.path.exists(resolved_path):
+        logger.warning(f"Teacher checkpoint for normalization not found at {resolved_path}. Using defaults (0.0, 1.0).")
+        return 0.0, 1.0
     try:
-        mean_sum = 0.0
-        square_sum = 0.0
-        sample_count = 0
-        logger.info(f"Processing subset of data for quick statistics...")
-        for i, batch in enumerate(data_loader):
-            if i >= max_batches: break
-            features = batch['spectro'].to('cpu')
-            batch_mean = torch.mean(features).item()
-            batch_square_mean = torch.mean(features.pow(2)).item()
-            mean_sum += batch_mean
-            square_sum += batch_square_mean
-            sample_count += 1
-            del features
-            if i % 2 == 0 and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        if sample_count > 0:
-            mean = mean_sum / sample_count
-            square_mean = square_sum / sample_count
-            std = np.sqrt(square_mean - mean**2)
-            logger.info(f"Quick stats from {sample_count} batches: mean={mean:.4f}, std={std:.4f}")
-            return mean, std
-        else:
-            logger.warning("No samples processed for statistics")
-            return 0.0, 1.0
+        checkpoint = torch.load(resolved_path, map_location='cpu')
+        mean = checkpoint.get('mean', 0.0)
+        std = checkpoint.get('std', 1.0)
+        mean = float(mean.item()) if hasattr(mean, 'item') else float(mean)
+        std = float(std.item()) if hasattr(std, 'item') else float(std)
+        if std == 0:
+            logger.warning("Teacher checkpoint std is zero, using 1.0 instead.")
+            std = 1.0
+        logger.info(f"Loaded normalization from teacher checkpoint: mean={mean:.4f}, std={std:.4f}")
+        return mean, std
     except Exception as e:
-        logger.error(f"Error in quick stats calculation: {e}")
+        logger.error(f"Error loading normalization from teacher checkpoint: {e}")
+        logger.warning("Using default normalization parameters (mean=0.0, std=1.0).")
         return 0.0, 1.0
 
 def main():
@@ -279,6 +274,9 @@ def main():
                         help='Path to BTC model checkpoint for finetuning (if model_type=BTC)')
     parser.add_argument('--log_chord_details', action='store_true',
                        help='Enable detailed logging of chords during MIR evaluation')
+    parser.add_argument('--teacher_checkpoint', type=str, default=None, # Renamed from --teacher_checkpoint_for_norm
+                        help='Path to the teacher model checkpoint to load normalization parameters (mean, std)')
+
 
     args = parser.parse_args()
 
@@ -316,6 +314,8 @@ def main():
     if 'FREEZE_FEATURE_EXTRACTOR' in os.environ: args.freeze_feature_extractor = os.environ['FREEZE_FEATURE_EXTRACTOR'].lower() == 'true'
     if 'SMALL_DATASET' in os.environ: args.small_dataset = float(os.environ['SMALL_DATASET'])
     if 'DISABLE_CACHE' in os.environ: args.disable_cache = os.environ['DISABLE_CACHE'].lower() == 'true'
+    # Add teacher checkpoint for norm override
+    if 'TEACHER_CHECKPOINT' in os.environ: args.teacher_checkpoint = os.environ['TEACHER_CHECKPOINT'] # Renamed from TEACHER_CHECKPOINT_FOR_NORM
     # Correctly handle boolean flags from ENV vars after argparse
     if 'METADATA_CACHE' in os.environ and os.environ['METADATA_CACHE'].lower() == 'true':
         args.metadata_cache = True
@@ -534,9 +534,9 @@ def main():
         'frame_duration': config.feature.get('hop_duration', 0.09288),
         'verbose': True,
         'device': device, # Keep device for potential future use, but SynthDataset primarily uses CPU loading
-        'pin_memory': False, # Usually False for SynthDataset
-        'prefetch_factor': float(args.prefetch_factor) if args.prefetch_factor else 1,
-        'num_workers': 12, # Adjust as needed
+        'pin_memory': False, # Set to False as num_workers will be 0
+        'prefetch_factor': float(args.prefetch_factor) if args.prefetch_factor else 1, # Keep original logic, DataLoader will override
+        'num_workers': 4, # Set to 0 as data is likely on GPU
         'require_teacher_logits': use_kd_loss,
         'use_cache': not args.disable_cache,
         'metadata_only': args.metadata_cache, # Pass boolean directly
@@ -582,25 +582,25 @@ def main():
         train_subset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=dataset_args['num_workers'],
-        pin_memory=dataset_args['pin_memory'],
-        prefetch_factor=int(dataset_args['prefetch_factor']) if dataset_args['prefetch_factor'] > 1 else None
+        num_workers=0, # Set to 0
+        pin_memory=False # Set to False
+        # Removed prefetch_factor=None
     )
     val_loader = DataLoader(
         eval_subset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=dataset_args['num_workers'],
-        pin_memory=dataset_args['pin_memory'],
-        prefetch_factor=int(dataset_args['prefetch_factor']) if dataset_args['prefetch_factor'] > 1 else None
+        num_workers=0, # Set to 0
+        pin_memory=False # Set to False
+        # Removed prefetch_factor=None
     )
     test_loader = DataLoader( # Create test loader
         test_subset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=dataset_args['num_workers'],
-        pin_memory=dataset_args['pin_memory'],
-        prefetch_factor=int(dataset_args['prefetch_factor']) if dataset_args['prefetch_factor'] > 1 else None
+        num_workers=0, # Set to 0
+        pin_memory=False # Set to False
+        # Removed prefetch_factor=None
     )
 
     logger.info(f"Training set: {len(train_subset)} samples")
@@ -656,6 +656,19 @@ def main():
         return
 
     # Create model instance
+    # start_epoch = 1 # REMOVED - Trainer handles its own start epoch internally
+    optimizer_state_dict_to_load = None # Initialize optimizer state as None
+
+    # --- Load Normalization from Teacher Checkpoint ---
+    mean_val, std_val = load_normalization_from_checkpoint(
+        args.teacher_checkpoint or config.paths.get('teacher_checkpoint'), # Use renamed arg/config key
+        storage_root, project_root
+    )
+    mean_tensor = torch.tensor(mean_val, device=device, dtype=torch.float32)
+    std_tensor = torch.tensor(std_val, device=device, dtype=torch.float32)
+    normalization = {'mean': mean_tensor, 'std': std_tensor}
+    logger.info(f"Using normalization parameters FOR TRAINING (from teacher checkpoint): mean={mean_val:.4f}, std={std_val:.4f}")
+
     try:
         n_freq = getattr(config.feature, 'n_bins', 144) # Use n_bins from config
         logger.info(f"Using frequency dimension (n_bins): {n_freq}")
@@ -708,7 +721,7 @@ def main():
         model.idx_to_chord = master_mapping
         logger.info("Attached chord mapping to model for correct MIR evaluation")
 
-        # Load pretrained weights
+        # Load pretrained weights AND potentially optimizer state for resuming
         if pretrained_path:
             try:
                 checkpoint = torch.load(pretrained_path, map_location=device)
@@ -730,9 +743,27 @@ def main():
                     state_dict = {k[7:]: v for k, v in state_dict.items()}
 
                 model.load_state_dict(state_dict, strict=not args.partial_loading)
-                logger.info("Successfully loaded pretrained weights")
+                logger.info(f"Successfully loaded model weights from {pretrained_path}")
+
+                # --- Load optimizer state if resuming ---
+                # Note: Normalization is now loaded separately from the teacher checkpoint above
+                if not args.reset_epoch:
+                    if 'optimizer_state_dict' in checkpoint:
+                        optimizer_state_dict_to_load = checkpoint['optimizer_state_dict']
+                        logger.info(f"Found optimizer state in {pretrained_path}. Will load if trainer doesn't load its own state.")
+                    else:
+                        logger.warning(f"Resuming requested (reset_epoch=False), but no optimizer state found in {pretrained_path}.")
+                    # We no longer load epoch here, trainer handles it internally based on its own checkpoints
+                else:
+                    logger.info("Reset flags active (--reset_epoch). Ignoring optimizer state from pretrained file.")
+                # --- End loading optimizer state ---
+
+                # Clean up checkpoint memory
+                del checkpoint, state_dict
+                gc.collect()
+
             except Exception as e:
-                logger.error(f"Error loading pretrained model from {pretrained_path}: {e}")
+                logger.error(f"Error loading pretrained model/state from {pretrained_path}: {e}")
                 if model_type == 'BTC':
                     logger.info("Continuing with freshly initialized BTC model")
                 else:
@@ -782,6 +813,22 @@ def main():
         weight_decay=config.training.get('weight_decay', 0.0)
     )
 
+    # Load the optimizer state dict if it was found and resuming is intended
+    # This state might be overwritten if the trainer loads its own checkpoint later
+    if optimizer_state_dict_to_load:
+        try:
+            optimizer.load_state_dict(optimizer_state_dict_to_load)
+            logger.info("Successfully loaded optimizer state from pretrained checkpoint.")
+            # Optional: Move optimizer state to the correct device if necessary
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+            logger.info("Moved optimizer state to current device.")
+        except Exception as e:
+            logger.error(f"Error loading optimizer state from pretrained checkpoint: {e}. Using fresh optimizer state.")
+            optimizer_state_dict_to_load = None # Ensure we know it wasn't loaded
+
     # Clean up GPU memory before training
     if torch.cuda.is_available():
         logger.info("Performing CUDA memory cleanup before training")
@@ -790,32 +837,6 @@ def main():
         allocated = torch.cuda.memory_allocated() / (1024 * 1024 * 1024)
         reserved = torch.cuda.memory_reserved() / (1024 * 1024 * 1024)
         logger.info(f"CUDA memory stats (GB): allocated={allocated:.2f}, reserved={reserved:.2f}")
-
-    # Calculate dataset statistics efficiently using a temporary loader
-    try:
-        logger.info("Calculating global mean and std for normalization...")
-        stats_batch_size = min(16, int(config.training.get('batch_size', 16)))
-        # Use a subset of the training data for stats calculation
-        stats_indices = random.sample(synth_dataset.train_indices, min(1000, len(synth_dataset.train_indices)))
-        stats_subset = SynthSegmentSubset(synth_dataset, stats_indices)
-        stats_loader = DataLoader(
-            stats_subset,
-            batch_size=stats_batch_size,
-            num_workers=0, # Use main process for stats
-            pin_memory=False
-        )
-        mean, std = get_quick_dataset_stats(stats_loader, device)
-        logger.info(f"Using statistics: mean={mean:.4f}, std={std:.4f}")
-    except Exception as e:
-        logger.error(f"Error calculating statistics: {e}")
-        mean, std = 0.0, 1.0
-        logger.warning("Using default mean=0.0, std=1.0 due to calculation error")
-
-    # Create normalized tensors on device
-    mean_tensor = torch.tensor(mean, device=device, dtype=torch.float32)
-    std_tensor = torch.tensor(std, device=device, dtype=torch.float32)
-    normalization = {'mean': mean_tensor, 'std': std_tensor}
-    logger.info(f"Normalization tensors created on device: {device}")
 
     # Final memory cleanup before training
     if torch.cuda.is_available():
@@ -846,7 +867,7 @@ def main():
         checkpoint_dir=checkpoints_dir,
         class_weights=None, # Add class weights later if needed
         idx_to_chord=master_mapping,
-        normalization=normalization,
+        normalization=normalization, # Pass the checkpoint-based normalization
         early_stopping_patience=int(config.training.get('early_stopping_patience', 10)), # Increased patience
         lr_decay_factor=float(config.training.get('lr_decay_factor', 0.95)),
         min_lr=float(config.training.get('min_learning_rate', 5e-6)),
@@ -861,15 +882,35 @@ def main():
         use_kd_loss=use_kd_loss,
         kd_alpha=kd_alpha,
         temperature=temperature,
-        teacher_model=None, # No teacher model needed for offline KD
-        teacher_normalization=None,
         timeout_minutes=args.timeout_minutes,
         reset_epoch=args.reset_epoch, # Pass reset flags
         reset_scheduler=args.reset_scheduler
+        # REMOVED: start_epoch=start_epoch
     )
 
     # Attach chord mapping to trainer (chord -> idx) if needed
     trainer.set_chord_mapping(chord_mapping)
+
+    # Log checkpoint loading status for resuming by checking for the latest state file
+    # This check informs the user about the trainer's likely behavior
+    latest_checkpoint_path = os.path.join(checkpoints_dir, "trainer_state_latest.pth")
+    will_trainer_load_internal_state = os.path.exists(latest_checkpoint_path) and not args.reset_epoch
+
+    if will_trainer_load_internal_state:
+         logger.info(f"Trainer found existing internal checkpoint '{latest_checkpoint_path}'. Attempting to resume training (will load epoch, optimizer, etc.).")
+         if optimizer_state_dict_to_load:
+             logger.warning("Optimizer state loaded from pretrained checkpoint might be overwritten by trainer's internal checkpoint.")
+    else:
+        if not os.path.exists(latest_checkpoint_path):
+            logger.info(f"No suitable internal trainer checkpoint found at '{latest_checkpoint_path}'.")
+        if args.reset_epoch:
+            logger.info("Reset flags active (--reset_epoch).")
+        logger.info("Starting training from scratch (epoch 1) after loading pretrained weights.")
+        if optimizer_state_dict_to_load:
+            logger.info("Using optimizer state loaded from the pretrained checkpoint.")
+        else:
+            logger.info("Using a fresh optimizer state.")
+
 
     # Run training
     logger.info(f"\n=== Starting fine-tuning ===")
@@ -889,7 +930,7 @@ def main():
             except Exception as e:
                 logger.error(f"Error verifying KD setup: {e}")
 
-        # Start training
+        # Start training - Trainer will handle loading its state internally
         trainer.train(train_loader, val_loader)
         logger.info("Fine-tuning completed successfully!")
     except KeyboardInterrupt:
@@ -962,12 +1003,10 @@ def main():
                     ref_intervals = np.array([(i * frame_duration, (i + 1) * frame_duration) for i in range(len(all_reference_labels))])
                     pred_intervals = np.array([(i * frame_duration, (i + 1) * frame_duration) for i in range(len(all_prediction_labels))])
 
-                    log_details = config.misc.get('log_chord_details', False) or args.log_chord_details
-
                     scores = large_voca_score_calculation(
                         ref_intervals, all_reference_labels,
-                        pred_intervals, all_prediction_labels,
-                        log_details=log_details
+                        pred_intervals, all_prediction_labels
+                        # Removed log_details=log_details
                     )
                     mir_eval_results.update(scores)
                     logger.info(f"Detailed MIR scores: {scores}")

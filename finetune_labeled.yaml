@@ -152,18 +152,21 @@ spec:
               value: "BTC"  # Default model type: BTC
             # BTC model checkpoint path (only used if MODEL_TYPE=BTC)
             - name: BTC_CHECKPOINT
-              value: "/mnt/storage/checkpoints/btc/btc_model_best.pth" # Path to the PRETRAINED BTC model
+              value: "/mnt/storage/checkpoints/btc_model_best.pth" # Path to the PRETRAINED BTC model
             # ChordNet model checkpoint path (only used if MODEL_TYPE=ChordNet)
             - name: PRETRAINED_MODEL # Renamed from PRETRAINED_MODEL for clarity
-              value: "/mnt/storage/checkpoints/student/student_model_best.pth" # Path to the PRETRAINED ChordNet model
+              value: "/mnt/storage/checkpoints/student_model_best.pth" # Path to the PRETRAINED ChordNet model
+            # Teacher model checkpoint path for loading normalization parameters
+            - name: TEACHER_CHECKPOINT # Renamed from TEACHER_CHECKPOINT_FOR_NORM
+              value: "/mnt/storage/BTC/test/btc_model_large_voca.pt" # Path to the teacher model for norm stats
             # Learning rate parameters
             - name: LEARNING_RATE
-              value: "0.00005"  # Lower base learning rate for fine-tuning
+              value: "0.001"  # Lower base learning rate for fine-tuning
             - name: MIN_LEARNING_RATE
               value: "0.000001"  # Minimum learning rate
             # Knowledge distillation settings (Offline KD)
             - name: USE_KD_LOSS
-              value: "true"  # Enable KD loss using pre-computed logits
+              value: "false"  # Enable KD loss using pre-computed logits
             - name: KD_ALPHA
               value: "0.3"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
@@ -209,7 +212,7 @@ spec:
             - name: EPOCHS
               value: "50"  # Number of fine-tuning epochs
             - name: BATCH_SIZE
-              value: "64"  # Adjust batch size based on GPU memory
+              value: "128"  # Adjust batch size based on GPU memory
             # LR schedule
             - name: LR_SCHEDULE
               value: "validation"  # e.g., validation, cosine, none
@@ -230,6 +233,12 @@ spec:
             # Checkpoint settings
             - name: SAVE_DIR
               value: "/mnt/storage/checkpoints/finetune_synthlike" # Updated save directory
+            # Add reset epoch control option
+            - name: RESET_EPOCH
+              value: "true"  # Force reset epoch for fine-tuning start
+            # Add reset scheduler control option
+            - name: RESET_SCHEDULER
+              value: "true"  # Force reset scheduler for fine-tuning start
             # Small dataset percentage for quick testing
             - name: SMALL_DATASET
               value: "0.3" # Set to e.g., "0.1" for 10% dataset, empty for full dataset
@@ -368,6 +377,13 @@ spec:
               # GPU Settings
               CMD_ARGS="${CMD_ARGS} --gpu_memory_fraction ${GPU_MEMORY_FRACTION}"
 
+              # Add reset flags to command line arguments
+              if [ "${RESET_EPOCH}" = "true" ]; then CMD_ARGS="${CMD_ARGS} --reset_epoch"; fi
+              if [ "${RESET_SCHEDULER}" = "true" ]; then CMD_ARGS="${CMD_ARGS} --reset_scheduler"; fi
+
+              # Add teacher checkpoint path for normalization
+              if [ -n "${TEACHER_CHECKPOINT}" ]; then CMD_ARGS="${CMD_ARGS} --teacher_checkpoint ${TEACHER_CHECKPOINT}"; fi
+
               # Run the fine-tuning script
               echo "Running command:"
               echo "python train_finetune.py --config ./config/student_config.yaml ${CMD_ARGS}"
@@ -385,7 +401,7 @@ spec:
               nvidia.com/gpu: "1"
             limits:
               cpu: "5"
-              memory: "24Gi" # Increased memory limit
+              memory: "64Gi" # Increased memory limit
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: storage
