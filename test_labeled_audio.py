@@ -18,7 +18,7 @@ import traceback
 from tqdm import tqdm
 from pathlib import Path
 from modules.utils import logger
-from modules.utils.mir_eval_modules import audio_file_to_features, idx2voca_chord
+from modules.utils.mir_eval_modules import audio_file_to_features, idx2voca_chord, lab_file_error_modify # Add lab_file_error_modify
 from modules.models.Transformer.ChordNet import ChordNet
 from modules.models.Transformer.btc_model import BTC_model # Import BTC_model
 from modules.utils.hparams import HParams
@@ -294,7 +294,12 @@ def process_audio_file(audio_path, label_path, model, config, mean, std, device,
                 gt_frames[start_frame:end_frame] = str(chord)
 
         # Convert predictions to chord names
-        pred_frames = [idx_to_chord[int(idx)] for idx in all_predictions[:num_frames]]
+        pred_frames_raw = [idx_to_chord[int(idx)] for idx in all_predictions[:num_frames]]
+
+        # Standardize ground truth and predicted labels
+        standardized_gt_labels = [lab_file_error_modify(str(label)) for label in flatten_nested_list(gt_frames.tolist())]
+        standardized_pred_labels = [lab_file_error_modify(str(label)) for label in flatten_nested_list(pred_frames_raw)]
+
 
         # Create sample dict with required fields
         sample = {
@@ -302,8 +307,8 @@ def process_audio_file(audio_path, label_path, model, config, mean, std, device,
             'spectro': feature,
             'model_pred': all_predictions,
             'gt_annotations': annotations,
-            'chord_label': [str(chord) for chord in flatten_nested_list(gt_frames.tolist())],
-            'pred_label': [str(chord) for chord in flatten_nested_list(pred_frames)],
+            'chord_label': standardized_gt_labels, # Use standardized GT labels
+            'pred_label': standardized_pred_labels,   # Use standardized predicted labels
             'feature_per_second': feature_per_second,
             'feature_length': num_frames,
             'model_type': model_type, # Store model type
@@ -332,6 +337,14 @@ def custom_calculate_chord_scores(timestamps, durations, reference_labels, predi
     # Ensure inputs are lists
     reference_labels = list(reference_labels)
     prediction_labels = list(prediction_labels)
+
+    # One-time logging for label inspection
+    if not hasattr(custom_calculate_chord_scores, 'logged_once'):
+        logger.info("Inspecting first 5 labels in custom_calculate_chord_scores:")
+        logger.info(f"  Reference labels: {reference_labels[:5]}")
+        logger.info(f"  Prediction labels: {prediction_labels[:5]}")
+        custom_calculate_chord_scores.logged_once = True
+
 
     # Ensure all inputs have the same length
     min_len = min(len(timestamps), len(durations), len(reference_labels), len(prediction_labels))

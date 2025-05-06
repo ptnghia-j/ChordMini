@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-finetune-synthlike # Updated name
+  name: chord-finetune-nokd # Updated name
   namespace: csuf-titans
   labels:
     app: chord-finetune-synthlike # Updated label
@@ -20,7 +20,7 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-GeForce-RTX-3090
+                - NVIDIA-A10
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -146,10 +146,13 @@ spec:
               value: /mnt/storage/ChordMini
             # Model scale - overrides student_config.yaml
             - name: MODEL_SCALE
-              value: "1.0"  # Default scale: 1.0 = base model
+              value: "1.0"  # Default scale: 1.0 = base model (only used for ChordNet)
             # Model type - ChordNet or BTC
             - name: MODEL_TYPE
               value: "BTC"  # Default model type: BTC
+            # BTC model config path (only used if MODEL_TYPE=BTC)
+            - name: BTC_CONFIG_PATH # ADDED: Path to BTC config
+              value: "/mnt/storage/ChordMini/config/btc_config.yaml"
             # BTC model checkpoint path (only used if MODEL_TYPE=BTC)
             - name: BTC_CHECKPOINT
               value: "/mnt/storage/checkpoints/btc_model_best.pth" # Path to the PRETRAINED BTC model
@@ -161,16 +164,16 @@ spec:
               value: "/mnt/storage/BTC/test/btc_model_large_voca.pt" # Path to the teacher model for norm stats
             # Learning rate parameters
             - name: LEARNING_RATE
-              value: "0.001"  # Lower base learning rate for fine-tuning
+              value: "0.0001"  # Lower base learning rate for fine-tuning
             - name: MIN_LEARNING_RATE
               value: "0.000001"  # Minimum learning rate
             # Knowledge distillation settings (Offline KD)
             - name: USE_KD_LOSS
               value: "false"  # Enable KD loss using pre-computed logits
             - name: KD_ALPHA
-              value: "0.3"  # Weight for KD loss (0-1)
+              value: "0.5"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
-              value: "2.0"  # Temperature for softening distributions
+              value: "3.0"  # Temperature for softening distributions
             # Focal loss settings
             - name: USE_FOCAL_LOSS
               value: "true"  # Enable focal loss
@@ -180,13 +183,13 @@ spec:
               value: "0.25"   # Class weight parameter (optional)
             # Warmup settings
             - name: USE_WARMUP
-              value: "false"  # Disable warm-up for fine-tuning usually
+              value: "true"  # Disable warm-up for fine-tuning usually
             - name: WARMUP_START_LR
-              value: "0.00001"
+              value: "0.0001"
             - name: WARMUP_END_LR
-              value: "0.00005"
+              value: "0.0002"
             - name: WARMUP_EPOCHS
-              value: "4"
+              value: "5"
             # Dropout setting
             - name: DROPOUT
               value: "0.2"
@@ -198,7 +201,8 @@ spec:
             - name: LOGITS_DIR # Pre-computed teacher logits
               value: "/mnt/storage/data/LabeledDataset_synth/logits"
             - name: LABEL_DIRS # REAL ground truth label directories (space-separated)
-              value: "/mnt/storage/data/LabeledDataset/Labels/billboardLabels /mnt/storage/data/LabeledDataset/Labels/caroleKingLabels /mnt/storage/data/LabeledDataset/Labels/queenLabels /mnt/storage/data/LabeledDataset/Labels/theBeatlesLabels"
+              # Point to the base directory; SynthDataset will handle subdirs
+              value: "/mnt/storage/data/LabeledDataset/Labels"
             - name: CACHE_DIR # Cache directory for SynthDataset
               value: "/mnt/storage/data/LabeledDataset_synth/cache"
             # Model vocabulary size - MUST match pretrained model
@@ -210,7 +214,7 @@ spec:
             - name: FREEZE_FEATURE_EXTRACTOR
               value: "false"  # Set to true to freeze early layers
             - name: EPOCHS
-              value: "50"  # Number of fine-tuning epochs
+              value: "100"  # Number of fine-tuning epochs
             - name: BATCH_SIZE
               value: "128"  # Adjust batch size based on GPU memory
             # LR schedule
@@ -232,7 +236,7 @@ spec:
               value: "false" # Usually false unless specific pattern benefits
             # Checkpoint settings
             - name: SAVE_DIR
-              value: "/mnt/storage/checkpoints/finetune_synthlike" # Updated save directory
+              value: "/mnt/storage/checkpoints/finetune_nokd" # Updated save directory
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Force reset epoch for fine-tuning start
@@ -241,7 +245,7 @@ spec:
               value: "true"  # Force reset scheduler for fine-tuning start
             # Small dataset percentage for quick testing
             - name: SMALL_DATASET
-              value: "0.3" # Set to e.g., "0.1" for 10% dataset, empty for full dataset
+              value: "1.0" # Set to e.g., "0.1" for 10% dataset, empty for full dataset
           command:
             - sh
             - -c
@@ -297,6 +301,14 @@ spec:
               # Model Type and Pretrained Path
               CMD_ARGS="${CMD_ARGS} --model_type ${MODEL_TYPE}"
               if [ "${MODEL_TYPE}" = "BTC" ]; then
+                # --- ADDED: Pass btc_config path ---
+                if [ -n "${BTC_CONFIG_PATH}" ]; then
+                  # This line adds the argument if BTC_CONFIG_PATH is set
+                  CMD_ARGS="${CMD_ARGS} --btc_config ${BTC_CONFIG_PATH}"
+                else
+                  echo "WARNING: MODEL_TYPE is BTC but BTC_CONFIG_PATH is not set. Using default."
+                fi
+                # --- END ADDED ---
                 if [ -n "${BTC_CHECKPOINT}" ]; then
                   CMD_ARGS="${CMD_ARGS} --btc_checkpoint ${BTC_CHECKPOINT}"
                 else
@@ -386,6 +398,7 @@ spec:
 
               # Run the fine-tuning script
               echo "Running command:"
+              # The ${CMD_ARGS} variable includes --btc_config when appropriate
               echo "python train_finetune.py --config ./config/student_config.yaml ${CMD_ARGS}"
 
               python train_finetune.py --config ./config/student_config.yaml ${CMD_ARGS}

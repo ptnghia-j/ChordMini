@@ -192,7 +192,7 @@ spec:
               value: "/mnt/storage/data"
             # Add teacher checkpoint path for normalization
             - name: TEACHER_CHECKPOINT
-              value: "/mnt/storage/checkpoints/btc/btc_model_large_voca.pt" # Example path, adjust as needed
+              value: "/mnt/storage/BTC/test/btc_model_large_voca.pt"
             # GPU memory utilization optimization
             - name: GPU_MEMORY_FRACTION
               value: "0.95"  # Use 95% of available GPU memory

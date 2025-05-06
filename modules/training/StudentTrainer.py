@@ -7,7 +7,7 @@ import traceback  # Add import for traceback module
 import torch.nn.functional as F
 import matplotlib.pyplot as plt  # Add missing matplotlib import
 
-from modules.utils.logger import info, warning, error, debug, logging_verbosity, is_debug
+from modules.utils.logger import info, warning, error, debug, logging_verbosity, is_debug # Ensure is_debug is imported
 from modules.training.Trainer import BaseTrainer
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, OneCycleLR, CosineAnnealingWarmRestarts
 from collections import Counter
@@ -1002,22 +1002,41 @@ class StudentTrainer(BaseTrainer):
             return torch.tensor(1.0, device=self.device, requires_grad=True)
 
     def _process_batch(self, batch):
-        """Process a batch to extract inputs and targets with GPU acceleration"""
-        if isinstance(batch, dict):
-            # Extract spectrograms and targets from dictionary
-            inputs = batch.get('spectro')
-            targets = batch.get('chord_idx')
-        else:
-            # Default unpacking
-            inputs, targets = batch
+        """Move batch to device and apply normalization."""
+        features = batch['spectro'].to(self.device)
+        targets = batch['chord_idx'].to(self.device)
 
-        # Move to device if not already there
-        if inputs.device != self.device:
-            inputs = inputs.to(self.device, non_blocking=True)
-        if targets.device != self.device:
-            targets = targets.to(self.device, non_blocking=True)
+        # Apply normalization if available
+        if self.normalization and 'mean' in self.normalization and 'std' in self.normalization:
+            # Ensure normalization params are tensors on the correct device
+            mean = self.normalization['mean']
+            std = self.normalization['std']
+            if not isinstance(mean, torch.Tensor): mean = torch.tensor(mean, device=self.device, dtype=features.dtype)
+            if not isinstance(std, torch.Tensor): std = torch.tensor(std, device=self.device, dtype=features.dtype)
+            # Add channel dimension if necessary for broadcasting (assuming mean/std are scalar or per-feature)
+            # Example: if features are [B, T, F] and mean/std are [F]
+            # mean = mean.view(1, 1, -1)
+            # std = std.view(1, 1, -1)
+            # Or if mean/std are scalar:
+            # No view needed
 
-        return inputs, targets
+            # Check shapes for broadcasting - ADDED DEBUG LOG
+            if is_debug(): # Only log if debug level is enabled
+                debug(f"Normalizing features shape {features.shape} with mean shape {mean.shape} and std shape {std.shape}")
+                # Basic check: Ensure mean/std are scalar or match the feature dimension if not scalar
+                if mean.numel() > 1 and mean.shape[-1] != features.shape[-1]:
+                    warning(f"Potential shape mismatch: Features last dim {features.shape[-1]}, Mean shape {mean.shape}")
+                if std.numel() > 1 and std.shape[-1] != features.shape[-1]:
+                    warning(f"Potential shape mismatch: Features last dim {features.shape[-1]}, Std shape {std.shape}")
+
+
+            features = (features - mean) / (std + 1e-6) # Add epsilon for stability
+
+        teacher_logits = batch.get('teacher_logits')
+        if teacher_logits is not None:
+            teacher_logits = teacher_logits.to(self.device, non_blocking=True)
+
+        return features, targets
 
     def train(self, train_loader, val_loader=None, start_epoch=1):
         """
@@ -1212,11 +1231,22 @@ class StudentTrainer(BaseTrainer):
                     if self.normalization:
                         # Create the normalization tensors using clone().detach() if they don't exist
                         if not hasattr(self, '_norm_mean_tensor') or not hasattr(self, '_norm_std_tensor'):
-                            # Fix: Use clone().detach() instead of torch.tensor()
-                            self._norm_mean_tensor = torch.as_tensor(self.normalization['mean'],
-                                                                   device=self.device, dtype=torch.float).clone().detach()
-                            self._norm_std_tensor = torch.as_tensor(self.normalization['std'],
-                                                                  device=self.device, dtype=torch.float).clone().detach()
+                            # Ensure normalization values are tensors before cloning
+                            norm_mean = self.normalization['mean']
+                            norm_std = self.normalization['std']
+                            if not isinstance(norm_mean, torch.Tensor):
+                                norm_mean = torch.as_tensor(norm_mean, device=self.device, dtype=torch.float)
+                            if not isinstance(norm_std, torch.Tensor):
+                                norm_std = torch.as_tensor(norm_std, device=self.device, dtype=torch.float)
+
+                            # Use clone().detach()
+                            self._norm_mean_tensor = norm_mean.clone().detach().to(self.device)
+                            self._norm_std_tensor = norm_std.clone().detach().to(self.device)
+                            # Ensure std is not zero
+                            if self._norm_std_tensor == 0:
+                                info("Warning: Normalization std is zero, using 1.0 instead.")
+                                self._norm_std_tensor = torch.tensor(1.0, device=self.device, dtype=torch.float)
+
 
                         # Apply normalization on GPU with in-place operations where possible
                         inputs = (inputs - self._norm_mean_tensor) / self._norm_std_tensor

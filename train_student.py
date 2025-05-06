@@ -626,7 +626,7 @@ def main(rank=0, world_size=1):
         'device': device,
         'pin_memory': False,
         'prefetch_factor': float(args.prefetch_factor) if args.prefetch_factor else 1,
-        'num_workers': 12,
+        'num_workers': 10,
         # debug area
         'require_teacher_logits': use_kd,
         'use_cache': not config.data.get('disable_cache', False),
@@ -784,9 +784,9 @@ def main(rank=0, world_size=1):
         f_layer = max(1, int(round(base_config.get('f_layer', 3) * scale_factor)))
         t_layer = max(1, int(round(base_config.get('t_layer', 3) * scale_factor)))
         d_layer = max(1, int(round(base_config.get('d_layer', 3) * scale_factor)))
-        f_head = 4
-        t_head = 4
-        d_head = 4
+        f_head = 6
+        t_head = 6
+        d_head = 6
 
         # Ensure f_head is compatible with feature_dim (must be a divisor)
         if feature_dim % f_head != 0:
@@ -1236,7 +1236,7 @@ def main(rank=0, world_size=1):
 
                         score_list_dict, song_length_list, average_score_dict = large_voca_score_calculation(
                             valid_dataset=split_samples, config=config, model=model, model_type=args.model,
-                            mean=mean, std=std, device=device, sampled_song_ids=sampled_song_ids)
+                            mean=mean_val, std=std_val, device=device, sampled_song_ids=sampled_song_ids)
 
                         # Gather results from all ranks
                         if world_size > 1:
@@ -1285,43 +1285,47 @@ def main(rank=0, world_size=1):
 
                         # Evaluate each split
                         logger.info(f"Evaluating model on {len(valid_dataset1)} samples in split 1...")
-                        # Get sampled_song_ids if using small dataset percentage
+                        # --- Define sampled_song_ids1 ---
                         sampled_song_ids1 = None
                         small_dataset_pct = dataset_args.get('small_dataset_percentage')
                         if small_dataset_pct is not None and small_dataset_pct != '' and float(small_dataset_pct) < 1.0:
                             # Extract unique song IDs from the samples
                             sampled_song_ids1 = set(sample.get('song_id', '') for sample in valid_dataset1 if 'song_id' in sample)
                             logger.info(f"Using {len(sampled_song_ids1)} sampled song IDs for MIR evaluation (split 1)")
-
+                        # --- MODIFICATION START: Use mean_val and std_val ---
                         score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
                             valid_dataset=valid_dataset1, config=config, model=model, model_type=args.model,
-                            mean=mean, std=std, device=device, sampled_song_ids=sampled_song_ids1)
+                            mean=mean_val, std=std_val, device=device, sampled_song_ids=sampled_song_ids1)
+                        # --- MODIFICATION END ---
 
                         logger.info(f"Evaluating model on {len(valid_dataset2)} samples in split 2...")
                         # Get sampled_song_ids if using small dataset percentage
                         sampled_song_ids2 = None
-                        small_dataset_pct = dataset_args.get('small_dataset_percentage')
+                        # small_dataset_pct = dataset_args.get('small_dataset_percentage') # Already defined above
                         if small_dataset_pct is not None and small_dataset_pct != '' and float(small_dataset_pct) < 1.0:
                             # Extract unique song IDs from the samples
                             sampled_song_ids2 = set(sample.get('song_id', '') for sample in valid_dataset2 if 'song_id' in sample)
                             logger.info(f"Using {len(sampled_song_ids2)} sampled song IDs for MIR evaluation (split 2)")
 
+                        # --- MODIFICATION START: Use mean_val and std_val ---
                         score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
                             valid_dataset=valid_dataset2, config=config, model=model, model_type=args.model,
-                            mean=mean, std=std, device=device, sampled_song_ids=sampled_song_ids2)
+                            mean=mean_val, std=std_val, device=device, sampled_song_ids=sampled_song_ids2)
+                        # --- MODIFICATION END ---
 
                         logger.info(f"Evaluating model on {len(valid_dataset3)} samples in split 3...")
-                        # Get sampled_song_ids if using small dataset percentage
+                        # --- Define sampled_song_ids3 ---
                         sampled_song_ids3 = None
-                        small_dataset_pct = dataset_args.get('small_dataset_percentage')
+                        # small_dataset_pct = dataset_args.get('small_dataset_percentage') # Already defined above
                         if small_dataset_pct is not None and small_dataset_pct != '' and float(small_dataset_pct) < 1.0:
                             # Extract unique song IDs from the samples
                             sampled_song_ids3 = set(sample.get('song_id', '') for sample in valid_dataset3 if 'song_id' in sample)
                             logger.info(f"Using {len(sampled_song_ids3)} sampled song IDs for MIR evaluation (split 3)")
-
+                        # --- MODIFICATION START: Use mean_val and std_val ---
                         score_list_dict3, song_length_list3, average_score_dict3 = large_voca_score_calculation(
                             valid_dataset=valid_dataset3, config=config, model=model, model_type=args.model,
-                            mean=mean, std=std, device=device, sampled_song_ids=sampled_song_ids3)
+                            mean=mean_val, std=std_val, device=device, sampled_song_ids=sampled_song_ids3) # Pass sampled_song_ids3
+                        # --- MODIFICATION END ---
 
                     # Combine results
                     mir_eval_results = {}

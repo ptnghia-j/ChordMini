@@ -178,7 +178,7 @@ spec:
               value: "1.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
             # Learning rate scheduling options - overrides student_config.yaml settings
             - name: LR_SCHEDULE
-              value: "cosine"  # Changed from empty string to 'validation'
+              value: "validation"  # Changed from empty string to 'validation'
             # Additional learning rate parameters - new additions
             - name: LEARNING_RATE
               value: "0.0001"  # Base learning rate
@@ -202,14 +202,14 @@ spec:
             - name: USE_WARMUP
               value: "true"  # Set to "true" to enable learning rate warm-up
             - name: WARMUP_START_LR
-              value: "0.00008"  # Starting learning rate for warm-up
+              value: "0.0001"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.0001"  # Final learning rate after warm-up
+              value: "0.0002"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
               value: "10"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
-              value: "0.2"  # Set dropout probability (0-1)
+              value: "0.35"  # Set dropout probability (0-1)
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
@@ -244,7 +244,7 @@ spec:
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: "0.01"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: ""  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
           command:
@@ -481,9 +481,10 @@ spec:
 
               # GPU acceleration options
               GPU_ARGS=""
-              if [ "${GPU_MEMORY_FRACTION}" != "" ]; then
-                GPU_ARGS="--gpu_memory_fraction ${GPU_MEMORY_FRACTION}"
-              fi
+              # Remove the following line as --gpu_memory_fraction is not a valid argument
+              # if [ "${GPU_MEMORY_FRACTION}" != "" ]; then
+              #   GPU_ARGS="--gpu_memory_fraction ${GPU_MEMORY_FRACTION}"
+              # fi
 
               if [ "${BATCH_GPU_CACHE}" = "true" ]; then
                 GPU_ARGS="${GPU_ARGS} --batch_gpu_cache"
@@ -590,7 +591,7 @@ spec:
               echo "Starting student training with GPU optimization and all options..."
               python train_student.py $DATASET_ARG --config ./config/student_config.yaml --save_dir ${CHECKPOINTS_DIR}/${SUB_DIR} \
                 ${LR_SCHEDULE_ARG} ${WARMUP_ARG} ${FOCAL_LOSS_ARG} ${KD_LOSS_ARG} ${MODEL_SCALE_ARG} ${CACHE_ARGS} ${DATA_ARGS} ${KD_ARGS} \
-                ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS} ${TEACHER_CHECKPOINT_ARG} # Added teacher checkpoint arg
+                ${GPU_ARGS} ${BATCH_OVERRIDE} ${DROPOUT_ARG} ${LR_ARGS} ${CHECKPOINT_ARG} ${DATASET_INIT_ARGS} ${TEACHER_CHECKPOINT_ARG} # Removed reference to GPU_ARGS containing gpu_memory_fraction
 
               echo "=== Student model training complete ==="
           resources:

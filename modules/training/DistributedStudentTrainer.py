@@ -328,28 +328,45 @@ class DistributedStudentTrainer(StudentTrainer):
             if self.idx_to_chord:
                 info("Per-quality accuracy:")
                 try:
-                    idx_to_quality = {
-                        idx: name.split(':')[-1] for idx, name in self.idx_to_chord.items()
-                        if isinstance(name, str) and ':' in name # Basic check for valid chord name format
-                    }
+                    # --- MODIFICATION START: Update quality extraction logic ---
+                    idx_to_quality = {}
+                    for idx, name in self.idx_to_chord.items():
+                        if isinstance(name, str):
+                            if name == "N" or name == "X":
+                                continue # Skip special chords N and X for quality mapping
+                            elif ':' in name:
+                                quality = name.split(':')[-1]
+                                idx_to_quality[idx] = quality
+                            else:
+                                # Assume it's a major chord if no colon and not N/X
+                                idx_to_quality[idx] = "maj"
+                    # --- MODIFICATION END ---
+
                     # Filter out invalid indices from predictions and targets before mapping
-                    valid_preds = [p for p in all_preds if p in idx_to_quality]
-                    valid_targets = [t for t in all_targets if t in idx_to_quality]
+                    # This filtering might not be strictly necessary anymore with the improved mapping,
+                    # but keeping it adds robustness against potential future mapping issues.
+                    valid_preds = [p for p in all_preds if p in idx_to_quality or p == n_chord_idx or p == x_chord_idx]
+                    valid_targets = [t for t in all_targets if t in idx_to_quality or t == n_chord_idx or t == x_chord_idx]
 
-                    # Map valid predictions and targets to qualities
-                    pred_quals = [idx_to_quality[p] for p in valid_preds]
-                    targ_quals = [idx_to_quality[t] for t in valid_targets]
+                    # Map valid predictions and targets to qualities - This part seems overly complex and potentially buggy.
+                    # Let's simplify the counting logic below instead.
+                    # pred_quals = [idx_to_quality[p] for p in valid_preds if p in idx_to_quality] # Map only valid quality indices
+                    # targ_quals = [idx_to_quality[t] for t in valid_targets if t in idx_to_quality] # Map only valid quality indices
 
-                    # Ensure pred_quals and targ_quals have the same length after filtering
-                    min_len = min(len(pred_quals), len(targ_quals))
-                    pred_quals = pred_quals[:min_len]
-                    targ_quals = targ_quals[:min_len]
+                    # Ensure pred_quals and targ_quals have the same length after filtering - This is problematic if filtering differs
+                    # min_len = min(len(pred_quals), len(targ_quals))
+                    # pred_quals = pred_quals[:min_len]
+                    # targ_quals = targ_quals[:min_len]
 
+                    # Get all unique quality names found in the mapping
                     all_qualities = sorted(list(set(idx_to_quality.values())))
 
                     # Create a mapping from index to quality for all targets and predictions
                     quality_counts = {}
                     correct_counts = {}
+                    # --- MODIFICATION START: Remove tracking for skipped indices ---
+                    # skipped_indices = {} # No longer needed with improved mapping
+                    # --- MODIFICATION END ---
 
                     # Find indices for special chord types "N" and "X"
                     n_chord_idx = None
@@ -367,42 +384,60 @@ class DistributedStudentTrainer(StudentTrainer):
 
                     # Count occurrences and correct predictions for each quality
                     for pred, target in zip(all_preds, all_targets):
-                        # Handle special chord types "N" and "X"
+                        target_qual = None
+                        pred_qual = None
+
+                        # Determine target quality
                         if target == n_chord_idx:
-                            quality_counts["N"] = quality_counts.get("N", 0) + 1
-                            if pred == n_chord_idx:
-                                correct_counts["N"] = correct_counts.get("N", 0) + 1
-                            continue
+                            target_qual = "N"
                         elif target == x_chord_idx:
-                            quality_counts["X"] = quality_counts.get("X", 0) + 1
-                            if pred == x_chord_idx:
-                                correct_counts["X"] = correct_counts.get("X", 0) + 1
-                            continue
+                            target_qual = "X"
+                        elif target in idx_to_quality:
+                            target_qual = idx_to_quality[target]
+                        else:
+                            # This case should ideally not happen with the improved mapping
+                            warning(f"Target index {target} not found in quality mapping or special chords. Skipping.")
+                            continue # Skip this sample if target quality cannot be determined
 
-                        # Skip if target is not in the quality mapping
-                        if target not in idx_to_quality:
-                            continue
-
-                        # Get the quality of the target
-                        target_qual = idx_to_quality[target]
-
-                        # Count this quality
+                        # Count this target quality
                         quality_counts[target_qual] = quality_counts.get(target_qual, 0) + 1
 
-                        # Check if prediction is correct (same quality)
-                        if pred in idx_to_quality and idx_to_quality[pred] == target_qual:
+                        # Determine predicted quality
+                        if pred == n_chord_idx:
+                            pred_qual = "N"
+                        elif pred == x_chord_idx:
+                            pred_qual = "X"
+                        elif pred in idx_to_quality:
+                            pred_qual = idx_to_quality[pred]
+                        # else: pred_qual remains None if prediction is not a valid quality index
+
+                        # Check if prediction quality matches target quality
+                        if pred_qual == target_qual:
                             correct_counts[target_qual] = correct_counts.get(target_qual, 0) + 1
 
-                    # Add special chord types to the list of qualities to report
+
+                    # Add special chord types to the list of qualities to report if they exist
                     all_qualities_with_special = list(all_qualities)
                     if "N" in quality_counts:
-                        all_qualities_with_special.append("N")
+                        if "N" not in all_qualities_with_special: all_qualities_with_special.append("N")
                     if "X" in quality_counts:
-                        all_qualities_with_special.append("X")
+                        if "X" not in all_qualities_with_special: all_qualities_with_special.append("X")
+                    # Ensure consistent sorting
+                    all_qualities_with_special.sort()
+
 
                     # Log the distribution of chord qualities in the validation set
                     total_samples = sum(quality_counts.values())
-                    info(f"Validation set contains {total_samples} total samples across {len(quality_counts)} qualities")
+                    # --- MODIFICATION START: Update log message ---
+                    info(f"Validation set contains {total_samples} total samples across {len(quality_counts)} counted qualities")
+                    # Remove logging for skipped counts as it's no longer relevant
+                    # total_skipped = sum(skipped_indices.values())
+                    # if total_skipped > 0:
+                    #     warning(f"Skipped {total_skipped} samples because their target indices were not found in the quality mapping.")
+                    #     # Log top 5 skipped indices for debugging
+                    #     top_skipped = sorted(skipped_indices.items(), key=lambda item: item[1], reverse=True)[:5]
+                    #     warning(f"Top 5 skipped target indices: {top_skipped}")
+                    # --- MODIFICATION END ---
 
                     # Log the top 5 most common qualities
                     top_qualities = sorted(quality_counts.items(), key=lambda x: x[1], reverse=True)[:5]

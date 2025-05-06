@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-mini-large
+  name: chord-mini-heads
   namespace: csuf-titans
   labels:
     app: chord-student-training
@@ -215,10 +215,10 @@ spec:
               value: /mnt/storage/ChordMini
             # Model scale - overrides student_config.yaml
             - name: MODEL_SCALE
-              value: "1.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
+              value: "2.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
             # Learning rate scheduling options - overrides student_config.yaml settings
             - name: LR_SCHEDULE
-              value: "cosine"  # Changed from empty string to 'validation'
+              value: "validation"  # Changed from empty string to 'validation'
             # Additional learning rate parameters - new additions
             - name: LEARNING_RATE
               value: "0.0001"  # Base learning rate
@@ -226,7 +226,7 @@ spec:
               value: "0.000001"  # Minimum learning rate for schedulers
             # Knowledge distillation settings
             - name: USE_KD_LOSS
-              value: "true"  # Set to "true" to enable KD loss
+              value: "false"  # Set to "true" to enable KD loss
             - name: KD_ALPHA
               value: "0.2"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
@@ -244,12 +244,12 @@ spec:
             - name: WARMUP_START_LR
               value: "0.0001"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.0003"  # Final learning rate after warm-up
+              value: "0.0002"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "10"  # Number of epochs for warm-up
+              value: "5"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
-              value: "0.3"  # Set dropout probability (0-1)
+              value: "0.2"  # Set dropout probability (0-1)
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
@@ -274,12 +274,12 @@ spec:
               value: "6"     # (no effect worker=0) Prefetch 6 batches for better throughput
             # Add dataset type environment variable with combined option
             - name: DATASET_TYPE
-              value: "combined"  # Options: "fma", "maestro", "dali_synth", "combined", "fma+maestro", "fma+dali_synth", or "maestro+dali_synth"
+              value: "maestro+dali_synth"  # Options: "fma", "maestro", "dali_synth", "combined", "fma+maestro", "fma+dali_synth", or "maestro+dali_synth"
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
             - name: SUB_DIR
-              value: "combined-logits"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
+              value: "student-md-heads"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
@@ -523,9 +523,6 @@ spec:
 
               # GPU acceleration options
               GPU_ARGS=""
-              if [ "${GPU_MEMORY_FRACTION}" != "" ]; then
-                GPU_ARGS="--gpu_memory_fraction ${GPU_MEMORY_FRACTION}"
-              fi
 
               if [ "${BATCH_GPU_CACHE}" = "true" ]; then
                 GPU_ARGS="${GPU_ARGS} --batch_gpu_cache"
@@ -679,11 +676,15 @@ spec:
           resources:
             requests:
               cpu: "4"
-              memory: "196Gi"
+              #memory: "196Gi"
+              #memory: "128Gi"
+              memory: "64Gi"
               nvidia.com/gpu: "2"
             limits:
               cpu: "18"
-              memory: "296Gi"
+              #memory: "296Gi"
+              #memory: "160Gi"
+              memory: "128Gi"
               nvidia.com/gpu: "2"
           volumeMounts:
             - name: storage

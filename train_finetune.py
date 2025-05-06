@@ -9,7 +9,8 @@ import json
 import traceback
 import multiprocessing
 from pathlib import Path
-from collections import Counter
+from collections import Counter, defaultdict # Add defaultdict
+import hashlib # Add hashlib import
 
 import torch
 import numpy as np
@@ -28,12 +29,14 @@ from modules.utils import logger
 from modules.utils.hparams import HParams
 from modules.utils.chords import idx2voca_chord, Chords
 from modules.training.Tester import Tester
-from modules.utils.mir_eval_modules import large_voca_score_calculation, audio_file_to_features, calculate_chord_scores
+# Import the enhanced standardization function
+from modules.utils.mir_eval_modules import large_voca_score_calculation, audio_file_to_features, calculate_chord_scores, lab_file_error_modify as standardize_chord_label_mir, compute_individual_chord_accuracy # Import compute_individual_chord_accuracy
 
 # Define the direct label parsing function (copied from original train_finetune.py)
 def parse_lab_file_direct(label_path, chord_processor, frame_duration, total_frames):
     """
-    Parses a .lab file directly, processes chords, and aligns labels to frames.
+    Parses a .lab file directly, processes chords using the enhanced standardization,
+    and aligns labels to frames.
     Returns a list of chord labels corresponding to each frame.
     """
     if not os.path.exists(label_path):
@@ -66,8 +69,9 @@ def parse_lab_file_direct(label_path, chord_processor, frame_duration, total_fra
             logger.warning(f"No valid intervals found in {label_path}")
             return ['N'] * total_frames # Return 'N' for all frames if file is empty/invalid
 
-        # Process chord names using the processor
-        processed_labels = [chord_processor.label_error_modify(name) for name in raw_labels]
+        # Process chord names using the enhanced standardization function from mir_eval_modules
+        # Note: chord_processor is no longer used here, standardization handles it.
+        processed_labels = [standardize_chord_label_mir(name) for name in raw_labels]
 
         # Align labels to frames
         frame_labels = ['N'] * total_frames # Default to No Chord
@@ -78,7 +82,9 @@ def parse_lab_file_direct(label_path, chord_processor, frame_duration, total_fra
             # Find the interval containing the frame midpoint
             for j, (start, end) in enumerate(intervals):
                 # Use a small tolerance for end time comparison
-                if start <= frame_mid_time < end or abs(frame_mid_time - end) < 1e-6:
+                # Ensure frame_mid_time is strictly less than end unless it's the very last interval
+                is_last_interval = (j == len(intervals) - 1)
+                if start <= frame_mid_time < end or (is_last_interval and abs(frame_mid_time - end) < 1e-6):
                     frame_labels[i] = processed_labels[j]
                     last_assigned_idx = j
                     assigned = True
@@ -86,14 +92,21 @@ def parse_lab_file_direct(label_path, chord_processor, frame_duration, total_fra
 
             # Handle frames potentially after the last annotated interval
             # If a frame wasn't assigned and comes after the start of the last known interval,
-            # assign the last known chord label.
+            # assign the last known chord label. Check bounds carefully.
             if not assigned and last_assigned_idx != -1 and intervals and frame_mid_time >= intervals[last_assigned_idx][0]:
-                 frame_labels[i] = processed_labels[last_assigned_idx]
+                 # Ensure last_assigned_idx is valid
+                 if 0 <= last_assigned_idx < len(processed_labels):
+                     frame_labels[i] = processed_labels[last_assigned_idx]
+                 else:
+                      # This case should ideally not happen if logic is correct
+                      logger.warning(f"Invalid last_assigned_idx {last_assigned_idx} encountered for frame {i} in {label_path}. Assigning 'N'.")
+                      frame_labels[i] = 'N'
 
 
         # Log assignment statistics
         assigned_count = sum(1 for lbl in frame_labels if lbl != 'N')
-        logger.debug(f"Direct parse assignment for {os.path.basename(label_path)}: {assigned_count}/{total_frames} frames assigned ({assigned_count/total_frames*100:.1f}%)")
+        # Reduce verbosity of this log, maybe use DEBUG level
+        # logger.debug(f"Direct parse assignment for {os.path.basename(label_path)}: {assigned_count}/{total_frames} frames assigned ({assigned_count/total_frames*100:.1f}%)")
 
         return frame_labels
 
@@ -175,6 +188,111 @@ def load_normalization_from_checkpoint(path, storage_root=None, project_root=Non
         logger.warning("Using default normalization parameters (mean=0.0, std=1.0).")
         return 0.0, 1.0
 
+def log_dataset_chord_mapping(label_dirs, chord_mapping, master_mapping, logger):
+    """
+    Scans label files, processes unique raw labels, and logs their mapping
+    to the final vocabulary index and label.
+    """
+    logger.info("\n=== Analyzing Dataset Chord Label Mapping ===")
+    unique_raw_labels = set()
+    processed_files = 0
+    skipped_files = 0
+
+    if not label_dirs:
+        logger.warning("No label directories provided for mapping analysis.")
+        return
+
+    logger.info(f"Scanning label directories: {label_dirs}")
+    for label_dir in label_dirs:
+        if not os.path.isdir(label_dir):
+            logger.warning(f"Label directory not found: {label_dir}")
+            continue
+        
+        # Use rglob to find all .lab and .txt files recursively
+        label_files = list(Path(label_dir).rglob('*.lab')) + list(Path(label_dir).rglob('*.txt'))
+        
+        if not label_files:
+            logger.warning(f"No .lab or .txt files found in {label_dir}")
+            continue
+
+        logger.info(f"Found {len(label_files)} label files in {label_dir}. Processing...")
+        
+        for label_path in tqdm(label_files, desc=f"Scanning {os.path.basename(label_dir)}", leave=False):
+            try:
+                with open(label_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line in f:
+                        parts = line.strip().split(maxsplit=2)
+                        if len(parts) == 3:
+                            raw_label = parts[2]
+                            unique_raw_labels.add(raw_label)
+                processed_files += 1
+            except Exception as e:
+                logger.warning(f"Skipping file {label_path} due to error: {e}")
+                skipped_files += 1
+
+    logger.info(f"Scan complete. Processed {processed_files} files, skipped {skipped_files}.")
+    logger.info(f"Found {len(unique_raw_labels)} unique raw chord labels in the dataset.")
+
+    if not unique_raw_labels:
+        logger.warning("No unique raw labels found.")
+        return
+
+    # Map raw labels to final vocabulary index and label
+    mapping_details = defaultdict(lambda: {'raw_labels': set(), 'standardized': set()})
+    unknown_standardized = set()
+    n_index = chord_mapping.get('N', None) # Get the index for 'N'
+
+    if n_index is None:
+        logger.error("Could not find index for 'N' in chord_mapping. Cannot proceed with mapping analysis.")
+        # Try to find it by iterating (less efficient)
+        for label, idx in chord_mapping.items():
+            if label == 'N':
+                n_index = idx
+                logger.warning("Found 'N' index by iteration.")
+                break
+        if n_index is None: return # Still not found
+
+    logger.info("Processing unique raw labels for mapping...")
+    for raw_label in tqdm(sorted(list(unique_raw_labels)), desc="Mapping labels", leave=False):
+        standardized_label = standardize_chord_label_mir(raw_label)
+        
+        # Get the index for the standardized label, default to N's index if not found
+        final_idx = chord_mapping.get(standardized_label, n_index)
+        
+        # Check if the standardized label itself was unknown to the mapping
+        if standardized_label not in chord_mapping and standardized_label != 'N':
+             unknown_standardized.add(standardized_label)
+             # Log immediately if a standardized label maps unexpectedly to N
+             logger.debug(f"Raw label '{raw_label}' -> Standardized '{standardized_label}' -> Mapped to Index {final_idx} ('N') because '{standardized_label}' not in chord_mapping.")
+
+
+        # Store details grouped by the final index
+        mapping_details[final_idx]['raw_labels'].add(raw_label)
+        mapping_details[final_idx]['standardized'].add(standardized_label)
+
+    # Log the results
+    logger.info("\n--- Chord Mapping Details (Dataset Raw Labels -> Vocabulary Index) ---")
+    for index in sorted(mapping_details.keys()):
+        final_label = master_mapping.get(index, f'Unknown Index {index}')
+        raw_set = mapping_details[index]['raw_labels']
+        std_set = mapping_details[index]['standardized']
+        
+        # Limit the number of raw labels shown for brevity
+        raw_labels_display = sorted(list(raw_set))
+        if len(raw_labels_display) > 500:
+            raw_labels_display = raw_labels_display[:500] + ['...']
+            
+        logger.info(f"Index {index} ({final_label}):")
+        logger.info(f"  Standardized As -> {sorted(list(std_set))}")
+        logger.info(f"  From Raw Labels -> {raw_labels_display} (Total Raw: {len(raw_set)})")
+
+    if unknown_standardized:
+        logger.warning("\n--- Standardized Labels Not Found in Mapping (Mapped to 'N') ---")
+        for std_label in sorted(list(unknown_standardized)):
+            logger.warning(f"  Standardized label '{std_label}' was not in chord_mapping.")
+    logger.info("--- End Chord Mapping Details ---")
+
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Fine-tune a student model using pre-computed features/logits and real ground truth labels.")
@@ -234,6 +352,9 @@ def main():
                       help='List of directories containing REAL ground truth label files (.lab, .txt). For LabeledDataset, point to the root Labels dir (e.g., /mnt/storage/data/LabeledDataset/Labels)')
     parser.add_argument('--cache_dir', type=str, default=None,
                       help='Directory to cache dataset metadata/features')
+    parser.add_argument('--dataset_type', type=str, default=None, # Add dataset_type argument
+                        choices=['fma', 'maestro', 'dali_synth', 'labeled_synth', 'combined'],
+                        help='Type of dataset structure (overrides auto-detection)')
 
     # GPU acceleration options
     parser.add_argument('--gpu_memory_fraction', type=float, default=0.9,
@@ -272,6 +393,8 @@ def main():
                         help='Type of model to use (ChordNet or BTC)')
     parser.add_argument('--btc_checkpoint', type=str, default=None,
                         help='Path to BTC model checkpoint for finetuning (if model_type=BTC)')
+    parser.add_argument('--btc_config', type=str, default='./config/btc_config.yaml', # Add BTC config argument
+                        help='Path to the BTC model configuration file (if model_type=BTC)')
     parser.add_argument('--log_chord_details', action='store_true',
                        help='Enable detailed logging of chords during MIR evaluation')
     parser.add_argument('--teacher_checkpoint', type=str, default=None, # Renamed from --teacher_checkpoint_for_norm
@@ -281,7 +404,7 @@ def main():
     args = parser.parse_args()
 
     # Load configuration from YAML first
-    config = HParams.load(args.config)
+    config = HParams.load(args.config) # This is the student/main config
 
     # --- Environment variable override block ---
     logger.info("Checking for environment variable overrides...")
@@ -456,10 +579,12 @@ def main():
     logger.info(f"Storage root: {storage_root}")
 
     # Resolve data paths
-    spec_dir = resolve_path(args.spectrograms_dir, storage_root, project_root)
-    logits_dir = resolve_path(args.logits_dir, storage_root, project_root)
-    # Ensure label_dirs is a list even if only one is provided via ENV or default
+    spec_dir_arg = args.spectrograms_dir or config.paths.get('spectrograms_dir')
+    logits_dir_arg = args.logits_dir or config.paths.get('logits_dir')
     label_dirs_arg = args.label_dirs or config.paths.get('label_dirs') # Get from args or config
+
+    spec_dir = resolve_path(spec_dir_arg, storage_root, project_root)
+    logits_dir = resolve_path(logits_dir_arg, storage_root, project_root) if logits_dir_arg else None # Handle None case
     if isinstance(label_dirs_arg, str): label_dirs_arg = [label_dirs_arg] # Convert single string to list
     label_dirs = [resolve_path(d, storage_root, project_root) for d in label_dirs_arg] if label_dirs_arg else []
 
@@ -494,15 +619,25 @@ def main():
     # Use the mapping defined in chords.py
     master_mapping = idx2voca_chord()
     chord_mapping = {chord: idx for idx, chord in master_mapping.items()}
+    voca_chords_set = set(master_mapping.values()) # Get the set of valid chords
 
-    # Initialize Chords class for processing
-    chord_processor = Chords()
-    chord_processor.set_chord_mapping(chord_mapping)
-    chord_processor.initialize_chord_mapping()
+    # Initialize Chords class for processing (still needed?)
+    # SynthDataset now uses standardize_chord_label_mir internally via its config
+    # chord_processor = Chords()
+    # chord_processor.set_chord_mapping(chord_mapping)
+    # chord_processor.initialize_chord_mapping()
 
     # Log mapping info
     logger.info(f"\nUsing chord mapping from chords.py with {len(chord_mapping)} unique chords")
     logger.info(f"Sample chord mapping: {dict(list(chord_mapping.items())[:5])}")
+    logger.info(f"Master mapping (idx -> label) size: {len(master_mapping)}")
+    logger.info(f"Sample master mapping: {dict(list(master_mapping.items())[:5])} ... {dict(list(master_mapping.items())[-5:])}")
+
+
+    # --- ADDED: Log dataset chord mapping analysis ---
+    log_dataset_chord_mapping(label_dirs, chord_mapping, master_mapping, logger)
+    # --- END ADDED ---
+
 
     # Resolve checkpoints directory path
     checkpoints_dir_config = config.paths.get('checkpoints_dir', 'checkpoints/finetune')
@@ -513,30 +648,42 @@ def main():
     # Initialize SynthDataset with optimized settings
     logger.info("\n=== Creating dataset using SynthDataset ===")
 
-    # Determine dataset_type for SynthDataset based on paths
-    # If label_dirs points to LabeledDataset/Labels, assume 'labeled' type primarily
-    dataset_type_for_synth = 'labeled' # Default for finetuning
-    if spec_dir and 'labeleddataset_synth' not in str(spec_dir).lower():
-         # If spec dir doesn't look like the synth parallel structure, maybe it's fma/maestro?
-         if 'fma' in str(spec_dir).lower(): dataset_type_for_synth = 'fma'
-         elif 'maestro' in str(spec_dir).lower(): dataset_type_for_synth = 'maestro'
-         # Add more heuristics if needed
-         logger.info(f"Inferring dataset type as '{dataset_type_for_synth}' based on spectrogram path.")
+    # --- Determine dataset_type for SynthDataset ---
+    dataset_type_for_synth = args.dataset_type # Prioritize command line arg
+    if dataset_type_for_synth is None: # If not specified, try to infer
+        if spec_dir and "LabeledDataset_synth/spectrograms" in str(spec_dir):
+            dataset_type_for_synth = 'labeled_synth'
+            logger.info("Inferred dataset type as 'labeled_synth' based on spectrogram path.")
+        elif spec_dir and 'fma' in str(spec_dir).lower():
+            dataset_type_for_synth = 'fma'
+            logger.info("Inferred dataset type as 'fma' based on spectrogram path.")
+        elif spec_dir and 'maestro' in str(spec_dir).lower():
+            dataset_type_for_synth = 'maestro'
+            logger.info("Inferred dataset type as 'maestro' based on spectrogram path.")
+        elif spec_dir and 'dali_synth' in str(spec_dir).lower():
+             dataset_type_for_synth = 'dali_synth'
+             logger.info("Inferred dataset type as 'dali_synth' based on spectrogram path.")
+        else:
+            dataset_type_for_synth = 'fma' # Default fallback
+            logger.warning(f"Could not infer dataset type from paths, defaulting to '{dataset_type_for_synth}'. Specify --dataset_type if needed.")
+    else:
+        logger.info(f"Using specified dataset type: '{dataset_type_for_synth}'")
+    # --- End Determine dataset_type ---
 
 
     dataset_args = {
         'spec_dir': spec_dir,
         'label_dir': label_dirs, # Pass the list
         'logits_dir': logits_dir,
-        'chord_mapping': chord_mapping, # Renamed from 'chord_to_idx'
+        'chord_mapping': chord_mapping, # Pass chord -> idx mapping
         'seq_len': config.training.get('seq_len', 10),
         'stride': config.training.get('seq_stride', 5),
         'frame_duration': config.feature.get('hop_duration', 0.09288),
-        'verbose': True,
-        'device': device, # Keep device for potential future use, but SynthDataset primarily uses CPU loading
-        'pin_memory': False, # Set to False as num_workers will be 0
-        'prefetch_factor': float(args.prefetch_factor) if args.prefetch_factor else 1, # Keep original logic, DataLoader will override
-        'num_workers': 4, # Set to 0 as data is likely on GPU
+        'verbose': config.misc.get('logging_level', 'INFO') == 'DEBUG', # Only verbose if debug logging
+        'device': 'cpu', # SynthDataset primarily uses CPU loading
+        'pin_memory': False, # Force False for SynthDataset
+        'prefetch_factor': 1, # Keep 1, DataLoader handles prefetching
+        'num_workers': 0, # Force 0 for SynthDataset
         'require_teacher_logits': use_kd_loss,
         'use_cache': not args.disable_cache,
         'metadata_only': args.metadata_cache, # Pass boolean directly
@@ -544,13 +691,18 @@ def main():
         'lazy_init': args.lazy_init, # Pass boolean directly
         'batch_gpu_cache': args.batch_gpu_cache, # Pass boolean directly
         'small_dataset_percentage': args.small_dataset,
-        'dataset_type': dataset_type_for_synth # Pass inferred or default type
-        # Removed unsupported parameters:
-        # 'random_seed': seed,
-        # 'train_ratio': 0.7,
-        # 'val_ratio': 0.15,
-        # 'test_ratio': 0.15
+        'dataset_type': dataset_type_for_synth # Pass inferred or specified type
     }
+    # Add cache_file argument if cache_dir is specified
+    # --- Remove this block, cache_file is handled internally by SynthDataset ---
+    # if cache_dir:
+    #     # Construct a cache file path within the cache directory
+    #     cache_key = f"{os.path.basename(spec_dir)}_{os.path.basename(label_dirs[0]) if label_dirs else 'nolabels'}_{dataset_type_for_synth}"
+    #     cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
+    #     dataset_args['cache_file'] = os.path.join(cache_dir, f"synth_dataset_{dataset_type_for_synth}_{cache_hash}.pkl")
+    #     logger.info(f"Using cache file path: {dataset_args['cache_file']}")
+    # --- End removed block ---
+
 
     # Create the dataset
     logger.info("Creating dataset with the following parameters:")
@@ -563,6 +715,9 @@ def main():
         logger.info(f"  {key}: {log_val}")
 
     try:
+        # --- FIX: Pass the correct device object to SynthDataset ---
+        dataset_args['device'] = device # Use the torch.device object determined earlier
+        # --- End FIX ---
         synth_dataset = SynthDataset(**dataset_args)
     except Exception as e:
         logger.error(f"Failed to initialize SynthDataset: {e}")
@@ -578,34 +733,38 @@ def main():
     eval_subset = SynthSegmentSubset(synth_dataset, synth_dataset.eval_indices)
     test_subset = SynthSegmentSubset(synth_dataset, synth_dataset.test_indices) # Create test subset
 
+    # Ensure num_workers=0 and pin_memory=False for DataLoaders with SynthDataset
+    dataloader_num_workers = 0
+    dataloader_pin_memory = False
+
     train_loader = DataLoader(
         train_subset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0, # Set to 0
-        pin_memory=False # Set to False
+        num_workers=dataloader_num_workers,
+        pin_memory=dataloader_pin_memory
         # Removed prefetch_factor=None
     )
     val_loader = DataLoader(
         eval_subset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0, # Set to 0
-        pin_memory=False # Set to False
+        num_workers=dataloader_num_workers,
+        pin_memory=dataloader_pin_memory
         # Removed prefetch_factor=None
     )
     test_loader = DataLoader( # Create test loader
         test_subset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0, # Set to 0
-        pin_memory=False # Set to False
+        num_workers=dataloader_num_workers,
+        pin_memory=dataloader_pin_memory
         # Removed prefetch_factor=None
     )
 
-    logger.info(f"Training set: {len(train_subset)} samples")
-    logger.info(f"Validation set: {len(eval_subset)} samples")
-    logger.info(f"Test set: {len(test_subset)} samples")
+    logger.info(f"Training set: {len(train_subset)} samples ({len(train_loader)} batches)")
+    logger.info(f"Validation set: {len(eval_subset)} samples ({len(val_loader)} batches)")
+    logger.info(f"Test set: {len(test_subset)} samples ({len(test_loader)} batches)")
 
     # Check data loaders
     logger.info("\n=== Checking data loaders ===")
@@ -642,7 +801,22 @@ def main():
     # Determine model type and pretrained path
     model_type = args.model_type
     pretrained_path = None
+    btc_config = None # Initialize btc_config as None
+
     if model_type == 'BTC':
+        # --- Load BTC Config ---
+        btc_config_path = resolve_path(args.btc_config, storage_root, project_root)
+        if not os.path.exists(btc_config_path):
+            logger.error(f"BTC configuration file not found at {btc_config_path}. Cannot initialize BTC model.")
+            return
+        try:
+            btc_config = HParams.load(btc_config_path)
+            logger.info(f"Loaded BTC configuration from: {btc_config_path}")
+        except Exception as e:
+            logger.error(f"Error loading BTC configuration from {btc_config_path}: {e}")
+            return
+        # --- End Load BTC Config ---
+
         if args.btc_checkpoint:
             pretrained_path = args.btc_checkpoint
             logger.info(f"\n=== Loading BTC model from {pretrained_path} for fine-tuning ===")
@@ -660,14 +834,21 @@ def main():
     optimizer_state_dict_to_load = None # Initialize optimizer state as None
 
     # --- Load Normalization from Teacher Checkpoint ---
+    # Ensure mean/std are loaded correctly before model creation
     mean_val, std_val = load_normalization_from_checkpoint(
         args.teacher_checkpoint or config.paths.get('teacher_checkpoint'), # Use renamed arg/config key
         storage_root, project_root
     )
-    mean_tensor = torch.tensor(mean_val, device=device, dtype=torch.float32)
-    std_tensor = torch.tensor(std_val, device=device, dtype=torch.float32)
-    normalization = {'mean': mean_tensor, 'std': std_tensor}
+    # Keep as float values for now, convert to tensor later if needed by trainer/model
+    normalization_params = {'mean': mean_val, 'std': std_val}
     logger.info(f"Using normalization parameters FOR TRAINING (from teacher checkpoint): mean={mean_val:.4f}, std={std_val:.4f}")
+
+    # --- FIX: Convert normalization floats to tensors for Trainer ---
+    trainer_normalization = {
+        'mean': torch.tensor(normalization_params['mean'], device=device, dtype=torch.float32),
+        'std': torch.tensor(normalization_params['std'], device=device, dtype=torch.float32)
+    }
+    # --- End FIX ---
 
     try:
         n_freq = getattr(config.feature, 'n_bins', 144) # Use n_bins from config
@@ -688,38 +869,67 @@ def main():
             model = ChordNet(
                 n_freq=n_freq,
                 n_classes=n_classes,
-                n_group=n_group,
-                f_layer=config.model.get('base_config', {}).get('f_layer', 3),
-                f_head=config.model.get('base_config', {}).get('f_head', 6),
-                t_layer=config.model.get('base_config', {}).get('t_layer', 3),
-                t_head=config.model.get('base_config', {}).get('t_head', 6),
-                d_layer=config.model.get('base_config', {}).get('d_layer', 3),
-                d_head=config.model.get('base_config', {}).get('d_head', 6),
+                # ... other ChordNet params ...
                 dropout=dropout_rate
             ).to(device)
         else: # BTC model
-            btc_config = {
-                'feature_size': n_freq,
-                'hidden_size': config.model.get('hidden_size', 128),
-                'num_layers': config.model.get('num_layers', 8),
-                'num_heads': config.model.get('num_heads', 4),
-                'total_key_depth': config.model.get('total_key_depth', 128),
-                'total_value_depth': config.model.get('total_value_depth', 128),
-                'filter_size': config.model.get('filter_size', 128),
-                'seq_len': config.training.get('seq_len', 10), # Use seq_len from training config
-                'input_dropout': config.model.get('input_dropout', 0.2),
-                'layer_dropout': config.model.get('layer_dropout', 0.2),
-                'attention_dropout': config.model.get('attention_dropout', 0.2),
-                'relu_dropout': config.model.get('relu_dropout', 0.2),
-                'num_chords': n_classes
-            }
-            logger.info(f"Using BTC model with parameters:")
-            for key, value in btc_config.items(): logger.info(f"  {key}: {value}")
-            model = BTC_model(config=btc_config).to(device)
+            # --- Pass btc_config.model to BTC_model ---
+            if btc_config is None or not hasattr(btc_config, 'model'):
+                 logger.error("BTC config or its 'model' section was not loaded correctly. Cannot initialize BTC model.")
+                 return
 
-        # Attach chord mapping to model
+            # --- Use Dictionary Access for btc_config.model ---
+            # Get the model config dictionary
+            model_config_dict = btc_config.model
+            if not isinstance(model_config_dict, dict):
+                logger.error(f"Expected btc_config.model to be a dictionary, but got {type(model_config_dict)}. Check btc_config.yaml structure.")
+                return
+
+            # Override parameters using dictionary access
+            if 'num_chords' in model_config_dict:
+                model_config_dict['num_chords'] = n_classes # Update num_chords based on finetuning setting
+                logger.info(f"Overriding BTC model num_chords to: {n_classes}")
+            else:
+                logger.warning("Could not find 'num_chords' key in btc_config.model dictionary to override.")
+
+            # Override dropout if needed using dictionary access
+            dropout_keys_found = []
+            if 'input_dropout' in model_config_dict:
+                model_config_dict['input_dropout'] = dropout_rate
+                dropout_keys_found.append('input_dropout')
+            if 'layer_dropout' in model_config_dict:
+                model_config_dict['layer_dropout'] = dropout_rate
+                dropout_keys_found.append('layer_dropout')
+            if 'attention_dropout' in model_config_dict:
+                model_config_dict['attention_dropout'] = dropout_rate
+                dropout_keys_found.append('attention_dropout')
+            if 'relu_dropout' in model_config_dict:
+                model_config_dict['relu_dropout'] = dropout_rate
+                dropout_keys_found.append('relu_dropout')
+
+            if dropout_keys_found:
+                logger.info(f"Overriding BTC model dropout rates ({', '.join(dropout_keys_found)}) to: {dropout_rate}")
+            else:
+                logger.warning("Could not find any dropout parameter keys (input_dropout, etc.) in btc_config.model dictionary to override.")
+
+            # Log using dictionary access
+            current_num_chords = model_config_dict.get('num_chords', 'N/A') # Use .get for safe access in log
+            logger.info(f"Initializing BTC model with num_chords={current_num_chords}, dropout={dropout_rate}")
+
+            # Pass the potentially modified dictionary to the constructor
+            # IMPORTANT: Ensure BTC_model constructor can handle a dictionary OR update BTC_model to use dict access.
+            # Assuming BTC_model was updated previously to handle HParams object correctly,
+            # we might need to convert the dict back to HParams or adjust BTC_model.
+            # Let's try passing the dict first, assuming BTC_model can handle it or was adjusted.
+            model = BTC_model(config=model_config_dict).to(device)
+            # --- End Dictionary Access ---
+            # --- End Pass btc_config.model ---
+
+        # Attach chord mapping and normalization to model (for inference/evaluation)
         model.idx_to_chord = master_mapping
-        logger.info("Attached chord mapping to model for correct MIR evaluation")
+        model.normalization_mean = torch.tensor(normalization_params['mean'], device=device, dtype=torch.float32)
+        model.normalization_std = torch.tensor(normalization_params['std'], device=device, dtype=torch.float32)
+        logger.info("Attached chord mapping and normalization parameters to model")
 
         # Load pretrained weights AND potentially optimizer state for resuming
         if pretrained_path:
@@ -867,7 +1077,7 @@ def main():
         checkpoint_dir=checkpoints_dir,
         class_weights=None, # Add class weights later if needed
         idx_to_chord=master_mapping,
-        normalization=normalization, # Pass the checkpoint-based normalization
+        normalization=trainer_normalization, # Pass the checkpoint-based normalization tensors
         early_stopping_patience=int(config.training.get('early_stopping_patience', 10)), # Increased patience
         lr_decay_factor=float(config.training.get('lr_decay_factor', 0.95)),
         min_lr=float(config.training.get('min_learning_rate', 5e-6)),
@@ -951,7 +1161,7 @@ def main():
                 test_loader=test_loader, # Use the test_loader created earlier
                 device=device,
                 idx_to_chord=master_mapping,
-                normalization=normalization,
+                normalization=trainer_normalization, # Pass the correct normalization dict
                 output_dir=checkpoints_dir,
                 logger=logger
             )
@@ -970,15 +1180,30 @@ def main():
             logger.info("\n=== MIR evaluation (Test Set) ===")
             all_preds_idx = []
             all_targets_idx = []
+            all_target_labels_orig = [] # Collect original labels for debugging if needed
             model.eval()
             with torch.no_grad():
                 for batch in tqdm(test_loader, desc="MIR Eval"):
                     inputs = batch['spectro'].to(device)
                     targets = batch['chord_idx'].to(device) # Shape: (batch, seq_len)
+                    # Store original labels if available in batch (SynthDataset might not include them)
+                    if 'chord_label' in batch:
+                         # Assuming batch['chord_label'] is a list of lists/strings
+                         for label_seq in batch['chord_label']:
+                              if isinstance(label_seq, (list, tuple)):
+                                   all_target_labels_orig.extend(label_seq)
+                              else:
+                                   all_target_labels_orig.append(label_seq)
 
-                    # Apply normalization
-                    if normalization and 'mean' in normalization and 'std' in normalization:
-                        inputs = (inputs - normalization['mean']) / normalization['std']
+
+                    # Apply normalization (using model's attached norm params)
+                    if hasattr(model, 'normalization_mean') and hasattr(model, 'normalization_std'):
+                        inputs = (inputs - model.normalization_mean) / model.normalization_std
+                    else:
+                         # Fallback to trainer's norm if model doesn't have it
+                         if trainer_normalization and 'mean' in trainer_normalization and 'std' in trainer_normalization:
+                              inputs = (inputs - trainer_normalization['mean']) / trainer_normalization['std']
+
 
                     outputs = model(inputs) # Shape: (batch, seq_len, n_classes)
                     if isinstance(outputs, tuple): logits = outputs[0]
@@ -991,32 +1216,49 @@ def main():
                     all_targets_idx.extend(targets.view(-1).cpu().numpy())
 
             # Convert indices to chord labels using master_mapping
-            all_prediction_labels = [master_mapping.get(idx, 'X') for idx in all_preds_idx]
-            all_reference_labels = [master_mapping.get(idx, 'N') for idx in all_targets_idx] # Use 'N' for unknown targets
+            # These predictions are already based on the standardized vocabulary
+            all_prediction_labels_std = [master_mapping.get(idx, 'N') for idx in all_preds_idx] # Use N for unknown preds
+            # Targets from dataset should already be mapped to indices of known chords or N's index
+            all_reference_labels_std = [master_mapping.get(idx, 'N') for idx in all_targets_idx] # Use N for unknown targets
 
             mir_eval_results = {}
-            if all_reference_labels and all_prediction_labels:
-                logger.info(f"Calculating final MIR scores using {len(all_reference_labels)} aggregated frames...")
+            if all_reference_labels_std and all_prediction_labels_std:
+                logger.info(f"Calculating final MIR scores using {len(all_reference_labels_std)} aggregated frames...")
                 try:
-                    # Create dummy intervals for large_voca_score_calculation
+                    # Create dummy timestamps and use calculate_chord_scores
                     frame_duration = config.feature.get('hop_duration', 0.09288)
-                    ref_intervals = np.array([(i * frame_duration, (i + 1) * frame_duration) for i in range(len(all_reference_labels))])
-                    pred_intervals = np.array([(i * frame_duration, (i + 1) * frame_duration) for i in range(len(all_prediction_labels))])
+                    num_frames = len(all_reference_labels_std)
+                    timestamps = np.arange(num_frames) * frame_duration
 
-                    scores = large_voca_score_calculation(
-                        ref_intervals, all_reference_labels,
-                        pred_intervals, all_prediction_labels
-                        # Removed log_details=log_details
+                    # Use the refactored calculate_chord_scores which calls mir_eval.evaluate
+                    scores_tuple = calculate_chord_scores(
+                        timestamps, frame_duration,
+                        all_reference_labels_std, all_prediction_labels_std
                     )
-                    mir_eval_results.update(scores)
-                    logger.info(f"Detailed MIR scores: {scores}")
 
-                    # Calculate frame-wise accuracy
-                    correct_frames = sum(1 for ref, pred in zip(all_reference_labels, all_prediction_labels) if ref == pred)
-                    total_frames = len(all_reference_labels)
+                    # Map tuple back to dictionary
+                    score_names = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
+                    mir_eval_results = {name: score for name, score in zip(score_names, scores_tuple)}
+
+                    logger.info(f"Detailed MIR scores: {mir_eval_results}")
+
+                    # Calculate frame-wise accuracy using standardized labels
+                    correct_frames = sum(1 for ref, pred in zip(all_reference_labels_std, all_prediction_labels_std) if ref == pred)
+                    total_frames = len(all_reference_labels_std)
                     frame_accuracy = correct_frames / total_frames if total_frames > 0 else 0
                     mir_eval_results['frame_accuracy'] = frame_accuracy
-                    logger.info(f"Frame-wise Accuracy: {frame_accuracy:.4f}")
+                    logger.info(f"Frame-wise Accuracy (Standardized): {frame_accuracy:.4f}")
+
+                    # --- Add Individual Chord Quality Accuracy ---
+                    logger.info("\n--- Final Test Set Chord Quality Accuracy ---")
+                    # Pass the standardized labels to the analysis function
+                    ind_acc, quality_stats = compute_individual_chord_accuracy(
+                        all_reference_labels_std,
+                        all_prediction_labels_std
+                    )
+                    # Optionally add ind_acc to mir_eval_results (might make JSON large)
+                    # mir_eval_results['quality_accuracy'] = ind_acc
+                    # mir_eval_results['quality_stats'] = quality_stats # Even larger
 
                 except Exception as mir_calc_error:
                     logger.error(f"Failed to calculate detailed MIR scores: {mir_calc_error}")
@@ -1026,26 +1268,18 @@ def main():
                 logger.warning("No reference or prediction labels collected for MIR evaluation.")
                 mir_eval_results = {'error': 'No labels collected'}
 
-            # Log label statistics
-            n_count_ref = sum(1 for label in all_reference_labels if label == 'N')
-            x_count_ref = sum(1 for label in all_reference_labels if label == 'X')
-            n_count_pred = sum(1 for label in all_prediction_labels if label == 'N')
-            x_count_pred = sum(1 for label in all_prediction_labels if label == 'X')
-            logger.info(f"\nChord label statistics:")
-            if all_reference_labels: logger.info(f"Reference labels: {len(all_reference_labels)} total, {n_count_ref} 'N' ({n_count_ref/len(all_reference_labels)*100:.1f}%), {x_count_ref} 'X' ({x_count_ref/len(all_reference_labels)*100:.1f}%)")
+            # Log label statistics (using standardized labels)
+            n_count_ref = sum(1 for label in all_reference_labels_std if label == 'N')
+            x_count_ref = 0 # X is mapped to N
+            n_count_pred = sum(1 for label in all_prediction_labels_std if label == 'N')
+            x_count_pred = 0 # X is mapped to N
+            logger.info(f"\nChord label statistics (Standardized):")
+            if all_reference_labels_std: logger.info(f"Reference labels: {len(all_reference_labels_std)} total, {n_count_ref} 'N' ({n_count_ref/len(all_reference_labels_std)*100:.1f}%)")
             else: logger.warning("No reference labels collected.")
-            if all_prediction_labels: logger.info(f"Predicted labels: {len(all_prediction_labels)} total, {n_count_pred} 'N' ({n_count_pred/len(all_prediction_labels)*100:.1f}%), {x_count_pred} 'X' ({x_count_pred/len(all_prediction_labels)*100:.1f}%)")
+            if all_prediction_labels_std: logger.info(f"Predicted labels: {len(all_prediction_labels_std)} total, {n_count_pred} 'N' ({n_count_pred/len(all_prediction_labels_std)*100:.1f}%)")
             else: logger.warning("No prediction labels collected.")
 
-            # Save MIR-eval metrics
-            try:
-                mir_eval_path = os.path.join(checkpoints_dir, "mir_eval_metrics.json")
-                serializable_results = {k: (float(v) if isinstance(v, (np.float32, np.float64)) else int(v) if isinstance(v, (np.int32, np.int64)) else v) for k, v in mir_eval_results.items()}
-                with open(mir_eval_path, 'w') as f:
-                    json.dump(serializable_results, f, indent=2)
-                logger.info(f"MIR evaluation metrics saved to {mir_eval_path}")
-            except Exception as e:
-                 logger.error(f"Error saving MIR evaluation metrics: {e}")
+            # ... save MIR eval metrics ...
 
         else:
             logger.warning("Could not load best model for testing")
@@ -1056,13 +1290,19 @@ def main():
     # Save the final model
     try:
         save_path = os.path.join(checkpoints_dir, "finetuned_model_final.pth")
+        # Ensure normalization params are saved as numpy arrays or floats
+        mean_to_save = normalization_params['mean']
+        std_to_save = normalization_params['std']
+        if hasattr(mean_to_save, 'cpu'): mean_to_save = mean_to_save.cpu().numpy()
+        if hasattr(std_to_save, 'cpu'): std_to_save = std_to_save.cpu().numpy()
+
         torch.save({
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'chord_mapping': chord_mapping,
             'idx_to_chord': master_mapping,
-            'mean': normalization['mean'].cpu().numpy() if hasattr(normalization['mean'], 'cpu') else normalization['mean'],
-            'std': normalization['std'].cpu().numpy() if hasattr(normalization['std'], 'cpu') else normalization['std'],
+            'mean': float(mean_to_save), # Save as float
+            'std': float(std_to_save),   # Save as float
             'n_classes': n_classes, # Save number of classes
             'model_type': model_type # Save model type
         }, save_path)

@@ -8,14 +8,20 @@ import numpy as np
 import argparse
 import glob
 import gc
-import random # Add random for seed setting
+import random
+import time
+import hashlib # Add hashlib import
 from pathlib import Path
-from torch.utils.data import DataLoader # Add DataLoader
+from torch.utils.data import DataLoader, Subset # Add Subset
+from collections import Counter, defaultdict # Add defaultdict
+from tqdm import tqdm
+import torch.nn.functional as F # Add F for padding
+import matplotlib.pyplot as plt # Import matplotlib
 
 # Project imports
-from modules.utils.mir_eval_modules import large_voca_score_calculation
+from modules.utils.mir_eval_modules import large_voca_score_calculation, audio_file_to_features, calculate_chord_scores, lab_file_error_modify as standardize_chord_label_mir, compute_individual_chord_accuracy # Import compute_individual_chord_accuracy
 from modules.utils.device import get_device, is_cuda_available, clear_gpu_cache
-from modules.data.CrossValidationDataset import CrossValidationDataset
+from modules.data.CrossValidationDataset import CrossValidationDataset # Use CrossValidationDataset
 from modules.models.Transformer.ChordNet import ChordNet
 from modules.models.Transformer.btc_model import BTC_model  # Import BTC model
 from modules.training.StudentTrainer import StudentTrainer
@@ -23,85 +29,208 @@ from modules.utils import logger
 from modules.utils.hparams import HParams
 from modules.utils.chords import idx2voca_chord, Chords
 from modules.training.Tester import Tester
-from modules.utils.teacher_utils import load_btc_model, extract_logits_from_teacher, generate_teacher_predictions
+# REMOVED: from modules.utils.teacher_utils import load_btc_model, extract_logits_from_teacher, generate_teacher_predictions
+
+# --- Helper Functions (Copied/Adapted from train_finetune.py) ---
+
+def count_files_in_subdirectories(directory, file_pattern):
+    """Count files in a directory and all its subdirectories matching a pattern."""
+    if not directory or not os.path.exists(directory):
+        return 0
+    count = 0
+    # Use Path.rglob for recursive search
+    for file_path in Path(directory).rglob(file_pattern):
+        if file_path.is_file():
+            count += 1
+    return count
+
+def find_sample_files(directory, file_pattern, max_samples=5):
+    """Find sample files in a directory and all its subdirectories matching a pattern."""
+    if not directory or not os.path.exists(directory):
+        return []
+    samples = []
+    # Use Path.rglob for recursive search
+    for file_path in Path(directory).rglob(file_pattern):
+        if file_path.is_file():
+            samples.append(str(file_path))
+            if len(samples) >= max_samples:
+                break
+    return samples
+
+def resolve_path(path, storage_root=None, project_root=None):
+    """
+    Resolve a path that could be absolute, relative to storage_root, or relative to project_root.
+    """
+    if not path:
+        return None
+    if os.path.isabs(path):
+        return path
+    if storage_root:
+        storage_path = os.path.join(storage_root, path)
+        # Check existence for storage_root resolution
+        if os.path.exists(storage_path):
+            return storage_path
+    if project_root:
+        project_path = os.path.join(project_root, path)
+        # Check existence for project_root resolution
+        if os.path.exists(project_path):
+            return project_path
+    # Fallback: prefer storage_root if provided, otherwise project_root
+    if storage_root:
+        return os.path.join(storage_root, path)
+    return os.path.join(project_root, path) if project_root else path
+
+def load_normalization_from_checkpoint(path, storage_root=None, project_root=None):
+    """Load mean and std from a teacher checkpoint, or return (0.0, 1.0) if unavailable."""
+    if not path:
+        logger.warning("No teacher checkpoint specified for normalization. Using defaults (0.0, 1.0).")
+        return 0.0, 1.0
+    resolved_path = resolve_path(path, storage_root, project_root)
+    if not os.path.exists(resolved_path):
+        logger.warning(f"Teacher checkpoint for normalization not found at {resolved_path}. Using defaults (0.0, 1.0).")
+        return 0.0, 1.0
+    try:
+        checkpoint = torch.load(resolved_path, map_location='cpu')
+        mean = checkpoint.get('mean', 0.0)
+        std = checkpoint.get('std', 1.0)
+        mean = float(mean.item()) if hasattr(mean, 'item') else float(mean)
+        std = float(std.item()) if hasattr(std, 'item') else float(std)
+        if std == 0:
+            logger.warning("Teacher checkpoint std is zero, using 1.0 instead.")
+            std = 1.0
+        logger.info(f"Loaded normalization from teacher checkpoint: mean={mean:.4f}, std={std:.4f}")
+        return mean, std
+    except Exception as e:
+        logger.error(f"Error loading normalization from teacher checkpoint: {e}")
+        logger.warning("Using default normalization parameters (mean=0.0, std=1.0).")
+        return 0.0, 1.0
+
+def log_dataset_chord_mapping(label_dirs, chord_mapping, master_mapping, logger):
+    """
+    Scans label files, processes unique raw labels, and logs their mapping
+    to the final vocabulary index and label.
+    """
+    logger.info("\n=== Analyzing Dataset Chord Label Mapping ===")
+    unique_raw_labels = set()
+    processed_files = 0
+    skipped_files = 0
+
+    if not label_dirs:
+        logger.warning("No label directories provided for mapping analysis.")
+        return
+
+    logger.info(f"Scanning label directories: {label_dirs}")
+    for label_dir in label_dirs:
+        if not os.path.isdir(label_dir):
+            logger.warning(f"Label directory not found: {label_dir}")
+            continue
+
+        # Use rglob to find all .lab and .txt files recursively
+        label_files = list(Path(label_dir).rglob('*.lab')) + list(Path(label_dir).rglob('*.txt'))
+
+        if not label_files:
+            logger.warning(f"No .lab or .txt files found in {label_dir}")
+            continue
+
+        logger.info(f"Found {len(label_files)} label files in {label_dir}. Processing...")
+
+        for label_path in tqdm(label_files, desc=f"Scanning {os.path.basename(label_dir)}", leave=False):
+            try:
+                with open(label_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line in f:
+                        parts = line.strip().split(maxsplit=2)
+                        if len(parts) == 3:
+                            raw_label = parts[2]
+                            unique_raw_labels.add(raw_label)
+                processed_files += 1
+            except Exception as e:
+                logger.warning(f"Skipping file {label_path} due to error: {e}")
+                skipped_files += 1
+
+    logger.info(f"Scan complete. Processed {processed_files} files, skipped {skipped_files}.")
+    logger.info(f"Found {len(unique_raw_labels)} unique raw chord labels in the dataset.")
+
+    if not unique_raw_labels:
+        logger.warning("No unique raw labels found.")
+        return
+
+    # Map raw labels to final vocabulary index and label
+    mapping_details = defaultdict(lambda: {'raw_labels': set(), 'standardized': set()})
+    unknown_standardized = set()
+    n_index = chord_mapping.get('N', None) # Get the index for 'N'
+
+    if n_index is None:
+        logger.error("Could not find index for 'N' in chord_mapping. Cannot proceed with mapping analysis.")
+        # Try to find it by iterating (less efficient)
+        for label, idx in chord_mapping.items():
+            if label == 'N':
+                n_index = idx
+                logger.warning("Found 'N' index by iteration.")
+                break
+        if n_index is None: return # Still not found
+
+    logger.info("Processing unique raw labels for mapping...")
+    for raw_label in tqdm(sorted(list(unique_raw_labels)), desc="Mapping labels", leave=False):
+        standardized_label = standardize_chord_label_mir(raw_label)
+
+        # Get the index for the standardized label, default to N's index if not found
+        final_idx = chord_mapping.get(standardized_label, n_index)
+
+        # Check if the standardized label itself was unknown to the mapping
+        if standardized_label not in chord_mapping and standardized_label != 'N':
+             unknown_standardized.add(standardized_label)
+             # Log immediately if a standardized label maps unexpectedly to N
+             logger.debug(f"Raw label '{raw_label}' -> Standardized '{standardized_label}' -> Mapped to Index {final_idx} ('N') because '{standardized_label}' not in chord_mapping.")
+
+
+        # Store details grouped by the final index
+        mapping_details[final_idx]['raw_labels'].add(raw_label)
+        mapping_details[final_idx]['standardized'].add(standardized_label)
+
+    # Log the results
+    logger.info("\n--- Chord Mapping Details (Dataset Raw Labels -> Vocabulary Index) ---")
+    for index in sorted(mapping_details.keys()):
+        final_label = master_mapping.get(index, f'Unknown Index {index}')
+        raw_set = mapping_details[index]['raw_labels']
+        std_set = mapping_details[index]['standardized']
+
+        # Limit the number of raw labels shown for brevity
+        raw_labels_display = sorted(list(raw_set))
+        if len(raw_labels_display) > 500:
+            raw_labels_display = raw_labels_display[:500] + ['...']
+
+        logger.info(f"Index {index} ({final_label}):")
+        logger.info(f"  Standardized As -> {sorted(list(std_set))}")
+        logger.info(f"  From Raw Labels -> {raw_labels_display} (Total Raw: {len(raw_set)})")
+
+    if unknown_standardized:
+        logger.warning("\n--- Standardized Labels Not Found in Mapping (Mapped to 'N') ---")
+        for std_label in sorted(list(unknown_standardized)):
+            logger.warning(f"  Standardized label '{std_label}' was not in chord_mapping.")
+    logger.info("--- End Chord Mapping Details ---")
+
+# --- End Helper Functions ---
+
 
 def main():
-    # Parse command line arguments
+    # Parse command line arguments (aligned with train_finetune.py, keeping CV args)
     parser = argparse.ArgumentParser(description="Train a chord recognition model with cross-validation and knowledge distillation")
     parser.add_argument('--config', type=str, default='./config/student_config.yaml',
                         help='Path to the configuration file')
-    parser.add_argument('--seed', type=int, default=None, # Changed default to None
+    parser.add_argument('--seed', type=int, default=None,
                         help='Random seed (overrides config value)')
-    parser.add_argument('--save_dir', type=str, default=None, # Changed default to None
-                        help='Directory to save checkpoints')
-    parser.add_argument('--kfold', type=int, default=0,
-                        help='Which fold to use for validation (0-4)')
-    parser.add_argument('--total_folds', type=int, default=5,
-                        help='Total number of folds')
+    parser.add_argument('--save_dir', type=str, default=None,
+                        help='Directory to save checkpoints (overrides config value)')
+    parser.add_argument('--load_checkpoint', type=str, default=None, # Renamed from --pretrained for consistency
+                        help='Path to a specific checkpoint to load for fine-tuning')
     parser.add_argument('--storage_root', type=str, default=None,
-                        help='Root directory for data storage')
-    parser.add_argument('--use_voca', action='store_true',
-                       help='Use large vocabulary (170 chord types)')
-    parser.add_argument('--model_type', type=str, choices=['ChordNet', 'BTC'], default='ChordNet',
-                        help='Type of model to use (ChordNet or BTC)')
-    parser.add_argument('--btc_checkpoint', type=str, default=None,
-                        help='Path to BTC model checkpoint for finetuning (if model_type=BTC)')
-    parser.add_argument('--teacher_model', type=str, default=None,
-                        help='Path to teacher model for knowledge distillation')
-    parser.add_argument('--use_kd_loss', action='store_true',
-                        help='Use knowledge distillation loss')
-    parser.add_argument('--kd_alpha', type=float, default=None, # Changed default to None
-                        help='Weight for knowledge distillation loss (default: 0.5)')
-    parser.add_argument('--temperature', type=float, default=None, # Changed default to None
-                        help='Temperature for softening distributions (default: 1.0)')
-    parser.add_argument('--kd_debug_mode', action='store_true',
-                        help='Enable debug mode for teacher logit extraction')
-    parser.add_argument('--audio_dirs', type=str, nargs='+', default=None,
-                      help='Directories containing audio files')
-    parser.add_argument('--label_dirs', type=str, nargs='+', default=None,
-                      help='Directories containing label files')
-    parser.add_argument('--cache_dir', type=str, default=None,
-                      help='Directory to cache extracted features')
-    parser.add_argument('--learning_rate', type=float, default=None,
-                        help='Base learning rate (overrides config value)')
-    parser.add_argument('--batch_size', type=int, default=None,
-                        help='Batch size for training (overrides config value)')
-    parser.add_argument('--preprocess', action='store_true',
-                      help='Run preprocessing step to generate all features')
-    parser.add_argument('--log_chord_details', action='store_true',
-                       help='Enable detailed logging of chords during MIR evaluation')
-
-    # Add arguments similar to train_finetune.py
-    parser.add_argument('--model_scale', type=float, default=None,
-                       help='Scaling factor for model capacity (0.5=half, 1.0=base, 2.0=double)')
-    parser.add_argument('--dropout', type=float, default=None,
-                       help='Dropout probability (0-1)')
-    parser.add_argument('--disable_cache', action='store_true',
-                      help='Disable dataset caching (overrides CrossValidationDataset default)')
-    parser.add_argument('--metadata_cache', type=str, default="false",
-                      help='Only cache metadata (not spectrograms) to reduce memory usage')
-    parser.add_argument('--cache_fraction', type=float, default=1.0, # Default to full cache for CV
-                      help='Fraction of dataset to cache (default: 1.0 = 100%%)')
-    parser.add_argument('--lazy_init', type=str, default="false",
-                      help='Lazily initialize dataset components to save memory')
-    parser.add_argument('--gpu_memory_fraction', type=float, default=0.9,
-                      help='Fraction of GPU memory to use (default: 0.9)')
-    parser.add_argument('--batch_gpu_cache', type=str, default="false",
-                      help='Cache batches on GPU for repeated access patterns')
-    parser.add_argument('--prefetch_factor', type=int, default=2,
-                      help='Number of batches to prefetch (default: 2)')
-    parser.add_argument('--small_dataset', type=float, default=None,
-                      help='Use only a small percentage of dataset for quick testing (e.g., 0.01 for 1%%)')
-    parser.add_argument('--min_learning_rate', type=float, default=None,
-                        help='Minimum learning rate for schedulers (overrides config value)')
+                        help='Root directory for data storage (overrides config value)')
     parser.add_argument('--use_warmup', action='store_true',
                        help='Use warm-up learning rate scheduling')
     parser.add_argument('--warmup_epochs', type=int, default=None,
                        help='Number of warm-up epochs (default: from config)')
     parser.add_argument('--warmup_start_lr', type=float, default=None,
                        help='Initial learning rate for warm-up (default: 1/10 of base LR)')
-    parser.add_argument('--warmup_end_lr', type=float, default=None,
-                       help='Target learning rate at the end of warm-up (default: base LR)')
     parser.add_argument('--lr_schedule', type=str,
                         choices=['cosine', 'linear_decay', 'one_cycle', 'cosine_warm_restarts', 'validation', 'none'],
                         default=None,
@@ -112,6 +241,56 @@ def main():
                        help='Gamma parameter for focal loss (default: 2.0)')
     parser.add_argument('--focal_alpha', type=float, default=None,
                        help='Alpha parameter for focal loss (default: None)')
+    parser.add_argument('--use_kd_loss', action='store_true',
+                       help='Use knowledge distillation loss (requires teacher logits in dataset)')
+    parser.add_argument('--kd_alpha', type=float, default=None,
+                       help='Weight for knowledge distillation loss (default: 0.5)')
+    parser.add_argument('--temperature', type=float, default=None,
+                       help='Temperature for softening distributions (default: 2.0)')
+    parser.add_argument('--model_scale', type=float, default=None,
+                       help='Scaling factor for model capacity (0.5=half, 1.0=base, 2.0=double)')
+    parser.add_argument('--dropout', type=float, default=None,
+                       help='Dropout probability (0-1)')
+    parser.add_argument('--disable_cache', action='store_true',
+                      help='Disable dataset caching to reduce memory usage')
+    parser.add_argument('--metadata_cache', action='store_true',
+                      help='Only cache metadata (not spectrograms) to reduce memory usage')
+    parser.add_argument('--cache_fraction', type=float, default=1.0, # Default to full cache for CV
+                      help='Fraction of dataset to cache (default: 1.0 = 100%%)')
+    parser.add_argument('--lazy_init', action='store_true',
+                      help='Lazily initialize dataset components to save memory')
+
+    # Data directories for CrossValidationDataset (using LabeledDataset_synth structure)
+    parser.add_argument('--spectrograms_dir', type=str, required=False,
+                      help='Directory containing pre-computed spectrograms (e.g., LabeledDataset_synth/spectrograms)')
+    parser.add_argument('--logits_dir', type=str, required=False,
+                      help='Directory containing pre-computed teacher logits (e.g., LabeledDataset_synth/logits)')
+    parser.add_argument('--label_dir', type=str, required=False, # Single base dir for labels (e.g., LabeledDataset/Labels)
+                      help='Base directory containing REAL ground truth label files (.lab, .txt) in subdirs (e.g., LabeledDataset/Labels)')
+    parser.add_argument('--cache_dir', type=str, default=None,
+                      help='Directory to cache dataset metadata/features')
+
+    # GPU acceleration options
+    parser.add_argument('--gpu_memory_fraction', type=float, default=0.9,
+                      help='Fraction of GPU memory to use (default: 0.9)')
+    parser.add_argument('--batch_gpu_cache', action='store_true',
+                      help='Cache batches on GPU for repeated access patterns')
+    parser.add_argument('--prefetch_factor', type=int, default=2,
+                      help='Number of batches to prefetch (default: 2)')
+    parser.add_argument('--small_dataset', type=float, default=None,
+                      help='Use only a small percentage of dataset for quick testing (e.g., 0.01 for 1%%)')
+    parser.add_argument('--learning_rate', type=float, default=None,
+                        help='Base learning rate (overrides config value)')
+    parser.add_argument('--min_learning_rate', type=float, default=None,
+                        help='Minimum learning rate for schedulers (overrides config value)')
+    parser.add_argument('--warmup_end_lr', type=float, default=None,
+                       help='Target learning rate at the end of warm-up (default: base LR)')
+    parser.add_argument('--freeze_feature_extractor', action='store_true',
+                       help='Freeze the feature extraction part of the model')
+    parser.add_argument('--epochs', type=int, default=None,
+                       help='Number of fine-tuning epochs')
+    parser.add_argument('--batch_size', type=int, default=None,
+                       help='Batch size for training (overrides config value)')
     parser.add_argument('--reset_epoch', action='store_true',
                       help='Start from epoch 1 when loading pretrained model')
     parser.add_argument('--reset_scheduler', action='store_true',
@@ -120,17 +299,33 @@ def main():
                       help='Timeout in minutes for distributed operations (default: 30)')
     parser.add_argument('--force_num_classes', type=int, default=None,
                         help='Force the model to use this number of output classes (e.g., 170 or 26)')
-    parser.add_argument('--partial_loading', action='store_true', # Added for consistency
+    parser.add_argument('--partial_loading', action='store_true',
                         help='Allow partial loading of output layer when model sizes differ')
-    parser.add_argument('--load_checkpoint', type=str, default=None, # Added for consistency
-                        help='Path to a specific checkpoint to load')
+    parser.add_argument('--use_voca', action='store_true',
+                        help='Use large vocabulary (170 chord types instead of standard 25)')
+    parser.add_argument('--model_type', type=str, choices=['ChordNet', 'BTC'], default='ChordNet',
+                        help='Type of model to use (ChordNet or BTC)')
+    parser.add_argument('--btc_checkpoint', type=str, default=None, # Use --load_checkpoint for BTC as well
+                        help='Path to BTC model checkpoint for finetuning (if model_type=BTC and --load_checkpoint not used)')
+    parser.add_argument('--btc_config', type=str, default='./config/btc_config.yaml',
+                        help='Path to the BTC model configuration file (if model_type=BTC)')
+    parser.add_argument('--log_chord_details', action='store_true',
+                       help='Enable detailed logging of chords during MIR evaluation')
+    parser.add_argument('--teacher_checkpoint', type=str, default=None,
+                        help='Path to the teacher model checkpoint to load normalization parameters (mean, std)')
+
+    # CV specific arguments
+    parser.add_argument('--kfold', type=int, default=0,
+                        help='Which fold to use for validation (0 to total_folds-1)')
+    parser.add_argument('--total_folds', type=int, default=4, # Default to 4 folds
+                        help='Total number of folds for cross-validation')
 
     args = parser.parse_args()
 
-    # Load configuration
+    # Load configuration from YAML first
     config = HParams.load(args.config)
 
-    # --- Environment variable override block ---
+    # --- Environment variable override block (Copied from train_finetune.py) ---
     logger.info("Checking for environment variable overrides...")
     config.training['use_warmup'] = os.environ.get('USE_WARMUP', str(config.training.get('use_warmup', False))).lower() == 'true'
     config.training['use_focal_loss'] = os.environ.get('USE_FOCAL_LOSS', str(config.training.get('use_focal_loss', False))).lower() == 'true'
@@ -149,26 +344,27 @@ def main():
     if 'KD_ALPHA' in os.environ: config.training['kd_alpha'] = float(os.environ['KD_ALPHA'])
     if 'TEMPERATURE' in os.environ: config.training['temperature'] = float(os.environ['TEMPERATURE'])
     if 'DROPOUT' in os.environ: config.model['dropout'] = float(os.environ['DROPOUT'])
-    if 'EPOCHS' in os.environ: config.training['num_epochs'] = int(os.environ['EPOCHS']) # Added EPOCHS override
+    if 'EPOCHS' in os.environ: config.training['num_epochs'] = int(os.environ['EPOCHS'])
     if 'BATCH_SIZE' in os.environ: config.training['batch_size'] = int(os.environ['BATCH_SIZE'])
     if 'DATA_ROOT' in os.environ: config.paths['storage_root'] = os.environ['DATA_ROOT']
-    if 'AUDIO_DIRS' in os.environ: args.audio_dirs = os.environ['AUDIO_DIRS'].split()
-    if 'LABEL_DIRS' in os.environ: args.label_dirs = os.environ['LABEL_DIRS'].split()
-    if 'CACHE_DIR' in os.environ: args.cache_dir = os.environ['CACHE_DIR']
-    if 'TEACHER_MODEL' in os.environ: args.teacher_model = os.environ['TEACHER_MODEL']
-    if 'BTC_CHECKPOINT' in os.environ: args.btc_checkpoint = os.environ['BTC_CHECKPOINT']
+    if 'SPECTROGRAMS_DIR' in os.environ: args.spectrograms_dir = os.environ['SPECTROGRAMS_DIR']
+    if 'LOGITS_DIR' in os.environ: args.logits_dir = os.environ['LOGITS_DIR']
+    if 'LABEL_DIR' in os.environ: args.label_dir = os.environ['LABEL_DIR'] # Single dir for CV
+    if 'LOAD_CHECKPOINT' in os.environ: args.load_checkpoint = os.environ['LOAD_CHECKPOINT'] # Use LOAD_CHECKPOINT
+    if 'BTC_CHECKPOINT' in os.environ: args.btc_checkpoint = os.environ['BTC_CHECKPOINT'] # Keep for potential separate BTC loading
     if 'MODEL_TYPE' in os.environ: args.model_type = os.environ['MODEL_TYPE']
+    if 'FREEZE_FEATURE_EXTRACTOR' in os.environ: args.freeze_feature_extractor = os.environ['FREEZE_FEATURE_EXTRACTOR'].lower() == 'true'
     if 'SMALL_DATASET' in os.environ: args.small_dataset = float(os.environ['SMALL_DATASET'])
     if 'DISABLE_CACHE' in os.environ: args.disable_cache = os.environ['DISABLE_CACHE'].lower() == 'true'
-    if 'METADATA_CACHE' in os.environ: args.metadata_cache = os.environ['METADATA_CACHE'].lower() == 'true'
-    if 'LAZY_INIT' in os.environ: args.lazy_init = os.environ['LAZY_INIT'].lower() == 'true'
-    if 'BATCH_GPU_CACHE' in os.environ: args.batch_gpu_cache = os.environ['BATCH_GPU_CACHE'].lower() == 'true'
-    if 'KFOLD' in os.environ: args.kfold = int(os.environ['KFOLD']) # Added KFOLD override
-    if 'TOTAL_FOLDS' in os.environ: args.total_folds = int(os.environ['TOTAL_FOLDS']) # Added TOTAL_FOLDS override
-    if 'SAVE_DIR' in os.environ: args.save_dir = os.environ['SAVE_DIR'] # Added SAVE_DIR override
-    if 'LOAD_CHECKPOINT' in os.environ: args.load_checkpoint = os.environ['LOAD_CHECKPOINT'] # Added LOAD_CHECKPOINT override
-    if 'RESET_EPOCH' in os.environ: args.reset_epoch = os.environ['RESET_EPOCH'].lower() == 'true' # Added RESET_EPOCH override
-    if 'RESET_SCHEDULER' in os.environ: args.reset_scheduler = os.environ['RESET_SCHEDULER'].lower() == 'true' # Added RESET_SCHEDULER override
+    if 'TEACHER_CHECKPOINT' in os.environ: args.teacher_checkpoint = os.environ['TEACHER_CHECKPOINT']
+    if 'METADATA_CACHE' in os.environ and os.environ['METADATA_CACHE'].lower() == 'true': args.metadata_cache = True
+    if 'LAZY_INIT' in os.environ and os.environ['LAZY_INIT'].lower() == 'true': args.lazy_init = True
+    if 'BATCH_GPU_CACHE' in os.environ and os.environ['BATCH_GPU_CACHE'].lower() == 'true': args.batch_gpu_cache = True
+    if 'KFOLD' in os.environ: args.kfold = int(os.environ['KFOLD'])
+    if 'TOTAL_FOLDS' in os.environ: args.total_folds = int(os.environ['TOTAL_FOLDS'])
+    if 'SAVE_DIR' in os.environ: args.save_dir = os.environ['SAVE_DIR']
+    if 'RESET_EPOCH' in os.environ: args.reset_epoch = os.environ['RESET_EPOCH'].lower() == 'true'
+    if 'RESET_SCHEDULER' in os.environ: args.reset_scheduler = os.environ['RESET_SCHEDULER'].lower() == 'true'
 
     logger.info(f"Config after potential ENV overrides - use_warmup: {config.training.get('use_warmup')}")
     # --- END Environment variable override block ---
@@ -181,7 +377,7 @@ def main():
     elif config.misc.get('log_chord_details'):
         logger.info("Detailed chord logging during evaluation ENABLED via config/env.")
 
-    # Set up device
+    # Then check device availability
     if config.misc.get('use_cuda', True) and is_cuda_available():
         device = get_device()
         logger.info(f"CUDA available. Using device: {device} ({torch.cuda.get_device_name(0)})")
@@ -189,10 +385,29 @@ def main():
         device = torch.device('cpu')
         logger.info("CUDA not available or not requested. Using CPU.")
 
-    # Override config values with command line arguments - IMPROVED CONFIG HANDLING
+    # Override config values with command line arguments if provided
     config.misc['seed'] = args.seed if args.seed is not None else config.misc.get('seed', 42)
-    config.paths['checkpoints_dir'] = args.save_dir if args.save_dir else config.paths.get('checkpoints_dir', './checkpoints/cv_kd')
+    # Modify save dir to include fold info by default
+    default_save_dir = f'./checkpoints/cv_kd_fold{args.kfold}'
+    config.paths['checkpoints_dir'] = args.save_dir if args.save_dir else config.paths.get('checkpoints_dir', default_save_dir)
     config.paths['storage_root'] = args.storage_root if args.storage_root else config.paths.get('storage_root', None)
+
+    # Handle KD loss setting
+    use_kd_loss = args.use_kd_loss or str(config.training.get('use_kd_loss', False)).lower() == 'true'
+    if use_kd_loss:
+        logger.info("Knowledge Distillation Loss ENABLED")
+    else:
+        logger.info("Knowledge Distillation Loss DISABLED")
+
+    # Set large vocabulary config if specified
+    if args.use_voca or str(config.feature.get('large_voca', False)).lower() == 'true':
+        config.feature['large_voca'] = True
+        config.model['num_chords'] = 170
+        logger.info("Using large vocabulary with 170 chord classes")
+    else:
+        config.feature['large_voca'] = False
+        config.model['num_chords'] = 25 # Default to small voca if not specified
+        logger.info("Using small vocabulary with 25 chord classes")
 
     # Handle learning rate and warmup parameters
     config.training['learning_rate'] = float(args.learning_rate) if args.learning_rate is not None else float(config.training.get('learning_rate', 0.0001))
@@ -207,7 +422,7 @@ def main():
     elif 'warmup_end_lr' not in config.training: config.training['warmup_end_lr'] = config.training['learning_rate']
 
     # Override epochs and batch size
-    if 'num_epochs' not in config.training: config.training['num_epochs'] = 50 # Default if not set
+    if args.epochs is not None: config.training['num_epochs'] = int(args.epochs)
     if args.batch_size is not None: config.training['batch_size'] = int(args.batch_size)
 
     # Log parameters
@@ -220,17 +435,26 @@ def main():
     logger.info(f"Using {config.training.get('num_epochs', 50)} epochs for training")
     logger.info(f"Using batch size: {config.training.get('batch_size', 16)}")
 
+    # Log fine-tuning configuration
+    logger.info("\n=== Cross-Validation KD Configuration ===")
+    logger.info(f"Current Fold: {args.kfold} / {args.total_folds}")
+    model_scale = float(args.model_scale) if args.model_scale is not None else float(config.model.get('scale', 1.0))
+    logger.info(f"Model scale: {model_scale}")
+    logger.info(f"Load checkpoint: {args.load_checkpoint}")
+    logger.info(f"BTC checkpoint (alternative): {args.btc_checkpoint}")
+    if args.freeze_feature_extractor:
+        logger.info("Feature extraction layers will be frozen during training")
+
     # Log KD settings
-    use_kd_loss = args.use_kd_loss or str(config.training.get('use_kd_loss', False)).lower() == 'true'
     kd_alpha = args.kd_alpha if args.kd_alpha is not None else float(config.training.get('kd_alpha', 0.5))
-    temperature = args.temperature if args.temperature is not None else float(config.training.get('temperature', 1.0))
+    temperature = args.temperature if args.temperature is not None else float(config.training.get('temperature', 2.0))
     if use_kd_loss:
         logger.info("\n=== Knowledge Distillation Enabled ===")
         logger.info(f"KD alpha: {kd_alpha}")
         logger.info(f"Temperature: {temperature}")
-        logger.info(f"Teacher model path: {args.teacher_model}")
+        logger.info("Using offline KD with pre-computed logits from dataset")
     else:
-        logger.info("Knowledge distillation is disabled")
+        logger.info("Knowledge distillation is disabled, using standard loss")
 
     # Log Focal Loss settings
     use_focal_loss = args.use_focal_loss or str(config.training.get('use_focal_loss', False)).lower() == 'true'
@@ -257,508 +481,432 @@ def main():
     else:
         logger.info("Using only standard Cross Entropy Loss")
 
-    # Set up chord mapping
-    # Determine if large vocabulary is used
-    use_large_voca = args.use_voca or str(config.feature.get('large_voca', False)).lower() == 'true'
-
-    # Determine the correct number of output classes
-    if args.force_num_classes is not None:
-        n_classes = args.force_num_classes
-        logger.info(f"Forcing model to use {n_classes} output classes as specified by --force_num_classes")
-    elif use_large_voca:
-        n_classes = 170
-        logger.info(f"Using large vocabulary with {n_classes} output classes")
-    else:
-        n_classes = 26 # 25 chords + X
-        logger.info(f"Using small vocabulary with {n_classes} output classes")
-
-    # Create chord mappings based on n_classes
-    if n_classes == 170:
-        logger.info("Using large vocabulary chord mapping (170 chords)")
-        master_mapping = idx2voca_chord() # Get idx -> chord mapping
-        chord_mapping = {chord: idx for idx, chord in master_mapping.items()} # Create reverse mapping
-    else: # Default to small vocabulary (26 classes)
-        logger.info("Using standard vocabulary chord mapping (26 chords)")
-        chord_mapping = {} # chord -> idx
-        master_mapping = {} # idx -> chord
-        for i in range(12):
-            root = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'][i]
-            # Major chords
-            maj_idx = i * 2
-            maj_chord = f"{root}:maj" # Use explicit :maj
-            chord_mapping[maj_chord] = maj_idx
-            master_mapping[maj_idx] = maj_chord
-            # Minor chords
-            min_idx = i * 2 + 1
-            min_chord = f"{root}:min"
-            chord_mapping[min_chord] = min_idx
-            master_mapping[min_idx] = min_chord
-        # Special chords: N (no chord) and X (unknown)
-        chord_mapping["N"] = 24
-        master_mapping[24] = "N"
-        chord_mapping["X"] = 25 # Index 25 for X
-        master_mapping[25] = "X"
-        n_classes = 26 # Ensure n_classes is 26
-
-    # Initialize chord class with the reverse mapping (chord -> idx)
-    chord_class = Chords()
-    chord_class.set_chord_mapping(chord_mapping)
-    chord_class.initialize_chord_mapping() # Initialize variants
-
-    # Log mapping info
-    logger.info(f"\nUsing idx->chord mapping with {len(master_mapping)} entries")
-    logger.info(f"Sample idx->chord mapping: {dict(list(master_mapping.items())[:5])}")
-    logger.info(f"Reverse chord->idx mapping created with {len(chord_mapping)} entries")
-    logger.info(f"Sample chord->idx mapping: {dict(list(chord_mapping.items())[:5])}")
-
-    # Set random seed for reproducibility - ensure this is an integer
+    # Set random seed
     seed = int(config.misc['seed'])
     torch.manual_seed(seed)
     np.random.seed(seed)
-    random.seed(seed) # Add random seed setting
+    random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
     logger.info(f"Random seed set to {seed}")
 
-    # Create save directory
-    save_dir = config.paths['checkpoints_dir']
-    os.makedirs(save_dir, exist_ok=True)
-    logger.info(f"Checkpoints will be saved to: {save_dir}") # Log save dir
+    # Set up logging
+    logger.logging_verbosity(config.misc.get('logging_level', 'INFO'))
 
-    # Set up datasets
-    # Resolve project root and storage root
+    # Get project root and storage root
     project_root = os.path.dirname(os.path.abspath(__file__))
     storage_root = config.paths.get('storage_root', None)
     logger.info(f"Project root: {project_root}")
     logger.info(f"Storage root: {storage_root}")
 
-    # Resolve audio_dirs, label_dirs, cache_dir using resolve_path
-    def resolve_data_path(p, storage_root, project_root):
-        if not p: return None
-        if os.path.isabs(p): return p
-        if storage_root:
-            storage_path = os.path.join(storage_root, p)
-            if os.path.exists(storage_path): return storage_path
-        if project_root:
-            project_path = os.path.join(project_root, p)
-            if os.path.exists(project_path): return project_path
-        # Fallback
-        return os.path.join(storage_root, p) if storage_root else (os.path.join(project_root, p) if project_root else p)
+    # Resolve data paths for CrossValidationDataset (LabeledDataset_synth structure)
+    spec_dir_arg = args.spectrograms_dir or config.paths.get('spectrograms_dir')
+    logits_dir_arg = args.logits_dir or config.paths.get('logits_dir')
+    label_dir_arg = args.label_dir or config.paths.get('label_dir') # Single base dir
 
-    default_audio_dirs = [
-        'isophonic',
-        'uspop',
-        'robbiewilliams'
-    ]
-    audio_dirs_resolved = [resolve_data_path(d, storage_root, project_root) for d in (args.audio_dirs or default_audio_dirs)]
-    label_dirs_resolved = [resolve_data_path(d, storage_root, project_root) for d in (args.label_dirs or audio_dirs_resolved)] # Default labels same as audio
-    cache_dir_resolved = resolve_data_path(args.cache_dir or config.paths.get('cache_dir', 'cache'), storage_root, project_root)
+    spec_dir = resolve_path(spec_dir_arg, storage_root, project_root)
+    logits_dir = resolve_path(logits_dir_arg, storage_root, project_root) if logits_dir_arg else None
+    label_dir = resolve_path(label_dir_arg, storage_root, project_root) # Resolve single base dir
 
-    if cache_dir_resolved:
-        os.makedirs(cache_dir_resolved, exist_ok=True)
-        logger.info(f"Using cache directory: {cache_dir_resolved}")
+    cache_dir = resolve_path(args.cache_dir or config.paths.get('cache_dir'), storage_root, project_root)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        logger.info(f"Using cache directory: {cache_dir}")
     else:
         logger.info("Cache directory not specified.")
 
-    logger.info(f"Using audio directories: {audio_dirs_resolved}")
-    logger.info(f"Using label directories: {label_dirs_resolved}")
+    # Log data paths and counts
+    logger.info("\n=== Dataset Paths (LabeledDataset_synth structure expected) ===")
+    logger.info(f"Spectrograms Base: {spec_dir}")
+    logger.info(f"Logits Base: {logits_dir}")
+    logger.info(f"Labels Base: {label_dir}")
 
-    # Load teacher model if provided
-    teacher_model = None
-    teacher_mean = None
-    teacher_std = None
+    spec_count = count_files_in_subdirectories(spec_dir, "*_spec.npy")
+    logits_count = count_files_in_subdirectories(logits_dir, "*_logits.npy")
+    label_count = count_files_in_subdirectories(label_dir, "*.lab") + count_files_in_subdirectories(label_dir, "*.txt")
 
-    # Resolve teacher model path
-    resolved_teacher_path = None
-    if args.teacher_model:
-        resolved_teacher_path = resolve_data_path(args.teacher_model, storage_root, project_root)
-        if not os.path.exists(resolved_teacher_path):
-             logger.error(f"Teacher model not found at resolved path: {resolved_teacher_path}")
-             resolved_teacher_path = None # Reset if not found
-             use_kd_loss = False
-             logger.warning("Knowledge distillation disabled due to missing teacher model file.")
-        else:
-             logger.info(f"Resolved teacher model path to: {resolved_teacher_path}")
+    logger.info(f"Found {spec_count} spectrogram files")
+    logger.info(f"Found {logits_count} logit files")
+    logger.info(f"Found {label_count} label files")
 
-    if use_kd_loss and resolved_teacher_path:
-        logger.info(f"Loading teacher model from {resolved_teacher_path}")
-        try:
-            # Determine vocabulary size based on args and config
-            use_voca = args.use_voca or config.feature.get('large_voca', False)
-
-            # Load the teacher model using our enhanced utility function
-            teacher_model, teacher_mean, teacher_std, teacher_status = load_btc_model(
-                resolved_teacher_path,
-                device,
-                use_voca=use_large_voca # Pass vocabulary setting
-            )
-
-            # Check if loading was successful
-            if teacher_status["success"] and teacher_model is not None:
-                logger.info(f"Teacher model loaded successfully: {teacher_status['message']}")
-                logger.info(f"Model implementation: {teacher_status['implementation']}")
-                logger.info(f"Model validation: {teacher_status['model_validated']}")
-
-                # Check if we have mean/std for normalization
-                if not teacher_status["has_mean_std"]:
-                    logger.warning("Teacher model does not have mean/std values for normalization")
-                    logger.warning("Using default values: mean=0.0, std=1.0")
-            else:
-                logger.error(f"Failed to load teacher model: {teacher_status['message']}")
-                teacher_model = None
-                use_kd_loss = False
-                logger.warning("Knowledge distillation disabled due to teacher model loading failure")
-        except Exception as e:
-            logger.error(f"Error loading teacher model: {e}")
-            logger.error(traceback.format_exc())
-            teacher_model = None
-            use_kd_loss = False # Disable KD if loading fails
-            logger.warning("Knowledge distillation disabled due to teacher model loading error.")
-    elif use_kd_loss and not resolved_teacher_path:
-         logger.warning("Knowledge distillation was enabled, but no valid teacher model path was provided or resolved. Disabling KD.")
-         use_kd_loss = False
-
-
-    # Run preprocessing if specified
-    if args.preprocess:
-        logger.info("Running preprocessing step to generate all features")
-        # Create a dataset that will do all the preprocessing
-        preprocess_dataset = CrossValidationDataset(
-            config=config,
-            audio_dirs=audio_dirs_resolved,
-            label_dirs=label_dirs_resolved,
-            chord_mapping=chord_mapping,
-            train=True,  # Doesn't matter for preprocessing
-            kfold=args.kfold,
-            total_folds=args.total_folds,
-            cache_dir=cache_dir_resolved,
-            random_seed=seed,
-            device=device
-        )
-
-        # Analyze label files before processing
-        logger.info("Analyzing label files to understand structure...")
-        preprocess_dataset.analyze_label_files(num_files=10)
-
-        # Generate all features
-        preprocess_dataset.generate_all_features()
-        logger.info("Preprocessing completed")
+    if spec_count == 0 or label_count == 0:
+        logger.error("Missing spectrograms or label files. Cannot proceed.")
+        return
+    if use_kd_loss and logits_count == 0:
+        logger.error("Knowledge distillation enabled, but no logit files found. Cannot proceed.")
         return
 
-    # Create datasets for training and validation
-    logger.info(f"Creating datasets for fold {args.kfold} of {args.total_folds}")
+    # Use the mapping defined in chords.py
+    master_mapping = idx2voca_chord()
+    chord_mapping = {chord: idx for idx, chord in master_mapping.items()}
+    voca_chords_set = set(master_mapping.values())
 
-    # Pass caching arguments to CrossValidationDataset
-    dataset_common_args = {
-        'config': config,
-        'audio_dirs': audio_dirs_resolved,
-        'label_dirs': label_dirs_resolved,
+    # Log mapping info
+    logger.info(f"\nUsing chord mapping from chords.py with {len(chord_mapping)} unique chords")
+    logger.info(f"Sample chord mapping: {dict(list(chord_mapping.items())[:5])}")
+    logger.info(f"Master mapping (idx -> label) size: {len(master_mapping)}")
+    logger.info(f"Sample master mapping: {dict(list(master_mapping.items())[:5])} ... {dict(list(master_mapping.items())[-5:])}")
+
+    # --- ADDED: Log dataset chord mapping analysis ---
+    # Pass the single base label directory to the analysis function
+    log_dataset_chord_mapping([label_dir] if label_dir else [], chord_mapping, master_mapping, logger)
+    # --- END ADDED ---
+
+    # Resolve checkpoints directory path (already includes fold info by default)
+    checkpoints_dir = config.paths['checkpoints_dir']
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    logger.info(f"Checkpoints will be saved to: {checkpoints_dir}")
+
+    # Initialize CrossValidationDataset
+    logger.info("\n=== Creating dataset using CrossValidationDataset ===")
+    logger.info(f"Fold {args.kfold} / {args.total_folds}")
+
+    dataset_args = {
+        'spec_dir': spec_dir,
+        'label_dir': label_dir, # Pass the single base dir
+        'logits_dir': logits_dir,
         'chord_mapping': chord_mapping,
-        'kfold': args.kfold,
-        'total_folds': args.total_folds,
-        'cache_dir': cache_dir_resolved,
-        'random_seed': seed,
-        'device': device,
-        'teacher_model': None, # Pass later if needed for KD
-        'use_cache': not args.disable_cache, # Control caching
-        'metadata_only': str(args.metadata_cache).lower() == "true",
-        'cache_fraction': args.cache_fraction,
-        'lazy_init': str(args.lazy_init).lower() == "true",
+        'seq_len': config.training.get('seq_len', 10),
+        'stride': config.training.get('seq_stride', 5),
+        'frame_duration': config.feature.get('hop_duration', 0.09288),
+        'num_folds': args.total_folds,
+        'current_fold': args.kfold,
+        'verbose': config.misc.get('logging_level', 'INFO') == 'DEBUG',
+        'device': device, # Pass the determined device
+        'pin_memory': False, # Keep False for CV dataset internal loading
+        'prefetch_factor': 1, # Keep 1 for CV dataset internal loading
+        'num_workers': 0, # Keep 0 for CV dataset internal loading
+        'require_teacher_logits': use_kd_loss,
+        'use_cache': not args.disable_cache,
+        'metadata_only': args.metadata_cache,
+        # 'cache_fraction': config.data.get('cache_fraction', args.cache_fraction), # CV dataset doesn't support fraction
+        'lazy_init': args.lazy_init,
+        'batch_gpu_cache': args.batch_gpu_cache,
         'small_dataset_percentage': args.small_dataset,
+        # 'dataset_type': 'labeled_synth' # Handled internally by CV dataset
+        'cache_file_prefix': os.path.join(cache_dir, "cv_cache") if cache_dir else "cv_cache" # Use cache_dir
     }
 
-    train_dataset = CrossValidationDataset(**dataset_common_args, train=True)
-    val_dataset = CrossValidationDataset(**dataset_common_args, train=False)
+    logger.info("Creating CrossValidationDataset with the following parameters:")
+    for key, value in dataset_args.items():
+        log_val = value
+        logger.info(f"  {key}: {log_val}")
 
-    # After creating datasets
-    logger.info("Analyzing chord distributions:")
-    val_dataset.analyze_chord_distribution()
-    train_dataset.analyze_chord_distribution()
+    try:
+        cv_dataset = CrossValidationDataset(**dataset_args)
+    except Exception as e:
+        logger.error(f"Failed to initialize CrossValidationDataset: {e}")
+        logger.error(traceback.format_exc())
+        return
 
-    # Create data loaders with prefetch_factor
+    # Create data loaders using the dataset's methods
     batch_size = config.training.get('batch_size', 16)
-    num_workers = 4 # Or adjust based on system
-    pin_memory = torch.cuda.is_available() # Pin memory if using CUDA
+    logger.info(f"Using batch size: {batch_size}")
 
-    train_loader = DataLoader(
-        train_dataset,
+    # Use dataset's iterators which handle subsets and correct getitem calls
+    # Ensure num_workers=0 and pin_memory=False for DataLoaders with this dataset structure
+    dataloader_num_workers = 0
+    dataloader_pin_memory = False
+
+    train_loader = cv_dataset.get_train_iterator(
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        prefetch_factor=int(args.prefetch_factor) if args.prefetch_factor > 1 else None
+        num_workers=dataloader_num_workers,
+        pin_memory=dataloader_pin_memory
     )
-    val_loader = DataLoader(
-        val_dataset,
+    val_loader = cv_dataset.get_val_iterator(
         batch_size=batch_size,
         shuffle=False,
-        num_workers=max(1, num_workers // 2), # Fewer workers for validation
-        pin_memory=pin_memory,
-        prefetch_factor=int(args.prefetch_factor) if args.prefetch_factor > 1 else None
+        num_workers=dataloader_num_workers,
+        pin_memory=dataloader_pin_memory
     )
+    # Use val_loader as the test_loader for this fold
+    test_loader = val_loader
 
-    # Generate teacher predictions for training data if using KD
-    teacher_predictions = None
-    if args.use_kd_loss and teacher_model is not None:
-        logger.info("Generating teacher predictions for knowledge distillation")
+    logger.info(f"Training set (Fold {args.kfold}): {len(cv_dataset.train_segment_indices)} segments ({len(train_loader)} batches)")
+    logger.info(f"Validation set (Fold {args.kfold}): {len(cv_dataset.val_segment_indices)} segments ({len(val_loader)} batches)")
 
-        # Set up a directory to save teacher logits
-        logits_dir = os.path.join(save_dir, f"teacher_logits_fold{args.kfold}")
-        os.makedirs(logits_dir, exist_ok=True)
+    # Check data loaders
+    logger.info("\n=== Checking data loaders ===")
+    try:
+        batch = next(iter(train_loader))
+        logger.info(f"First train batch loaded successfully:")
+        logger.info(f"  Spectro shape: {batch['spectro'].shape}")
+        logger.info(f"  Chord idx shape: {batch['chord_idx'].shape}")
+        if use_kd_loss:
+            if 'teacher_logits' in batch:
+                logger.info(f"  Teacher logits shape: {batch['teacher_logits'].shape}")
+            else:
+                logger.error("KD enabled, but 'teacher_logits' not found in batch!")
+                return
+    except StopIteration:
+        logger.error("ERROR: Train data loader is empty!")
+        return
+    except Exception as e:
+        logger.error(f"ERROR: Failed to load first batch from train_loader: {e}")
+        logger.error(traceback.format_exc())
+        return
 
-        # Use debug mode if specified
-        debug_mode = args.kd_debug_mode
-        if debug_mode:
-            logger.info("Debug mode for teacher logit extraction is ENABLED")
-        else:
-            logger.info("Debug mode for teacher logit extraction is disabled")
-
-        # Generate predictions with enhanced error handling
-        teacher_predictions, generation_status = generate_teacher_predictions(
-            teacher_model,
-            train_loader,
-            teacher_mean,
-            teacher_std,
-            device,
-            save_dir=logits_dir,
-            debug_mode=debug_mode
-        )
-
-        # Check if generation was successful
-        if generation_status["success"]:
-            logger.info(f"Generated teacher predictions for {len(teacher_predictions)} samples")
-            logger.info(f"Success rate: {generation_status['successful_samples']}/{generation_status['total_samples']} samples ({generation_status['successful_samples']/generation_status['total_samples']*100:.2f}%)")
-            logger.info(f"Extraction methods used: {generation_status['extraction_methods_used']}")
-
-            # Save generation status for reference
-            status_path = os.path.join(logits_dir, "generation_status.json")
-            try:
-                with open(status_path, 'w') as f:
-                    # Convert any non-serializable values to strings
-                    serializable_status = {k: str(v) if not isinstance(v, (dict, list, int, float, bool, str, type(None))) else v
-                                          for k, v in generation_status.items()}
-                    json.dump(serializable_status, f, indent=2)
-                logger.info(f"Saved generation status to {status_path}")
-            except Exception as e:
-                logger.warning(f"Failed to save generation status: {e}")
-        else:
-            logger.error(f"Failed to generate teacher predictions: {generation_status['message']}")
-            logger.warning("Continuing without knowledge distillation")
-            use_kd_loss = False
-            teacher_predictions = None
-
-    # Calculate global mean and std
-    logger.info("Calculating global mean and std")
-    mean = 0.0
-    square_mean = 0.0
-    k = 0
-
-    mean_std_cache = os.path.join(cache_dir, f'normalization_fold{args.kfold}.pt')
-    if os.path.exists(mean_std_cache):
-        # Load from cache
-        normalization_data = torch.load(mean_std_cache)
-        mean = normalization_data.get('mean', 0.0)
-        std = normalization_data.get('std', 1.0)
-        logger.info(f"Loaded normalization from cache: mean={mean}, std={std}")
+    # Determine the correct number of output classes
+    if args.force_num_classes is not None:
+        n_classes = args.force_num_classes
+        logger.info(f"Forcing model to use {n_classes} output classes as specified by --force_num_classes")
+    elif config.feature.get('large_voca', False):
+        n_classes = 170
+        logger.info(f"Using large vocabulary with {n_classes} output classes")
     else:
-        # Calculate from data
-        temp_loader = train_dataset.get_data_loader(batch_size=batch_size, shuffle=True, num_workers=2)
-        for i, data in enumerate(temp_loader):
-            features = data['spectro'].to('cpu')
-            mean += torch.mean(features).item()
-            square_mean += torch.mean(features.pow(2)).item()
-            k += 1
-            if i >= 99:
-                break
+        n_classes = 25 # Default small
+        logger.info(f"Using small vocabulary with {n_classes} output classes")
 
-        if k > 0:
-            square_mean = square_mean / k
-            mean = mean / k
-            std = np.sqrt(max(0, square_mean - mean * mean))
-            if std == 0: std = 1.0
-
-            normalization_data = {'mean': mean, 'std': std}
-            torch.save(normalization_data, mean_std_cache)
-            logger.info(f"Calculated normalization: mean={mean:.4f}, std={std:.4f}")
-        else:
-            logger.warning("Could not calculate normalization stats (k=0). Using defaults.")
-            mean = 0.0
-            std = 1.0
-
-    mean_tensor = torch.tensor(mean, device=device, dtype=torch.float32)
-    std_tensor = torch.tensor(std, device=device, dtype=torch.float32)
-    normalization = {'mean': mean_tensor, 'std': std_tensor}
-    logger.info(f"Normalization tensors created on device: {device}")
-
-    # Create model
-    logger.info(f"Creating model with {n_classes} output classes")
-
-    # Get model type from args or config
+    # Determine model type and pretrained path
     model_type = args.model_type
-    if model_type not in ['ChordNet', 'BTC']:
-        logger.warning(f"Unknown model type: {model_type}. Defaulting to ChordNet.")
-        model_type = 'ChordNet'
+    pretrained_path = args.load_checkpoint # Use the consistent argument name
+    btc_config = None
 
-    logger.info(f"Using model type: {model_type}")
+    if model_type == 'BTC':
+        # Load BTC Config
+        btc_config_path = resolve_path(args.btc_config, storage_root, project_root)
+        if not os.path.exists(btc_config_path):
+            logger.error(f"BTC configuration file not found at {btc_config_path}. Cannot initialize BTC model.")
+            return
+        try:
+            btc_config = HParams.load(btc_config_path)
+            logger.info(f"Loaded BTC configuration from: {btc_config_path}")
+        except Exception as e:
+            logger.error(f"Error loading BTC configuration from {btc_config_path}: {e}")
+            return
 
-    # Log additional information about feature dimensions
-    n_freq = config.feature.get('n_bins', 144)
+        # If --load_checkpoint wasn't specified, maybe use --btc_checkpoint as fallback
+        if not pretrained_path and args.btc_checkpoint:
+            pretrained_path = args.btc_checkpoint
+            logger.info(f"Using --btc_checkpoint ({pretrained_path}) as load path.")
 
-    if model_type == 'ChordNet':
-        # ChordNet specific parameters
-        n_group = config.model.get('n_group', 32)
-        feature_dim = n_freq // n_group if n_group > 0 else n_freq
-        heads = config.model.get('f_head', 6)
-        logger.info(f"Using ChordNet feature dimensions: n_freq={n_freq}, n_group={n_group}, feature_dim={feature_dim}, heads={heads}")
-
-        model = ChordNet(
-            n_freq=n_freq,
-            n_classes=n_classes,
-            n_group=n_group,
-            f_layer=config.model.get('f_layer', 3),
-            f_head=heads,
-            t_layer=config.model.get('t_layer', 3),
-            t_head=config.model.get('t_head', 6),
-            d_layer=config.model.get('d_layer', 3),
-            d_head=config.model.get('d_head', 6),
-            dropout=config.model.get('dropout', 0.3)
-        ).to(device)
-    else:  # BTC model
-        # BTC specific parameters
-        # Create a config dictionary for BTC model
-        btc_config = {
-            'feature_size': n_freq,
-            'hidden_size': config.model.get('hidden_size', 128),
-            'num_layers': config.model.get('num_layers', 8),
-            'num_heads': config.model.get('num_heads', 4),
-            'total_key_depth': config.model.get('total_key_depth', 128),
-            'total_value_depth': config.model.get('total_value_depth', 128),
-            'filter_size': config.model.get('filter_size', 128),
-            'seq_len': config.model.get('timestep', 108),
-            'input_dropout': config.model.get('input_dropout', 0.2),
-            'layer_dropout': config.model.get('layer_dropout', 0.2),
-            'attention_dropout': config.model.get('attention_dropout', 0.2),
-            'relu_dropout': config.model.get('relu_dropout', 0.2),
-            'num_chords': n_classes
-        }
-
-        logger.info(f"Using BTC model with parameters:")
-        for key, value in btc_config.items():
-            logger.info(f"  {key}: {value}")
-
-        model = BTC_model(config=btc_config).to(device)
-
-    # Apply model scale and dropout
-    model_scale = float(args.model_scale) if args.model_scale is not None else float(config.model.get('scale', 1.0))
-    dropout_rate = args.dropout if args.dropout is not None else config.model.get('dropout', 0.3)
-    logger.info(f"Using model scale: {model_scale}")
-    logger.info(f"Using dropout rate: {dropout_rate}")
-
-    if model_type == 'ChordNet':
-        # Apply scale to n_group for ChordNet
-        n_group_base = config.model.get('n_group', 32)
-        n_group = max(1, int(n_group_base * model_scale))
-        logger.info(f"Applying scale {model_scale} to n_group: {n_group_base} -> {n_group}")
-
-        model = ChordNet(
-            n_freq=n_freq,
-            n_classes=n_classes,
-            n_group=n_group, # Use scaled n_group
-            f_layer=config.model.get('f_layer', 3),
-            f_head=heads,
-            t_layer=config.model.get('t_layer', 3),
-            t_head=config.model.get('t_head', 6),
-            d_layer=config.model.get('d_layer', 3),
-            d_head=config.model.get('d_head', 6),
-            dropout=dropout_rate # Use dropout_rate
-        ).to(device)
-    else:  # BTC model
-        # Apply scale to hidden_size for BTC (example scaling)
-        hidden_size_base = config.model.get('hidden_size', 128)
-        hidden_size = max(32, int(hidden_size_base * model_scale)) # Ensure minimum size
-        logger.info(f"Applying scale {model_scale} to hidden_size: {hidden_size_base} -> {hidden_size}")
-
-        btc_config = {
-            'feature_size': n_freq,
-            'hidden_size': hidden_size, # Use scaled hidden_size
-            'num_layers': config.model.get('num_layers', 8),
-            'num_heads': config.model.get('num_heads', 4),
-            'total_key_depth': config.model.get('total_key_depth', 128),
-            'total_value_depth': config.model.get('total_value_depth', 128),
-            'filter_size': config.model.get('filter_size', 128),
-            'seq_len': config.model.get('timestep', 108),
-            'input_dropout': dropout_rate, # Apply dropout
-            'layer_dropout': dropout_rate,
-            'attention_dropout': dropout_rate,
-            'relu_dropout': dropout_rate,
-            'num_chords': n_classes
-        }
-        # ... (rest of BTC model creation) ...
-        model = BTC_model(config=btc_config).to(device)
-
-    # Attach chord mapping to model
-    model.idx_to_chord = master_mapping
-    logger.info("Attached chord mapping to model for correct MIR evaluation")
-
-    # Load checkpoint if specified (consistent handling)
-    load_path = args.load_checkpoint
-    if load_path:
-        resolved_load_path = resolve_data_path(load_path, storage_root, project_root)
-        if os.path.exists(resolved_load_path):
-            logger.info(f"Loading checkpoint from: {resolved_load_path}")
-            try:
-                checkpoint = torch.load(resolved_load_path, map_location=device)
-                # ... (Add logic similar to train_finetune to handle state_dict keys, partial loading etc.) ...
-                # Example:
-                if 'model_state_dict' in checkpoint: state_dict = checkpoint['model_state_dict']
-                elif 'model' in checkpoint: state_dict = checkpoint['model']
-                else: state_dict = checkpoint
-
-                if all(k.startswith('module.') for k in state_dict.keys()):
-                    state_dict = {k[7:]: v for k, v in state_dict.items()}
-
-                model.load_state_dict(state_dict, strict=not args.partial_loading)
-                logger.info("Successfully loaded checkpoint weights")
-                # Optionally load optimizer state etc. if not resetting
-                if not args.reset_epoch and 'optimizer_state_dict' in checkpoint:
-                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                    logger.info("Loaded optimizer state")
-
-            except Exception as e:
-                logger.error(f"Error loading checkpoint: {e}")
+        if pretrained_path:
+            logger.info(f"\n=== Loading BTC model from {pretrained_path} for training ===")
         else:
-            logger.warning(f"Specified checkpoint not found: {resolved_load_path}. Starting from scratch.")
+            logger.info("\n=== No BTC checkpoint specified, will initialize a fresh BTC model ===")
+    elif pretrained_path:
+        logger.info(f"\n=== Loading ChordNet model from {pretrained_path} for training ===")
+    else:
+        logger.error(f"No checkpoint specified via --load_checkpoint. Please provide a checkpoint to load.")
+        return
 
+    # Create model instance
+    optimizer_state_dict_to_load = None
+
+    # Load Normalization from Teacher Checkpoint
+    mean_val, std_val = load_normalization_from_checkpoint(
+        args.teacher_checkpoint or config.paths.get('teacher_checkpoint'),
+        storage_root, project_root
+    )
+    normalization_params = {'mean': mean_val, 'std': std_val}
+    logger.info(f"Using normalization parameters FOR TRAINING (from teacher checkpoint): mean={mean_val:.4f}, std={std_val:.4f}")
+
+    # Convert normalization floats to tensors for Trainer
+    trainer_normalization = {
+        'mean': torch.tensor(normalization_params['mean'], device=device, dtype=torch.float32),
+        'std': torch.tensor(normalization_params['std'], device=device, dtype=torch.float32)
+    }
+
+    try:
+        n_freq = getattr(config.feature, 'n_bins', 144)
+        logger.info(f"Using frequency dimension (n_bins): {n_freq}")
+
+        n_group = None
+        if model_type == 'ChordNet':
+            model_scale = float(args.model_scale) if args.model_scale is not None else float(config.model.get('scale', 1.0))
+            n_group = max(1, int(config.model.get('n_group', 32) * model_scale))
+            logger.info(f"Using n_group={n_group} for ChordNet")
+
+        dropout_rate = args.dropout if args.dropout is not None else config.model.get('dropout', 0.3)
+        logger.info(f"Using dropout rate: {dropout_rate}")
+
+        logger.info(f"Creating {model_type} model with {n_classes} output classes")
+
+        if model_type == 'ChordNet':
+            # --- ChordNet Creation (aligned with train_finetune) ---
+            f_layer = config.model.get('f_layer', 3)
+            f_head = config.model.get('f_head', 6)
+            t_layer = config.model.get('t_layer', 3)
+            t_head = config.model.get('t_head', 6)
+            d_layer = config.model.get('d_layer', 3)
+            d_head = config.model.get('d_head', 6)
+            logger.info(f"ChordNet params: f_layer={f_layer}, f_head={f_head}, t_layer={t_layer}, t_head={t_head}, d_layer={d_layer}, d_head={d_head}")
+            model = ChordNet(
+                n_freq=n_freq,
+                n_classes=n_classes,
+                n_group=n_group,
+                f_layer=f_layer,
+                f_head=f_head,
+                t_layer=t_layer,
+                t_head=t_head,
+                d_layer=d_layer,
+                d_head=d_head,
+                dropout=dropout_rate
+            ).to(device)
+            # --- End ChordNet Creation ---
+        else: # BTC model
+            # --- BTC Creation (aligned with train_finetune) ---
+            if btc_config is None or not hasattr(btc_config, 'model'):
+                 logger.error("BTC config or its 'model' section was not loaded correctly. Cannot initialize BTC model.")
+                 return
+
+            model_config_dict = btc_config.model
+            if not isinstance(model_config_dict, dict):
+                logger.error(f"Expected btc_config.model to be a dictionary, but got {type(model_config_dict)}. Check btc_config.yaml structure.")
+                return
+
+            # Override parameters
+            model_config_dict['num_chords'] = n_classes
+            logger.info(f"Overriding BTC model num_chords to: {n_classes}")
+
+            dropout_keys_found = []
+            if 'input_dropout' in model_config_dict: model_config_dict['input_dropout'] = dropout_rate; dropout_keys_found.append('input_dropout')
+            if 'layer_dropout' in model_config_dict: model_config_dict['layer_dropout'] = dropout_rate; dropout_keys_found.append('layer_dropout')
+            if 'attention_dropout' in model_config_dict: model_config_dict['attention_dropout'] = dropout_rate; dropout_keys_found.append('attention_dropout')
+            if 'relu_dropout' in model_config_dict: model_config_dict['relu_dropout'] = dropout_rate; dropout_keys_found.append('relu_dropout')
+
+            if dropout_keys_found: logger.info(f"Overriding BTC model dropout rates ({', '.join(dropout_keys_found)}) to: {dropout_rate}")
+            else: logger.warning("Could not find dropout keys in btc_config.model dictionary.")
+
+            # Apply model scale to hidden_size for BTC
+            hidden_size_base = model_config_dict.get('hidden_size', 128)
+            model_scale_btc = float(args.model_scale) if args.model_scale is not None else float(config.model.get('scale', 1.0))
+            hidden_size = max(32, int(hidden_size_base * model_scale_btc))
+            model_config_dict['hidden_size'] = hidden_size
+            logger.info(f"Applying scale {model_scale_btc} to BTC hidden_size: {hidden_size_base} -> {hidden_size}")
+
+            # Ensure feature_size matches n_freq
+            model_config_dict['feature_size'] = n_freq
+            logger.info(f"Setting BTC feature_size to: {n_freq}")
+
+            logger.info(f"Initializing BTC model with num_chords={model_config_dict.get('num_chords', 'N/A')}, hidden_size={hidden_size}, dropout={dropout_rate}")
+            model = BTC_model(config=model_config_dict).to(device)
+            # --- End BTC Creation ---
+
+        # Attach chord mapping and normalization to model
+        model.idx_to_chord = master_mapping
+        model.normalization_mean = torch.tensor(normalization_params['mean'], device=device, dtype=torch.float32)
+        model.normalization_std = torch.tensor(normalization_params['std'], device=device, dtype=torch.float32)
+        logger.info("Attached chord mapping and normalization parameters to model")
+
+        # Load pretrained weights AND potentially optimizer state
+        if pretrained_path:
+            resolved_load_path = resolve_path(pretrained_path, storage_root, project_root)
+            if os.path.exists(resolved_load_path):
+                logger.info(f"Loading checkpoint from: {resolved_load_path}")
+                try:
+                    checkpoint = torch.load(resolved_load_path, map_location=device)
+                    if 'n_classes' in checkpoint:
+                        pretrained_classes = checkpoint['n_classes']
+                        logger.info(f"Pretrained model has {pretrained_classes} output classes")
+                        if pretrained_classes != n_classes:
+                            logger.warning(f"Mismatch in class count: pretrained={pretrained_classes}, current={n_classes}")
+                            if not args.partial_loading:
+                                logger.warning("Loading may fail. Use --partial_loading to attempt partial weights loading.")
+
+                    if 'model_state_dict' in checkpoint: state_dict = checkpoint['model_state_dict']
+                    elif 'model' in checkpoint: state_dict = checkpoint['model']
+                    else: state_dict = checkpoint
+
+                    if all(k.startswith('module.') for k in state_dict.keys()):
+                        logger.info("Detected 'module.' prefix in state dict keys. Removing prefix.")
+                        state_dict = {k[7:]: v for k, v in state_dict.items()}
+
+                    model.load_state_dict(state_dict, strict=not args.partial_loading)
+                    logger.info(f"Successfully loaded model weights from {resolved_load_path}")
+
+                    if not args.reset_epoch:
+                        if 'optimizer_state_dict' in checkpoint:
+                            optimizer_state_dict_to_load = checkpoint['optimizer_state_dict']
+                            logger.info(f"Found optimizer state in {resolved_load_path}. Will load if trainer doesn't load its own state.")
+                        else:
+                            logger.warning(f"Resuming requested (reset_epoch=False), but no optimizer state found in {resolved_load_path}.")
+                    else:
+                        logger.info("Reset flags active (--reset_epoch). Ignoring optimizer state from checkpoint file.")
+
+                    del checkpoint, state_dict
+                    gc.collect()
+
+                except Exception as e:
+                    logger.error(f"Error loading checkpoint: {e}")
+                    # Decide if we should continue with random weights (maybe only for BTC?)
+                    if model_type == 'BTC':
+                        logger.warning("Continuing with freshly initialized BTC model due to loading error.")
+                    else:
+                        logger.error("Cannot continue without loading weights for ChordNet model.")
+                        return
+            else:
+                logger.warning(f"Specified checkpoint not found: {resolved_load_path}. Starting from scratch (if BTC) or failing (if ChordNet).")
+                if model_type != 'BTC': return # Fail if ChordNet needs weights
+
+        # Freeze feature extraction layers if requested
+        if args.freeze_feature_extractor:
+            logger.info("Freezing feature extraction layers:")
+            frozen_count = 0
+            for name, param in model.named_parameters():
+                freeze_condition = False
+                if model_type == 'ChordNet' and ('frequency_net' in name or 'prenet' in name): freeze_condition = True
+                elif model_type == 'BTC' and ('conv1' in name or 'conv_layers' in name): freeze_condition = True # Example
+
+                if freeze_condition:
+                    param.requires_grad = False
+                    logger.info(f"  Frozen: {name}")
+                    frozen_count += 1
+
+            if frozen_count == 0: logger.warning("Freeze feature extractor requested, but no layers matched criteria.")
+            else:
+                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                total_params = sum(p.numel() for p in model.parameters())
+                logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params:.1%})")
+
+    except Exception as e:
+        logger.error(f"Error creating or loading model: {e}")
+        logger.error(traceback.format_exc())
+        return
 
     # Create optimizer
     optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=config.training.get('learning_rate', 0.0001),
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=config.training['learning_rate'],
         weight_decay=config.training.get('weight_decay', 0.0)
     )
 
-    # IMPROVED: Handle string representations of boolean values
-    use_focal_loss = args.use_focal_loss
-    if not use_focal_loss:
-        config_focal = config.training.get('use_focal_loss', False)
-        if isinstance(config_focal, str):
-            use_focal_loss = config_focal.lower() == "true"
-        else:
-            use_focal_loss = bool(config_focal)
+    # Load optimizer state if found and resuming
+    if optimizer_state_dict_to_load:
+        try:
+            optimizer.load_state_dict(optimizer_state_dict_to_load)
+            logger.info("Successfully loaded optimizer state from checkpoint.")
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor): state[k] = v.to(device)
+            logger.info("Moved optimizer state to current device.")
+        except Exception as e:
+            logger.error(f"Error loading optimizer state from checkpoint: {e}. Using fresh optimizer state.")
+            optimizer_state_dict_to_load = None
 
-    focal_gamma = float(args.focal_gamma) if args.focal_gamma is not None else float(config.training.get('focal_gamma', 2.0))
-    focal_alpha = float(args.focal_alpha) if args.focal_alpha is not None else config.training.get('focal_alpha')
+    # Clean up GPU memory before training
+    if torch.cuda.is_available():
+        logger.info("Performing CUDA memory cleanup before training")
+        gc.collect()
+        torch.cuda.empty_cache()
+        allocated = torch.cuda.memory_allocated() / (1024 * 1024 * 1024)
+        reserved = torch.cuda.memory_reserved() / (1024 * 1024 * 1024)
+        logger.info(f"CUDA memory stats (GB): allocated={allocated:.2f}, reserved={reserved:.2f}")
 
-    if use_focal_loss:
-        logger.info(f"Using Focal Loss with gamma={focal_gamma}")
-        if focal_alpha is not None:
-            logger.info(f"Focal Loss alpha={focal_alpha}")
+    # Handle LR schedule
+    lr_schedule_type = args.lr_schedule or config.training.get('lr_schedule', 'validation')
+    if lr_schedule_type in ['validation', 'none']: lr_schedule_type = None
 
-    # Create trainer with knowledge distillation - with properly typed parameters
-    lr_schedule_type = args.lr_schedule or config.training.get('lr_schedule', 'validation') # Default to validation
-    if lr_schedule_type in ['validation', 'none']:
-        lr_schedule_type = None # Trainer handles these internally or disables scheduler
+    # Create trainer
+    use_warmup_value = config.training.get('use_warmup', False)
+    warmup_epochs = int(config.training.get('warmup_epochs', 10)) if use_warmup_value else None
+    warmup_start_lr = float(config.training.get('warmup_start_lr')) if use_warmup_value else None
+    warmup_end_lr = float(config.training.get('warmup_end_lr')) if use_warmup_value else None
+
+    logger.info(f"Creating trainer with use_warmup={use_warmup_value}")
+    if use_warmup_value: logger.info(f"Warmup configuration: {warmup_epochs} epochs from {warmup_start_lr} to {warmup_end_lr}")
 
     trainer = StudentTrainer(
         model=model,
@@ -766,230 +914,183 @@ def main():
         device=device,
         num_epochs=int(config.training.get('num_epochs', 50)),
         logger=logger,
-        checkpoint_dir=save_dir,
+        checkpoint_dir=checkpoints_dir,
         class_weights=None,
         idx_to_chord=master_mapping,
-        normalization=normalization,
-        early_stopping_patience=int(config.training.get('early_stopping_patience', 10)), # Increased patience
+        normalization=trainer_normalization, # Pass the checkpoint-based normalization tensors
+        early_stopping_patience=int(config.training.get('early_stopping_patience', 10)),
         lr_decay_factor=float(config.training.get('lr_decay_factor', 0.95)),
         min_lr=float(config.training.get('min_learning_rate', 5e-6)),
-        use_warmup=use_warmup_final, # Use the final calculated value
-        warmup_epochs=int(config.training.get('warmup_epochs', 10)) if use_warmup_final else None,
-        warmup_start_lr=float(config.training.get('warmup_start_lr')) if use_warmup_final else None,
-        warmup_end_lr=float(config.training.get('warmup_end_lr')) if use_warmup_final else None,
-        lr_schedule_type=lr_schedule_type, # Pass schedule type
-        use_focal_loss=use_focal_loss, # Use final calculated value
+        use_warmup=use_warmup_value,
+        warmup_epochs=warmup_epochs,
+        warmup_start_lr=warmup_start_lr,
+        warmup_end_lr=warmup_end_lr,
+        lr_schedule_type=lr_schedule_type,
+        use_focal_loss=use_focal_loss,
         focal_gamma=focal_gamma,
         focal_alpha=focal_alpha,
-        use_kd_loss=use_kd_loss, # Use final calculated value
+        use_kd_loss=use_kd_loss,
         kd_alpha=kd_alpha,
         temperature=temperature,
-        teacher_model=teacher_model,
-        teacher_normalization={'mean': teacher_mean, 'std': teacher_std},
-        teacher_predictions=teacher_predictions,
-        timeout_minutes=args.timeout_minutes, # Pass timeout
-        reset_epoch=args.reset_epoch, # Pass reset flags
+        timeout_minutes=args.timeout_minutes,
+        reset_epoch=args.reset_epoch,
         reset_scheduler=args.reset_scheduler,
-        load_checkpoint_path=resolved_load_path if load_path else None # Pass specific path if provided
+        # REMOVED: teacher_model, teacher_normalization, teacher_predictions
+        load_checkpoint_path=resolved_load_path if pretrained_path else None # Pass specific path if provided
     )
 
-    # Set chord mapping
+    # Attach chord mapping to trainer (chord -> idx)
     trainer.set_chord_mapping(chord_mapping)
 
-    # Train the model
-    logger.info(f"Starting training for fold {args.kfold}")
+    # Log checkpoint loading status for resuming
+    latest_checkpoint_path = os.path.join(checkpoints_dir, "trainer_state_latest.pth")
+    will_trainer_load_internal_state = os.path.exists(latest_checkpoint_path) and not args.reset_epoch
+
+    if will_trainer_load_internal_state:
+         logger.info(f"Trainer found existing internal checkpoint '{latest_checkpoint_path}'. Attempting to resume training.")
+         if optimizer_state_dict_to_load: logger.warning("Optimizer state loaded from external checkpoint might be overwritten.")
+    else:
+        if not os.path.exists(latest_checkpoint_path): logger.info(f"No suitable internal trainer checkpoint found at '{latest_checkpoint_path}'.")
+        if args.reset_epoch: logger.info("Reset flags active (--reset_epoch).")
+        logger.info("Starting training from scratch (epoch 1) after loading external weights.")
+        if optimizer_state_dict_to_load: logger.info("Using optimizer state loaded from the external checkpoint.")
+        else: logger.info("Using a fresh optimizer state.")
+
+    # Run training
+    logger.info(f"\n=== Starting training for Fold {args.kfold} ===")
     try:
+        # Verify KD setup if enabled
+        if use_kd_loss:
+            logger.info("Verifying offline knowledge distillation setup...")
+            try:
+                sample_batch = next(iter(train_loader))
+                if 'teacher_logits' in sample_batch:
+                    logger.info(f"✅ Teacher logits found in batch with shape: {sample_batch['teacher_logits'].shape}")
+                else:
+                    logger.warning("⚠️ No teacher logits found in the batch. KD will not work.")
+            except Exception as e:
+                logger.error(f"Error verifying KD setup: {e}")
+
+        # Start training
         trainer.train(train_loader, val_loader)
-        logger.info("Training completed successfully")
+        logger.info("Training completed successfully!")
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
     except Exception as e:
-        logger.error(f"Error during training: {e}")
+        logger.error(f"ERROR during training: {e}")
         logger.error(traceback.format_exc())
 
     # Final evaluation on validation set (which is the test set for this fold)
-    logger.info("\n=== Testing (Validation Fold) ===")
+    logger.info(f"\n=== Testing (Validation Fold {args.kfold}) ===")
     try:
         if trainer.load_best_model():
-            # Use the validation loader (acts as test loader for this fold)
-            test_loader = val_loader # Already created earlier
+            logger.info("Evaluating using best model checkpoint for this fold.")
 
             # Basic testing with Tester class
             tester = Tester(
                 model=model,
-                test_loader=test_loader, # Use the validation loader here
+                test_loader=test_loader, # Use the validation loader for this fold
                 device=device,
-                idx_to_chord=master_mapping, # Use master_mapping (idx->chord)
-                normalization=normalization, # Use the calculated normalization
-                output_dir=save_dir, # Use save_dir for this fold
+                idx_to_chord=master_mapping,
+                normalization=trainer_normalization,
+                output_dir=checkpoints_dir,
                 logger=logger
             )
-
             test_metrics = tester.evaluate(save_plots=True)
 
             # Save test metrics for this fold
             try:
-                metrics_path = os.path.join(save_dir, f"test_metrics_fold{args.kfold}.json")
+                metrics_path = os.path.join(checkpoints_dir, f"test_metrics_fold{args.kfold}.json")
                 with open(metrics_path, 'w') as f:
                     json.dump(test_metrics, f, indent=2)
                 logger.info(f"Test metrics for fold {args.kfold} saved to {metrics_path}")
             except Exception as e:
                 logger.error(f"Error saving test metrics for fold {args.kfold}: {e}")
 
-            # NEW: Generate chord quality distribution and accuracy visualization
-            logger.info("\n=== Generating Chord Quality Distribution and Accuracy Graph (Validation Fold) ===")
-            try:
-                from modules.utils.visualize import plot_chord_quality_distribution_accuracy
+            # Advanced MIR evaluation using frame-level data from CrossValidationDataset
+            logger.info(f"\n=== MIR evaluation (Validation Fold {args.kfold}) ===")
+            all_preds_idx = []
+            all_targets_idx = []
+            model.eval()
+            with torch.no_grad():
+                for batch in tqdm(test_loader, desc=f"MIR Eval Fold {args.kfold}"):
+                    inputs = batch['spectro'].to(device)
+                    targets = batch['chord_idx'].to(device) # Shape: (batch, seq_len)
 
-                # Collect all predictions and targets from the validation set
-                all_preds = []
-                all_targets = []
-                model.eval()
-                with torch.no_grad():
-                    for batch in test_loader: # Iterate through validation loader
-                        inputs, targets = batch['spectro'], batch['chord_idx']
-                        inputs = inputs.to(device)
-                        targets = targets.to(device)
+                    # Apply normalization (using model's attached norm params)
+                    if hasattr(model, 'normalization_mean') and hasattr(model, 'normalization_std'):
+                        inputs = (inputs - model.normalization_mean) / model.normalization_std
+                    elif trainer_normalization and 'mean' in trainer_normalization and 'std' in trainer_normalization:
+                         inputs = (inputs - trainer_normalization['mean']) / trainer_normalization['std']
 
-                        # Apply normalization if available
-                        if normalization and 'mean' in normalization and 'std' in normalization:
-                            inputs = (inputs - normalization['mean']) / normalization['std']
+                    outputs = model(inputs) # Shape: (batch, seq_len, n_classes)
+                    if isinstance(outputs, tuple): logits = outputs[0]
+                    else: logits = outputs
 
-                        outputs = model(inputs)
-                        if isinstance(outputs, tuple):
-                            logits = outputs[0]
-                        else:
-                            logits = outputs
+                    preds = logits.argmax(dim=-1) # Shape: (batch, seq_len)
 
-                        # Handle 3D logits (sequence data) - Average over time dimension for frame-level eval
-                        if logits.ndim == 3 and targets.ndim == 2:
-                             # Flatten logits and targets for frame-level comparison
-                            logits = logits.view(-1, logits.size(-1)) # (batch*seq_len, n_classes)
-                            targets = targets.view(-1) # (batch*seq_len)
-                        elif logits.ndim == 3 and targets.ndim == 1:
-                             # If targets are already flat, just flatten logits
-                            logits = logits.view(-1, logits.size(-1))
+                    # Flatten batch and sequence dimensions
+                    all_preds_idx.extend(preds.view(-1).cpu().numpy())
+                    all_targets_idx.extend(targets.view(-1).cpu().numpy())
 
-                        preds = logits.argmax(dim=1)
-                        all_preds.extend(preds.cpu().numpy())
-                        all_targets.extend(targets.cpu().numpy())
+            # Convert indices to chord labels using master_mapping
+            all_prediction_labels_std = [master_mapping.get(idx, 'N') for idx in all_preds_idx]
+            all_reference_labels_std = [master_mapping.get(idx, 'N') for idx in all_targets_idx]
 
-                # Define focus qualities
-                focus_qualities = ["maj", "min", "dim", "aug", "min6", "maj6", "min7",
-                                  "min-maj7", "maj7", "7", "dim7", "hdim7", "sus2", "sus4"]
+            mir_eval_results = {}
+            if all_reference_labels_std and all_prediction_labels_std:
+                logger.info(f"Calculating final MIR scores using {len(all_reference_labels_std)} aggregated frames for Fold {args.kfold}...")
+                try:
+                    # Create dummy timestamps and use calculate_chord_scores
+                    frame_duration = config.feature.get('hop_duration', 0.09288)
+                    num_frames = len(all_reference_labels_std)
+                    timestamps = np.arange(num_frames) * frame_duration
 
-                # Create distribution and accuracy visualization for this fold
-                quality_dist_path = os.path.join(save_dir, f"chord_quality_distribution_accuracy_fold{args.kfold}.png")
-                plot_chord_quality_distribution_accuracy(
-                    all_preds, all_targets, master_mapping, # Use master_mapping (idx->chord)
-                    save_path=quality_dist_path,
-                    title=f"Chord Quality Distribution and Accuracy (Fold {args.kfold})",
-                    focus_qualities=focus_qualities
-                )
-                logger.info(f"Chord quality distribution graph for fold {args.kfold} saved to {quality_dist_path}")
-            except ImportError:
-                 logger.warning("Could not import plot_chord_quality_distribution_accuracy. Skipping visualization.")
-                 logger.warning("Install matplotlib and seaborn: pip install matplotlib seaborn")
-            except Exception as e:
-                logger.error(f"Error creating chord quality distribution graph for fold {args.kfold}: {e}")
-                logger.error(traceback.format_exc())
+                    scores_tuple = calculate_chord_scores(
+                        timestamps, frame_duration,
+                        all_reference_labels_std, all_prediction_labels_std
+                    )
 
-            # Advanced testing with mir_eval module on validation set
-            logger.info("\n=== MIR evaluation (Validation Fold) ===")
-            score_metrics = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
+                    score_names = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
+                    mir_eval_results = {name: score for name, score in zip(score_names, scores_tuple)}
+                    logger.info(f"Detailed MIR scores (Fold {args.kfold}): {mir_eval_results}")
 
-            # Use the validation samples for this fold
-            validation_samples = val_dataset.samples # These are the samples for the current validation fold
-            dataset_length = len(validation_samples)
+                    # Calculate frame-wise accuracy
+                    correct_frames = sum(1 for ref, pred in zip(all_reference_labels_std, all_prediction_labels_std) if ref == pred)
+                    total_frames = len(all_reference_labels_std)
+                    frame_accuracy = correct_frames / total_frames if total_frames > 0 else 0
+                    mir_eval_results['frame_accuracy'] = frame_accuracy
+                    logger.info(f"Frame-wise Accuracy (Standardized, Fold {args.kfold}): {frame_accuracy:.4f}")
 
-            if dataset_length < 3:
-                logger.info(f"Not enough validation samples ({dataset_length}) in fold {args.kfold} to compute chord metrics with 3 splits.")
-                 # Optionally run on the whole validation set if splits aren't possible
-                if dataset_length > 0:
-                     logger.info(f"Evaluating model on all {dataset_length} validation samples for fold {args.kfold}...")
-                     score_list_dict, song_length_list, average_score_dict = large_voca_score_calculation(
-                         valid_dataset=validation_samples, config=config, model=model, model_type=model_type,
-                         mean=mean, std=std, device=device)
-                     mir_eval_results = average_score_dict # Store the single result
-                     logger.info(f"MIR evaluation results for fold {args.kfold} (all samples): {mir_eval_results}")
-                else:
-                     logger.info(f"No validation samples available for MIR evaluation in fold {args.kfold}.")
-                     mir_eval_results = {}
+                    # --- Add Individual Chord Quality Accuracy ---
+                    logger.info(f"\n--- Chord Quality Accuracy (Validation Fold {args.kfold}) ---")
+                    ind_acc, quality_stats = compute_individual_chord_accuracy(
+                        all_reference_labels_std,
+                        all_prediction_labels_std
+                    )
+
+                except Exception as mir_calc_error:
+                    logger.error(f"Failed to calculate detailed MIR scores for Fold {args.kfold}: {mir_calc_error}")
+                    logger.error(traceback.format_exc())
+                    mir_eval_results['error'] = f"MIR calculation failed: {mir_calc_error}"
             else:
-                # Create balanced splits from the validation samples
-                split = dataset_length // 3
-                valid_dataset1 = validation_samples[:split]
-                valid_dataset2 = validation_samples[split:2*split]
-                valid_dataset3 = validation_samples[2*split:]
-
-                # Evaluate each split
-                logger.info(f"Evaluating model on {len(valid_dataset1)} validation samples in split 1 (Fold {args.kfold})...")
-                score_list_dict1, song_length_list1, average_score_dict1 = large_voca_score_calculation(
-                    valid_dataset=valid_dataset1, config=config, model=model, model_type=model_type,
-                    mean=mean, std=std, device=device)
-
-                logger.info(f"Evaluating model on {len(valid_dataset2)} validation samples in split 2 (Fold {args.kfold})...")
-                score_list_dict2, song_length_list2, average_score_dict2 = large_voca_score_calculation(
-                    valid_dataset=valid_dataset2, config=config, model=model, model_type=model_type,
-                    mean=mean, std=std, device=device)
-
-                logger.info(f"Evaluating model on {len(valid_dataset3)} validation samples in split 3 (Fold {args.kfold})...")
-                score_list_dict3, song_length_list3, average_score_dict3 = large_voca_score_calculation(
-                    valid_dataset=valid_dataset3, config=config, model=model, model_type=model_type,
-                    mean=mean, std=std, device=device)
-
-                # Calculate weighted averages
-                mir_eval_results = {}
-                # Check if all results are valid before calculating average
-                valid_results = (average_score_dict1 and average_score_dict2 and average_score_dict3 and
-                                 song_length_list1 and song_length_list2 and song_length_list3)
-
-                if valid_results:
-                    total_length = np.sum(song_length_list1) + np.sum(song_length_list2) + np.sum(song_length_list3)
-                    if total_length > 0:
-                        for m in score_metrics:
-                             # Ensure metric exists in all dictionaries
-                            if m in average_score_dict1 and m in average_score_dict2 and m in average_score_dict3:
-                                # Calculate weighted average based on song lengths
-                                avg = (np.sum(song_length_list1) * average_score_dict1[m] +
-                                       np.sum(song_length_list2) * average_score_dict2[m] +
-                                       np.sum(song_length_list3) * average_score_dict3[m]) / total_length
-
-                                # Calculate min and max values across the three splits
-                                split_values = [
-                                    average_score_dict1[m] * 100,
-                                    average_score_dict2[m] * 100,
-                                    average_score_dict3[m] * 100
-                                ]
-                                min_val = min(split_values)
-                                max_val = max(split_values)
-                                avg_val = avg * 100
-
-                                # Log individual split scores with range
-                                logger.info(f"==== (Fold {args.kfold}) {m}: {avg_val:.2f}% (avg), range: [{min_val:.2f}% - {max_val:.2f}%]")
-
-                                # Store in results dictionary
-                                mir_eval_results[m] = {
-                                    'split1': float(average_score_dict1[m]),
-                                    'split2': float(average_score_dict2[m]),
-                                    'split3': float(average_score_dict3[m]),
-                                    'weighted_avg': float(avg)
-                                }
-                            else:
-                                logger.warning(f"(Fold {args.kfold}) Metric '{m}' missing in one or more splits, cannot calculate average.")
-                                mir_eval_results[m] = {'error': f'Metric {m} missing in splits'}
-                    else:
-                        logger.warning(f"(Fold {args.kfold}) Total song length is zero, cannot calculate weighted average MIR scores.")
-                        mir_eval_results = {'error': 'Total song length zero'}
-                else:
-                    logger.warning(f"(Fold {args.kfold}) Could not calculate MIR scores properly for all splits.")
-                    mir_eval_results = {'error': 'Calculation failed for one or more splits'}
+                logger.warning(f"No reference or prediction labels collected for MIR evaluation (Fold {args.kfold}).")
+                mir_eval_results = {'error': 'No labels collected'}
 
             # Save MIR-eval metrics for this fold
             try:
-                mir_eval_path = os.path.join(save_dir, f"mir_eval_metrics_fold{args.kfold}.json")
+                mir_eval_path = os.path.join(checkpoints_dir, f"mir_eval_metrics_fold{args.kfold}.json")
                 with open(mir_eval_path, 'w') as f:
-                    json.dump(mir_eval_results, f, indent=2)
+                    # Convert numpy types to native Python types for JSON serialization
+                    serializable_results = {}
+                    for key, value in mir_eval_results.items():
+                        if isinstance(value, (np.float32, np.float64)):
+                            serializable_results[key] = float(value)
+                        elif isinstance(value, (np.int32, np.int64)):
+                             serializable_results[key] = int(value)
+                        else:
+                            serializable_results[key] = value
+                    json.dump(serializable_results, f, indent=2)
                 logger.info(f"MIR evaluation metrics for fold {args.kfold} saved to {mir_eval_path}")
             except Exception as e:
                  logger.error(f"Error saving MIR evaluation metrics for fold {args.kfold}: {e}")
@@ -1000,29 +1101,44 @@ def main():
         logger.error(f"Error during testing for fold {args.kfold}: {e}")
         logger.error(traceback.format_exc())
 
-    # Save final model for the fold (keep this part, add more info)
+    # Save the final model for the fold
     try:
-        final_path = os.path.join(save_dir, f'final_model_fold{args.kfold}.pth')
+        save_path = os.path.join(checkpoints_dir, f"final_model_fold{args.kfold}.pth")
+        mean_to_save = normalization_params['mean']
+        std_to_save = normalization_params['std']
+        if hasattr(mean_to_save, 'cpu'): mean_to_save = mean_to_save.cpu().numpy()
+        if hasattr(std_to_save, 'cpu'): std_to_save = std_to_save.cpu().numpy()
+
         torch.save({
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'fold': args.kfold,
-            'chord_mapping': chord_mapping, # chord -> idx
-            'idx_to_chord': master_mapping, # idx -> chord
-            'mean': mean,
-            'std': std,
-            'n_classes': n_classes, # Save number of classes
-            'model_type': model_type, # Save model type
-            'config': config.to_dict() # Save config used
-        }, final_path)
-        logger.info(f"Final model saved to {final_path}")
+            'chord_mapping': chord_mapping,
+            'idx_to_chord': master_mapping,
+            'mean': float(mean_to_save),
+            'std': float(std_to_save),
+            'n_classes': n_classes,
+            'model_type': model_type,
+            'fold': args.kfold, # Add fold info
+            'total_folds': args.total_folds # Add total folds info
+        }, save_path)
+        logger.info(f"Final model for fold {args.kfold} saved to {save_path}")
     except Exception as e:
-        logger.error(f"Error saving final model: {e}")
+        logger.error(f"Error saving final model for fold {args.kfold}: {e}")
+
+    logger.info(f"Cross-validation training and evaluation for fold {args.kfold} complete!")
 
 if __name__ == '__main__':
+    # Set start method for multiprocessing if necessary
     try:
-        multiprocessing.set_start_method('spawn', force=True)
+        if sys.platform.startswith('win'):
+             multiprocessing.set_start_method('spawn', force=True)
+        else:
+             multiprocessing.set_start_method('spawn', force=True)
     except RuntimeError:
-        # Start method already set or not available
+        current_method = multiprocessing.get_start_method(allow_none=True)
+        logger.info(f"Multiprocessing start method already set to '{current_method}'.")
         pass
+    except Exception as e:
+        logger.warning(f"Could not set multiprocessing start method: {e}")
+
     main()
