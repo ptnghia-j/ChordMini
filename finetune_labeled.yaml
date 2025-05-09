@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-finetune-nokd # Updated name
+  name: chord-finetune # Updated name
   namespace: csuf-titans
   labels:
     app: chord-finetune-synthlike # Updated label
@@ -169,9 +169,9 @@ spec:
               value: "0.000001"  # Minimum learning rate
             # Knowledge distillation settings (Offline KD)
             - name: USE_KD_LOSS
-              value: "false"  # Enable KD loss using pre-computed logits
+              value: "true"  # Enable KD loss using pre-computed logits
             - name: KD_ALPHA
-              value: "0.5"  # Weight for KD loss (0-1)
+              value: "0.3"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
               value: "3.0"  # Temperature for softening distributions
             # Focal loss settings
@@ -185,9 +185,9 @@ spec:
             - name: USE_WARMUP
               value: "true"  # Disable warm-up for fine-tuning usually
             - name: WARMUP_START_LR
-              value: "0.0001"
+              value: "0.00009"
             - name: WARMUP_END_LR
-              value: "0.0002"
+              value: "0.0001"
             - name: WARMUP_EPOCHS
               value: "5"
             # Dropout setting
@@ -234,9 +234,13 @@ spec:
               value: "false" # Use lazy init to save startup memory
             - name: BATCH_GPU_CACHE
               value: "false" # Usually false unless specific pattern benefits
+            - name: PREFETCH_FACTOR # ADDED: For DataLoader optimization
+              value: "6"     # ! NO EFFECT if num_workers=0
             # Checkpoint settings
-            - name: SAVE_DIR
-              value: "/mnt/storage/checkpoints/finetune_nokd" # Updated save directory
+            - name: SAVE_DIR # This is the base save directory
+              value: "/mnt/storage/checkpoints/finetune"
+            - name: SUB_DIR # ADDED: Subdirectory for this specific run
+              value: "cv" # Example: change as needed for different runs
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Force reset epoch for fine-tuning start
@@ -277,10 +281,18 @@ spec:
               echo "Logits Dir: ${LOGITS_DIR}"
               echo "Label Dirs: ${LABEL_DIRS}"
               echo "Cache Dir: ${CACHE_DIR}"
-              echo "Save Dir: ${SAVE_DIR}"
+              echo "Save Dir (base): ${SAVE_DIR}"
+              echo "Sub Dir: ${SUB_DIR}"
+
+              # Construct effective save directory
+              EFFECTIVE_SAVE_DIR="${SAVE_DIR}"
+              if [ -n "${SUB_DIR}" ]; then
+                EFFECTIVE_SAVE_DIR="${EFFECTIVE_SAVE_DIR}/${SUB_DIR}"
+              fi
+              echo "Effective Save Dir for this run: ${EFFECTIVE_SAVE_DIR}"
 
               # Create checkpoints directory
-              mkdir -p ${SAVE_DIR}
+              mkdir -p "${EFFECTIVE_SAVE_DIR}"
 
               # Check file counts again inside container
               echo "Checking file counts inside container..."
@@ -328,7 +340,7 @@ spec:
               CMD_ARGS="${CMD_ARGS} --logits_dir ${LOGITS_DIR}"
               CMD_ARGS="${CMD_ARGS} --label_dirs ${LABEL_DIRS}" # Pass space-separated list directly
               CMD_ARGS="${CMD_ARGS} --cache_dir ${CACHE_DIR}"
-              CMD_ARGS="${CMD_ARGS} --save_dir ${SAVE_DIR}"
+              CMD_ARGS="${CMD_ARGS} --save_dir ${EFFECTIVE_SAVE_DIR}" # MODIFIED: Use effective save dir
 
               # Training Params
               CMD_ARGS="${CMD_ARGS} --learning_rate ${LEARNING_RATE}"
@@ -373,6 +385,7 @@ spec:
               if [ "${METADATA_CACHE}" = "true" ]; then CMD_ARGS="${CMD_ARGS} --metadata_cache"; fi # Boolean flag, don't pass value
               if [ "${LAZY_INIT}" = "true" ]; then CMD_ARGS="${CMD_ARGS} --lazy_init"; fi # Boolean flag, don't pass value
               if [ "${BATCH_GPU_CACHE}" = "true" ]; then CMD_ARGS="${CMD_ARGS} --batch_gpu_cache"; fi # Boolean flag, don't pass value
+              if [ -n "${PREFETCH_FACTOR}" ]; then CMD_ARGS="${CMD_ARGS} --prefetch_factor ${PREFETCH_FACTOR}"; fi # ADDED
 
               # Small Dataset
               if [ -n "${SMALL_DATASET}" ]; then

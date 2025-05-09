@@ -82,7 +82,7 @@ def scale_config(config, scale_factor, n_freq, n_group):
     # Fix t_head and d_head similar to train_student.py (now using 4)
     t_head = 4
     d_head = 4
-    f_head = 4
+    f_head = 2
 
     feature_dim = n_freq // n_group
 

@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-cv-kd-01
+  name: chord-cv-kd
   namespace: csuf-titans
   labels:
     app: chord-cv-kd-training
@@ -20,7 +20,11 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-A10
+                - NVIDIA-A10 # Or other suitable GPU
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - gpu-11.nrp.mghpcc.org
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -69,12 +73,12 @@ spec:
             - name: MODEL_SCALE
               value: "1.0"  # Scale factor for model size (1.0 = standard, 2.0 = 2x larger)
             - name: MODEL_TYPE
-              value: "ChordNet"  # Model type: ChordNet or BTC
+              value: "BTC"  # Model type: ChordNet or BTC
             - name: BTC_CHECKPOINT
-              value: "/mnt/storage/checkpoints/btc/btc_model_best.pth"  # Path to BTC model checkpoint
+              value: "/mnt/storage/checkpoints/btc_model_best.pt"  # Path to BTC model checkpoint, changed .pth to .pt
             # Learning rate scheduling options
             - name: LR_SCHEDULE
-              value: "cosine"  # Options: cosine, step, validation
+              value: "validation"  # Options: cosine, step, validation
             # Additional learning rate parameters
             - name: LEARNING_RATE
               value: "0.0001"  # Base learning rate
@@ -82,40 +86,52 @@ spec:
               value: "0.000001"  # Minimum learning rate for schedulers
             # Knowledge distillation settings
             - name: USE_KD_LOSS
-              value: "false"  # Set to "true" to enable KD loss
+              value: "true"  # Set to "true" to enable KD loss
             - name: KD_ALPHA
-              value: "0.2"  # Weight for KD loss (0-1)
+              value: "0.3"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
               value: "4.0"  # Temperature for softening distributions
-            - name: TEACHER_MODEL
-              value: "/mnt/storage/checkpoints/btc/btc_model_large_voca.pt"  # Path to teacher model
+            - name: TEACHER_CHECKPOINT # MODIFIED: Was TEACHER_MODEL
+              value: "/mnt/storage/BTC/test/btc_model_large_voca.pt"  # Path to teacher model for normalization stats
             # Focal loss settings
             - name: USE_FOCAL_LOSS
-              value: "true"  # Set to "true" to enable focal loss
+              value: "false"  # Set to "true" to enable focal loss
             - name: FOCAL_GAMMA
               value: "2.0"   # Focusing parameter for focal loss
             - name: FOCAL_ALPHA
-              value: "0.25"  # Class weight parameter for focal loss
+              value: "0.5"  # Class weight parameter for focal loss
             # Warmup settings
             - name: USE_WARMUP
               value: "true"  # Set to "true" to enable learning rate warm-up
             - name: WARMUP_START_LR
-              value: "0.0001"  # Starting learning rate for warm-up
+              value: "0.00009"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.0005"  # Final learning rate after warm-up
+              value: "0.0001"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "10"  # Number of epochs for warm-up
+              value: "5"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
-              value: "0.3"  # Set dropout probability (0-1)
+              value: "0.2"  # Set dropout probability (0-1)
             # Cross-validation settings
             - name: KFOLD
-              value: "0"  # Which fold to use for validation (0-4)
+              value: "0"  # Specify the fold to run (e.g., "0", "1", "2", "3", "4")
             - name: TOTAL_FOLDS
-              value: "5"  # Total number of folds
+              value: "5"  # Total number of folds (should match 'completions')
             # Single data root for all data types
             - name: DATA_ROOT
               value: "/mnt/storage/data"
+            # ---- BEGIN: Ensure these data path ENV VARS are defined in your YAML ----
+            # These are examples, adjust paths as needed.
+            # The python script (train_cv_kd.py) will pick these up via its os.environ.get() logic.
+            - name: SPECTROGRAMS_DIR # ADDED: Example, ensure this is set
+              value: "LabeledDataset_synth/spectrograms" # Relative to DATA_ROOT or absolute
+            - name: LOGITS_DIR # ADDED: Example, ensure this is set
+              value: "LabeledDataset_synth/logits" # Relative to DATA_ROOT or absolute
+            - name: LABEL_DIR # ADDED: Example, ensure this is set
+              value: "LabeledDataset/Labels" # Relative to DATA_ROOT or absolute
+            - name: CACHE_DIR # ADDED: Example, ensure this is set
+              value: "data_cache/cv_kd" # Relative to DATA_ROOT or absolute
+            # ---- END: Ensure these data path ENV VARS are defined in your YAML ----
             # GPU memory utilization optimization
             - name: GPU_MEMORY_FRACTION
               value: "0.95"  # Use 95% of available GPU memory
@@ -128,22 +144,32 @@ spec:
               value: "6"     # ! NO EFFECT if num_workers=0
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
-              value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
+              value: "auto"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist), or actual path
             - name: SUB_DIR
-              value: "cv-kd-01"  # This will be used to append to the save directory for checkpoints
+              value: "cv-kd-fold-0"  # Make SUB_DIR specific to the KFOLD value above
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
+                             # When true: Training will start from epoch 1 regardless of the checkpoint's epoch
+                             # When false: Training will resume from the checkpoint's epoch + 1
             # Add reset scheduler control option
             - name: RESET_SCHEDULER
-              value: "true"  # Whether to reset LR scheduler when resetting epochs (true/false)
+              value: "true"  # Whether to reset LR scheduler when loading a checkpoint (true/false)
+                             # When true: Scheduler state will be reset even if RESET_EPOCH=false
+                             # When false: Scheduler state will be loaded from checkpoint if available
             # Dataset initialization controls
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: ""  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: "1.0"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
+            # ---- BEGIN: Ensure these ENV VARS are defined in your YAML ----
+            - name: EPOCHS # ADDED: Example, ensure this is set
+              value: "100"
+            - name: BATCH_SIZE # ADDED: Example, ensure this is set
+              value: "128"
+            # ---- END: Ensure these ENV VARS are defined in your YAML ----
           command:
             - sh
             - -c
@@ -225,13 +251,14 @@ spec:
               KD_LOSS_ARG=""
               if [ "${USE_KD_LOSS}" = "true" ]; then
                 echo "Using knowledge distillation with alpha=${KD_ALPHA} and temperature=${TEMPERATURE}"
+                # REMOVED: --teacher_model from here, as train_cv_kd.py uses logits_dir for offline KD
                 KD_LOSS_ARG="--use_kd_loss --kd_alpha ${KD_ALPHA} --temperature ${TEMPERATURE}"
-                
-                # Add teacher model path if specified
-                if [ "${TEACHER_MODEL}" != "" ]; then
-                  KD_LOSS_ARG="${KD_LOSS_ARG} --teacher_model ${TEACHER_MODEL}"
-                  echo "Using teacher model: ${TEACHER_MODEL}"
-                fi
+              fi
+
+              TEACHER_CHECKPOINT_ARG=""
+              if [ "${TEACHER_CHECKPOINT}" != "" ]; then
+                echo "Using teacher checkpoint for normalization: ${TEACHER_CHECKPOINT}"
+                TEACHER_CHECKPOINT_ARG="--teacher_checkpoint ${TEACHER_CHECKPOINT}"
               fi
 
               # Get model scale from environment
@@ -242,13 +269,13 @@ spec:
               else
                 echo "Using default model scale (1.0)"
               fi
-              
+
               # Get model type arguments
               MODEL_TYPE_ARGS=""
               if [ "${MODEL_TYPE}" != "" ]; then
                 echo "Using model type: ${MODEL_TYPE}"
                 MODEL_TYPE_ARGS="--model_type ${MODEL_TYPE}"
-                
+
                 # Add BTC checkpoint if model type is BTC
                 if [ "${MODEL_TYPE}" = "BTC" ] && [ "${BTC_CHECKPOINT}" != "" ]; then
                   MODEL_TYPE_ARGS="${MODEL_TYPE_ARGS} --btc_checkpoint ${BTC_CHECKPOINT}"
@@ -262,10 +289,60 @@ spec:
                 echo "Using fold ${KFOLD} for validation"
                 CV_ARGS="--kfold ${KFOLD}"
               fi
-              
+
               if [ "${TOTAL_FOLDS}" != "" ]; then
                 echo "Using ${TOTAL_FOLDS} total folds"
                 CV_ARGS="${CV_ARGS} --total_folds ${TOTAL_FOLDS}"
+              fi
+
+              DROPOUT_ARG=""
+              if [ "${DROPOUT}" != "" ]; then
+                echo "Using dropout: ${DROPOUT}"
+                DROPOUT_ARG="--dropout ${DROPOUT}"
+              fi
+
+              EPOCHS_ARG=""
+              if [ "${EPOCHS}" != "" ]; then
+                echo "Setting epochs: ${EPOCHS}"
+                EPOCHS_ARG="--epochs ${EPOCHS}"
+              fi
+
+              BATCH_SIZE_ARG=""
+              if [ "${BATCH_SIZE}" != "" ]; then
+                echo "Setting batch size: ${BATCH_SIZE}"
+                BATCH_SIZE_ARG="--batch_size ${BATCH_SIZE}"
+              fi
+
+              RESET_EPOCH_ARG=""
+              if [ "${RESET_EPOCH}" = "true" ]; then
+                echo "Reset epoch enabled"
+                RESET_EPOCH_ARG="--reset_epoch"
+              fi
+
+              RESET_SCHEDULER_ARG=""
+              if [ "${RESET_SCHEDULER}" = "true" ]; then
+                echo "Reset scheduler enabled"
+                RESET_SCHEDULER_ARG="--reset_scheduler"
+              fi
+
+              LOAD_CHECKPOINT_ARG=""
+              # Pass --load_checkpoint only if LOAD_CHECKPOINT is not empty and not "never"
+              # The python script's ENV override will handle LOAD_CHECKPOINT="never" by setting args.load_checkpoint to "never"
+              # The python script should ideally interpret "never" as None or skip loading.
+              # For safety, we only pass the arg if it's a potential path.
+              if [ "${LOAD_CHECKPOINT}" != "" ] && [ "${LOAD_CHECKPOINT}" != "never" ]; then
+                echo "Attempting to load checkpoint from: ${LOAD_CHECKPOINT}"
+                LOAD_CHECKPOINT_ARG="--load_checkpoint ${LOAD_CHECKPOINT}"
+              elif [ "${LOAD_CHECKPOINT}" = "never" ]; then
+                echo "LOAD_CHECKPOINT is 'never', will not pass --load_checkpoint arg directly, relying on ENV override in script."
+                # If script doesn't handle "never" from ENV, this might still try to load a file named "never".
+                # A more robust python script would check `if args.load_checkpoint == "never": args.load_checkpoint = None`
+              fi
+
+              CACHE_DIR_ARG=""
+              if [ "${CACHE_DIR}" != "" ]; then
+                echo "Using cache directory: ${CACHE_DIR}"
+                CACHE_DIR_ARG="--cache_dir ${CACHE_DIR}"
               fi
 
               # Handle caching options for memory optimization
@@ -300,7 +377,7 @@ spec:
               else
                 echo "Disabling lazy initialization for dataset (will pre-load all metadata)"
               fi
-              
+
               # Small dataset argument
               SMALL_DATASET_ARG=""
               if [ "${SMALL_DATASET}" != "" ]; then
@@ -328,24 +405,32 @@ spec:
                 ${WARMUP_ARG} \
                 ${FOCAL_LOSS_ARG} \
                 ${KD_LOSS_ARG} \
+                ${TEACHER_CHECKPOINT_ARG} \
                 ${CV_ARGS} \
                 ${GPU_ARGS} \
                 ${CACHE_ARGS} \
+                ${CACHE_DIR_ARG} \
                 ${DATASET_INIT_ARGS} \
-                ${SMALL_DATASET_ARG}
+                ${SMALL_DATASET_ARG} \
+                ${DROPOUT_ARG} \
+                ${EPOCHS_ARG} \
+                ${BATCH_SIZE_ARG} \
+                ${RESET_EPOCH_ARG} \
+                ${RESET_SCHEDULER_ARG} \
+                ${LOAD_CHECKPOINT_ARG}
           resources:
             limits:
               nvidia.com/gpu: "1"
-              memory: 32Gi
-              cpu: "8"
+              memory: "64Gi"
+              cpu: "6"
             requests:
               nvidia.com/gpu: "1"
-              memory: 16Gi
-              cpu: "4"
+              memory: "16Gi"
+              cpu: "2"
           volumeMounts:
             - name: storage
               mountPath: /mnt/storage
       volumes:
         - name: storage
           persistentVolumeClaim:
-            claimName: chord-data-pvc
+            claimName: temporary-storage

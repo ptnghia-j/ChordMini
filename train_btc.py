@@ -589,45 +589,75 @@ def main():
 
     # Collect paths based on active types
     if 'fma' in active_types:
-        # Use args override if provided, otherwise use default FMA path
-        current_spec_dir = resolve_path(args.spec_dir or fma_spec_dir, storage_root, project_root)
-        current_label_dir = resolve_path(args.label_dir or fma_label_dir, storage_root, project_root)
-        spec_dirs_list.append(current_spec_dir)
-        label_dirs_list.append(current_label_dir)
+        # If FMA is active, args.spec_dir (etc.) are considered FMA overrides if provided
+        effective_fma_spec_dir = args.spec_dir or fma_spec_dir
+        effective_fma_label_dir = args.label_dir or fma_label_dir
+
+        resolved_spec_dir = resolve_path(effective_fma_spec_dir, storage_root, project_root)
+        resolved_label_dir = resolve_path(effective_fma_label_dir, storage_root, project_root)
+        spec_dirs_list.append(resolved_spec_dir)
+        label_dirs_list.append(resolved_label_dir)
+
         if use_kd:
-            # Use args override if provided, otherwise use default FMA logits path
-            current_logits_dir = resolve_path(args.logits_dir or fma_logits_dir, storage_root, project_root)
-            logits_dirs_list.append(current_logits_dir)
-        fma_spec_count = count_files_in_subdirectories(current_spec_dir, "*_spec.npy")
-        fma_label_count = count_files_in_subdirectories(current_label_dir, "*.lab")
-        logger.info(f"  FMA: {fma_spec_count} specs, {fma_label_count} labels")
+            effective_fma_logits_dir = args.logits_dir or fma_logits_dir
+            resolved_logits_dir = resolve_path(effective_fma_logits_dir, storage_root, project_root)
+            logits_dirs_list.append(resolved_logits_dir)
+        
+        fma_spec_count = count_files_in_subdirectories(resolved_spec_dir, "*_spec.npy")
+        fma_label_count = count_files_in_subdirectories(resolved_label_dir, "*.lab")
+        logger.info(f"  FMA: {fma_spec_count} specs, {fma_label_count} labels at {resolved_spec_dir}")
 
     if 'maestro' in active_types:
-        # Use args override ONLY if it wasn't already used for FMA (avoid double override)
-        # If args.spec_dir/label_dir/logits_dir are set, they apply globally unless specific logic is added
-        current_spec_dir = resolve_path(args.spec_dir if 'fma' not in active_types else maestro_spec_dir, storage_root, project_root)
-        current_label_dir = resolve_path(args.label_dir if 'fma' not in active_types else maestro_label_dir, storage_root, project_root)
-        spec_dirs_list.append(current_spec_dir)
-        label_dirs_list.append(current_label_dir)
+        # For Maestro, args.spec_dir (etc.) apply only if dataset_type is 'maestro' or 'combined'
+        effective_maestro_spec_dir = maestro_spec_dir
+        if args.spec_dir and (args.dataset_type == 'maestro' or args.dataset_type == 'combined'):
+            effective_maestro_spec_dir = args.spec_dir
+
+        effective_maestro_label_dir = maestro_label_dir
+        if args.label_dir and (args.dataset_type == 'maestro' or args.dataset_type == 'combined'):
+            effective_maestro_label_dir = args.label_dir
+
+        resolved_spec_dir = resolve_path(effective_maestro_spec_dir, storage_root, project_root)
+        resolved_label_dir = resolve_path(effective_maestro_label_dir, storage_root, project_root)
+        spec_dirs_list.append(resolved_spec_dir)
+        label_dirs_list.append(resolved_label_dir)
+
         if use_kd:
-            current_logits_dir = resolve_path(args.logits_dir if 'fma' not in active_types else maestro_logits_dir, storage_root, project_root)
-            logits_dirs_list.append(current_logits_dir)
-        maestro_spec_count = count_files_in_subdirectories(current_spec_dir, "*_spec.npy")
-        maestro_label_count = count_files_in_subdirectories(current_label_dir, "*.lab")
-        logger.info(f"  Maestro: {maestro_spec_count} specs, {maestro_label_count} labels")
+            effective_maestro_logits_dir = maestro_logits_dir
+            if args.logits_dir and (args.dataset_type == 'maestro' or args.dataset_type == 'combined'):
+                effective_maestro_logits_dir = args.logits_dir
+            resolved_logits_dir = resolve_path(effective_maestro_logits_dir, storage_root, project_root)
+            logits_dirs_list.append(resolved_logits_dir)
+
+        maestro_spec_count = count_files_in_subdirectories(resolved_spec_dir, "*_spec.npy")
+        maestro_label_count = count_files_in_subdirectories(resolved_label_dir, "*.lab")
+        logger.info(f"  Maestro: {maestro_spec_count} specs, {maestro_label_count} labels at {resolved_spec_dir}")
 
     if 'dali_synth' in active_types:
-        # Use args override ONLY if it wasn't already used for FMA/Maestro
-        current_spec_dir = resolve_path(args.spec_dir if ('fma' not in active_types and 'maestro' not in active_types) else dali_spec_dir, storage_root, project_root)
-        current_label_dir = resolve_path(args.label_dir if ('fma' not in active_types and 'maestro' not in active_types) else dali_label_dir, storage_root, project_root)
-        spec_dirs_list.append(current_spec_dir)
-        label_dirs_list.append(current_label_dir)
+        # For DALI, args.spec_dir (etc.) apply only if dataset_type is 'dali_synth' or 'combined'
+        effective_dali_spec_dir = dali_spec_dir
+        if args.spec_dir and (args.dataset_type == 'dali_synth' or args.dataset_type == 'combined'):
+            effective_dali_spec_dir = args.spec_dir
+
+        effective_dali_label_dir = dali_label_dir
+        if args.label_dir and (args.dataset_type == 'dali_synth' or args.dataset_type == 'combined'):
+            effective_dali_label_dir = args.label_dir
+        
+        resolved_spec_dir = resolve_path(effective_dali_spec_dir, storage_root, project_root)
+        resolved_label_dir = resolve_path(effective_dali_label_dir, storage_root, project_root)
+        spec_dirs_list.append(resolved_spec_dir)
+        label_dirs_list.append(resolved_label_dir)
+
         if use_kd:
-            current_logits_dir = resolve_path(args.logits_dir if ('fma' not in active_types and 'maestro' not in active_types) else dali_logits_dir, storage_root, project_root)
-            logits_dirs_list.append(current_logits_dir)
-        dali_spec_count = count_files_in_subdirectories(current_spec_dir, "*_spec.npy")
-        dali_label_count = count_files_in_subdirectories(current_label_dir, "*.lab")
-        logger.info(f"  DALI Synth: {dali_spec_count} specs, {dali_label_count} labels")
+            effective_dali_logits_dir = dali_logits_dir
+            if args.logits_dir and (args.dataset_type == 'dali_synth' or args.dataset_type == 'combined'):
+                effective_dali_logits_dir = args.logits_dir
+            resolved_logits_dir = resolve_path(effective_dali_logits_dir, storage_root, project_root)
+            logits_dirs_list.append(resolved_logits_dir)
+
+        dali_spec_count = count_files_in_subdirectories(resolved_spec_dir, "*_spec.npy")
+        dali_label_count = count_files_in_subdirectories(resolved_label_dir, "*.lab")
+        logger.info(f"  DALI Synth: {dali_spec_count} specs, {dali_label_count} labels at {resolved_spec_dir}")
 
     # Check if any data was found
     if not spec_dirs_list or not label_dirs_list:

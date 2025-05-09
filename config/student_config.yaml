@@ -36,13 +36,13 @@ training:
 model:
   scale: 1.0          # Scaling factor: 0.5 = half size, 1.0 = base size, 2.0 = double size
   base_config:        # Base configuration for scale=1.0
-    f_layer: 4        # Base frequency attention layers 
-    f_head: 6         # Base frequency attention heads
-    t_layer: 2        # Base temporal attention layers
-    t_head: 6         # Base temporal attention heads
+    f_layer: 3        # Base frequency attention layers 
+    f_head: 2         # Base frequency attention heads
+    t_layer: 4        # Base temporal attention layers
+    t_head: 4         # Base temporal attention heads
     d_layer: 3        # Base decoder layers
-    d_head: 6         # Base decoder heads
-  n_group: 12         # Changed from 4 to 12 to ensure compatibility with n_bins=144 (must divide evenly)
+    d_head: 4         # Base decoder heads
+  n_group: 2         # Changed from 4 to 12 to ensure compatibility with n_bins=144 (must divide evenly)
   dropout: 0.3        # Dropout rate
   use_chord_aware_loss: false
 

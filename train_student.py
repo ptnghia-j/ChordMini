@@ -754,10 +754,10 @@ def main(rank=0, world_size=1):
     logger.info(f"Using frequency dimension: {n_freq}")
     logger.info(f"Output classes: {n_classes}")
 
-    # Always use n_group=12 for all inputs
-    n_group = 4
+    # Always use n_group=2 for all inputs
+    n_group = 2
     feature_dim = n_freq // n_group
-    logger.info(f"Using fixed n_group=12, resulting in feature dimension: {feature_dim}")
+    logger.info(f"Using fixed n_group=2, resulting in feature dimension: {feature_dim}")
 
     # Get dropout value
     dropout_rate = args.dropout if args.dropout is not None else config.model.get('dropout', 0.3)
@@ -773,20 +773,20 @@ def main(rank=0, world_size=1):
         if not base_config:
             base_config = {
                 'f_layer': config.model.get('f_layer', 3),
-                'f_head': config.model.get('f_head', 6),
-                't_layer': config.model.get('t_layer', 3),
-                't_head': config.model.get('t_head', 6),
+                'f_head': config.model.get('f_head', 2),
+                't_layer': config.model.get('t_layer', 4),
+                't_head': config.model.get('t_head', 4),
                 'd_layer': config.model.get('d_layer', 3),
-                'd_head': config.model.get('d_head', 6)
+                'd_head': config.model.get('d_head', 4)
             }
 
         # Apply scale to model parameters
         f_layer = max(1, int(round(base_config.get('f_layer', 3) * scale_factor)))
         t_layer = max(1, int(round(base_config.get('t_layer', 3) * scale_factor)))
         d_layer = max(1, int(round(base_config.get('d_layer', 3) * scale_factor)))
-        f_head = 6
-        t_head = 6
-        d_head = 6
+        f_head = 2
+        t_head = 4
+        d_head = 4
 
         # Ensure f_head is compatible with feature_dim (must be a divisor)
         if feature_dim % f_head != 0:

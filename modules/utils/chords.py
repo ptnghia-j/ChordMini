@@ -115,6 +115,7 @@ QUALITY_NORM_MAP = {
     '69': 'maj6',       # Simplify 6/9 chords to maj6
     'maj6(9)': 'maj6',
     'min69': 'min6',    # Add min6/9
+    '6/9': 'maj6',      # For C:6/9
 
     # Altered Chords (Normalize to base quality)
     # Parentheses content is removed by regex first, but handle common non-parentheses alterations
@@ -337,39 +338,100 @@ def _parse_single_interval_to_int(interval_str):
         return None
 
 # Map of interval sets (frozenset of pitch classes relative to root 0) to quality strings
+# The values should be one of the 14 target qualities:
+# maj, min, aug, dim, maj7, 7, min7, minmaj7, maj6, min6, sus4, sus2, dim7, hdim7
 INTERVAL_SETS_TO_QUALITY = {
-    # Triads
-    frozenset({0, 4, 7}): "maj",
-    frozenset({0, 3, 7}): "min",
-    frozenset({0, 3, 6}): "dim",
-    frozenset({0, 4, 8}): "aug",
-    # Sevenths
-    frozenset({0, 4, 7, 11}): "maj7",
-    frozenset({0, 3, 7, 10}): "min7",
-    frozenset({0, 4, 7, 10}): "7",
-    frozenset({0, 3, 6, 9}): "dim7",  # bb7 is 9
-    frozenset({0, 3, 6, 10}): "hdim7", # m7b5
-    # Suspended
-    frozenset({0, 5, 7}): "sus4", # 1, 4, 5
-    frozenset({0, 2, 7}): "sus2", # 1, 2, 5
-    # Power Chord
-    frozenset({0, 7}): "5",
-    # Extended Chords (examples)
-    # Ninths (Major 9th is interval class 2)
-    frozenset({0, 4, 7, 11, 2}): "maj9", # 1, 3, 5, 7, 9
-    frozenset({0, 3, 7, 10, 2}): "min9", # 1, b3, 5, b7, 9
-    frozenset({0, 4, 7, 10, 2}): "9",    # 1, 3, 5, b7, 9
-    # Elevenths (Perfect 11th is interval class 5)
-    frozenset({0, 4, 7, 11, 2, 5}): "maj11", # 1, 3, 5, 7, 9, 11
-    frozenset({0, 3, 7, 10, 2, 5}): "min11", # 1, b3, 5, b7, 9, 11
-    frozenset({0, 4, 7, 10, 2, 5}): "11",    # 1, 3, 5, b7, 9, 11
-    # For the specific example F:(b3,5,b7,11) -> intervals {b3,5,b7,11} -> pcs {0,3,7,10,5}
-    frozenset({0, 3, 7, 10, 5}): "min11", # Root, b3, 5, b7, 11(pc 5)
-    frozenset({0, 4, 7, 10, 5}): "11",    # Root, 3, 5, b7, 11(pc 5) - dominant 11th
-    frozenset({0, 4, 7, 11, 5}): "maj11", # Root, 3, 5, maj7, 11(pc 5) - major 11th
+    # Major (maj)
+    frozenset({0, 4, 7}): "maj",              # 1, 3, 5
+    frozenset({0, 4}): "maj",                 # 1, 3 (5th omitted)
+    frozenset({0, 2, 4, 7}): "maj",           # 1, 3, 5, 9 (add9)
+    frozenset({0}): "maj",                    # Root only
 
-    # More specific extended chords if needed, ensure they map to something in QUALITY_NORM_MAP
-    # Example: (b3,5,b7,9,11) -> {0,3,7,10,5,9} -> "min11" (already covered by QUALITY_NORM_MAP)
+    # Minor (min)
+    frozenset({0, 3, 7}): "min",              # 1, b3, 5
+    frozenset({0, 3}): "min",                 # 1, b3 (5th omitted)
+    frozenset({0, 2, 3, 7}): "min",           # 1, b3, 5, 9 (add9)
+
+    # Augmented (aug)
+    frozenset({0, 4, 8}): "aug",              # 1, 3, #5
+    frozenset({0, 2, 4, 8}): "aug",           # 1, 3, #5, 9 (aug add9)
+    frozenset({0, 4, 8, 10}): "aug",          # 1, 3, #5, b7 (aug7 -> aug) C:(1,3,#5,b7)
+    frozenset({0, 2, 4, 8, 10}): "aug",       # 1, 3, #5, b7, 9 (aug9 -> aug)
+    frozenset({0, 4, 8, 11}): "aug",          # 1, 3, #5, 7 (augmaj7 -> aug) C:(1,3,#5,7)
+
+
+    # Diminished (dim)
+    frozenset({0, 3, 6}): "dim",              # 1, b3, b5
+
+    # Major Seventh (maj7)
+    frozenset({0, 4, 7, 11}): "maj7",         # 1, 3, 5, 7
+    frozenset({0, 4, 11}): "maj7",            # 1, 3, 7 (5th omitted)
+    frozenset({0, 2, 4, 7, 11}): "maj7",      # 1, 3, 5, 7, 9 (maj9)
+    frozenset({0, 2, 4, 5, 7, 11}): "maj7",   # 1, 3, 5, 7, 9, 11 (maj11)
+    frozenset({0, 2, 4, 5, 7, 9, 11}): "maj7",# 1, 3, 5, 7, 9, 11, 13 (maj13)
+    frozenset({0, 4, 6, 7, 11}): "maj7",      # 1, 3, 5, 7, #11 (Lydian maj7)
+    frozenset({0, 4, 8, 11}): "maj7",         # 1, 3, #5, 7 (Augmented maj7) - Standard augmaj7, maps to maj7 if aug is primary
+   
+    # Dominant Seventh (7)
+    frozenset({0, 4, 7, 10}): "7",            # 1, 3, 5, b7
+    frozenset({0, 4, 10}): "7",               # 1, 3, b7 (5th omitted)
+    frozenset({0, 2, 4, 7, 10}): "7",         # 1, 3, 5, b7, 9 (dom9)
+    frozenset({0, 2, 4, 5, 7, 10}): "7",      # 1, 3, 5, b7, 9, 11 (dom11)
+    frozenset({0, 2, 4, 5, 7, 9, 10}): "7",   # 1, 3, 5, b7, 9, 11, 13 (dom13)
+    frozenset({0, 1, 4, 7, 10}): "7",         # 1, 3, 5, b7, b9 (7b9)
+    frozenset({0, 3, 4, 7, 10}): "7",         # 1, 3, 5, b7, #9 (7#9)
+    frozenset({0, 4, 6, 7, 10}): "7",         # 1, 3, 5, b7, #11 (Lydian Dominant)
+    frozenset({0, 4, 6, 10}): "7",            # 1, 3, b5, b7 (7b5) - also used for Ab:(3,b7,#11)
+    frozenset({0, 3, 4, 6, 8, 10}): "7",      # Complex altered dominant (e.g. Ab:(3,b7,#9,#11,b13))
+
+    # Minor Seventh (min7)
+    frozenset({0, 3, 7, 10}): "min7",         # 1, b3, 5, b7
+    frozenset({0, 3, 10}): "min7",            # 1, b3, b7 (5th omitted)
+    frozenset({0, 2, 3, 7, 10}): "min7",      # 1, b3, 5, b7, 9 (min9)
+    frozenset({0, 2, 3, 5, 7, 10}): "min7",   # 1, b3, 5, b7, 9, 11 (min11)
+    frozenset({0, 3, 5, 7, 10}): "min7",      # 1, b3, 5, b7, 11 (no 9) (e.g. F:(b3,5,b7,11))
+    frozenset({0, 2, 3, 5, 7, 9, 10}): "min7",# 1, b3, 5, b7, 9, 11, 13 (min13)
+
+    # Minor-Major Seventh (minmaj7)
+    frozenset({0, 3, 7, 11}): "minmaj7",      # 1, b3, 5, 7
+    frozenset({0, 2, 3, 7, 11}): "minmaj7",   # 1, b3, 5, 7, 9 (min-maj9)
+
+    # Major Sixth (maj6)
+    frozenset({0, 4, 7, 9}): "maj6",          # 1, 3, 5, 6
+    frozenset({0, 2, 4, 7, 9}): "maj6",       # 1, 3, 5, 6, 9 (maj6/9)
+
+    # Minor Sixth (min6)
+    frozenset({0, 3, 7, 9}): "min6",          # 1, b3, 5, 6
+    frozenset({0, 2, 3, 7, 9}): "min6",       # 1, b3, 5, 6, 9 (min6/9)
+
+    # Suspended Fourth (sus4)
+    frozenset({0, 5, 7}): "sus4",             # 1, 4, 5
+    frozenset({0, 5}): "sus4",                # 1, 4 (5th omitted)
+    frozenset({0, 5, 7, 10}): "sus4",         # 1, 4, 5, b7 (7sus4)
+    frozenset({0, 2, 5, 7}): "sus4",          # 1, 4, 5, 9 (sus4(9))
+
+    # Suspended Second (sus2)
+    frozenset({0, 2, 7}): "sus2",             # 1, 2, 5
+    frozenset({0, 2}): "sus2",                # 1, 2 (5th omitted)
+    frozenset({0, 2, 7, 10}): "sus2",         # 1, 2, 5, b7 (sus2(b7)) - can also be 9sus4 if 4th is present
+
+    # Diminished Seventh (dim7)
+    frozenset({0, 3, 6, 9}): "dim7",          # 1, b3, b5, bb7
+
+    # Half-Diminished Seventh (hdim7)
+    frozenset({0, 3, 6, 10}): "hdim7",        # 1, b3, b5, b7 (m7b5)
+
+    # Power Chord (maps to maj for 14-quality set)
+    frozenset({0, 7}): "maj",                 # 1, 5 (Power chord -> maj)
+
+    # Specific cases from previous changes (ensure they align with 14 qualities)
+    # frozenset({0, 3, 7, 10, 5}): "min11", # Root, b3, 5, b7, 11(pc 5) -> should be min7
+    # frozenset({0, 4, 7, 10, 5}): "11",    # Root, 3, 5, b7, 11(pc 5) - dominant 11th -> should be 7
+    # frozenset({0, 4, 7, 11, 5}): "maj11", # Root, 3, 5, maj7, 11(pc 5) - major 11th -> should be maj7
+    # These are covered by the more general extended chord mappings above.
+    # Example: {0,3,7,10,5} is {0,3,5,7,10} (min11 without 9th) -> maps to min7
+    # Example: {0,4,7,10,5} is {0,4,5,7,10} (dom11 without 9th) -> maps to 7
+    # Example: {0,4,7,11,5} is {0,4,5,7,11} (maj11 without 9th) -> maps to maj7
 }
 
 # Helper function to parse an interval list string (e.g., "(b3,5,b7)") to a quality string
@@ -481,140 +543,205 @@ def _parse_chord_string(chord_label):
         return "X", None, None
 
     # Basic cleaning
-    chord_label = chord_label.strip()
+    cleaned_chord_label = chord_label.strip()
 
     # --- Fix common specific issues first ---
-    # These often break general parsing rules
     specific_fixes = {
         'Emin/4': 'E:min/4', 'A7/3': 'A:7/3', 'Bb7/3': 'Bb:7/3', 'Bb7/5': 'Bb:7/5',
         # Add more specific known issues if needed
     }
-    if chord_label in specific_fixes:
-        chord_label = specific_fixes[chord_label]
+    if cleaned_chord_label in specific_fixes:
+        cleaned_chord_label = specific_fixes[cleaned_chord_label]
 
-    root_str, quality_str, bass_str = None, None, None
-    chord_part = chord_label # Part representing the chord itself (root+quality)
-
-    # 1. Split bass note first
-    if '/' in chord_label:
-        parts = chord_label.split('/', 1)
-        if len(parts) == 2 and parts[1]: # Ensure bass part is not empty
-            chord_part = parts[0].strip()
-            bass_str = parts[1].strip()
-            # Try parsing bass as pitch class, otherwise keep as string (scale degree)
+    # 1. Separate chord part and raw bass part (refined logic)
+    chord_part_str = cleaned_chord_label
+    raw_bass_notation = None
+    
+    # Try to split by the last '/'
+    # This is to handle cases like "C:maj7/G" correctly,
+    # and also to help with qualities like "6/9" if they are not followed by a bass note.
+    if '/' in cleaned_chord_label:
+        potential_chord_part, potential_bass = cleaned_chord_label.rsplit('/', 1)
+        potential_bass = potential_bass.strip()
+        
+        # Check if potential_bass is a valid pitch name or interval
+        is_bass_valid = False
+        if potential_bass: # Ensure potential_bass is not empty
             try:
-                bass_int = _parse_root(bass_str)
-                # Normalize bass pitch class spelling like the root
-                default_bass_name = PITCH_CLASS[bass_int]
-                bass_str = PREFERRED_SPELLING_MAP.get(default_bass_name, default_bass_name)
+                _parse_root(potential_bass) # Check if it's a pitch name
+                is_bass_valid = True
             except ValueError:
-                # Keep bass_str as is (e.g., '3', 'b7', '#4', '9')
-                # Validate if it looks like a scale degree
-                if not re.match(r'^[#b]?\d+$', bass_str):
-                     logger.debug(f"Invalid bass note string '{bass_str}' derived from '{chord_label}'. Ignoring bass.")
-                     bass_str = None # Treat as root position if bass is invalid string
-        else: # Malformed bass? Ignore it. Treat as root position.
-            chord_part = chord_label.replace('/', '').strip()
-            bass_str = None # Explicitly set bass to None
+                # Not a standard pitch name, check if it's an interval string like "b3", "5"
+                if _parse_single_interval_to_int(potential_bass) is not None:
+                    is_bass_valid = True
+        
+        if is_bass_valid:
+            chord_part_str = potential_chord_part.strip()
+            raw_bass_notation = potential_bass
+            if not chord_part_str: # Handles cases like "/G"
+                logger.debug(f"Empty chord part in '{cleaned_chord_label}' when bass is '{raw_bass_notation}'. Cannot parse.")
+                return "X", None, None
+        else:
+            # potential_bass is not a valid pitch/interval, so assume '/' is part of the quality
+            # chord_part_str remains cleaned_chord_label, raw_bass_notation remains None
+            pass # Default behavior: chord_part_str is whole label, raw_bass_notation is None
 
-    # Handle case where chord_part might be empty after splitting bass
-    if not chord_part:
-         logger.debug(f"Empty chord part after splitting bass from '{chord_label}'")
+    if not chord_part_str: # Should be caught above if bass was valid, but double check
+         logger.debug(f"Empty chord part in '{cleaned_chord_label}'. Cannot parse.")
          return "X", None, None
 
-    # 2. Split root and quality
-    if ':' in chord_part:
-        parts = chord_part.split(':', 1)
+    # 2. Parse root and intermediate quality from chord_part_str
+    # These are temporary variables before full normalization
+    parsed_root_from_chord_part = None
+    parsed_quality_from_chord_part = None
+
+    if ':' in chord_part_str:
+        parts = chord_part_str.split(':', 1)
         if len(parts) == 2:
-            root_str = parts[0].strip()
-            quality_str = parts[1].strip()
-            if not root_str: # Handle labels like ":min"
-                 logger.debug(f"Missing root in colon notation: '{chord_label}'")
+            parsed_root_from_chord_part = parts[0].strip()
+            parsed_quality_from_chord_part = parts[1].strip()
+            if not parsed_root_from_chord_part: # Handle labels like ":min"
+                 logger.debug(f"Missing root in colon notation: '{chord_part_str}' from '{cleaned_chord_label}'")
                  return "X", None, None
-        else: # Malformed colon? Treat as root only.
-            root_str = chord_part.replace(':', '').strip()
-            quality_str = '' # Assume major if only root is given
+        else: # Malformed colon (e.g. "C:")
+            parsed_root_from_chord_part = chord_part_str.replace(':', '').strip()
+            parsed_quality_from_chord_part = '' # Assume major
     else:
-        # No colon, need to find split point using regex
-        # Match root note (A-G, optional #/b) at the beginning
-        match = re.match(r'^([A-G][#b]?)', chord_part)
+        # No colon, find split point using regex for root (now case-insensitive for root)
+        match = re.match(r'^([a-gA-G][#b]?)', chord_part_str)
         if match:
-            root_str = match.group(1)
-            quality_str = chord_part[len(root_str):].strip()
-            # If quality_str is empty here, it means only root was provided (e.g., "C", "Bb")
+            parsed_root_from_chord_part = match.group(1)
+            parsed_quality_from_chord_part = chord_part_str[len(parsed_root_from_chord_part):].strip()
         else:
             # Cannot identify a valid root note at the start
-            logger.debug(f"Could not parse root from: {chord_part} in label {chord_label}")
-            return "X", None, None # Treat as unknown if root is unparseable
+            logger.debug(f"Could not parse root from: {chord_part_str} in label {cleaned_chord_label}")
+            return "X", None, None
 
     # 3. Normalize Root
+    final_root_str = None
+    root_int = None # Integer representation of the root (0-11)
     try:
-        root_int = _parse_root(root_str) # Handles B#, Cb etc via _parse_root's use of ENHARMONIC_MAP
-        # Get the default pitch class name (preferring sharps for C#, D#, F#, G#, A#)
+        root_int = _parse_root(parsed_root_from_chord_part)
         default_root_name = PITCH_CLASS[root_int]
-        # Use preferred spelling if available (e.g., A# -> Bb), otherwise use default
-        root_str = PREFERRED_SPELLING_MAP.get(default_root_name, default_root_name)
-
+        final_root_str = PREFERRED_SPELLING_MAP.get(default_root_name, default_root_name)
     except ValueError as e:
-        logger.debug(f"Error parsing root '{root_str}' from label '{chord_label}': {e}")
-        return "X", None, None # Treat as unknown
+        logger.debug(f"Error parsing root '{parsed_root_from_chord_part}' from label '{cleaned_chord_label}': {e}")
+        return "X", None, None # Treat as unknown if root parsing fails
 
-    # 4. Normalize Quality
-    # Remove parentheses content for normalization (e.g., maj(9) -> maj)
-    # This simplifies handling of complex MIREX notations like * and alterations within ()
-    original_quality_str = quality_str # Keep original for logging if needed
+    # 4. Parse and Normalize Bass Note (if raw_bass_notation was found)
+    final_bass_str = None
+    if raw_bass_notation:
+        is_potential_interval_degree = re.match(r'^[#b]?\d+$', raw_bass_notation)
+        parsed_as_interval = False
 
-    # Check if quality_str is an explicit interval list like (b3,5,b7)
-    # It must start with '(', end with ')', and contain at least one comma if multiple intervals.
-    # Single interval like (b3) won't have a comma but should still be parsed if we want.
-    # For now, align with prompt: "contains commas like (b3,5,b7,11)"
-    # A more general check for "is it purely an interval list?" could be:
-    # quality_str.startswith('(') and quality_str.endswith(')') and not any(c.isalpha() for c in quality_str[1:-1] if c not in 'b#(),')
-    
-    is_interval_list_notation = False
-    if quality_str.startswith('(') and quality_str.endswith(')'):
-        # Check if content looks like intervals rather than text e.g. (maj)
-        # A simple check: contains digits or 'b'/'#' and not too many letters.
-        # Or, more strictly, require a comma for multi-interval lists as per prompt.
-        # If it's like "(b3,5)", it should be parsed.
-        # If it's like "(maj)", it should not.
-        # If it's like "(9)", it could be an interval.
-        # Let's use the comma criteria from the prompt for now for multi-item lists.
-        # For single items like "(b3)", _parse_intervals_to_quality handles it if no comma.
-        # The key is to distinguish "(b3,5)" from "(add9)".
+        if is_potential_interval_degree:
+            # Try parsing as an interval relative to the chord's root first.
+            # root_int must be valid if we've reached here.
+            interval_pc_from_bass = _parse_single_interval_to_int(raw_bass_notation)
+            if interval_pc_from_bass is not None:
+                # interval_pc_from_bass is 0-11 relative to a hypothetical root 0.
+                # Add to current chord's root_int to get absolute pitch class.
+                absolute_bass_pc = (root_int + interval_pc_from_bass) % 12
+                default_bass_name = PITCH_CLASS[absolute_bass_pc]
+                final_bass_str = PREFERRED_SPELLING_MAP.get(default_bass_name, default_bass_name)
+                parsed_as_interval = True
         
-        # If it's purely parenthesized, try parsing as intervals.
-        # The _parse_intervals_to_quality function will return None if it's not a valid list.
-        parsed_quality_from_intervals = _parse_intervals_to_quality(quality_str)
-        if parsed_quality_from_intervals:
-            quality_str = parsed_quality_from_intervals
-            is_interval_list_notation = True # Mark that we used this path
-            logger.debug(f"Parsed interval list '{original_quality_str}' to quality '{quality_str}' for label '{chord_label}'")
-        # else: it was parenthesized but not a valid interval list (e.g. "(maj)", "(nonsense)")
-        # or parsing failed, so it will fall through to re.sub.
+        if not parsed_as_interval:
+            # If not parsed as an interval (either not interval-like or _parse_single_interval_to_int failed)
+            # Attempt to parse bass as a direct pitch name (e.g., "C#", "Bb")
+            try:
+                bass_pc_direct = _parse_root(raw_bass_notation)
+                default_bass_name = PITCH_CLASS[bass_pc_direct]
+                final_bass_str = PREFERRED_SPELLING_MAP.get(default_bass_name, default_bass_name)
+            except ValueError:
+                # Failed as direct pitch name as well.
+                # If it originally looked like an interval/degree string, keep it as is.
+                if is_potential_interval_degree:
+                    final_bass_str = raw_bass_notation # Keep as scale degree string
+                else:
+                    # Otherwise, it's an invalid bass string.
+                    logger.debug(f"Invalid bass note string '{raw_bass_notation}' for chord '{cleaned_chord_label}'. Ignoring bass.")
+                    # final_bass_str remains None, effectively ignoring invalid bass
 
-    if not is_interval_list_notation:
-        # If not parsed as an interval list, apply standard regex stripping for parentheses
-        # This handles cases like "maj(9)" -> "maj", or if "(b3,5)" failed interval parsing.
-        quality_str = re.sub(r'\(.*\)', '', quality_str).strip()
+    # 5. Normalize Quality (from parsed_quality_from_chord_part) - Reordered Logic
+    quality_str_to_process = parsed_quality_from_chord_part 
+    original_quality_for_log = quality_str_to_process
+    final_quality_str = None
+
+    # Attempt 1: Direct lookup in QUALITY_NORM_MAP for the full quality string
+    if quality_str_to_process in QUALITY_NORM_MAP:
+        final_quality_str = QUALITY_NORM_MAP[quality_str_to_process]
+        logger.debug(f"Quality '{original_quality_for_log}' found directly in QUALITY_NORM_MAP as '{final_quality_str}' for label '{cleaned_chord_label}'")
+
+    # Attempt 2: Parse as interval list if not found directly and matches interval list format
+    if final_quality_str is None and \
+       quality_str_to_process.startswith('(') and quality_str_to_process.endswith(')'):
+        parsed_from_intervals = _parse_intervals_to_quality(quality_str_to_process)
+        if parsed_from_intervals:
+            # The result from _parse_intervals_to_quality might itself be a quality like "min7" or "maj9"
+            # This needs to be run through QUALITY_NORM_MAP again to get the final normalized form (e.g. "min9" -> "min7")
+            final_quality_str = QUALITY_NORM_MAP.get(parsed_from_intervals, parsed_from_intervals)
+            logger.debug(f"Parsed interval list '{original_quality_for_log}' to '{parsed_from_intervals}', further normalized to '{final_quality_str}' for label '{cleaned_chord_label}'")
+
+    # Attempt 3: Strip parentheses `(.*)` and lookup if still not resolved
+    if final_quality_str is None:
+        # This stripping is primarily for MIREX-style alterations like maj(9), min(add11), etc.
+        # where the content of parentheses is not part of the primary quality name.
+        stripped_quality = re.sub(r'\(.*\)', '', quality_str_to_process).strip()
+        
+        # Only proceed if stripping actually changed the string AND the original string wasn't empty
+        if stripped_quality != quality_str_to_process and quality_str_to_process:
+            # Lookup the stripped quality string
+            # If stripped_quality is now empty (e.g. from "(sus)"), it will map to 'maj' later.
+            # If stripped_quality is "min" from "min(9)", it will be found.
+            intermediate_quality = QUALITY_NORM_MAP.get(stripped_quality, stripped_quality)
+            if intermediate_quality: # Check if it's not None or empty before assigning
+                final_quality_str = intermediate_quality
+                logger.debug(f"Quality '{original_quality_for_log}' stripped to '{stripped_quality}', looked up as '{final_quality_str}' for label '{cleaned_chord_label}'")
+            # If stripped_quality is not in map (e.g. "foo" from "foo(bar)"), final_quality_str remains None here.
+        elif not quality_str_to_process and stripped_quality == '': # Original was empty, stripped is empty
+             pass # Will be handled by fallback to 'maj'
+
+    # If after all attempts, final_quality_str is still None,
+    # it means the original quality_str_to_process was not in map,
+    # not an interval list, and stripping didn't help or wasn't applicable.
+    # Fallback to the original (or stripped, if that was the last assignment attempt that failed lookup).
+    if final_quality_str is None:
+        # If stripping occurred but didn't find a map, `stripped_quality` might hold the relevant string.
+        # Otherwise, use the original `quality_str_to_process`.
+        # This handles cases like "susfoo" which are not in map and not parentheses-stripped.
+        # If quality_str_to_process was "min7(b5)" and it wasn't in map (it is), and stripping made it "min7",
+        # and "min7" was found, final_quality_str would be set.
+        # If quality_str_to_process was "foo(bar)", stripped to "foo", "foo" not in map, final_quality_str is None.
+        # Then it should become "foo" here.
+        current_candidate = re.sub(r'\(.*\)', '', quality_str_to_process).strip() if not (quality_str_to_process.startswith('(') and quality_str_to_process.endswith(')')) else quality_str_to_process
+        final_quality_str = QUALITY_NORM_MAP.get(current_candidate, current_candidate)
 
 
-    # Apply standard quality mappings
-    normalized_quality = QUALITY_NORM_MAP.get(quality_str, quality_str)
+    # Fallback for empty quality string (e.g. from "C", "C:", or if processing resulted in empty)
+    if not final_quality_str: # This checks if final_quality_str is None or empty string
+        final_quality_str = 'maj'
+        logger.debug(f"Quality '{original_quality_for_log}' resulted in empty or None, defaulting to 'maj' for label '{cleaned_chord_label}'")
 
-    # Handle empty quality -> 'maj' AFTER normalization lookup
-    # This covers cases like "C", "C/5", "C:", "C:M" -> 'maj'
-    if not quality_str or normalized_quality == '':
-        normalized_quality = 'maj'
+    # Final check: if the quality is still not a known *value* from QUALITY_NORM_MAP (a "normalized" quality),
+    # then it's an unknown quality string. Default to 'maj'.
+    # This handles cases like "susfoo" which would pass through all previous steps.
+    # Create a temporary set of all possible values in QUALITY_NORM_MAP for efficient lookup.
+    # This includes intermediate values like 'maj9' as well as final ones like 'maj7'.
+    valid_normalized_qualities = set(QUALITY_NORM_MAP.values())
+    if final_quality_str not in valid_normalized_qualities:
+         # Before defaulting, one last check: is the raw final_quality_str a key in the map?
+         # If "aug9" was the result, and "aug9" maps to "aug7", this is fine.
+         # If "susfoo" was the result, it's not in .values(). Is it a key? No. So default.
+         # This check is mostly for qualities that are keys but map to themselves, and are also values.
+         # The `final_quality_str = QUALITY_NORM_MAP.get(current_candidate, current_candidate)` above
+         # should handle this. If current_candidate was "susfoo", final_quality_str is "susfoo".
+         # "susfoo" is not in valid_normalized_qualities. So it becomes 'maj'.
+         logger.debug(f"Quality '{original_quality_for_log}' (processed to '{final_quality_str}') is not a standard normalized value. Defaulting to 'maj' for label '{cleaned_chord_label}'.")
+         final_quality_str = 'maj'
 
-    # If after all this, the quality is still not in our known list, map to 'X' or keep?
-    # Let's map unknown qualities to 'maj' for now, assuming it's a typo or simple chord.
-    # A stricter approach would map to 'X'.
-    if normalized_quality not in QUALITY_NORM_MAP.values():
-         logger.debug(f"Unknown quality '{original_quality_str}' (parsed as '{quality_str}', normalized to '{normalized_quality}') in label '{chord_label}'. Mapping to 'maj'.")
-         normalized_quality = 'maj' # Default unknown qualities to major
 
-    return root_str, normalized_quality, bass_str
+    return final_root_str, final_quality_str, final_bass_str
 
 
 def get_chord_quality(chord_label):
@@ -689,8 +816,7 @@ class Chords:
         # Handle special cases like 'bb7'
         if interval_str == 'bb7':
             # _CHROMA_ID[6] is 7th (11 semitones). 'bb' means -2. So 9.
-            return self._modify(_CHROMA_ID[7 - 1], 'bb') # Original logic was modulo 12, but interval() seems to return raw sometimes.
-                                                        # Let's ensure it returns raw semitones for _shorthands.
+            return self._modify(_CHROMA_ID[7 - 1], 'bb') # Original logic was modulo 12, but interval() seems to return raw semitones for _shorthands.
                                                         # _shorthands expect pitch class bitmasks, so %12 is needed eventually.
                                                         # The Chords.interval_list applies %12 via self.interval() then uses it as index.
                                                         # Let's make Chords.interval return pitch class (0-11) for consistency.
@@ -1131,7 +1257,7 @@ class Chords:
         unison = intervals[:, 0].astype(bool)
         maj_sec = intervals[:, 2].astype(bool)
         min_third = intervals[:, 3].astype(bool)
-        maj_third = intervals[:, 4].astype(bool)
+        maj_third = intervals[:,  4].astype(bool)
         perf_fourth = intervals[:, 5].astype(bool)
         dim_fifth = intervals[:, 6].astype(bool)
         perf_fifth = intervals[:, 7].astype(bool)
@@ -1208,7 +1334,7 @@ class Chords:
     # --- Removed Legacy / Unused Methods ---
     # def pitch(self, pitch_str): ... # Removed, use _parse_root internally
     # def load_chords(self, filename): ... # Removed, had bug, unused
-    # def convert_to_id(self, root, is_major): ... # Removed, legacy
+    # def convert to id(self, root, is_major): ... # Removed, legacy
     # def convert_to_id_voca(self, root, quality): ... # Removed, legacy, use get_chord_idx
     # def assign_chord_id(self, entry): ... # Removed, legacy
     # def get_converted_chord(self, filename): ... # Removed, legacy

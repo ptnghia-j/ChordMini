@@ -1,5 +1,6 @@
 from modules.models.Transformer.transformer_modules import *
 from modules.models.Transformer.transformer_modules import _gen_timing_signal, _gen_bias_mask
+from modules.utils.logger import warning # Added import for warning
 
 use_cuda = torch.cuda.is_available()
 
@@ -103,12 +104,14 @@ class bi_directional_self_attention_layers(nn.Module):
         super(bi_directional_self_attention_layers, self).__init__()
 
         self.timing_signal = _gen_timing_signal(max_length, hidden_size)
+        # Store max_length for internal use if needed, e.g., for bias mask generation
+        self.max_length = max_length
         params = (hidden_size,
                   total_key_depth or hidden_size,
                   total_value_depth or hidden_size,
                   filter_size,
                   num_heads,
-                  max_length,
+                  max_length, # Pass max_length for bias mask generation
                   layer_dropout,
                   attention_dropout,
                   relu_dropout)
@@ -125,7 +128,25 @@ class bi_directional_self_attention_layers(nn.Module):
         x = self.embedding_proj(x)
 
         # Add timing signal
-        x += self.timing_signal[:, :inputs.shape[1], :].type_as(inputs.data)
+        # Input 'x' is now expected to have x.shape[1] == self.max_length (timing_signal.shape[1])
+        # due to segmentation/padding in BTC_model.forward
+        if x.shape[1] != self.timing_signal.shape[1]:
+            # This case should ideally not be hit if BTC_model.forward prepares input correctly.
+            # However, as a safeguard or for standalone use of this layer:
+            # warning(
+            #     f"bi_directional_self_attention_layers received input of length {x.shape[1]}, "
+            #     f"but expected {self.timing_signal.shape[1]}. This might lead to errors or unexpected behavior."
+            # )
+            # Pad or truncate if necessary, though BTC_model should handle this.
+            # For now, we assume BTC_model has prepared 'x' to be self.max_length.
+            # If not, the original error would occur here or in self_attn_layers.
+            # To be robust, let's ensure the timing signal slice matches x's current length,
+            # but this relies on BTC_model sending fixed-size chunks.
+            x = x + self.timing_signal[:, :x.shape[1], :].type_as(x)
+        else:
+            # Standard case: x.shape[1] == self.max_length
+            x = x + self.timing_signal.type_as(x)
+
 
         # A Stack of Bi-directional Self-attention Layers
         y, weights_list = self.self_attn_layers((x, []))
@@ -139,7 +160,7 @@ class BTC_model(nn.Module):
         super(BTC_model, self).__init__()
 
         # Use get with default values for safer config access
-        self.timestep = config.get('seq_len', 108) # Use seq_len from config
+        self.timestep = config.get('seq_len', 108) # This is the max_length for components
         # probs_out is removed as SoftmaxOutputLayer always returns logits
         # self.probs_out = config.get('probs_out', False)
 
@@ -183,8 +204,55 @@ class BTC_model(nn.Module):
                      x = x.squeeze(3)
                  # else: raise ValueError(f"Expected 3D input [batch, time, features], got {x.shape}")
 
+        max_chunk_len = self.timestep # Max sequence length for self_attn_layers
+        original_input_len = x.shape[1]
+        processed_outputs = []
 
-        self_attn_output, weights_list = self.self_attn_layers(x)
+        if original_input_len == 0:
+            # Handle empty sequence input gracefully
+            # Output layer expects [batch, time, hidden_size]
+            # Assuming hidden_size can be inferred from output_layer or a default
+            hidden_size = self.output_layer.fc.in_features # Infer from output layer
+            # Or use: hidden_size = self.self_attn_layers.embedding_proj.out_features
+
+            # Create zero logits of shape [batch, 0, num_chords]
+            # num_chords can be inferred from self.output_layer.output_size
+            num_chords = self.output_layer.output_size
+            return torch.zeros(x.shape[0], 0, num_chords, device=x.device, dtype=x.dtype)
+
+
+        # Segment input if it's longer than max_chunk_len, or pad if shorter/equal.
+        # All chunks passed to self.self_attn_layers will have length max_chunk_len.
+        
+        current_pos = 0
+        while current_pos < original_input_len:
+            chunk = x[:, current_pos : current_pos + max_chunk_len, :]
+            current_chunk_len = chunk.shape[1]
+
+            if current_chunk_len < max_chunk_len:
+                padding_size = max_chunk_len - current_chunk_len
+                padding = torch.zeros(chunk.shape[0], padding_size, chunk.shape[2], 
+                                      device=x.device, dtype=x.dtype)
+                chunk = torch.cat((chunk, padding), dim=1)
+            
+            # Now chunk.shape[1] is guaranteed to be max_chunk_len
+            attn_output_chunk, _ = self.self_attn_layers(chunk) # weights_list is ignored
+            processed_outputs.append(attn_output_chunk)
+            current_pos += max_chunk_len
+            
+        if not processed_outputs:
+             # This should not happen if original_input_len > 0
+             # But as a safeguard, if somehow no chunks were processed (e.g. original_input_len was 0 and not caught)
+             # Create a zero tensor of appropriate shape to avoid crashing output_layer
+            hidden_size = self.output_layer.fc.in_features
+            self_attn_output = torch.zeros(x.shape[0], original_input_len, hidden_size, device=x.device, dtype=x.dtype)
+        else:
+            # Concatenate all processed chunks
+            self_attn_output_possibly_padded = torch.cat(processed_outputs, dim=1)
+    
+            # Truncate the concatenated output back to the original_input_len
+            self_attn_output = self_attn_output_possibly_padded[:, :original_input_len, :]
+
 
         # Pass the output through the final layer to get logits
         logits = self.output_layer(self_attn_output)

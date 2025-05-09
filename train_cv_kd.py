@@ -576,7 +576,7 @@ def main():
         'device': device, # Pass the determined device
         'pin_memory': False, # Keep False for CV dataset internal loading
         'prefetch_factor': 1, # Keep 1 for CV dataset internal loading
-        'num_workers': 0, # Keep 0 for CV dataset internal loading
+        'num_workers': 4, # Keep 0 for CV dataset internal loading
         'require_teacher_logits': use_kd_loss,
         'use_cache': not args.disable_cache,
         'metadata_only': args.metadata_cache,
@@ -679,7 +679,7 @@ def main():
 
         # If --load_checkpoint wasn't specified, maybe use --btc_checkpoint as fallback
         if not pretrained_path and args.btc_checkpoint:
-            pretrained_path = args.btc_checkpoint
+            pretrained_path = args.btc_checkpoint # pretrained_path can be set by args.btc_checkpoint here
             logger.info(f"Using --btc_checkpoint ({pretrained_path}) as load path.")
 
         if pretrained_path:
@@ -792,12 +792,12 @@ def main():
         logger.info("Attached chord mapping and normalization parameters to model")
 
         # Load pretrained weights AND potentially optimizer state
-        if pretrained_path:
+        if pretrained_path: # This condition checks if a path was determined
             resolved_load_path = resolve_path(pretrained_path, storage_root, project_root)
             if os.path.exists(resolved_load_path):
                 logger.info(f"Loading checkpoint from: {resolved_load_path}")
                 try:
-                    checkpoint = torch.load(resolved_load_path, map_location=device)
+                    checkpoint = torch.load(resolved_load_path, map_location=device) # Actual model loading
                     if 'n_classes' in checkpoint:
                         pretrained_classes = checkpoint['n_classes']
                         logger.info(f"Pretrained model has {pretrained_classes} output classes")
@@ -934,9 +934,7 @@ def main():
         temperature=temperature,
         timeout_minutes=args.timeout_minutes,
         reset_epoch=args.reset_epoch,
-        reset_scheduler=args.reset_scheduler,
-        # REMOVED: teacher_model, teacher_normalization, teacher_predictions
-        load_checkpoint_path=resolved_load_path if pretrained_path else None # Pass specific path if provided
+        reset_scheduler=args.reset_scheduler
     )
 
     # Attach chord mapping to trainer (chord -> idx)

@@ -1,10 +1,12 @@
 import torch
 import torch.distributed as dist
 import time
+import os # Added for path join
 from modules.training.StudentTrainer import StudentTrainer
 from modules.utils.logger import info, warning, error, debug
 from torch.nn.parallel import DistributedDataParallel
 from modules.utils.timeout_handler import timeout_handler, TimeoutException
+from modules.utils import checkpoint_utils # Added import
 
 class DistributedStudentTrainer(StudentTrainer):
     """
@@ -69,6 +71,12 @@ class DistributedStudentTrainer(StudentTrainer):
             info(f"Initialized DistributedStudentTrainer with {world_size} processes")
             info(f"This is the main process (rank {rank})")
             info(f"Using timeout of {timeout_minutes} minutes for distributed operations")
+
+    def _get_model_state_dict(self):
+        """Helper to get model state_dict, unwrapping DDP model if necessary."""
+        if isinstance(self.model, DistributedDataParallel):
+            return self.model.module.state_dict()
+        return self.model.state_dict()
 
     def reduce_tensor(self, tensor, timeout_minutes=None):
         """Reduce tensor across all ranks with timeout handling.
@@ -191,11 +199,11 @@ class DistributedStudentTrainer(StudentTrainer):
 
         # Check for early stopping
         early_stop = False
-        if self._save_best_model(val_acc, val_loss, epoch):
-            if self.is_main_process:
+        if self._save_best_model(val_acc, val_loss, epoch): # This will be handled by overridden method
+            if self.is_main_process: # Log only on main process
                 info(f'New best model with validation accuracy: {val_acc:.4f}')
 
-        if self._check_early_stopping():
+        if self._check_early_stopping(): # _check_early_stopping is fine as is
             if self.is_main_process:
                 info('Early stopping triggered')
             early_stop = True
@@ -345,8 +353,6 @@ class DistributedStudentTrainer(StudentTrainer):
                     # Filter out invalid indices from predictions and targets before mapping
                     # This filtering might not be strictly necessary anymore with the improved mapping,
                     # but keeping it adds robustness against potential future mapping issues.
-                    valid_preds = [p for p in all_preds if p in idx_to_quality or p == n_chord_idx or p == x_chord_idx]
-                    valid_targets = [t for t in all_targets if t in idx_to_quality or t == n_chord_idx or t == x_chord_idx]
 
                     # Map valid predictions and targets to qualities - This part seems overly complex and potentially buggy.
                     # Let's simplify the counting logic below instead.
@@ -471,9 +477,35 @@ class DistributedStudentTrainer(StudentTrainer):
         Only the main process (rank 0) saves checkpoints.
         """
         if not self.is_main_process:
-            return False
+            # For non-main processes, still update internal state if accuracy improved,
+            # but don't save. The actual saving is guarded by is_main_process.
+            if val_acc > self.best_val_acc:
+                self.best_val_acc = val_acc
+                self.early_stop_counter = 0
+            else:
+                self.early_stop_counter += 1
+            return False # Indicate no save happened on this process
 
+        # Main process proceeds with saving logic from parent,
+        # which now uses _get_model_state_dict() correctly.
         return super()._save_best_model(val_acc, val_loss, epoch)
+
+    def _save_trainer_state(self, current_epoch_completed):
+        """
+        Save the full trainer state. Only the main process saves.
+        """
+        if not self.is_main_process:
+            return False
+        return super()._save_trainer_state(current_epoch_completed)
+
+    def _save_epoch_checkpoint(self, epoch, avg_train_loss, train_acc):
+        """
+        Saves a model checkpoint for a specific epoch. Only the main process saves.
+        """
+        if not self.is_main_process:
+            return
+        super()._save_epoch_checkpoint(epoch, avg_train_loss, train_acc)
+
 
     def train(self, train_loader, val_loader, start_epoch=1):
         """

@@ -9,8 +9,10 @@ import matplotlib.pyplot as plt  # Add missing matplotlib import
 
 from modules.utils.logger import info, warning, error, debug, logging_verbosity, is_debug # Ensure is_debug is imported
 from modules.training.Trainer import BaseTrainer
-from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, OneCycleLR, CosineAnnealingWarmRestarts
+from modules.training.Schedulers import create_scheduler, create_warmup_scheduler
 from collections import Counter
+from modules.utils import checkpoint_utils # Added import
+from modules.utils.gradient_utils import safe_clip_grad_norm_ # Added import
 
 # Import visualization functions including chord quality mapping
 from modules.utils.visualize import (
@@ -18,191 +20,6 @@ from modules.utils.visualize import (
     plot_learning_curve, calculate_quality_confusion_matrix,
     calculate_confusion_matrix
 )
-
-def safe_clip_grad_norm_(parameters, max_norm, error_if_nonfinite=False, verbose=True):
-    """
-    Safely clip gradient norm while providing helpful diagnostics for non-finite values.
-
-    Args:
-        parameters: Model parameters to clip gradients for
-        max_norm: Maximum allowed gradient norm
-        error_if_nonfinite: Whether to raise error on non-finite gradients
-        verbose: Whether to print detailed diagnostics when non-finite values are found
-
-    Returns:
-        total_norm: The total gradient norm before clipping
-    """
-    # Filter parameters that have gradients
-    parameters = list(filter(lambda p: p.grad is not None, parameters))
-
-    # Check if there are any parameters with gradients
-    if len(parameters) == 0:
-        return torch.tensor(0.0)
-
-    # Track gradient statistics for adaptive handling
-    if not hasattr(safe_clip_grad_norm_, 'problem_history'):
-        safe_clip_grad_norm_.problem_history = {}
-        safe_clip_grad_norm_.call_count = 0
-        safe_clip_grad_norm_.last_report = 0
-
-    # Increment call counter
-    safe_clip_grad_norm_.call_count += 1
-
-    # Add gradient clamping to stabilize training
-    for p in parameters:
-        if p.grad is not None:
-            # Enhanced clamping strategy with larger bounds for main parameters
-            if p.numel() <= 12:  # For small vectors like biases
-                p.grad.data.clamp_(-1.0, 1.0)  # More conservative for small parameters
-            elif p.numel() <= 144:  # Medium-sized matrices (e.g. 12x12)
-                p.grad.data.clamp_(-3.0, 3.0)  # Moderate clamping for medium tensors
-            else:
-                p.grad.data.clamp_(-5.0, 5.0)  # Allow larger gradients for weights
-
-    # Check for non-finite gradients before clipping
-    has_nonfinite = False
-    problem_params = []
-
-    for i, p in enumerate(parameters):
-        if not torch.isfinite(p.grad).all():
-            has_nonfinite = True
-            problem_params.append((i, p))
-
-            # Track problematic parameters by shape to identify recurring issues
-            param_shape = tuple(p.shape)
-            if param_shape not in safe_clip_grad_norm_.problem_history:
-                safe_clip_grad_norm_.problem_history[param_shape] = {
-                    'count': 0,
-                    'total_nan_percent': 0.0,
-                    'total_inf_percent': 0.0,
-                    'last_seen': 0
-                }
-
-            # Update statistics
-            nan_count = torch.isnan(p.grad).sum().item()
-            inf_count = torch.isinf(p.grad).sum().item()
-            total_elements = p.grad.numel()
-            nan_percent = nan_count/total_elements if total_elements > 0 else 0
-            inf_percent = inf_count/total_elements if total_elements > 0 else 0
-
-            stats = safe_clip_grad_norm_.problem_history[param_shape]
-            stats['count'] += 1
-            stats['total_nan_percent'] += nan_percent
-            stats['total_inf_percent'] += inf_percent
-            stats['last_seen'] = safe_clip_grad_norm_.call_count
-
-    # Handle non-finite gradients with better diagnostics and adaptive handling
-    if has_nonfinite:
-        if verbose:
-            info(f"Non-finite gradients detected in {len(problem_params)} parameters")
-
-            # Print stats about the first few problematic parameters
-            for i, (idx, param) in enumerate(problem_params[:3]):  # Limit to first 3
-                grad = param.grad
-                nan_count = torch.isnan(grad).sum().item()
-                inf_count = torch.isinf(grad).sum().item()
-                total_elements = grad.numel()
-
-                info(
-                    f"Parameter {idx}: shape={list(param.shape)}, "
-                    f"NaNs: {nan_count}/{total_elements} ({nan_count/total_elements:.2%}), "
-                    f"Infs: {inf_count}/{total_elements} ({inf_count/total_elements:.2%})"
-                )
-
-            if len(problem_params) > 3:
-                info(f"... and {len(problem_params) - 3} more parameters with issues")
-
-        # ADAPTIVE HANDLING: Instead of just zeroing out bad gradients, apply a recovery strategy
-        for _, p in problem_params:
-            grad = p.grad
-            mask_finite = torch.isfinite(grad)
-            mask_nonfinite = ~mask_finite
-
-            if mask_nonfinite.any():
-                # Check if we can recover from partial NaNs by using tensor statistics
-                if mask_finite.any():
-                    # Some values are finite - calculate statistics from those
-                    finite_mean = grad[mask_finite].mean().item()
-                    finite_std = grad[mask_finite].std().item()
-
-                    # Replace non-finite values with small random values based on statistics
-                    # This avoids completely killing the gradient
-                    with torch.no_grad():
-                        if abs(finite_mean) < 1e-6:
-                            # If mean is very small, use a tiny fixed value with noise
-                            fixed_val = 1e-6
-                            noise = torch.randn_like(grad[mask_nonfinite]) * 1e-6
-                            grad[mask_nonfinite] = fixed_val * torch.sign(noise) + noise
-                        else:
-                            # Scale down the mean and add small noise
-                            recovery_scale = 0.01  # Scale factor for recovered values
-                            noise_scale = max(abs(finite_std) * 0.01, 1e-6)
-                            replacement = finite_mean * recovery_scale
-                            noise = torch.randn_like(grad[mask_nonfinite]) * noise_scale
-                            grad[mask_nonfinite] = replacement + noise
-                else:
-                    # All values are non-finite, replace with small random values
-                    with torch.no_grad():
-                        # Use a very small fixed value with minimal noise
-                        grad[mask_nonfinite] = torch.randn_like(grad[mask_nonfinite]) * 1e-6
-
-            # Apply an additional step: ensure the gradient has a minimum L2 norm
-            # This helps prevent gradient vanishing after fixing non-finite values
-            with torch.no_grad():
-                grad_norm = torch.norm(grad)
-                min_grad_norm = 1e-4  # Minimum allowed gradient norm
-                if grad_norm < min_grad_norm:
-                    # Rescale the gradient to ensure it has at least the minimum norm
-                    scale_factor = min_grad_norm / (grad_norm + 1e-10)
-                    grad.mul_(scale_factor)
-
-        # Log adaptive recovery rather than zeroing
-        info(
-            "Non-finite gradients detected and adaptively reconstructed. "
-            "Applied small random values with proper scaling to maintain training signal."
-        )
-
-    # Periodically report persistent gradient issues (every 200 steps)
-    if safe_clip_grad_norm_.call_count - safe_clip_grad_norm_.last_report >= 200:
-        safe_clip_grad_norm_.last_report = safe_clip_grad_norm_.call_count
-
-        # Find shapes with recurring issues
-        persistent_issues = {
-            shape: stats for shape, stats in safe_clip_grad_norm_.problem_history.items()
-            if stats['count'] > 5  # Shapes with multiple occurrences
-        }
-
-        if persistent_issues:
-            info("===== Gradient Health Report =====")
-            info(f"Total steps: {safe_clip_grad_norm_.call_count}")
-
-            for shape, stats in sorted(persistent_issues.items(),
-                                      key=lambda x: x[1]['count'],
-                                      reverse=True)[:5]:  # Top 5 issues
-                avg_nan = stats['total_nan_percent'] / stats['count'] * 100
-                avg_inf = stats['total_inf_percent'] / stats['count'] * 100
-                info(f"Parameter shape {shape}: {stats['count']} occurrences, "
-                     f"avg {avg_nan:.1f}% NaNs, {avg_inf:.1f}% Infs, "
-                     f"last seen {safe_clip_grad_norm_.call_count - stats['last_seen']} steps ago")
-
-            # Suggest solutions based on patterns
-            if any(stats['total_nan_percent']/stats['count'] > 0.5 for stats in persistent_issues.values()):
-                info("Suggestion: Consider reducing learning rate by 50% or adding batch normalization")
-            info("==================================")
-
-    # Now apply gradient clipping with the fixed gradients
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        total_norm = torch.nn.utils.clip_grad_norm_(
-            parameters, max_norm, error_if_nonfinite=error_if_nonfinite
-        )
-
-    # Detect vanishing gradients
-    if total_norm < 1e-4 and safe_clip_grad_norm_.call_count % 50 == 0:
-        info(f"WARNING: Potential gradient vanishing detected! Gradient norm: {total_norm:.8f}")
-        info("Consider adjusting learning rate or model architecture.")
-
-    return total_norm
 
 class StudentTrainer(BaseTrainer):
     """
@@ -247,8 +64,6 @@ class StudentTrainer(BaseTrainer):
 
         if class_weights is not None and hasattr(model, 'fc') and hasattr(model.fc, 'out_features'):
             # Handle class imbalance - modify weights before padding
-            if idx_to_chord is not None and not self.use_focal_loss:
-                class_weights = self._adjust_weights_for_no_chord(class_weights, idx_to_chord)
 
             expected_classes = model.fc.out_features
             info(f"Padding class weights from {len(class_weights)} to {expected_classes}")
@@ -367,6 +182,10 @@ class StudentTrainer(BaseTrainer):
         # Add flags for reset behavior
         self.reset_epoch = reset_epoch
         self.reset_scheduler = reset_scheduler
+
+    def _get_model_state_dict(self):
+        """Helper to get model state_dict, overridden in DDP."""
+        return self.model.state_dict()
 
     def train_batch(self, batch):
         """Train on a single batch."""
@@ -511,49 +330,19 @@ class StudentTrainer(BaseTrainer):
             # No warmup, scheduler will be used for all epochs
             self.post_warmup_epochs = self.num_epochs
 
-        if self.lr_schedule_type == 'cosine':
-            # Cosine annealing from warmup_end_lr (or initial_lr if no warmup) to min_lr
-            # Note: We'll start this scheduler from the warmup_end_lr value, not from self.initial_lr
-            start_lr = self.warmup_end_lr if self.use_warmup else self.initial_lr
-            self.smooth_scheduler = CosineAnnealingLR(
-                self.optimizer,
-                T_max=self.post_warmup_epochs,
-                eta_min=self.min_lr
-            )
-            info(f"Cosine annealing from {start_lr:.6f} to {self.min_lr:.6f} after warmup")
-        elif self.lr_schedule_type == 'cosine_warm_restarts':
-            # Cosine annealing with warm restarts
-            # First restart after 5 epochs, then double the period
-            self.smooth_scheduler = CosineAnnealingWarmRestarts(
-                self.optimizer,
-                T_0=5,  # First restart after 5 epochs
-                T_mult=2,  # Double the period after each restart
-                eta_min=self.min_lr
-            )
-            info(f"Cosine annealing with warm restarts: min_lr={self.min_lr:.6f} after warmup")
+        # Use the factory function from Schedulers.py to create the appropriate scheduler
+        self.smooth_scheduler = create_scheduler(
+            self.lr_schedule_type,
+            self.optimizer,
+            post_warmup_epochs=self.post_warmup_epochs,
+            num_epochs=self.num_epochs,
+            min_lr=self.min_lr,
+            lr_decay_factor=self.lr_decay_factor,
+            steps_per_epoch=100  # Estimate, will be updated in train()
+        )
 
-        elif self.lr_schedule_type == 'one_cycle':
-            # One-cycle learning rate schedule
-            steps_per_epoch = 100  # Estimate, will be updated in train()
-            self.smooth_scheduler = OneCycleLR(
-                self.optimizer,
-                max_lr=self.initial_lr * 10,  # Peak LR
-                total_steps=steps_per_epoch * self.post_warmup_epochs,
-                pct_start=0.3,  # Spend 30% ramping up, 70% ramping down
-                div_factor=25,  # Initial LR = max_lr/25
-                final_div_factor=10000,  # Final LR = max_lr/10000
-                anneal_strategy='cos'
-            )
-            info(f"One-cycle LR: {self.initial_lr:.6f} → {self.initial_lr*10:.6f} → {self.initial_lr*10/10000:.8f} after warmup")
-
-        elif self.lr_schedule_type == 'linear_decay':
-            # Linear decay from initial LR to min_lr
-            lambda_fn = lambda epoch: 1 - (1 - self.min_lr / self.initial_lr) * (epoch / self.post_warmup_epochs)
-            self.smooth_scheduler = LambdaLR(self.optimizer, lr_lambda=lambda_fn)
-            info(f"Linear decay from {self.initial_lr:.6f} to {self.min_lr:.6f} after warmup")
-
-        else:
-            info(f"Unknown scheduler type: {self.lr_schedule_type}. Using warmup-only with validation-based adjustment")
+        # If no scheduler was created (unknown type), set lr_schedule_type to None
+        if self.smooth_scheduler is None:
             self.lr_schedule_type = None
 
     def _update_learning_rate(self, epoch, batch_idx=None, num_batches=None):
@@ -575,6 +364,9 @@ class StudentTrainer(BaseTrainer):
             # In warmup phase, use warmup-specific LR calculation
             return self._warmup_learning_rate(epoch, batch_idx, num_batches)
         elif self.lr_schedule_type:
+            # Import scheduler types here to avoid circular imports
+            from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, OneCycleLR, CosineAnnealingWarmRestarts
+
             # After warmup, use the selected scheduler with adjusted epoch numbering
             if self.use_warmup:
                 # For fractional updates within an epoch (some schedulers support this)
@@ -611,27 +403,6 @@ class StudentTrainer(BaseTrainer):
         else:
             # No scheduler - just return current LR (will be handled by validation-based adjustment)
             return self.optimizer.param_groups[0]['lr']
-
-    def _adjust_weights_for_no_chord(self, weights, idx_to_chord):
-        """
-        Previously adjusted weights for 'N' chord class. Now simply logs chord information
-        without modifying weights to ensure balanced training.
-        """
-        n_chord_idx = None
-
-        # Find the index that corresponds to "N" chord (for logging only)
-        for idx, chord in idx_to_chord.items():
-            if chord == "N":
-                n_chord_idx = idx
-                break
-
-        if n_chord_idx is not None and n_chord_idx < len(weights):
-            info(f"Found 'N' (no chord) at index {n_chord_idx}")
-            info(f"Weight for 'N' class: {weights[n_chord_idx]:.4f}")
-            info("No weight adjustment applied - using original class weights")
-
-        # Return weights unmodified
-        return weights
 
     def focal_loss(self, logits, targets, gamma=2.0, alpha=None):
         """
@@ -710,61 +481,41 @@ class StudentTrainer(BaseTrainer):
 
     def _warmup_learning_rate(self, epoch, batch_idx=None, num_batches=None):
         """Calculate and set learning rate during warm-up period (per-step)."""
-        # Ensure we have batch info for per-step calculation
-        if batch_idx is None or num_batches is None or num_batches == 0:
-            # Fallback to epoch-based if batch info is missing (e.g., initial call)
-            warmup_progress = (epoch - 1) / max(1, self.warmup_epochs - 1) if self.warmup_epochs > 1 else 1.0
-        else:
-            # Calculate total steps in warmup phase
-            total_warmup_steps = self.warmup_epochs * num_batches
-            # Calculate current step number (0-indexed)
-            current_step = (epoch - 1) * num_batches + batch_idx
-            # Calculate progress (0.0 to 1.0)
-            warmup_progress = current_step / max(1, total_warmup_steps -1) # Avoid division by zero if total_warmup_steps is 1
+        # Create a warmup scheduler if it doesn't exist
+        if not hasattr(self, 'warmup_scheduler'):
+            self.warmup_scheduler = create_warmup_scheduler(
+                self.optimizer,
+                True,
+                warmup_epochs=self.warmup_epochs,
+                warmup_start_lr=self.warmup_start_lr,
+                warmup_end_lr=self.warmup_end_lr
+            )
 
-        # Clamp progress
-        warmup_progress = max(0.0, min(1.0, warmup_progress))
-
-        # Linear interpolation between start_lr and end_lr
-        new_lr = self.warmup_start_lr + warmup_progress * (self.warmup_end_lr - self.warmup_start_lr)
-
-        # Log LR change during warmup (less frequently to avoid spam)
-        # if batch_idx is not None and batch_idx % (num_batches // 4) == 0: # Log ~4 times per epoch
-        #     info(f"Warm-up step {current_step}/{total_warmup_steps}: progress={warmup_progress:.4f}, LR = {new_lr:.7f}")
-        # elif batch_idx is None: # Log initial epoch-based calculation
-        #      info(f"Warm-up epoch {epoch} (initial): progress={warmup_progress:.4f}, LR = {new_lr:.7f}")
-
-
-        return self._set_lr(new_lr)
+        # Use the warmup scheduler to calculate and set the learning rate
+        return self.warmup_scheduler.step(epoch, batch_idx, num_batches)
 
     def _adjust_learning_rate(self, val_acc):
-        """Adjust learning rate based on validation accuracy with 2-epoch patience."""
-        if self.before_val_acc > val_acc:
-            # Increment counter for consecutive epochs without improvement
-            self.consecutive_no_improve += 1
+        """Adjust learning rate based on validation accuracy."""
+        # Create a validation-based scheduler if it doesn't exist
+        if not hasattr(self, 'validation_scheduler'):
+            self.validation_scheduler = create_scheduler(
+                'validation',
+                self.optimizer,
+                lr_decay_factor=self.lr_decay_factor,
+                min_lr=self.min_lr,
+                patience=1  # Default patience value
+            )
 
-            if self.consecutive_no_improve >= 1:
-                # Only reduce learning rate after 2 consecutive epochs without improvement
-                old_lr = self.optimizer.param_groups[0]['lr']
-                new_lr = self._reduce_lr(self.optimizer, self.lr_decay_factor, self.min_lr)
-                info(f"Decreasing learning rate from {old_lr:.6f} to {new_lr:.6f} after {self.consecutive_no_improve} epochs without improvement")
-                self.consecutive_no_improve = 0  # Reset counter after reducing LR
-            else:
-                info(f"No improvement for {self.consecutive_no_improve} epoch(s); waiting for one more before reducing learning rate")
-        else:
-            # Reset counter when accuracy improves or stays the same
-            if self.consecutive_no_improve > 0:
-                info(f"Validation accuracy improved, resetting consecutive non-improvement counter")
-            self.consecutive_no_improve = 0
+            # Initialize best_val_acc with current before_val_acc to maintain state
+            self.validation_scheduler.best_val_acc = self.before_val_acc
+
+        # Use the validation scheduler to adjust the learning rate
+        lr_reduced = self.validation_scheduler.step(val_acc)
 
         # Update previous validation accuracy
         self.before_val_acc = val_acc
 
-    def _reduce_lr(self, optimizer, factor=0.95, min_lr=5e-6):
-        """Reduce learning rate by a factor but ensuring it doesn't go below min_lr."""
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = max(param_group['lr'] * factor, min_lr)
-        return param_group['lr']
+        return lr_reduced
 
     def set_chord_mapping(self, chord_mapping):
         """Set chord mapping for saving with checkpoints."""
@@ -776,32 +527,21 @@ class StudentTrainer(BaseTrainer):
             self.best_val_acc = val_acc
             self.early_stop_counter = 0
 
-            # Create checkpoint data
-            checkpoint_data = {
+            model_state_dict = self._get_model_state_dict()
+            optimizer_state_dict = self.optimizer.state_dict()
+            
+            data_to_save = {
                 'epoch': epoch,
-                'model_state_dict': self.model.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
+                'model_state_dict': model_state_dict,
+                'optimizer_state_dict': optimizer_state_dict,
                 'loss': val_loss,
                 'accuracy': val_acc,
                 'chord_mapping': self.chord_mapping,
                 'idx_to_chord': self.idx_to_chord,
-                'mean': self.normalization['mean'] if self.normalization else None,
-                'std': self.normalization['std'] if self.normalization else None
+                'normalization': self.normalization,
             }
 
-            # Ensure primary checkpoint directory exists (redundant check, but safe)
-            os.makedirs(self.primary_checkpoint_dir, exist_ok=True)
-
-            # Save to primary path
-            save_success = False
-            try:
-                torch.save(checkpoint_data, self.best_model_path)
-                info(f"Saved best model to primary path: {self.best_model_path}")
-                save_success = True
-            except Exception as e:
-                info(f"Error saving best model to primary path: {str(e)}")
-
-            # Removed fallback saving logic
+            save_success = checkpoint_utils.save_checkpoint(self.best_model_path, **data_to_save)
 
             if save_success:
                 info(f"Saved best model with validation accuracy: {val_acc:.4f}")
@@ -1038,6 +778,127 @@ class StudentTrainer(BaseTrainer):
 
         return features, targets
 
+    def load_checkpoint(self):
+        """
+        Load the trainer's internal state from trainer_state_latest.pth.
+        This method handles loading the trainer's state based on reset flags.
+
+        Returns:
+            bool: True if checkpoint was loaded successfully, False otherwise
+        """
+        checkpoint_path = os.path.join(self.primary_checkpoint_dir, "trainer_state_latest.pth")
+        checkpoint = checkpoint_utils.load_checkpoint(checkpoint_path, device=self.device)
+
+        if checkpoint is None:
+            return False
+
+        try:
+            # Load model weights
+            if 'model_state_dict' in checkpoint:
+                checkpoint_utils.apply_model_state(self.model, checkpoint['model_state_dict'])
+                info("Loaded model state from trainer checkpoint")
+            else:
+                info("No model state found in trainer checkpoint")
+
+            # Handle epoch counter based on reset_epoch flag
+            if self.reset_epoch:
+                info("Reset epoch flag is set, starting from epoch 1")
+                self.start_epoch = 1
+                # Reset metric histories
+                self.train_losses = []
+                self.val_losses = []
+                self.best_val_acc = 0
+                self.early_stop_counter = 0
+                self.before_val_acc = 0
+                self.consecutive_no_improve = 0
+            else:
+                self.start_epoch = checkpoint.get('epoch', 0) + 1
+                info(f"Resuming from epoch {self.start_epoch}")
+                self.train_losses = checkpoint.get('train_losses', [])
+                self.val_losses = checkpoint.get('val_losses', [])
+                self.best_val_acc = checkpoint.get('best_val_acc', 0)
+                self.early_stop_counter = checkpoint.get('early_stop_counter', 0)
+                self.before_val_acc = checkpoint.get('before_val_acc', 0)
+                self.consecutive_no_improve = checkpoint.get('consecutive_no_improve', 0)
+                info(f"Loaded metric histories: {len(self.train_losses)} train losses, {len(self.val_losses)} val losses")
+                info(f"Best validation accuracy so far: {self.best_val_acc:.4f}")
+
+            # Handle optimizer state based on reset_epoch flag
+            if not self.reset_epoch and 'optimizer_state_dict' in checkpoint:
+                checkpoint_utils.apply_optimizer_state(self.optimizer, checkpoint['optimizer_state_dict'], self.device)
+                info("Loaded optimizer state from checkpoint")
+
+            # Handle scheduler state based on reset_scheduler flag
+            if not self.reset_scheduler and not self.reset_epoch and 'scheduler_state_dict' in checkpoint:
+                checkpoint_utils.apply_scheduler_state(self.smooth_scheduler, checkpoint.get('scheduler_state_dict'))
+                info("Loaded scheduler state from checkpoint")
+            elif self.reset_scheduler and self.smooth_scheduler is not None:
+                info("Reset scheduler flag is set, scheduler state not loaded")
+            
+            self.chord_mapping = checkpoint.get('chord_mapping')
+            self.idx_to_chord = checkpoint.get('idx_to_chord')
+            self.normalization = checkpoint.get('normalization')
+
+            info(f"Successfully loaded trainer state from {checkpoint_path}")
+            return True
+
+        except Exception as e:
+            error(f"Error processing loaded trainer state: {e}")
+            import traceback
+            error(traceback.format_exc())
+            return False
+
+    def _save_trainer_state(self, current_epoch_completed):
+        """
+        Save the full trainer state to trainer_state_latest.pth.
+        """
+        checkpoint_path = os.path.join(self.primary_checkpoint_dir, "trainer_state_latest.pth")
+        model_state_dict = self._get_model_state_dict()
+        optimizer_state_dict = self.optimizer.state_dict()
+        scheduler_state_dict = self.smooth_scheduler.state_dict() if self.smooth_scheduler else None
+
+        data_to_save = {
+            'epoch': current_epoch_completed,
+            'model_state_dict': model_state_dict,
+            'optimizer_state_dict': optimizer_state_dict,
+            'scheduler_state_dict': scheduler_state_dict,
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses,
+            'best_val_acc': self.best_val_acc,
+            'early_stop_counter': self.early_stop_counter,
+            'before_val_acc': self.before_val_acc,
+            'consecutive_no_improve': self.consecutive_no_improve,
+            'chord_mapping': self.chord_mapping,
+            'idx_to_chord': self.idx_to_chord,
+            'normalization': self.normalization,
+        }
+        return checkpoint_utils.save_checkpoint(checkpoint_path, **data_to_save)
+
+    def _save_epoch_checkpoint(self, epoch, avg_train_loss, train_acc):
+        """Saves a model checkpoint for a specific epoch."""
+        checkpoint_path = os.path.join(self.primary_checkpoint_dir, f"{self.model_prefix}_model_epoch_{epoch}.pth")
+        model_state_dict = self._get_model_state_dict()
+        optimizer_state_dict = self.optimizer.state_dict()
+        scheduler_state_dict = self.smooth_scheduler.state_dict() if self.smooth_scheduler else None
+
+        data_to_save = {
+            'epoch': epoch,
+            'model_state_dict': model_state_dict,
+            'optimizer_state_dict': optimizer_state_dict,
+            'scheduler_state_dict': scheduler_state_dict,
+            'loss': avg_train_loss,
+            'accuracy': train_acc,
+            'chord_mapping': self.chord_mapping,
+            'idx_to_chord': self.idx_to_chord,
+            'normalization': self.normalization,
+        }
+        save_success = checkpoint_utils.save_checkpoint(checkpoint_path, **data_to_save)
+        if save_success:
+            info(f"Saved checkpoint at epoch {epoch}")
+        else:
+            info(f"Failed to save checkpoint at epoch {epoch}")
+
+
     def train(self, train_loader, val_loader=None, start_epoch=1):
         """
         Train the model with optimized GPU usage.
@@ -1048,6 +909,12 @@ class StudentTrainer(BaseTrainer):
             start_epoch: Epoch to start training from (for resuming from checkpoint)
         """
         try:
+            # Initialize start_epoch from the parameter
+            self.start_epoch = start_epoch
+
+            # Load checkpoint if available (may update self.start_epoch)
+            self.load_checkpoint()
+
             self.model.train()
 
             # Get actual steps per epoch for scheduler
@@ -1060,6 +927,9 @@ class StudentTrainer(BaseTrainer):
             # Pre-allocate common tensors to avoid repeated allocations
             if torch.cuda.is_available():
                 self._zero_tensor = torch.zeros(1, device=self.device)
+
+            # Import scheduler types here to avoid circular imports
+            from torch.optim.lr_scheduler import OneCycleLR
 
             # Update OneCycleLR with actual steps if needed
             if isinstance(self.smooth_scheduler, OneCycleLR):
@@ -1149,6 +1019,9 @@ class StudentTrainer(BaseTrainer):
             elif self.use_warmup and start_epoch > self.warmup_epochs and self.lr_schedule_type:
                 # Resuming after warmup, need to advance scheduler to the right point
                 effective_epoch = start_epoch - self.warmup_epochs - 1
+
+                # Import scheduler types here to avoid circular imports
+                from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts
 
                 # For OneCycleLR and CosineAnnealingWarmRestarts that need explicit epoch values
                 if isinstance(self.smooth_scheduler, (OneCycleLR, CosineAnnealingWarmRestarts)):
@@ -1369,6 +1242,9 @@ class StudentTrainer(BaseTrainer):
                 if self.animator:
                     self.animator.add(epoch, avg_train_loss)
 
+                # Import scheduler types here to avoid circular imports
+                from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
+
                 # Step epoch-based schedulers
                 if self.lr_schedule_type and isinstance(self.smooth_scheduler, (CosineAnnealingLR, LambdaLR)):
                     if not (self.use_warmup and epoch <= self.warmup_epochs):
@@ -1397,36 +1273,12 @@ class StudentTrainer(BaseTrainer):
 
                 # Save checkpoints periodically
                 if epoch % 5 == 0 or epoch == self.num_epochs:
-                    # Create checkpoint data
-                    checkpoint_data = {
-                        'epoch': epoch,
-                        'model_state_dict': self.model.state_dict(),
-                        'optimizer_state_dict': self.optimizer.state_dict(),
-                        'scheduler_state_dict': self.smooth_scheduler.state_dict() if self.smooth_scheduler else None,
-                        'loss': avg_train_loss,
-                        'accuracy': train_acc,
-                        'chord_mapping': self.chord_mapping,
-                        'idx_to_chord': self.idx_to_chord,
-                        'mean': self.normalization['mean'] if self.normalization else None,
-                        'std': self.normalization['std'] if self.normalization else None
-                    }
+                    # Save the full trainer state
+                    self._save_trainer_state(epoch)
 
-                    # Save to primary checkpoint directory
-                    checkpoint_path = os.path.join(self.primary_checkpoint_dir, f"{self.model_prefix}_model_epoch_{epoch}.pth")
-                    save_success = False
-                    try:
-                        torch.save(checkpoint_data, checkpoint_path)
-                        info(f"Saved checkpoint to primary path: {checkpoint_path}")
-                        save_success = True
-                    except Exception as e:
-                        info(f"Error saving checkpoint to primary path: {str(e)}")
+                    # Also save a separate epoch-specific checkpoint for compatibility
+                    self._save_epoch_checkpoint(epoch, avg_train_loss, train_acc)
 
-                    # Removed fallback saving logic
-
-                    if save_success:
-                        info(f"Saved checkpoint at epoch {epoch}")
-                    else:
-                        info(f"Failed to save checkpoint at epoch {epoch}")
 
             info(f"Training complete! Scheduler steps: {self._scheduler_step_count}")
             self._print_loss_history()
@@ -1452,15 +1304,14 @@ class StudentTrainer(BaseTrainer):
 
     def load_best_model(self):
         """Load the best model saved during training."""
-        # Only try the primary path
-        if os.path.exists(self.best_model_path):
+        checkpoint = checkpoint_utils.load_checkpoint(self.best_model_path, device=self.device)
+        if checkpoint:
             try:
-                checkpoint = torch.load(self.best_model_path)
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-                info(f"Loaded best model from primary path (epoch {checkpoint['epoch']}) with validation accuracy {checkpoint['accuracy']:.4f}")
+                checkpoint_utils.apply_model_state(self.model, checkpoint['model_state_dict'])
+                info(f"Loaded best model from primary path (epoch {checkpoint.get('epoch', 'N/A')}) with validation accuracy {checkpoint.get('accuracy', 0.0):.4f}")
                 return True
             except Exception as e:
-                info(f"Error loading best model from primary path: {str(e)}")
+                error(f"Error applying best model state from primary path: {str(e)}")
                 return False
         else:
             info(f"No best model found at primary path: {self.best_model_path}")

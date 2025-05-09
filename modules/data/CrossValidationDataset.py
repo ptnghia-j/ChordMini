@@ -143,8 +143,8 @@ class CrossValidationDataset(Dataset):
         self.gpu_batch_cache = {} if self.batch_gpu_cache and self.device.type == 'cuda' else None
         self._zero_spec_cache = {}
         self._zero_logit_cache = {}
-        if self.device.type == 'cuda':
-            self._init_gpu_cache()
+        # if self.device.type == 'cuda': # Line to be moved
+        #     self._init_gpu_cache() # Line to be moved
 
         if self.require_teacher_logits and self.logits_dir is None:
             raise ValueError("require_teacher_logits=True requires a valid logits_dir")
@@ -169,6 +169,10 @@ class CrossValidationDataset(Dataset):
         # Generate segments for both train and validation sets
         self._generate_segments()
 
+        # Initialize GPU cache after multiprocessing pool in _load_data has finished
+        if self.device.type == 'cuda':
+            self._init_gpu_cache()
+
         init_time = time.time() - init_start_time
         if verbose:
             print(f"Dataset initialization for Fold {current_fold} completed in {init_time:.2f} seconds")
@@ -178,7 +182,7 @@ class CrossValidationDataset(Dataset):
     # --- Core Data Loading and Splitting Logic ---
 
     def _load_data(self):
-        """Loads data, performs train/validation split based on K-Fold CV."""
+        """Loads data, performs train/validation split based on K-Fold CV with mixing strategy."""
         start_time = time.time()
 
         # --- Attempt to load from cache ---
@@ -186,8 +190,15 @@ class CrossValidationDataset(Dataset):
             try:
                 with open(self.cache_file, 'rb') as f:
                     cache_data = pickle.load(f)
-                # Validate cache content (add check for small_dataset_percentage if needed)
-                if all(k in cache_data for k in ['train_samples', 'val_samples', 'chord_to_idx', 'train_song_ids', 'val_song_ids']):
+                # Validate cache content
+                # Ensure 'small_dataset_percentage' matches if it was part of cache_data
+                cached_small_percentage = cache_data.get('small_dataset_percentage')
+                current_small_percentage = self.small_dataset_percentage
+                # Treat None and 0.0 as different for cache validation if necessary, or align them.
+                # For simplicity, exact match or both are None.
+                small_percentage_matches = (cached_small_percentage == current_small_percentage)
+
+                if all(k in cache_data for k in ['train_samples', 'val_samples', 'chord_to_idx', 'train_song_ids', 'val_song_ids']) and small_percentage_matches:
                     self.train_samples = cache_data['train_samples']
                     self.val_samples = cache_data['val_samples']
                     self.chord_to_idx = cache_data['chord_to_idx']
@@ -212,11 +223,11 @@ class CrossValidationDataset(Dataset):
 
         # --- Scan Files and Identify Songs ---
         if self.verbose: print("Scanning files for 'labeled_synth' structure...")
-        all_spec_files = {} # {file_id: path}
-        label_files_dict = {} # {file_id: path}
-        logit_files_dict = {} # {file_id: path}
-        song_ids_by_subdir = {subdir: set() for subdir in self.labeled_synth_subdirs}
-        file_id_to_subdir = {} # {file_id: subdir}
+        all_spec_files = {}  # {file_id: path}
+        label_files_dict = {}  # {file_id: path}
+        logit_files_dict = {}  # {file_id: path}
+        song_ids = []  # Combined list of all song IDs
+        file_id_to_subdir = {}  # {file_id: subdir}
 
         # Scan Spectrograms
         for subdir in self.labeled_synth_subdirs:
@@ -228,9 +239,10 @@ class CrossValidationDataset(Dataset):
                         base_name = match.group(1)
                         file_id = f"{subdir}/{base_name}"
                         all_spec_files[file_id] = spec_path
-                        song_ids_by_subdir[subdir].add(file_id)
+                        song_ids.append(file_id)
                         file_id_to_subdir[file_id] = subdir
-            elif self.verbose: print(f"  Spectrogram subdir not found: {subdir_path}")
+            elif self.verbose:
+                print(f"  Spectrogram subdir not found: {subdir_path}")
 
         # Scan Labels
         for subdir in self.labeled_synth_subdirs:
@@ -242,7 +254,8 @@ class CrossValidationDataset(Dataset):
                         base_name = match.group(1)
                         file_id = f"{subdir}/{base_name}"
                         label_files_dict[file_id] = label_path
-            elif self.verbose: print(f"  Label subdir not found: {subdir_path}")
+            elif self.verbose:
+                print(f"  Label subdir not found: {subdir_path}")
 
         # Scan Logits (if directory provided)
         if self.logits_dir:
@@ -255,56 +268,39 @@ class CrossValidationDataset(Dataset):
                             base_name = match.group(1)
                             file_id = f"{subdir}/{base_name}"
                             logit_files_dict[file_id] = logit_path
-                elif self.verbose: print(f"  Logits subdir not found: {subdir_path}")
+                elif self.verbose:
+                    print(f"  Logits subdir not found: {subdir_path}")
 
         if not all_spec_files:
             raise FileNotFoundError(f"No spectrogram files found in subdirs {self.labeled_synth_subdirs} under {self.spec_dir}")
 
         if self.verbose:
             print(f"Found {len(all_spec_files)} potential tracks across specified subdirs.")
-            for subdir, ids in song_ids_by_subdir.items():
-                print(f"  Subdir '{subdir}': {len(ids)} tracks")
+
+        # --- Shuffle and Mix Songs ---
+        np.random.seed(42)  # For reproducible shuffling
+        np.random.shuffle(song_ids)
 
         # --- K-Fold Split Logic ---
-        kfold_song_ids_list = []
-        for subdir in self.kfold_subdirs:
-            kfold_song_ids_list.extend(list(song_ids_by_subdir.get(subdir, set())))
-        
-        fixed_song_ids_list = []
-        for subdir in self.fixed_subdirs:
-            fixed_song_ids_list.extend(list(song_ids_by_subdir.get(subdir, set())))
-
-        if not kfold_song_ids_list:
-             warnings.warn(f"No songs found in kfold_subdirs {self.kfold_subdirs} for splitting.")
-             # Handle case where there's nothing to split - maybe put all in train?
-             self.train_song_ids = fixed_song_ids_list
-             self.val_song_ids = []
+        if not song_ids:
+            warnings.warn(f"No songs found in labeled_synth_subdirs {self.labeled_synth_subdirs} for splitting.")
+            self.train_song_ids = []
+            self.val_song_ids = []
         else:
-            # Shuffle the song IDs intended for K-Fold splitting
-            np.random.seed(42) # for reproducible shuffling
-            kfold_song_ids_list = np.array(kfold_song_ids_list)
-            np.random.shuffle(kfold_song_ids_list)
+            kf = KFold(n_splits=self.num_folds, shuffle=False)  # Already shuffled
+            all_splits = list(kf.split(song_ids))
 
-            # Perform K-Fold split on the shuffled K-Fold IDs
-            kf = KFold(n_splits=self.num_folds, shuffle=False) # Already shuffled
-            all_splits = list(kf.split(kfold_song_ids_list))
-            
             if self.current_fold >= len(all_splits):
-                 raise IndexError(f"current_fold {self.current_fold} is out of bounds for the generated splits.")
+                raise IndexError(f"current_fold {self.current_fold} is out of bounds for the generated splits.")
 
             train_indices, val_indices = all_splits[self.current_fold]
 
             # Get the song IDs for train and validation based on the current fold
-            fold_train_kfold_ids = kfold_song_ids_list[train_indices].tolist()
-            fold_val_ids = kfold_song_ids_list[val_indices].tolist()
-
-            # Final training set for this fold = K-Fold training part + Fixed part
-            self.train_song_ids = sorted(list(set(fold_train_kfold_ids + fixed_song_ids_list)))
-            self.val_song_ids = sorted(fold_val_ids)
+            self.train_song_ids = sorted([song_ids[i] for i in train_indices])
+            self.val_song_ids = sorted([song_ids[i] for i in val_indices])
 
         if self.verbose:
-            print(f"Fold {self.current_fold}: Splitting {len(kfold_song_ids_list)} songs from {self.kfold_subdirs}")
-            print(f"  Adding {len(fixed_song_ids_list)} fixed songs from {self.fixed_subdirs}")
+            print(f"Fold {self.current_fold}: Splitting {len(song_ids)} songs across all subdirs")
             print(f"  Total Train Songs: {len(self.train_song_ids)}")
             print(f"  Total Validation Songs: {len(self.val_song_ids)}")
 
@@ -451,6 +447,49 @@ class CrossValidationDataset(Dataset):
                     print(f"    - {reason}: {count} ({reason_pct:.1f}%)")
             print(f"  Loaded Train Samples: {len(self.train_samples)}")
             print(f"  Loaded Validation Samples: {len(self.val_samples)}")
+
+
+        # --- Dynamically build chord_to_idx if chord_mapping was None ---
+        if self.chord_mapping is None:
+            if self.verbose: print("Building chord_to_idx dynamically from all loaded samples...")
+            all_labels_set = set()
+            for sample_list in [self.train_samples, self.val_samples]:
+                for sample in sample_list:
+                    # 'chord_label' from _process_file via _validate_chord_label
+                    # is already the normalized string label.
+                    all_labels_set.add(sample['chord_label'])
+
+            # Ensure "N" (No Chord) is handled, typically mapped to 0.
+            final_chord_to_idx = {}
+            if "N" in all_labels_set:
+                final_chord_to_idx["N"] = 0
+                all_labels_set.remove("N")
+                next_idx = 1
+            else:
+                # If "N" wasn't found in data but is expected, add it.
+                final_chord_to_idx["N"] = 0
+                next_idx = 1
+                if self.verbose: warnings.warn("Label 'N' not found in dataset, adding it to chord_to_idx with index 0.")
+            
+            sorted_labels = sorted(list(all_labels_set)) # Sort for deterministic mapping
+
+            for label in sorted_labels:
+                if label not in final_chord_to_idx: # Should not happen if "N" handled correctly
+                    final_chord_to_idx[label] = next_idx
+                    next_idx += 1
+            
+            self.chord_to_idx = final_chord_to_idx
+
+            # Add plain note names as aliases for major chords (simplified for dynamic build)
+            for root_note_name in ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']:
+                maj_chord_name = f"{root_note_name}:maj"
+                # If the major chord (e.g., "C:maj") exists in our map,
+                # and the root note (e.g., "C") isn't already mapped (e.g. as a different chord type),
+                # then map the root note as an alias to the major chord's index.
+                if maj_chord_name in self.chord_to_idx and root_note_name not in self.chord_to_idx:
+                    self.chord_to_idx[root_note_name] = self.chord_to_idx[maj_chord_name]
+            
+            if self.verbose: print(f"Dynamically built chord_to_idx with {len(self.chord_to_idx)} unique entries (aliases included).")
 
 
         # --- Caching Results ---
@@ -1118,22 +1157,25 @@ class CrossValidationDataset(Dataset):
         if normalized_label == "N" or normalized_label == "X":
             return "N"
 
-        # Check if the *normalized* label exists in the provided mapping
-        if self.chord_to_idx and normalized_label in self.chord_to_idx:
-            return normalized_label
-        elif not self.chord_to_idx:
-             # Build dynamic mapping if none provided
-             if normalized_label not in self.chord_to_idx:
-                  self.chord_to_idx[normalized_label] = len(self.chord_to_idx)
-             return normalized_label
+        # If a chord_mapping was provided at initialization, use it for validation.
+        if self.chord_mapping is not None:
+            if normalized_label in self.chord_to_idx:
+                return normalized_label
+            else:
+                # Normalized label not in the provided mapping
+                warn_key = f'_warned_norm_{normalized_label}'
+                if self.verbose and not hasattr(self, warn_key):
+                     warnings.warn(f"Normalized chord '{normalized_label}' (from '{chord_label}' in {os.path.basename(str(source_file))}) not in provided chord_mapping. Using 'N'.")
+                     setattr(self, warn_key, True)
+                return "N"
         else:
-            # Normalized label not in the provided mapping
-            # Use a warning mechanism that doesn't spam
-            warn_key = f'_warned_norm_{normalized_label}'
-            if self.verbose and not hasattr(self, warn_key):
-                 warnings.warn(f"Normalized chord '{normalized_label}' (from '{chord_label}' in {os.path.basename(str(source_file))}) not in chord_mapping. Using 'N'.")
-                 setattr(self, warn_key, True)
-            return "N"
+            # If chord_mapping was None (dynamic building mode):
+            # This method, when called by workers in _process_file,
+            # should just return the normalized string.
+            # The actual self.chord_to_idx map is built centrally in _load_data afterwards.
+            # When called later by __getitem__, self.chord_to_idx will be populated,
+            # and __getitem__ will handle the lookup.
+            return normalized_label
 
     def _init_gpu_cache(self):
         """Initialize GPU cache with common zero tensors."""
@@ -1204,7 +1246,6 @@ class CrossValidationDataset(Dataset):
             shuffle=shuffle if sampler is None else False, # Sampler handles shuffling
             num_workers=effective_num_workers,
             pin_memory=effective_pin_memory,
-            prefetch_factor=self.prefetch_factor if effective_num_workers > 0 else None,
             sampler=sampler,
             # collate_fn=None, # Use default collate
             # worker_init_fn=None # Add if needed for seeding workers

@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: btc-large-ce # Changed name
+  name: btc-large-fl-a # Changed name
   namespace: csuf-titans
   labels:
     app: btc-training # Changed label
@@ -24,7 +24,7 @@ spec:
               - key: kubernetes.io/hostname      # new host pin
                 operator: In
                 values:
-                - gpu-04.nrp.mghpcc.org
+                - gpu-03.nrp.mghpcc.org
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -200,11 +200,11 @@ spec:
               value: "4.0"   # Temperature for softening distributions
             # Focal loss settings (optional for BTC)
             - name: USE_FOCAL_LOSS
-              value: "false" # Set to "true" to enable focal loss
+              value: "true" # Set to "true" to enable focal loss
             - name: FOCAL_GAMMA
               value: "2.0"   # Focusing parameter for focal loss
             - name: FOCAL_ALPHA
-              value: "0.25"  # Class weight parameter for focal loss
+              value: "0.75"  # Class weight parameter for focal loss
             # Warmup settings (optional for BTC)
             - name: USE_WARMUP
               value: "true"  # Set to "true" to enable learning rate warm-up
@@ -246,7 +246,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never", "required"
             - name: SUB_DIR
-              value: "btc-ce" # Subdirectory for BTC checkpoints
+              value: "btc-fl-a" # Subdirectory for BTC checkpoints
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint
@@ -257,7 +257,7 @@ spec:
             - name: LAZY_INIT
               value: "false" # Controls dataset lazy initialization
             - name: SMALL_DATASET
-              value: ""   # Set percentage of dataset to use (0.1 = 10%, null = full)
+              value: "0.01"   # Set percentage of dataset to use (0.1 = 10%, null = full)
             - name: METADATA_CACHE
               value: "false" # Use metadata-only caching
           command:

@@ -683,7 +683,7 @@ def main():
         'device': 'cpu', # SynthDataset primarily uses CPU loading
         'pin_memory': False, # Force False for SynthDataset
         'prefetch_factor': 1, # Keep 1, DataLoader handles prefetching
-        'num_workers': 0, # Force 0 for SynthDataset
+        'num_workers': 2, # Force 0 for SynthDataset
         'require_teacher_logits': use_kd_loss,
         'use_cache': not args.disable_cache,
         'metadata_only': args.metadata_cache, # Pass boolean directly
