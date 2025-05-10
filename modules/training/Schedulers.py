@@ -160,16 +160,22 @@ class ValidationBasedScheduler:
         self.best_val_acc = 0
         self.consecutive_no_improve = 0
 
-    def step(self, val_acc):
+    def step(self, val_acc, in_warmup=False):
         """
         Adjust learning rate based on validation accuracy.
 
         Args:
             val_acc: Current validation accuracy
+            in_warmup: Whether we're currently in warmup phase (if True, no adjustment will be made)
 
         Returns:
             bool: Whether learning rate was reduced
         """
+        # Skip adjustment during warmup
+        if in_warmup:
+            info("Validation-based scheduler: Skipping LR adjustment during warmup phase")
+            return False
+
         lr_reduced = False
 
         if self.best_val_acc > val_acc:

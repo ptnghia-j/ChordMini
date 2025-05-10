@@ -371,16 +371,55 @@ def main():
 
         # Check if model state dict is directly available or nested
         if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            state_dict = checkpoint['model_state_dict']
         elif 'model' in checkpoint:
-            model.load_state_dict(checkpoint['model'])
+            state_dict = checkpoint['model']
         else:
-            # Try to load the state dict directly
-            model.load_state_dict(checkpoint)
+            # Try to use the checkpoint directly as a state dict
+            state_dict = checkpoint
+
+        # Check if the state dict has 'module.' prefix (from DistributedDataParallel)
+        # and remove it if necessary
+        if any(k.startswith('module.') for k in state_dict.keys()):
+            logger.info("Detected 'module.' prefix in state dict keys. Removing prefix for compatibility.")
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+        # Now load the cleaned state dict
+        try:
+            model.load_state_dict(state_dict)
+            logger.info("Model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading model state dict: {e}")
+            # Try with strict=False as a fallback
+            logger.info("Attempting to load with strict=False...")
+            model.load_state_dict(state_dict, strict=False)
+            logger.info("Model loaded with strict=False (some weights may be missing)")
+
+        # Set idx_to_chord attribute on the model if available in checkpoint
+        if 'idx_to_chord' in checkpoint:
+            model.idx_to_chord = checkpoint['idx_to_chord']
+            logger.info("Loaded idx_to_chord mapping from checkpoint")
+        else:
+            # Set default mapping
+            model.set_chord_mapping(None)
+            logger.info("Using default idx_to_chord mapping")
 
         # Get normalization parameters
         ckpt_mean = checkpoint.get('mean', 0.0) # Use ckpt_mean/std consistently
         ckpt_std = checkpoint.get('std', 1.0)
+
+        # Convert tensors to numpy arrays if needed
+        if isinstance(ckpt_mean, torch.Tensor):
+            ckpt_mean = ckpt_mean.cpu().numpy()
+        if isinstance(ckpt_std, torch.Tensor):
+            ckpt_std = ckpt_std.cpu().numpy()
+
+        # Ensure we have scalar values if they're single-element arrays
+        if hasattr(ckpt_mean, 'shape') and ckpt_mean.size == 1:
+            ckpt_mean = float(ckpt_mean.item() if hasattr(ckpt_mean, 'item') else ckpt_mean)
+        if hasattr(ckpt_std, 'shape') and ckpt_std.size == 1:
+            ckpt_std = float(ckpt_std.item() if hasattr(ckpt_std, 'item') else ckpt_std)
+
         logger.info(f"Using Checkpoint Normalization parameters: mean={ckpt_mean:.4f}, std={ckpt_std:.4f}")
     else:
         logger.error(f"Model file not found: {model_file}")
@@ -418,14 +457,46 @@ def main():
             # Transpose and normalize using checkpoint stats
             feature = feature.T  # Shape: [frames, features]
             logger.info(f"Feature stats BEFORE norm: Min={np.min(feature):.4f}, Max={np.max(feature):.4f}, Mean={np.mean(feature):.4f}, Std={np.std(feature):.4f}")
+
+            # Apply normalization - ensure types match
             epsilon = 1e-8
-            feature = (feature - ckpt_mean) / (ckpt_std + epsilon)
+            # Handle different shapes of normalization parameters
+            if hasattr(ckpt_mean, 'shape') and len(ckpt_mean.shape) > 0 and ckpt_mean.shape[0] > 1:
+                # If mean/std are arrays with the same dimension as features, reshape for broadcasting
+                if ckpt_mean.shape[0] == feature.shape[1]:
+                    ckpt_mean_reshaped = ckpt_mean.reshape(1, -1)  # [1, features]
+                    ckpt_std_reshaped = ckpt_std.reshape(1, -1)    # [1, features]
+                    feature = (feature - ckpt_mean_reshaped) / (ckpt_std_reshaped + epsilon)
+                else:
+                    # If shapes don't match, use scalar mean/std
+                    logger.warning(f"Normalization parameter shape mismatch: mean shape {ckpt_mean.shape}, feature shape {feature.shape}. Using scalar normalization.")
+                    feature = (feature - float(np.mean(ckpt_mean))) / (float(np.mean(ckpt_std)) + epsilon)
+            else:
+                # Scalar normalization
+                feature = (feature - ckpt_mean) / (ckpt_std + epsilon)
+
             logger.info(f"Feature stats AFTER norm (using checkpoint stats): Min={np.min(feature):.4f}, Max={np.max(feature):.4f}, Mean={np.mean(feature):.4f}, Std={np.std(feature):.4f}")
 
-            # Get sequence length from config
-            # NOTE: ChordNet might use a different config name for sequence length, adjust if needed
-            # Assuming 'timestep' based on original code snippet
-            n_timestep = config.model.get('timestep', 10) # Default from original snippet
+            # Get sequence length from config or checkpoint
+            # Try to get from checkpoint first, then config, then use default
+            n_timestep = None
+
+            # Try to get from checkpoint
+            if 'timestep' in checkpoint:
+                n_timestep = checkpoint['timestep']
+                logger.info(f"Using timestep={n_timestep} from checkpoint")
+            # Try to get from model config
+            elif hasattr(config, 'model') and hasattr(config.model, 'timestep'):
+                n_timestep = config.model.timestep
+                logger.info(f"Using timestep={n_timestep} from config")
+            # Try to get from model attribute
+            elif hasattr(model, 'timestep'):
+                n_timestep = model.timestep
+                logger.info(f"Using timestep={n_timestep} from model attribute")
+            # Use default
+            else:
+                n_timestep = 108  # Default value from ChordMini
+                logger.info(f"Using default timestep={n_timestep}")
 
             # Pad to match sequence length
             original_num_frames = feature.shape[0] # Store original length before padding

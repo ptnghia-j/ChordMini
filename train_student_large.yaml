@@ -24,7 +24,7 @@ spec:
               - key: kubernetes.io/hostname      # new host pin
                 operator: In
                 values:
-                - gpu-08.nrp.mghpcc.org
+                - gpu-11.nrp.mghpcc.org
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -244,9 +244,9 @@ spec:
             - name: WARMUP_START_LR
               value: "0.0001"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.0004"  # Final learning rate after warm-up
+              value: "0.0003"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "8"  # Number of epochs for warm-up
+              value: "7"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
               value: "0.2"  # Set dropout probability (0-1)
@@ -274,7 +274,7 @@ spec:
               value: "6"     # (no effect worker=0) Prefetch 6 batches for better throughput
             # Add dataset type environment variable with combined option
             - name: DATASET_TYPE
-              value: "maestro+dali_synth"  # Options: "fma", "maestro", "dali_synth", "combined", "fma+maestro", "fma+dali_synth", or "maestro+dali_synth"
+              value: "dali_synth"  # Options: "fma", "maestro", "dali_synth", "combined", "fma+maestro", "fma+dali_synth", or "maestro+dali_synth"
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
@@ -290,7 +290,7 @@ spec:
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: ""  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: "0.01"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
           command:

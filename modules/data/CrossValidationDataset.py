@@ -8,13 +8,14 @@ import warnings
 import hashlib
 import traceback
 import glob
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from collections import Counter
 from pathlib import Path
 from multiprocessing import Pool
 from functools import partial
 from tqdm import tqdm
-from sklearn.model_selection import KFold, train_test_split # Add train_test_split
+from sklearn.model_selection import KFold, train_test_split, StratifiedKFold # Add train_test_split and StratifiedKFold
+import random
 
 # Assuming these utilities are available in the specified paths
 from modules.utils.device import get_device, to_device, clear_gpu_cache
@@ -143,6 +144,9 @@ class CrossValidationDataset(Dataset):
         self.gpu_batch_cache = {} if self.batch_gpu_cache and self.device.type == 'cuda' else None
         self._zero_spec_cache = {}
         self._zero_logit_cache = {}
+        # Initialize sampler storage
+        self._current_train_sampler = None
+        self._current_val_sampler = None
         # if self.device.type == 'cuda': # Line to be moved
         #     self._init_gpu_cache() # Line to be moved
 
@@ -281,14 +285,22 @@ class CrossValidationDataset(Dataset):
         np.random.seed(42)  # For reproducible shuffling
         np.random.shuffle(song_ids)
 
-        # --- K-Fold Split Logic ---
+        # --- K-Fold Split Logic with Stratification ---
         if not song_ids:
             warnings.warn(f"No songs found in labeled_synth_subdirs {self.labeled_synth_subdirs} for splitting.")
             self.train_song_ids = []
             self.val_song_ids = []
         else:
-            kf = KFold(n_splits=self.num_folds, shuffle=False)  # Already shuffled
-            all_splits = list(kf.split(song_ids))
+            # Create stratification labels based on subdirectories to ensure balanced distribution
+            # This ensures each fold has a similar distribution of songs from each subdirectory
+            strat_labels = []
+            for song_id in song_ids:
+                subdir = song_id.split('/')[0]  # Extract subdirectory from song_id
+                strat_labels.append(subdir)
+
+            # Use StratifiedKFold to ensure balanced distribution of subdirectories across folds
+            skf = StratifiedKFold(n_splits=self.num_folds, shuffle=True, random_state=42)
+            all_splits = list(skf.split(song_ids, strat_labels))
 
             if self.current_fold >= len(all_splits):
                 raise IndexError(f"current_fold {self.current_fold} is out of bounds for the generated splits.")
@@ -296,8 +308,25 @@ class CrossValidationDataset(Dataset):
             train_indices, val_indices = all_splits[self.current_fold]
 
             # Get the song IDs for train and validation based on the current fold
-            self.train_song_ids = sorted([song_ids[i] for i in train_indices])
-            self.val_song_ids = sorted([song_ids[i] for i in val_indices])
+            # Don't sort to preserve the stratified order from the split
+            self.train_song_ids = [song_ids[i] for i in train_indices]
+            self.val_song_ids = [song_ids[i] for i in val_indices]
+
+            # Log the distribution of subdirectories in each split for verification
+            if self.verbose:
+                train_subdirs = [s.split('/')[0] for s in self.train_song_ids]
+                val_subdirs = [s.split('/')[0] for s in self.val_song_ids]
+
+                train_dist = Counter(train_subdirs)
+                val_dist = Counter(val_subdirs)
+
+                print(f"Subdirectory distribution in training set:")
+                for subdir, count in train_dist.items():
+                    print(f"  {subdir}: {count} songs ({count/len(train_subdirs)*100:.1f}%)")
+
+                print(f"Subdirectory distribution in validation set:")
+                for subdir, count in val_dist.items():
+                    print(f"  {subdir}: {count} songs ({count/len(val_subdirs)*100:.1f}%)")
 
         if self.verbose:
             print(f"Fold {self.current_fold}: Splitting {len(song_ids)} songs across all subdirs")
@@ -351,7 +380,7 @@ class CrossValidationDataset(Dataset):
                 if not label_file or not os.path.exists(label_file): continue
                 logit_file = logit_files_dict.get(song_id)
                 if self.require_teacher_logits and (not logit_file or not os.path.exists(logit_file)): continue
-                
+
                 train_files_to_process.append((spec_file, song_id, label_files_dict, logit_files_dict, True)) # Add return_skip_reason flag
 
         for song_id in self.val_song_ids:
@@ -376,14 +405,14 @@ class CrossValidationDataset(Dataset):
 
         def run_processing(file_list, target_sample_list, desc):
             if not file_list: return 0, 0 # No files to process
-            
+
             # Adjust num_cpus if file list is small
             current_num_cpus = min(num_cpus, len(file_list))
             if current_num_cpus == 0: return 0, 0
 
             total_processed = 0
             total_skipped = 0
-            
+
             args_list = [(self,) + item for item in file_list] # Add self as first arg for wrapper
 
             if self.verbose: print(f"Processing {len(args_list)} {desc} files with {current_num_cpus} workers...")
@@ -396,7 +425,7 @@ class CrossValidationDataset(Dataset):
                         desc=f"Loading {desc} data (Fold {self.current_fold})",
                         disable=not self.verbose
                     ))
-                
+
                 for samples, skip_reason in process_results:
                     total_processed += 1
                     if samples:
@@ -410,7 +439,7 @@ class CrossValidationDataset(Dataset):
                 if self.verbose:
                     print(f"ERROR during multiprocessing for {desc}: {e}\n{error_msg}")
                     print("Attempting sequential fallback...")
-                
+
                 # Sequential fallback
                 for args in tqdm(args_list, desc=f"Loading {desc} data (sequential fallback)"):
                     try:
@@ -470,14 +499,14 @@ class CrossValidationDataset(Dataset):
                 final_chord_to_idx["N"] = 0
                 next_idx = 1
                 if self.verbose: warnings.warn("Label 'N' not found in dataset, adding it to chord_to_idx with index 0.")
-            
+
             sorted_labels = sorted(list(all_labels_set)) # Sort for deterministic mapping
 
             for label in sorted_labels:
                 if label not in final_chord_to_idx: # Should not happen if "N" handled correctly
                     final_chord_to_idx[label] = next_idx
                     next_idx += 1
-            
+
             self.chord_to_idx = final_chord_to_idx
 
             # Add plain note names as aliases for major chords (simplified for dynamic build)
@@ -488,7 +517,7 @@ class CrossValidationDataset(Dataset):
                 # then map the root note as an alias to the major chord's index.
                 if maj_chord_name in self.chord_to_idx and root_note_name not in self.chord_to_idx:
                     self.chord_to_idx[root_note_name] = self.chord_to_idx[maj_chord_name]
-            
+
             if self.verbose: print(f"Dynamically built chord_to_idx with {len(self.chord_to_idx)} unique entries (aliases included).")
 
 
@@ -594,7 +623,7 @@ class CrossValidationDataset(Dataset):
                     segment_end_sample_idx = segment_start_sample_idx + self.seq_len
                     segment_indices.append((segment_start_sample_idx, segment_end_sample_idx))
                     total_segments += 1
-            
+
             if self.verbose: print(f"Generated {total_segments} segments for {set_name} set.")
             return segment_indices
 
@@ -994,7 +1023,7 @@ class CrossValidationDataset(Dataset):
                              logit_frames = logit_info.shape[0] # Use N
                         elif logit_info.ndim == 1 and num_frames == 1: # Single frame case
                              logit_frames = 1
-                        
+
                         if logit_frames > num_frames:
                             expected_num_frames = logit_frames # Store expected length
                     except Exception as e:
@@ -1036,7 +1065,7 @@ class CrossValidationDataset(Dataset):
                             # Get time dimension correctly
                             if teacher_logits_full.ndim >= 1: # Expecting (N, C) or (C,)
                                 logit_frames = teacher_logits_full.shape[0] if teacher_logits_full.ndim > 1 else 1
-                            
+
                             # Pad spectrogram if logits are longer
                             if logit_frames > num_frames:
                                 pad_width = logit_frames - num_frames
@@ -1240,6 +1269,12 @@ class CrossValidationDataset(Dataset):
 
         subset = CrossValSubset(self, indices, use_val_getitem=use_val_getitem)
 
+        # Store the sampler for later epoch updates
+        if name == "training":
+            self._current_train_sampler = sampler
+        else:
+            self._current_val_sampler = sampler
+
         return DataLoader(
             subset,
             batch_size=batch_size,
@@ -1251,32 +1286,194 @@ class CrossValidationDataset(Dataset):
             # worker_init_fn=None # Add if needed for seeding workers
         )
 
-    def get_train_iterator(self, batch_size=128, shuffle=True, num_workers=None, pin_memory=None, sampler=None):
-        """Get DataLoader for the training set of the current fold."""
+    def update_epoch(self, epoch):
+        """
+        Update the epoch number for all samplers to ensure different shuffling patterns.
+        Call this method at the beginning of each epoch in your training loop.
+
+        Args:
+            epoch: Current epoch number (0-indexed)
+        """
+        # Update train sampler if it exists and has set_epoch method
+        if hasattr(self, '_current_train_sampler') and self._current_train_sampler is not None:
+            if hasattr(self._current_train_sampler, 'set_epoch'):
+                self._current_train_sampler.set_epoch(epoch)
+                if self.verbose and epoch == 0:
+                    print(f"Updated training sampler epoch to {epoch}")
+
+        # Update validation sampler if it exists and has set_epoch method
+        if hasattr(self, '_current_val_sampler') and self._current_val_sampler is not None:
+            if hasattr(self._current_val_sampler, 'set_epoch'):
+                self._current_val_sampler.set_epoch(epoch)
+                if self.verbose and epoch == 0:
+                    print(f"Updated validation sampler epoch to {epoch}")
+
+    def get_train_iterator(self, batch_size=128, shuffle=True, num_workers=None, pin_memory=None, sampler=None, use_song_aware_sampler=True):
+        """
+        Get DataLoader for the training set of the current fold.
+
+        Args:
+            batch_size: Batch size for the DataLoader
+            shuffle: Whether to shuffle the data (ignored if sampler is provided)
+            num_workers: Number of worker processes for data loading
+            pin_memory: Whether to pin memory in GPU
+            sampler: Custom sampler (if provided, overrides shuffle and use_song_aware_sampler)
+            use_song_aware_sampler: Whether to use song-aware shuffling (default: True)
+
+        Returns:
+            DataLoader for the training set
+        """
+        indices = list(range(len(self.train_segment_indices)))
+
+        # Create appropriate sampler if none provided
+        if sampler is None and shuffle:
+            if use_song_aware_sampler:
+                # Use song-aware sampler for better shuffling
+                sampler = SongAwareShuffleSampler(
+                    self,
+                    self.train_segment_indices,
+                    self.train_song_ids,
+                    seed=42
+                )
+                if self.verbose:
+                    print("Using SongAwareShuffleSampler for training data")
+            else:
+                # Use epoch-dependent sampler for standard shuffling
+                sampler = EpochDependentSampler(indices, seed=42)
+                if self.verbose:
+                    print("Using EpochDependentSampler for training data")
+
         return self._get_data_iterator(
-            list(range(len(self.train_segment_indices))), # Use indices 0 to N-1
+            indices,
             "training",
             batch_size=batch_size,
-            shuffle=shuffle,
+            shuffle=shuffle and sampler is None,  # Only shuffle if no sampler
             num_workers=num_workers,
             pin_memory=pin_memory,
             sampler=sampler,
-            use_val_getitem=False # Use main __getitem__
+            use_val_getitem=False  # Use main __getitem__
         )
 
     def get_val_iterator(self, batch_size=128, shuffle=False, num_workers=None, pin_memory=None, sampler=None):
-        """Get DataLoader for the validation set of the current fold."""
+        """
+        Get DataLoader for the validation set of the current fold.
+
+        Args:
+            batch_size: Batch size for the DataLoader
+            shuffle: Whether to shuffle the data (usually False for validation)
+            num_workers: Number of worker processes for data loading
+            pin_memory: Whether to pin memory in GPU
+            sampler: Custom sampler (if provided, overrides shuffle)
+
+        Returns:
+            DataLoader for the validation set
+        """
+        indices = list(range(len(self.val_segment_indices)))
+
+        # Create epoch-dependent sampler if shuffle is True and no sampler provided
+        if sampler is None and shuffle:
+            sampler = EpochDependentSampler(indices, seed=43)  # Different seed from training
+            if self.verbose:
+                print("Using EpochDependentSampler for validation data")
+
         return self._get_data_iterator(
-            list(range(len(self.val_segment_indices))), # Use indices 0 to M-1
+            indices,
             "validation",
             batch_size=batch_size,
-            shuffle=shuffle, # Usually False for validation
+            shuffle=shuffle and sampler is None,  # Only shuffle if no sampler
             num_workers=num_workers,
             pin_memory=pin_memory,
             sampler=sampler,
-            use_val_getitem=True # Use _get_item_val
+            use_val_getitem=True  # Use _get_item_val
         )
 
+
+# --- Custom Samplers for Improved Shuffling ---
+class EpochDependentSampler(Sampler):
+    """
+    Sampler that shuffles indices with a different seed for each epoch.
+    This ensures different shuffling patterns across epochs.
+    """
+    def __init__(self, data_source, seed=42):
+        self.data_source = data_source
+        self.seed = seed
+        self.epoch = 0
+
+    def __iter__(self):
+        # Use a different seed for each epoch by combining base seed and epoch number
+        epoch_seed = self.seed + self.epoch
+        g = torch.Generator()
+        g.manual_seed(epoch_seed)
+
+        # Create shuffled indices
+        indices = torch.randperm(len(self.data_source), generator=g).tolist()
+        return iter(indices)
+
+    def __len__(self):
+        return len(self.data_source)
+
+    def set_epoch(self, epoch):
+        """
+        Set the epoch for this sampler. This affects the shuffling pattern.
+
+        Args:
+            epoch: Current epoch number
+        """
+        self.epoch = epoch
+
+class SongAwareShuffleSampler(Sampler):
+    """
+    Sampler that ensures segments from the same song are not scattered too widely.
+    First shuffles songs, then shuffles segments within each song.
+    """
+    def __init__(self, dataset, segment_indices, song_ids, seed=42):
+        self.dataset = dataset
+        self.segment_indices = segment_indices
+        self.song_ids = song_ids
+        self.seed = seed
+        self.epoch = 0
+
+        # Group segments by song
+        self.song_to_segments = self._group_segments_by_song()
+
+    def _group_segments_by_song(self):
+        """Group segment indices by song ID"""
+        song_to_segments = {}
+
+        for idx, (seg_start_idx, _) in enumerate(self.segment_indices):
+            if seg_start_idx < len(self.dataset.train_samples):
+                song_id = self.dataset.train_samples[seg_start_idx]['song_id']
+                if song_id not in song_to_segments:
+                    song_to_segments[song_id] = []
+                song_to_segments[song_id].append(idx)
+
+        return song_to_segments
+
+    def __iter__(self):
+        # Use a different seed for each epoch
+        epoch_seed = self.seed + self.epoch
+        rng = random.Random(epoch_seed)
+
+        # Shuffle the song IDs
+        song_ids = list(self.song_to_segments.keys())
+        rng.shuffle(song_ids)
+
+        # Create final indices list by taking segments from each song in shuffled order
+        indices = []
+        for song_id in song_ids:
+            # Get segments for this song and shuffle them
+            song_segments = self.song_to_segments[song_id].copy()
+            rng.shuffle(song_segments)
+            indices.extend(song_segments)
+
+        return iter(indices)
+
+    def __len__(self):
+        return len(self.segment_indices)
+
+    def set_epoch(self, epoch):
+        """Set the epoch for this sampler"""
+        self.epoch = epoch
 
 # --- Subset Helper Class ---
 class CrossValSubset(Dataset):

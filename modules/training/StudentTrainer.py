@@ -357,12 +357,18 @@ class StudentTrainer(BaseTrainer):
         Returns:
             Current learning rate after update
         """
+        # Get current learning rate before any updates
+        current_lr = self.optimizer.param_groups[0]['lr']
+
         # Determine if we're in warmup phase (epoch is 1-indexed)
         in_warmup = self.use_warmup and epoch <= self.warmup_epochs
 
         if in_warmup:
             # In warmup phase, use warmup-specific LR calculation
-            return self._warmup_learning_rate(epoch, batch_idx, num_batches)
+            new_lr = self._warmup_learning_rate(epoch, batch_idx, num_batches)
+            if abs(new_lr - current_lr) > 1e-7:  # Only log if there's a meaningful change
+                info(f"Warmup LR update for epoch {epoch}/{self.warmup_epochs}: {current_lr:.6f} → {new_lr:.6f}")
+            return new_lr
         elif self.lr_schedule_type:
             # Import scheduler types here to avoid circular imports
             from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, OneCycleLR, CosineAnnealingWarmRestarts
@@ -374,7 +380,9 @@ class StudentTrainer(BaseTrainer):
                     fractional_epoch = epoch - self.warmup_epochs - 1 + (batch_idx / num_batches)
                     self.smooth_scheduler.step(fractional_epoch)
                     self._scheduler_step_count += 1
-                    info(f"Fractional scheduler step at epoch {epoch}, batch {batch_idx}/{num_batches}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
+                    new_lr = self.optimizer.param_groups[0]['lr']
+                    if batch_idx % 100 == 0:  # Reduce log frequency
+                        info(f"Fractional scheduler step at epoch {epoch}, batch {batch_idx}/{num_batches}: LR={new_lr:.7f}")
                 else:
                     # Just use regular epoch-based steps (CosineAnnealingLR, LambdaLR)
                     # Only step if we haven't already stepped for this epoch
@@ -383,26 +391,33 @@ class StudentTrainer(BaseTrainer):
                         self.smooth_scheduler.step()
                         self._last_stepped_epoch = epoch - self.warmup_epochs - 1
                         self._scheduler_step_count += 1
-                        info(f"Full scheduler step at adjusted epoch {epoch - self.warmup_epochs - 1}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
+                        new_lr = self.optimizer.param_groups[0]['lr']
+                        info(f"Post-warmup scheduler step at adjusted epoch {epoch - self.warmup_epochs - 1}: {current_lr:.6f} → {new_lr:.6f}")
             else:
                 # No warmup - use standard scheduler stepping
                 if batch_idx is not None and num_batches is not None and isinstance(self.smooth_scheduler, (OneCycleLR, CosineAnnealingWarmRestarts)):
                     fractional_epoch = (epoch - 1) + (batch_idx / num_batches)
                     self.smooth_scheduler.step(fractional_epoch)
                     self._scheduler_step_count += 1
-                    info(f"Fractional scheduler step (no warmup) at epoch {epoch}, batch {batch_idx}/{num_batches}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
+                    new_lr = self.optimizer.param_groups[0]['lr']
+                    if batch_idx % 100 == 0:  # Reduce log frequency
+                        info(f"Fractional scheduler step (no warmup) at epoch {epoch}, batch {batch_idx}/{num_batches}: LR={new_lr:.7f}")
                 else:
                     # Just use regular epoch-based steps without epoch parameter
                     if not hasattr(self, '_last_stepped_epoch') or self._last_stepped_epoch != (epoch - 1):
                         self.smooth_scheduler.step()
                         self._last_stepped_epoch = epoch - 1
                         self._scheduler_step_count += 1
-                        info(f"Full scheduler step (no warmup) at epoch {epoch-1}: LR={self.optimizer.param_groups[0]['lr']:.7f}")
+                        new_lr = self.optimizer.param_groups[0]['lr']
+                        info(f"Scheduler step at epoch {epoch-1}: {current_lr:.6f} → {new_lr:.6f}")
 
             return self.optimizer.param_groups[0]['lr']
         else:
             # No scheduler - just return current LR (will be handled by validation-based adjustment)
-            return self.optimizer.param_groups[0]['lr']
+            # Only log this message once per epoch (when batch_idx is None or 0)
+            if batch_idx is None or batch_idx == 0:
+                info(f"No active scheduler at epoch {epoch}, maintaining LR={current_lr:.6f} (will be adjusted by validation if needed)")
+            return current_lr
 
     def focal_loss(self, logits, targets, gamma=2.0, alpha=None):
         """
@@ -480,7 +495,17 @@ class StudentTrainer(BaseTrainer):
         return new_lr
 
     def _warmup_learning_rate(self, epoch, batch_idx=None, num_batches=None):
-        """Calculate and set learning rate during warm-up period (per-step)."""
+        """
+        Calculate and set learning rate during warm-up period (per-step).
+
+        Args:
+            epoch: Current epoch (1-indexed)
+            batch_idx: Current batch index within epoch (optional)
+            num_batches: Total number of batches per epoch (optional)
+
+        Returns:
+            New learning rate
+        """
         # Create a warmup scheduler if it doesn't exist
         if not hasattr(self, 'warmup_scheduler'):
             self.warmup_scheduler = create_warmup_scheduler(
@@ -490,12 +515,49 @@ class StudentTrainer(BaseTrainer):
                 warmup_start_lr=self.warmup_start_lr,
                 warmup_end_lr=self.warmup_end_lr
             )
+            info(f"Created warmup scheduler: {self.warmup_start_lr:.6f} → {self.warmup_end_lr:.6f} over {self.warmup_epochs} epochs")
+
+        # Calculate warmup progress for logging
+        if batch_idx is None or num_batches is None:
+            # Epoch-based progress
+            progress = (epoch - 1) / max(1, self.warmup_epochs - 1) if self.warmup_epochs > 1 else 1.0
+            progress_str = f"epoch {epoch}/{self.warmup_epochs}"
+        else:
+            # Step-based progress
+            total_steps = self.warmup_epochs * num_batches
+            current_step = (epoch - 1) * num_batches + batch_idx
+            progress = current_step / max(1, total_steps - 1)
+            progress_str = f"step {current_step}/{total_steps}"
 
         # Use the warmup scheduler to calculate and set the learning rate
-        return self.warmup_scheduler.step(epoch, batch_idx, num_batches)
+        new_lr = self.warmup_scheduler.step(epoch, batch_idx, num_batches)
 
-    def _adjust_learning_rate(self, val_acc):
-        """Adjust learning rate based on validation accuracy."""
+        # Only log detailed messages at the beginning of epochs or every 100 batches
+        if batch_idx is None or batch_idx == 0 or batch_idx % 100 == 0:
+            # Calculate expected final warmup LR for this epoch
+            expected_epoch_end_lr = self.warmup_start_lr + (self.warmup_end_lr - self.warmup_start_lr) * (epoch / self.warmup_epochs)
+            info(f"Warmup active at {progress_str} ({progress:.1%}): LR={new_lr:.6f}, target end of epoch: {expected_epoch_end_lr:.6f}")
+
+        return new_lr
+
+    def _adjust_learning_rate(self, val_acc, current_epoch=None):
+        """
+        Adjust learning rate based on validation accuracy.
+
+        Args:
+            val_acc: Current validation accuracy
+            current_epoch: Current epoch number (optional, for warmup check)
+
+        Returns:
+            bool: Whether learning rate was reduced
+        """
+        # Check if we're in warmup phase
+        in_warmup = False
+        if hasattr(self, 'use_warmup') and self.use_warmup and current_epoch is not None:
+            if current_epoch <= self.warmup_epochs:
+                info(f"Warmup active (epoch {current_epoch}/{self.warmup_epochs}), will skip validation-based LR adjustment")
+                in_warmup = True
+
         # Create a validation-based scheduler if it doesn't exist
         if not hasattr(self, 'validation_scheduler'):
             self.validation_scheduler = create_scheduler(
@@ -510,7 +572,7 @@ class StudentTrainer(BaseTrainer):
             self.validation_scheduler.best_val_acc = self.before_val_acc
 
         # Use the validation scheduler to adjust the learning rate
-        lr_reduced = self.validation_scheduler.step(val_acc)
+        lr_reduced = self.validation_scheduler.step(val_acc, in_warmup=in_warmup)
 
         # Update previous validation accuracy
         self.before_val_acc = val_acc
@@ -529,7 +591,7 @@ class StudentTrainer(BaseTrainer):
 
             model_state_dict = self._get_model_state_dict()
             optimizer_state_dict = self.optimizer.state_dict()
-            
+
             data_to_save = {
                 'epoch': epoch,
                 'model_state_dict': model_state_dict,
@@ -834,7 +896,7 @@ class StudentTrainer(BaseTrainer):
                 info("Loaded scheduler state from checkpoint")
             elif self.reset_scheduler and self.smooth_scheduler is not None:
                 info("Reset scheduler flag is set, scheduler state not loaded")
-            
+
             self.chord_mapping = checkpoint.get('chord_mapping')
             self.idx_to_chord = checkpoint.get('idx_to_chord')
             self.normalization = checkpoint.get('normalization')
@@ -1259,12 +1321,19 @@ class StudentTrainer(BaseTrainer):
                     val_loss, val_acc = self.validate_with_metrics(val_loader, current_epoch=epoch)
                     self.val_losses.append(val_loss)
 
-                    # Only apply standard LR adjustment if:
-                    # 1. We're not using a smooth scheduler
-                    # 2. We're not in the warm-up phase
-                    if not self.lr_schedule_type and not (self.use_warmup and epoch <= self.warmup_epochs):
-                        self._adjust_learning_rate(val_acc)
-                        info(f"Epoch {epoch}: LR = {self.optimizer.param_groups[0]['lr']:.6f} (from {lr_source})")
+                    # First check if we're in the warm-up phase
+                    if self.use_warmup and epoch <= self.warmup_epochs:
+                        # In warmup phase - don't apply any other LR adjustments
+                        info(f"Epoch {epoch}: Maintaining warmup LR = {self.optimizer.param_groups[0]['lr']:.6f} (warmup active)")
+                    else:
+                        # Not in warmup phase - apply appropriate scheduler
+                        if not self.lr_schedule_type:
+                            # Only apply validation-based adjustment if no other scheduler is active
+                            lr_before = self.optimizer.param_groups[0]['lr']
+                            self._adjust_learning_rate(val_acc, current_epoch=epoch)
+                            lr_after = self.optimizer.param_groups[0]['lr']
+                            if lr_before != lr_after:
+                                info(f"Epoch {epoch}: LR adjusted from {lr_before:.6f} to {lr_after:.6f} based on validation accuracy")
 
                     # Always track the best model and check for early stopping
                     self._save_best_model(val_acc, val_loss, epoch)
@@ -1308,6 +1377,18 @@ class StudentTrainer(BaseTrainer):
         if checkpoint:
             try:
                 checkpoint_utils.apply_model_state(self.model, checkpoint['model_state_dict'])
+
+                # Also load idx_to_chord attribute if available in the checkpoint
+                if 'idx_to_chord' in checkpoint:
+                    # Handle both distributed and non-distributed models
+                    if hasattr(self.model, 'module'):
+                        self.model.module.idx_to_chord = checkpoint['idx_to_chord']
+                    else:
+                        self.model.idx_to_chord = checkpoint['idx_to_chord']
+                    info("Loaded idx_to_chord mapping from checkpoint for MIR evaluation")
+                else:
+                    info("Warning: idx_to_chord mapping not found in checkpoint")
+
                 info(f"Loaded best model from primary path (epoch {checkpoint.get('epoch', 'N/A')}) with validation accuracy {checkpoint.get('accuracy', 0.0):.4f}")
                 return True
             except Exception as e:

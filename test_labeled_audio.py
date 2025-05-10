@@ -15,13 +15,18 @@ import torch
 import mir_eval
 import re
 import traceback
+import matplotlib.pyplot as plt
+import seaborn as sns
 from tqdm import tqdm
+from sklearn.metrics import confusion_matrix
 from pathlib import Path
+from collections import Counter
 from modules.utils import logger
-from modules.utils.mir_eval_modules import audio_file_to_features, idx2voca_chord, lab_file_error_modify # Add lab_file_error_modify
+from modules.utils.mir_eval_modules import audio_file_to_features, idx2voca_chord, lab_file_error_modify, calculate_chord_scores # Import calculate_chord_scores
 from modules.models.Transformer.ChordNet import ChordNet
 from modules.models.Transformer.btc_model import BTC_model # Import BTC_model
 from modules.utils.hparams import HParams
+from modules.utils.visualize import plot_confusion_matrix, plot_chord_quality_distribution_accuracy
 
 def load_model(model_file, config, device, model_type='ChordNet'): # Add model_type argument
     """Load the model from a checkpoint file."""
@@ -30,17 +35,24 @@ def load_model(model_file, config, device, model_type='ChordNet'): # Add model_t
     n_classes = config.model.get('num_chords', 170) # Use num_chords for BTC
 
     if model_type == 'ChordNet':
+        # Use the same architecture as in train_student.py
+        n_group = 2  # Always use n_group=2 as in train_student.py
+        feature_dim = n_freq // n_group
+
+        # Print feature dimensions for debugging
+        print(f"Using feature dimensions: n_freq={n_freq}, n_group={n_group}, feature_dim={feature_dim}, heads={config.model.get('f_head', 6)}")
+
         logger.info("Loading ChordNet model...")
         model = ChordNet(
             n_freq=n_freq,
             n_classes=n_classes,
-            n_group=config.model.get('n_group', 4),
+            n_group=n_group,  # Always use n_group=2
             f_layer=config.model.get('f_layer', 3),
-            f_head=config.model.get('f_head', 6),
-            t_layer=config.model.get('t_layer', 3),
-            t_head=config.model.get('t_head', 6),
+            f_head=config.model.get('f_head', 2),  # Use f_head=2 as in train_student.py
+            t_layer=config.model.get('t_layer', 4),  # Use t_layer=4 as in train_student.py
+            t_head=config.model.get('t_head', 4),  # Use t_head=4 as in train_student.py
             d_layer=config.model.get('d_layer', 3),
-            d_head=config.model.get('d_head', 6),
+            d_head=config.model.get('d_head', 4),  # Use d_head=4 as in train_student.py
             dropout=config.model.get('dropout', 0.3)
         ).to(device)
     elif model_type == 'BTC':
@@ -54,41 +66,85 @@ def load_model(model_file, config, device, model_type='ChordNet'): # Add model_t
     # Load weights with robust error handling
     checkpoint = None
 
+    # Check if file exists
+    if not os.path.exists(model_file):
+        logger.error(f"Model file not found: {model_file}")
+        return None, 0.0, 1.0, {}
+
+    # Check file size to ensure it's not empty
+    file_size = os.path.getsize(model_file)
+    if file_size < 1000:  # Arbitrary small size threshold
+        logger.error(f"Model file is too small ({file_size} bytes), likely corrupted: {model_file}")
+        return None, 0.0, 1.0, {}
+
+    # Handle PyTorch 2.6+ compatibility by adding numpy scalar to safe globals
     try:
-        # Handle PyTorch 2.6+ compatibility by adding numpy scalar to safe globals
+        import numpy as np
         try:
-            import numpy as np
             from torch.serialization import add_safe_globals
             # Add numpy scalar to safe globals list
             add_safe_globals([np.core.multiarray.scalar])
             logger.info("Added numpy scalar type to PyTorch safe globals list")
         except (ImportError, AttributeError) as e:
             logger.info(f"Could not add numpy scalar to safe globals: {e}")
+    except Exception as e:
+        logger.info(f"Error setting up numpy compatibility: {e}")
 
-        # Try loading with weights_only parameter
+    # Try multiple loading approaches
+    loading_exceptions = []
+
+    # Approach 1: Standard torch.load with weights_only=False
+    try:
+        checkpoint = torch.load(model_file, map_location=device, weights_only=False)
+        logger.info("Model loaded successfully with weights_only=False")
+    except Exception as e:
+        loading_exceptions.append(f"Standard loading failed: {str(e)}")
+
+    # Approach 2: torch.load with weights_only=True
+    if checkpoint is None:
         try:
-            checkpoint = torch.load(model_file, map_location=device, weights_only=False)
-            logger.info("Model loaded successfully with weights_only=False")
-        except TypeError:
-            # Fall back to older PyTorch versions that don't have weights_only parameter
-            logger.info("Falling back to legacy loading method (for older PyTorch versions)")
+            checkpoint = torch.load(model_file, map_location=device, weights_only=True)
+            logger.info("Model loaded successfully with weights_only=True")
+        except Exception as e:
+            loading_exceptions.append(f"weights_only=True loading failed: {str(e)}")
+
+    # Approach 3: Legacy loading method
+    if checkpoint is None:
+        try:
             checkpoint = torch.load(model_file, map_location=device)
             logger.info("Model loaded successfully with legacy method")
-    except Exception as e:
-        logger.error(f"Error loading checkpoint: {e}")
-        logger.error("Trying one more approach with explicitly disabled security...")
-        import torch._C as _C
-        try:
-            checkpoint = _C._load_from_file(model_file, map_location=device)
-            logger.info("Model loaded successfully with _C._load_from_file")
-        except Exception as fallback_e:
-            logger.error(f"All loading attempts failed: {fallback_e}")
-            logger.error(traceback.format_exc())
-            return None, 0.0, 1.0, {}
+        except Exception as e:
+            loading_exceptions.append(f"Legacy loading failed: {str(e)}")
 
+    # Approach 4: Try with _C._load_from_file
     if checkpoint is None:
-        logger.error("Failed to load checkpoint - checkpoint is None")
+        try:
+            try:
+                import torch._C as _C
+                checkpoint = _C._load_from_file(model_file, map_location=device)
+                logger.info("Model loaded successfully with _C._load_from_file")
+            except ImportError:
+                logger.info("torch._C not available")
+        except Exception as e:
+            loading_exceptions.append(f"_C._load_from_file failed: {str(e)}")
+
+    # Approach 5: Try pickle loading as last resort
+    if checkpoint is None:
+        try:
+            import pickle
+            with open(model_file, 'rb') as f:
+                checkpoint = pickle.load(f)
+            logger.info("Model loaded successfully with pickle")
+        except Exception as e:
+            loading_exceptions.append(f"Pickle loading failed: {str(e)}")
+
+    # If all approaches failed, raise an error with details
+    if checkpoint is None:
+        error_details = "\n".join(loading_exceptions)
+        logger.error(f"All loading approaches failed:\n{error_details}")
         return None, 0.0, 1.0, {}
+
+    # Checkpoint loading check is already done above
 
     try:
         # Check if model state dict is directly available or nested
@@ -110,11 +166,36 @@ def load_model(model_file, config, device, model_type='ChordNet'): # Add model_t
             logger.info("Removing 'module.' prefix from state dict keys for compatibility.")
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
-        model.load_state_dict(state_dict)
+        # Try to load state dict with strict=True first, then fall back to strict=False if it fails
+        try:
+            model.load_state_dict(state_dict)
+            logger.info("Model state dict loaded successfully with strict=True")
+        except Exception as e:
+            logger.warning(f"Failed to load model state dict with strict=True: {e}")
+            logger.info("Attempting to load with strict=False...")
+            try:
+                model.load_state_dict(state_dict, strict=False)
+                logger.info("Model state dict loaded successfully with strict=False")
+            except Exception as e2:
+                logger.error(f"Failed to load model state dict with strict=False: {e2}")
+                raise
 
-        # Get normalization parameters
+        # Get normalization parameters with proper handling
         mean = checkpoint.get('mean', 0.0)
         std = checkpoint.get('std', 1.0)
+
+        # Convert tensors to scalar values if needed
+        if isinstance(mean, torch.Tensor):
+            mean = float(mean.item()) if hasattr(mean, 'item') else float(mean)
+        if isinstance(std, torch.Tensor):
+            std = float(std.item()) if hasattr(std, 'item') else float(std)
+
+        # Ensure std is not zero
+        if std == 0:
+            logger.warning("Checkpoint std is zero, using 1.0 instead.")
+            std = 1.0
+
+        logger.info(f"Using normalization parameters: mean={mean:.4f}, std={std:.4f}")
 
         # Attach chord mapping
         idx_to_chord = idx2voca_chord()
@@ -127,32 +208,7 @@ def load_model(model_file, config, device, model_type='ChordNet'): # Add model_t
         logger.error(traceback.format_exc())
         return None, 0.0, 1.0, {}
 
-# NEW FUNCTION: Create and load HMM model
-def create_hmm_model(checkpoint, base_model, device):
-    """Create and initialize HMM model from checkpoint"""
-    try:
-        from modules.models.HMM.ChordHMM import ChordHMM
-
-        # Get configuration
-        config = checkpoint.get('config', {})
-        num_states = config.get('num_states', 170)
-
-        # Create HMM model
-        hmm_model = ChordHMM(
-            pretrained_model=base_model,  # Use the already loaded base model
-            num_states=num_states,
-            device=device
-        ).to(device)
-
-        # Load HMM state dict
-        hmm_model.load_state_dict(checkpoint['model_state_dict'])
-
-        logger.info(f"HMM model initialized with {num_states} states")
-        return hmm_model
-    except Exception as e:
-        logger.error(f"Error initializing HMM model: {e}")
-        logger.error(traceback.format_exc())
-        return None
+# HMM functionality has been removed as it's no longer needed
 
 def flatten_nested_list(nested_list):
     """
@@ -175,7 +231,7 @@ def flatten_nested_list(nested_list):
 
     return flattened
 
-def process_audio_file(audio_path, label_path, model, config, mean, std, device, idx_to_chord, hmm_model=None, model_type='ChordNet'): # Add model_type
+def process_audio_file(audio_path, label_path, model, config, mean, std, device, idx_to_chord, model_type='ChordNet'):
     """Process a single audio-label pair and create a sample for MIR evaluation."""
     try:
         # Extract features
@@ -188,6 +244,18 @@ def process_audio_file(audio_path, label_path, model, config, mean, std, device,
         if isinstance(std, torch.Tensor):
             std = std.cpu().numpy()
 
+        # Ensure mean and std are scalars if they're arrays with a single value
+        if isinstance(mean, np.ndarray) and mean.size == 1:
+            mean = float(mean.item())
+        if isinstance(std, np.ndarray) and std.size == 1:
+            std = float(std.item())
+
+        # Ensure std is not zero
+        if std == 0 or (isinstance(std, np.ndarray) and (std == 0).any()):
+            logger.warning("Std contains zero values, using 1.0 instead")
+            std = 1.0
+
+        logger.info(f"Normalizing features with mean={mean} and std={std}")
         feature = (feature - mean) / std
 
         # Get predictions
@@ -223,24 +291,21 @@ def process_audio_file(audio_path, label_path, model, config, mean, std, device,
 
                 # Adjust input shape for ChordNet if necessary
                 if model_type == 'ChordNet':
-                    # ChordNet expects [batch, group, time, features]
-                    # Reshape [batch, time, features] -> [batch, time, group, feat_per_group] -> [batch, group, time, feat_per_group]
-                    n_group = config.model.get('n_group', 4)
-                    batch_s, time_s, feat_s = segment_batch.shape
-                    feat_per_group = feat_s // n_group
-                    if feat_s % n_group != 0:
-                         logger.error(f"Feature size {feat_s} not divisible by n_group {n_group}")
-                         # Handle error or skip batch
-                         continue
-                    segment_batch = segment_batch.view(batch_s, time_s, n_group, feat_per_group)
-                    segment_batch = segment_batch.permute(0, 2, 1, 3) # [batch, group, time, feat_per_group]
+                    # ChordNet expects [batch, 1, time, features] for the BaseTransformer
+                    # The BaseTransformer will handle the reshaping internally
+                    # Just add a channel dimension at position 1
+                    segment_batch = segment_batch.unsqueeze(1)  # [batch, 1, time, features]
 
                 # Get prediction (model.predict should handle the specific model's logic)
-                # Both models' predict methods should return [batch, time] or similar frame-level predictions
-                # prediction = model.predict(segment_batch, per_frame=True if model_type == 'ChordNet' else False) # BTC predict doesn't need per_frame
                 if model_type == 'ChordNet':
                     prediction = model.predict(segment_batch, per_frame=True)
                 else: # For BTC model
+                    # BTC model expects input of shape [batch, time, features]
+                    # segment_batch is already in this format for BTC
+                    # Make sure it's the right shape
+                    if segment_batch.dim() == 4 and segment_batch.size(1) == 1:
+                        # If we have [batch, 1, time, features], squeeze out the channel dimension
+                        segment_batch = segment_batch.squeeze(1)
                     prediction = model.predict(segment_batch) # Call without per_frame
 
                 prediction = prediction.cpu()
@@ -253,25 +318,7 @@ def process_audio_file(audio_path, label_path, model, config, mean, std, device,
                     all_predictions.append(prediction.numpy())
 
         # Concatenate raw base model predictions
-        raw_predictions = np.concatenate(all_predictions) if all_predictions else np.array([])
-
-        # Apply HMM smoothing only if HMM model is available AND model_type is ChordNet
-        if hmm_model is not None and model_type == 'ChordNet':
-            logger.debug(f"Applying HMM smoothing to predictions for {os.path.basename(audio_path)}")
-            with torch.no_grad():
-                hmm_model.eval()
-                # Convert predictions to tensor for HMM processing
-                feature_tensor = torch.tensor(feature, dtype=torch.float32).to(device)
-
-                # Get HMM smoothed predictions using Viterbi decoding
-                smoothed_preds = hmm_model.decode(feature_tensor).cpu().numpy()
-
-                # Use HMM predictions instead of raw predictions
-                all_predictions = smoothed_preds
-                logger.debug(f"HMM smoothing applied: raw shape={raw_predictions.shape}, smoothed shape={all_predictions.shape}")
-        else:
-            # Keep the raw predictions if no HMM model
-            all_predictions = raw_predictions
+        all_predictions = np.concatenate(all_predictions) if all_predictions else np.array([])
 
         # Parse ground truth annotations
         annotations = []
@@ -300,7 +347,6 @@ def process_audio_file(audio_path, label_path, model, config, mean, std, device,
         standardized_gt_labels = [lab_file_error_modify(str(label)) for label in flatten_nested_list(gt_frames.tolist())]
         standardized_pred_labels = [lab_file_error_modify(str(label)) for label in flatten_nested_list(pred_frames_raw)]
 
-
         # Create sample dict with required fields
         sample = {
             'song_id': os.path.splitext(os.path.basename(audio_path))[0],
@@ -311,8 +357,7 @@ def process_audio_file(audio_path, label_path, model, config, mean, std, device,
             'pred_label': standardized_pred_labels,   # Use standardized predicted labels
             'feature_per_second': feature_per_second,
             'feature_length': num_frames,
-            'model_type': model_type, # Store model type
-            'used_hmm': hmm_model is not None and model_type == 'ChordNet' # HMM only used for ChordNet
+            'model_type': model_type # Store model type
         }
 
         return sample
@@ -321,81 +366,10 @@ def process_audio_file(audio_path, label_path, model, config, mean, std, device,
         logger.error(traceback.format_exc())
         return None
 
-def custom_calculate_chord_scores(timestamps, durations, reference_labels, prediction_labels):
-    """
-    Calculate chord evaluation metrics using mir_eval.evaluate.
-
-    Args:
-        timestamps: Array of frame timestamps
-        durations: Array of frame durations
-        reference_labels: List of reference chord labels
-        prediction_labels: List of predicted chord labels
-
-    Returns:
-        Tuple of evaluation scores (root, thirds, triads, sevenths, tetrads, majmin, mirex)
-    """
-    # Ensure inputs are lists
-    reference_labels = list(reference_labels)
-    prediction_labels = list(prediction_labels)
-
-    # One-time logging for label inspection
-    if not hasattr(custom_calculate_chord_scores, 'logged_once'):
-        logger.info("Inspecting first 5 labels in custom_calculate_chord_scores:")
-        logger.info(f"  Reference labels: {reference_labels[:5]}")
-        logger.info(f"  Prediction labels: {prediction_labels[:5]}")
-        custom_calculate_chord_scores.logged_once = True
-
-
-    # Ensure all inputs have the same length
-    min_len = min(len(timestamps), len(durations), len(reference_labels), len(prediction_labels))
-    if min_len == 0:
-        logger.warning("Zero length input to custom_calculate_chord_scores. Returning all zeros.")
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-
-    timestamps = timestamps[:min_len]
-    durations = durations[:min_len]
-    reference_labels = reference_labels[:min_len]
-    prediction_labels = prediction_labels[:min_len]
-
-    # Create intervals for mir_eval
-    ref_intervals = np.zeros((min_len, 2))
-    ref_intervals[:, 0] = timestamps
-    ref_intervals[:, 1] = timestamps + durations
-
-    est_intervals = np.zeros((min_len, 2))
-    est_intervals[:, 0] = timestamps
-    est_intervals[:, 1] = timestamps + durations
-
-    # why standardize here result in worse results?
-    scores = {}
-    try:
-        # mir_eval.chord.evaluate handles merging, weighting, and calculates all metrics
-        scores = mir_eval.chord.evaluate(ref_intervals, reference_labels, est_intervals, prediction_labels)
-
-        # Extract scores safely, defaulting to 0.0 if a metric is missing
-        root_score = float(scores.get('root', 0.0))
-        thirds_score = float(scores.get('thirds', 0.0))
-        triads_score = float(scores.get('triads', 0.0))
-        sevenths_score = float(scores.get('sevenths', 0.0))
-        tetrads_score = float(scores.get('tetrads', 0.0))
-        majmin_score = float(scores.get('majmin', 0.0))
-        mirex_score = float(scores.get('mirex', 0.0))
-
-    except Exception as e:
-        logger.error(f"Error during mir_eval.chord.evaluate: {e}")
-        # Return default zero scores on error
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-
-    # Ensure all scores are within the valid range [0, 1]
-    root_score = max(0.0, min(1.0, root_score))
-    thirds_score = max(0.0, min(1.0, thirds_score))
-    triads_score = max(0.0, min(1.0, triads_score))
-    sevenths_score = max(0.0, min(1.0, sevenths_score))
-    tetrads_score = max(0.0, min(1.0, tetrads_score))
-    majmin_score = max(0.0, min(1.0, majmin_score))
-    mirex_score = max(0.0, min(1.0, mirex_score))
-
-    return root_score, thirds_score, triads_score, sevenths_score, tetrads_score, majmin_score, mirex_score
+# The custom_calculate_chord_scores function has been removed
+# We now use the calculate_chord_scores function from modules/utils/mir_eval_modules.py
+# This ensures consistent evaluation between test_labeled_audio.py and train_cv_kd.py
+# The imported function lets mir_eval handle standardization internally to avoid double standardization
 
 def extract_chord_quality(chord):
     """
@@ -584,6 +558,172 @@ def compute_chord_quality_accuracy(reference_labels, prediction_labels):
     # Return both raw and mapped statistics
     return mapped_acc, mapped_stats
 
+def generate_chord_distribution_accuracy_plot(quality_stats, quality_accuracy, output_path, title=None):
+    """
+    Generate a bar chart showing chord distribution with accuracy line overlay.
+
+    Args:
+        quality_stats: Dictionary of quality statistics
+        quality_accuracy: Dictionary of quality accuracies
+        output_path: Path to save the plot
+        title: Optional title for the plot
+
+    Returns:
+        Path to the saved plot
+    """
+    # Extract data for plotting
+    qualities = []
+    counts = []
+    accuracies = []
+    total_samples = sum(stats['total'] for stats in quality_stats.values())
+
+    # Sort qualities by count (descending)
+    sorted_qualities = sorted(quality_stats.keys(), key=lambda q: quality_stats[q]['total'], reverse=True)
+
+    # Filter out qualities with very few samples (less than 10)
+    for quality in sorted_qualities:
+        if quality_stats[quality]['total'] >= 10:
+            qualities.append(quality)
+            counts.append(quality_stats[quality]['total'])
+            accuracies.append(quality_accuracy.get(quality, 0.0))
+
+    if not qualities:
+        logger.warning("No chord qualities with sufficient samples for plotting")
+        return None
+
+    # Calculate percentages
+    percentages = [100 * count / total_samples for count in counts]
+
+    # Create figure with two y-axes
+    fig, ax1 = plt.subplots(figsize=(14, 8))
+
+    # Plot distribution bars
+    bars = ax1.bar(qualities, percentages, alpha=0.7, color='steelblue', label='Distribution (%)')
+    ax1.set_ylabel('Distribution (%)', color='steelblue', fontsize=12)
+    ax1.tick_params(axis='y', labelcolor='steelblue')
+    ax1.set_ylim(0, max(percentages) * 1.2 if percentages else 10)
+
+    # Add percentage labels above bars
+    for bar, pct, count in zip(bars, percentages, counts):
+        height = bar.get_height()
+        ax1.annotate(f'{pct:.1f}%\n({count})',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha='center', va='bottom', color='steelblue', fontsize=10)
+
+    # Create second y-axis for accuracy
+    ax2 = ax1.twinx()
+    ax2.plot(qualities, accuracies, 'ro-', linewidth=2, markersize=8, label='Accuracy')
+    ax2.set_ylabel('Accuracy', color='red', fontsize=12)
+    ax2.tick_params(axis='y', labelcolor='red')
+    ax2.set_ylim(0, 1.0)
+
+    # Add accuracy values as text
+    for i, acc in enumerate(accuracies):
+        ax2.annotate(f'{acc:.2f}',
+                    xy=(i, acc),
+                    xytext=(0, 5),
+                    textcoords="offset points",
+                    ha='center', va='bottom', color='red', fontsize=10)
+
+    # Add a legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+
+    # Set title and adjust layout
+    plt.title(title or "Chord Quality Distribution and Accuracy", fontsize=14)
+    plt.xticks(rotation=45, ha='right', fontsize=11)
+    plt.tight_layout()
+
+    # Save the figure
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+    logger.info(f"Saved chord distribution and accuracy plot to {output_path}")
+    return output_path
+
+def generate_confusion_matrix_heatmap(ref_labels, pred_labels, output_path, title=None):
+    """
+    Generate a heatmap confusion matrix for chord qualities.
+
+    Args:
+        ref_labels: List of reference chord labels
+        pred_labels: List of prediction chord labels
+        output_path: Path to save the plot
+        title: Optional title for the plot
+
+    Returns:
+        Path to the saved plot
+    """
+    # Extract chord qualities
+    ref_qualities = [map_chord_to_quality(chord) for chord in ref_labels]
+    pred_qualities = [map_chord_to_quality(chord) for chord in pred_labels]
+
+    # Get unique qualities (sorted by frequency in reference labels)
+    quality_counts = Counter(ref_qualities)
+    unique_qualities = sorted(quality_counts.keys(), key=lambda q: quality_counts[q], reverse=True)
+
+    # Filter out qualities with very few samples
+    filtered_qualities = [q for q in unique_qualities if quality_counts[q] >= 10]
+
+    if not filtered_qualities:
+        logger.warning("No chord qualities with sufficient samples for confusion matrix")
+        return None
+
+    # Create mapping from quality to index
+    quality_to_idx = {q: i for i, q in enumerate(filtered_qualities)}
+
+    # Filter data to only include selected qualities
+    filtered_indices = []
+    for i, (ref, pred) in enumerate(zip(ref_qualities, pred_qualities)):
+        if ref in filtered_qualities and pred in filtered_qualities:
+            filtered_indices.append(i)
+
+    filtered_ref = [ref_qualities[i] for i in filtered_indices]
+    filtered_pred = [pred_qualities[i] for i in filtered_indices]
+
+    # Convert qualities to indices
+    ref_indices = [quality_to_idx[q] for q in filtered_ref]
+    pred_indices = [quality_to_idx[q] for q in filtered_pred]
+
+    # Calculate confusion matrix
+    cm = confusion_matrix(ref_indices, pred_indices, labels=range(len(filtered_qualities)))
+
+    # Normalize by row (true labels)
+    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+    cm_normalized = np.nan_to_num(cm_normalized)  # Replace NaN with 0
+
+    # Create heatmap
+    fig, ax = plt.subplots(figsize=(12, 10))
+    sns.heatmap(cm_normalized, annot=True, fmt='.2f', cmap='Blues',
+                xticklabels=filtered_qualities, yticklabels=filtered_qualities,
+                square=True, linewidths=0.5, cbar_kws={"shrink": 0.8})
+
+    # Improve layout
+    plt.tight_layout()
+    ax.set_xlabel('Predicted', fontsize=12)
+    ax.set_ylabel('True', fontsize=12)
+
+    if title:
+        ax.set_title(title, fontsize=14)
+    else:
+        ax.set_title('Chord Quality Confusion Matrix', fontsize=14)
+
+    # Set tick font sizes and rotation
+    plt.xticks(rotation=45, ha='right', fontsize=10)
+    plt.yticks(rotation=0, fontsize=10)
+
+    # Save the figure
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+    logger.info(f"Saved chord quality confusion matrix to {output_path}")
+    return output_path
+
 def evaluate_dataset(dataset, config, model, device, mean, std):
     """
     Evaluate chord recognition on a dataset of audio samples.
@@ -602,6 +742,7 @@ def evaluate_dataset(dataset, config, model, device, mean, std):
         average_score_dict: Dictionary of average scores for each metric
         quality_accuracy: Dictionary of per-quality accuracies
         quality_stats: Detailed stats for chord qualities
+        visualization_paths: Dictionary of paths to generated visualizations
     """
     logger.info(f"Evaluating {len(dataset)} audio samples")
 
@@ -635,10 +776,13 @@ def evaluate_dataset(dataset, config, model, device, mean, std):
             all_reference_labels.extend([str(label) for label in reference_labels])
             all_prediction_labels.extend([str(label) for label in prediction_labels])
 
-            durations = np.diff(np.append(timestamps, [timestamps[-1] + frame_duration]))
+            # We no longer need to calculate durations separately
+            # The calculate_chord_scores function uses frame_duration directly
 
+            # Use the imported calculate_chord_scores function from modules/utils/mir_eval_modules.py
+            # This function lets mir_eval handle standardization internally
             root_score, thirds_score, triads_score, sevenths_score, tetrads_score, majmin_score, mirex_score = \
-                custom_calculate_chord_scores(timestamps, durations, reference_labels, prediction_labels)
+                calculate_chord_scores(timestamps, frame_duration, reference_labels, prediction_labels)
 
             score_list_dict['root'].append(root_score)
             score_list_dict['thirds'].append(thirds_score)
@@ -670,6 +814,7 @@ def evaluate_dataset(dataset, config, model, device, mean, std):
 
     quality_accuracy = {}
     quality_stats = {}
+    visualization_paths = {}
 
     if len(all_reference_labels) > 0 and len(all_prediction_labels) > 0:
         logger.info("\n=== Chord Quality Analysis ===")
@@ -691,7 +836,48 @@ def evaluate_dataset(dataset, config, model, device, mean, std):
 
             quality_accuracy, quality_stats = compute_chord_quality_accuracy(ref_labels, pred_labels)
 
-    return score_list_dict, song_length_list, average_score_dict, quality_accuracy, quality_stats
+            # Generate visualizations
+            try:
+                # Get dataset identifier from the first sample if available
+                dataset_id = "unknown_dataset"
+                if dataset and len(dataset) > 0 and 'song_id' in dataset[0]:
+                    # Extract dataset name from the first part of the song_id (usually contains dataset name)
+                    song_id = dataset[0]['song_id']
+                    if '/' in song_id:
+                        dataset_id = song_id.split('/')[0]
+                    else:
+                        dataset_id = song_id.split('_')[0]
+
+                # Create output directory for visualizations
+                output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluation_visualizations", dataset_id)
+                os.makedirs(output_dir, exist_ok=True)
+
+                # Generate chord distribution and accuracy plot
+                dist_plot_path = os.path.join(output_dir, f"{dataset_id}_chord_distribution_accuracy.png")
+                dist_plot_path = generate_chord_distribution_accuracy_plot(
+                    quality_stats,
+                    quality_accuracy,
+                    dist_plot_path,
+                    title=f"Chord Quality Distribution and Accuracy - {dataset_id}"
+                )
+                visualization_paths['distribution_plot'] = dist_plot_path
+
+                # Generate confusion matrix heatmap
+                cm_plot_path = os.path.join(output_dir, f"{dataset_id}_chord_confusion_matrix.png")
+                cm_plot_path = generate_confusion_matrix_heatmap(
+                    ref_labels,
+                    pred_labels,
+                    cm_plot_path,
+                    title=f"Chord Quality Confusion Matrix - {dataset_id}"
+                )
+                visualization_paths['confusion_matrix'] = cm_plot_path
+
+                logger.info(f"Generated visualizations saved to {output_dir}")
+            except Exception as e:
+                logger.error(f"Error generating visualizations: {e}")
+                logger.debug(traceback.format_exc())
+
+    return score_list_dict, song_length_list, average_score_dict, quality_accuracy, quality_stats, visualization_paths
 
 def find_matching_audio_label_pairs(audio_dir, label_dir):
     """Find matching audio and label files in the given directories."""
@@ -721,13 +907,13 @@ def find_matching_audio_label_pairs(audio_dir, label_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Test chord recognition on labeled audio files")
-    parser.add_argument('--audio_dir', type=str, required=True, help='Directory containing audio files')
-    parser.add_argument('--label_dir', type=str, required=True, help='Directory containing label files')
+    parser.add_argument('--audio_dir', type=str, required=True, nargs='+', help='Directory (or directories) containing audio files')
+    parser.add_argument('--label_dir', type=str, required=True, nargs='+', help='Directory (or directories) containing label files')
     parser.add_argument('--config', type=str, default='./config/student_config.yaml', help='Path to ChordNet configuration file')
     parser.add_argument('--model', type=str, default=None, help='Path to ChordNet model file (if None, will try external path)')
     parser.add_argument('--output', type=str, default='evaluation_results.json', help='Path to save results')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
-    parser.add_argument('--hmm', type=str, default=None, help='Path to HMM model for sequence smoothing (ChordNet only)')
+    # HMM argument has been removed
     # Add arguments for BTC model
     parser.add_argument('--model_type', type=str, default='ChordNet', choices=['ChordNet', 'BTC'], help='Type of model to test')
     parser.add_argument('--btc_config', type=str, default='./config/btc_config.yaml', help='Path to BTC configuration file')
@@ -736,27 +922,28 @@ def main():
 
     logger.logging_verbosity(2 if args.verbose else 1)
 
-    if not os.path.exists(args.audio_dir):
-        logger.error(f"Audio directory not found: {args.audio_dir}")
-        return
-    if not os.path.exists(args.label_dir):
-        logger.error(f"Label directory not found: {args.label_dir}")
+    if len(args.audio_dir) != len(args.label_dir):
+        logger.error("The number of audio directories must match the number of label directories.")
         return
 
     # Select config and model path based on model_type
     if args.model_type == 'BTC':
         config_path = args.btc_config
 
-        # Use provided model path or try external path
+        # Use provided model path from either --btc_model or --model argument
         if args.btc_model:
             model_path = args.btc_model
+            logger.info(f"Using BTC model from --btc_model argument: {model_path}")
+        elif args.model:
+            model_path = args.model
+            logger.info(f"Using BTC model from --model argument: {model_path}")
         else:
-            # Always use external storage path
+            # Fall back to external storage path only if no model path is provided
             external_model_path = 'checkpoints/btc/btc_model_best.pth'
             # Create directory if it doesn't exist
             os.makedirs(os.path.dirname(external_model_path), exist_ok=True)
             model_path = external_model_path
-            logger.info(f"Using external BTC checkpoint at {model_path}")
+            logger.info(f"No model path provided. Using default BTC checkpoint at {model_path}")
 
         logger.info(f"Using BTC model type with config: {config_path} and model: {model_path}")
     else: # Default to ChordNet
@@ -765,56 +952,29 @@ def main():
         # Use provided model path or try external path
         if args.model:
             model_path = args.model
+            logger.info(f"Using ChordNet model from --model argument: {model_path}")
         else:
-            # Always use external storage path
-            external_model_path = '/mnt/storage/checkpoints/student/student_model_final.pth'
+            # Fall back to local path only if no model path is provided
+            external_model_path = 'checkpoints/student/student_model_final.pth'
             # Create directory if it doesn't exist
             os.makedirs(os.path.dirname(external_model_path), exist_ok=True)
             model_path = external_model_path
-            logger.info(f"Using external ChordNet checkpoint at {model_path}")
+            logger.info(f"No model path provided. Using default ChordNet checkpoint at {model_path}")
 
         logger.info(f"Using ChordNet model type with config: {config_path} and model: {model_path}")
 
     if not os.path.exists(config_path):
         logger.error(f"Config file not found: {config_path}")
         return
-    if not os.path.exists(model_path):
-        logger.error(f"Model file not found: {model_path}")
-        return
+    # Model path check will be done before loading the model,
+    # as it might be an external path that doesn't exist locally initially.
 
     config = HParams.load(config_path)
 
     device = torch.device('cpu')
     logger.info(f"Using device: {device}")
 
-    hmm_model = None
-    hmm_checkpoint = None
-
-    # Load HMM only if model_type is ChordNet
-    if args.model_type == 'ChordNet':
-        hmm_path = args.hmm
-
-        # If no HMM path provided, use the external storage path
-        if not hmm_path:
-            external_hmm_path = '/mnt/storage/checkpoints/hmm/hmm_model_best.pth'
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(external_hmm_path), exist_ok=True)
-            hmm_path = external_hmm_path
-            logger.info(f"Using external HMM checkpoint at {hmm_path}")
-
-        # Load HMM if path exists
-        if hmm_path and os.path.exists(hmm_path):
-            try:
-                logger.info(f"Loading HMM checkpoint from {hmm_path}")
-                hmm_checkpoint = torch.load(hmm_path, map_location=device)
-                logger.info("HMM checkpoint loaded successfully, will initialize after base model")
-            except Exception as e:
-                logger.error(f"Error loading HMM checkpoint: {e}")
-                hmm_checkpoint = None
-        elif hmm_path:
-            logger.warning(f"HMM model file not found: {hmm_path}")
-    elif args.model_type == 'BTC' and args.hmm:
-        logger.warning(f"HMM smoothing is not supported for BTC model type. Ignoring --hmm argument.")
+    # HMM functionality has been removed
 
     # Pass model_type to load_model
     model, mean, std, idx_to_chord = load_model(model_path, config, device, model_type=args.model_type)
@@ -822,98 +982,131 @@ def main():
         logger.error("Model loading failed. Cannot continue.")
         return
 
-    # Initialize HMM only if checkpoint loaded and model is ChordNet
-    if hmm_checkpoint is not None and args.model_type == 'ChordNet':
-        hmm_model = create_hmm_model(hmm_checkpoint, model, device)
-        if hmm_model is not None:
-            logger.info("HMM model initialized successfully and will be used for smoothing")
-        else:
-            logger.warning("HMM model initialization failed, will continue without HMM smoothing")
+    # HMM functionality has been removed
+    logger.info("HMM functionality has been removed. Using raw model predictions.")
 
-    logger.info(f"Finding matching audio and label files...")
-    matched_pairs = find_matching_audio_label_pairs(args.audio_dir, args.label_dir)
-    logger.info(f"Found {len(matched_pairs)} matching audio-label pairs")
+    all_datasets_results = {}
 
-    if len(matched_pairs) == 0:
-        logger.error("No matching audio-label pairs found. Cannot continue.")
-        return
+    for i in range(len(args.audio_dir)):
+        current_audio_dir = args.audio_dir[i]
+        current_label_dir = args.label_dir[i]
+        dataset_identifier = os.path.basename(current_audio_dir.rstrip('/\\'))
 
-    dataset = []
-    for audio_path, label_path in tqdm(matched_pairs, desc="Processing audio files"):
-        sample = process_audio_file(
-            audio_path, label_path, model, config, mean, std, device, idx_to_chord,
-            hmm_model=hmm_model, model_type=args.model_type # Pass model_type
-        )
-        if sample is not None:
-            dataset.append(sample)
+        logger.info(f"\n\n===== Processing Dataset: {dataset_identifier} =====")
+        logger.info(f"Audio directory: {current_audio_dir}")
+        logger.info(f"Label directory: {current_label_dir}")
 
-    logger.info(f"Successfully processed {len(dataset)} of {len(matched_pairs)} audio files")
+        if not os.path.exists(current_audio_dir):
+            logger.error(f"Audio directory not found: {current_audio_dir}. Skipping dataset.")
+            all_datasets_results[dataset_identifier] = {"error": f"Audio directory not found: {current_audio_dir}"}
+            continue
+        if not os.path.exists(current_label_dir):
+            logger.error(f"Label directory not found: {current_label_dir}. Skipping dataset.")
+            all_datasets_results[dataset_identifier] = {"error": f"Label directory not found: {current_label_dir}"}
+            continue
 
-    if len(dataset) == 0:
-        logger.error("No samples were processed successfully. Cannot continue.")
-        return
+        # Check model_path existence here, before processing each dataset with it
+        if not os.path.exists(model_path):
+            logger.error(f"Model file not found: {model_path}. Cannot process dataset {dataset_identifier}.")
+            all_datasets_results[dataset_identifier] = {"error": f"Model file not found: {model_path}"}
+            continue
 
-    logger.info(f"\nRunning evaluation with{'out' if hmm_model is None else ''} HMM smoothing...")
-    try:
-        score_list_dict, song_length_list, average_score_dict, quality_accuracy, quality_stats = evaluate_dataset(
-            dataset=dataset,
-            config=config,
-            model=model,
-            device=device,
-            mean=mean,
-            std=std
-        )
 
-        logger.info("\nOverall MIR evaluation results:")
-        for metric, score in average_score_dict.items():
-            logger.info(f"{metric} score: {score:.4f}")
+        logger.info(f"Finding matching audio and label files for {dataset_identifier}...")
+        matched_pairs = find_matching_audio_label_pairs(current_audio_dir, current_label_dir)
+        logger.info(f"Found {len(matched_pairs)} matching audio-label pairs for {dataset_identifier}")
 
-        if quality_accuracy:
-            logger.info("\nIndividual Chord Quality Accuracy:")
-            logger.info("---------------------------------")
+        if len(matched_pairs) == 0:
+            logger.warning(f"No matching audio-label pairs found for {dataset_identifier}. Skipping evaluation for this dataset.")
+            all_datasets_results[dataset_identifier] = {"status": "No matching files found", "average_scores": {}, "quality_accuracy": {}}
+            continue
 
-            meaningful_qualities = [(q, acc) for q, acc in quality_accuracy.items()
-                                  if quality_stats.get(q, {}).get('total', 0) >= 10 or acc > 0]
+        dataset = []
+        for audio_path, label_path in tqdm(matched_pairs, desc=f"Processing audio files for {dataset_identifier}"):
+            sample = process_audio_file(
+                audio_path, label_path, model, config, mean, std, device, idx_to_chord,
+                model_type=args.model_type # Pass model_type
+            )
+            if sample is not None:
+                dataset.append(sample)
 
-            for chord_quality, accuracy in sorted(meaningful_qualities, key=lambda x: x[1], reverse=True):
-                total = quality_stats.get(chord_quality, {}).get('total', 0)
-                correct = quality_stats.get(chord_quality, {}).get('correct', 0)
-                if total >= 10:
-                    logger.info(f"{chord_quality}: {accuracy*100:.2f}% ({correct}/{total})")
-        else:
-            logger.warning("\nNo chord quality accuracy data available!")
+        logger.info(f"Successfully processed {len(dataset)} of {len(matched_pairs)} audio files for {dataset_identifier}")
 
-        results = {
-            'model_type': args.model_type, # Add model type to results
-            'used_hmm': hmm_model is not None and args.model_type == 'ChordNet',
-            'hmm_path': args.hmm if hmm_model is not None and args.model_type == 'ChordNet' else None,
-            'average_scores': average_score_dict,
-            'quality_accuracy': quality_accuracy,
-            'quality_stats': {k: {'total': v['total'], 'correct': v['correct']}
-                             for k, v in quality_stats.items() if v['total'] >= 5},
-            'song_details': [
-                {
-                    'song_id': sample['song_id'],
-                    'duration': song_length_list[i],
-                    'scores': {
-                        metric: score_list_dict[metric][i]
-                        for metric in score_list_dict
+        if len(dataset) == 0:
+            logger.warning(f"No samples were processed successfully for {dataset_identifier}. Skipping evaluation for this dataset.")
+            all_datasets_results[dataset_identifier] = {"status": "No samples processed successfully", "average_scores": {}, "quality_accuracy": {}}
+            continue
+
+        logger.info(f"\nRunning evaluation for {dataset_identifier}...")
+        try:
+            score_list_dict, song_length_list, average_score_dict, quality_accuracy, quality_stats, visualization_paths = evaluate_dataset(
+                dataset=dataset,
+                config=config,
+                model=model,
+                device=device,
+                mean=mean,
+                std=std
+            )
+
+            logger.info(f"\nOverall MIR evaluation results for {dataset_identifier}:")
+            for metric, score in average_score_dict.items():
+                logger.info(f"{metric} score: {score:.4f}")
+
+            if quality_accuracy:
+                logger.info(f"\nIndividual Chord Quality Accuracy for {dataset_identifier}:")
+                logger.info("---------------------------------")
+
+                meaningful_qualities = [(q, acc) for q, acc in quality_accuracy.items()
+                                      if quality_stats.get(q, {}).get('total', 0) >= 10 or acc > 0]
+
+                for chord_quality, accuracy in sorted(meaningful_qualities, key=lambda x: x[1], reverse=True):
+                    total = quality_stats.get(chord_quality, {}).get('total', 0)
+                    correct = quality_stats.get(chord_quality, {}).get('correct', 0)
+                    if total >= 10: # Only log if substantial samples
+                        logger.info(f"{chord_quality}: {accuracy*100:.2f}% ({correct}/{total})")
+
+                # Log visualization paths if available
+                if visualization_paths:
+                    logger.info("\nGenerated visualizations:")
+                    for viz_type, path in visualization_paths.items():
+                        if path:
+                            logger.info(f"  {viz_type}: {path}")
+            else:
+                logger.warning(f"\nNo chord quality accuracy data available for {dataset_identifier}!")
+
+            current_dataset_results = {
+                'model_type': args.model_type,
+                'audio_dir': current_audio_dir,
+                'label_dir': current_label_dir,
+                'average_scores': average_score_dict,
+                'quality_accuracy': quality_accuracy,
+                'quality_stats': {k: {'total': v['total'], 'correct': v['correct']}
+                                 for k, v in quality_stats.items() if v['total'] >= 5},
+                'visualization_paths': visualization_paths,
+                'song_details': [
+                    {
+                        'song_id': sample['song_id'],
+                        'duration': song_length_list[idx],
+                        'scores': {
+                            metric: score_list_dict[metric][idx]
+                            for metric in score_list_dict
+                        }
                     }
-                }
-                for i, sample in enumerate(dataset)
-            ]
-        }
+                    for idx, sample in enumerate(dataset) # Use idx for song_length_list and score_list_dict
+                ]
+            }
+            all_datasets_results[dataset_identifier] = current_dataset_results
 
-        with open(args.output, 'w') as f:
-            json.dump(results, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error during evaluation for dataset {dataset_identifier}: {e}")
+            logger.error(traceback.format_exc())
+            all_datasets_results[dataset_identifier] = {"error": f"Evaluation failed: {str(e)}"}
 
-        logger.info(f"Results saved to {args.output}")
+    with open(args.output, 'w') as f:
+        json.dump(all_datasets_results, f, indent=2)
 
-    except Exception as e:
-        logger.error(f"Error during evaluation: {e}")
-        logger.error(traceback.format_exc())
+    logger.info(f"\n\nAll dataset evaluations complete. Results saved to {args.output}")
 
-    logger.info("Evaluation complete")
 
 if __name__ == "__main__":
     main()

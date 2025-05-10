@@ -204,7 +204,7 @@ spec:
             - name: WARMUP_START_LR
               value: "0.0001"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.0005"  # Final learning rate after warm-up
+              value: "0.0003"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
               value: "10"  # Number of epochs for warm-up
             # Dropout setting

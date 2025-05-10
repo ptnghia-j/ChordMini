@@ -353,7 +353,7 @@ def standardize_chord_label(chord_label_orig):
             final_label = candidate_label
         # else:
             # debug(f"Label '{candidate_label}' (from original '{chord_label_orig}') not in vocabulary. Mapping to 'N'.")
-    
+
     # Optional: Detailed logging for changes or failures
     # if final_label != "N" and chord_label_orig != final_label :
     #    debug(f"Standardized '{chord_label_orig}' to '{final_label}' (parsed root: '{parsed_root}', parsed qual: '{parsed_quality}', simplified qual: '{simplified_quality}')")
@@ -529,26 +529,28 @@ def compute_individual_chord_accuracy(reference_labels, prediction_labels, chunk
         # Process chunk
         for i, (ref_orig, pred_orig) in enumerate(zip(ref_chunk, pred_chunk)):
             try:
-                # Standardize chord labels FIRST for consistent evaluation
-                ref = lab_file_error_modify(ref_orig) # Use the enhanced standardization
-                pred = lab_file_error_modify(pred_orig)
+                # Let mir_eval handle standardization internally
+                # We'll use the original labels directly for quality extraction
+                # This matches how we're now handling labels in calculate_chord_scores
 
-                # If standardization results in 'N', treat it as such
-                if ref == "N" or pred == "N":
-                    q_ref_raw = "N" if ref == "N" else extract_chord_quality(ref)
-                    q_pred_raw = "N" if pred == "N" else extract_chord_quality(pred)
+                # Extract chord qualities directly from original labels
+                q_ref_raw = extract_chord_quality(ref_orig)
+                q_pred_raw = extract_chord_quality(pred_orig)
+
+                # Handle special cases
+                q_ref_mapped = "Other"  # Default mapping
+                q_pred_mapped = "Other"  # Default mapping
+
+                if ref_orig == "N" or ref_orig == "X" or q_ref_raw == "N":
                     q_ref_mapped = "No Chord"
+                elif pred_orig == "N" or pred_orig == "X" or q_pred_raw == "N":
                     q_pred_mapped = "No Chord"
                 else:
-                    # Extract chord qualities using the local function (assumes standardized input)
-                    q_ref_raw = extract_chord_quality(ref)
-                    q_pred_raw = extract_chord_quality(pred)
-
                     # Map to broader categories using the visualize.py mapping if available
                     if use_quality_mapping:
                         # map_chord_to_quality expects the full chord label
-                        q_ref_mapped = map_chord_to_quality(ref)
-                        q_pred_mapped = map_chord_to_quality(pred)
+                        q_ref_mapped = map_chord_to_quality(ref_orig)
+                        q_pred_mapped = map_chord_to_quality(pred_orig)
                     else:
                         # Fallback to local broad mapping using QUALITY_CATEGORIES from chords.py
                         q_ref_mapped = QUALITY_CATEGORIES.get(q_ref_raw, "Other")
@@ -643,13 +645,13 @@ def compute_individual_chord_accuracy(reference_labels, prediction_labels, chunk
 def large_voca_score_calculation(valid_dataset, config, model, model_type, mean, std, device=None, sampled_song_ids=None):
     """
     Calculate MIR evaluation scores using the model on a validation dataset.
-    Uses standardized chord labels for evaluation.
+    Uses original chord labels for evaluation, letting mir_eval handle standardization internally.
 
     Args:
         valid_dataset: List of samples for evaluation (dictionaries expected)
         config: Configuration object
         model: Model to evaluate
-        model_type: Type of the model
+        model_type: Type of the model (not used, kept for backward compatibility)
         mean: Mean value for normalization
         std: Standard deviation for normalization
         device: Device to run evaluation on (default: None, will use model's device)
@@ -730,8 +732,8 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
     all_metrics = list(score_list_dict.keys()) # For convenience
 
     song_length_list = []
-    collected_refs_standardized = []     # <-- Collect STANDARDIZED reference chord labels
-    collected_preds_standardized = []    # <-- Collect STANDARDIZED predicted chord labels
+    collected_refs_original = []     # <-- Collect original reference chord labels
+    collected_preds_original = []    # <-- Collect original predicted chord labels
     errors = 0
 
     # Process each song group
@@ -939,23 +941,23 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
             # Convert prediction indices to chord names
             pred_chords_orig = [idx_to_chord_map.get(int(idx), "N") for idx in predictions_idx]
 
-            # Standardize both reference and predicted labels
-            reference_labels_std = lab_file_error_modify(reference_labels_orig)
-            pred_chords_std = lab_file_error_modify(pred_chords_orig)
+            # We no longer standardize labels before passing to calculate_chord_scores
+            # Let mir_eval handle standardization internally
 
-            # Collect standardized labels for overall quality analysis
-            collected_refs_standardized.extend(reference_labels_std)
-            collected_preds_standardized.extend(pred_chords_std)
+            # Collect original labels for overall quality analysis
+            collected_refs_original.extend(reference_labels_orig)
+            collected_preds_original.extend(pred_chords_orig)
 
             # Debug first few predicted chords to verify format (only for the first song)
             if i == 0 and not hasattr(large_voca_score_calculation, '_first_chords_logged_std'):
-                print(f"First 5 standardized predicted chords: {pred_chords_std[:5]}")
-                print(f"First 5 standardized reference chords: {reference_labels_std[:5]}")
+                print(f"First 5 original predicted chords: {pred_chords_orig[:5]}")
+                print(f"First 5 original reference chords: {reference_labels_orig[:5]}")
                 large_voca_score_calculation._first_chords_logged_std = True
 
-            # Calculate scores using the standardized labels and refactored function
+            # Calculate scores using the original labels (not pre-standardized)
+            # mir_eval.chord.evaluate will handle standardization internally
             scores_tuple = calculate_chord_scores(
-                timestamps, frame_duration, reference_labels_std, pred_chords_std)
+                timestamps, frame_duration, reference_labels_orig, pred_chords_orig)
 
             # Store scores
             for metric_idx, metric_name in enumerate(all_metrics):
@@ -988,17 +990,17 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
     print(f"Finished evaluation with {errors} errors.")
 
     # Extra: Debug print to ensure labels were collected
-    print(f"\nCollected {len(collected_refs_standardized)} standardized reference labels and {len(collected_preds_standardized)} standardized predictions for chord quality analysis")
+    print(f"\nCollected {len(collected_refs_original)} original reference labels and {len(collected_preds_original)} original predictions for chord quality analysis")
 
     # Extra: Print individual chord accuracy computed over all processed songs
-    if collected_refs_standardized and collected_preds_standardized:
-        min_len_overall = min(len(collected_refs_standardized), len(collected_preds_standardized))
+    if collected_refs_original and collected_preds_original:
+        min_len_overall = min(len(collected_refs_original), len(collected_preds_original))
         if min_len_overall > 0:
-            ref_sample = collected_refs_standardized[:min_len_overall]
-            pred_sample = collected_preds_standardized[:min_len_overall]
+            ref_sample = collected_refs_original[:min_len_overall]
+            pred_sample = collected_preds_original[:min_len_overall]
 
             print("\n--- Overall Chord Quality Accuracy Analysis ---")
-            # This function now expects standardized labels
+            # This function now works with original labels (not pre-standardized)
             ind_acc, quality_stats = compute_individual_chord_accuracy(ref_sample, pred_sample)
 
             if not ind_acc:
@@ -1044,13 +1046,16 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
 def calculate_chord_scores(timestamps, frame_duration, reference_labels, prediction_labels):
     """
     Calculate various chord evaluation metrics correctly using mir_eval.evaluate.
-    Assumes labels are already standardized.
+    Let mir_eval handle standardization internally to avoid double standardization.
+
+    IMPORTANT: Do NOT standardize labels before passing them to this function,
+    as mir_eval.chord.evaluate already performs its own standardization internally.
 
     Args:
         timestamps: Array of frame start timestamps.
         frame_duration: Duration of a single frame.
-        reference_labels: List of standardized reference chord labels.
-        prediction_labels: List of standardized predicted chord labels.
+        reference_labels: List of reference chord labels (not pre-standardized).
+        prediction_labels: List of predicted chord labels (not pre-standardized).
 
     Returns:
         Tuple of evaluation scores (root, thirds, triads, sevenths, tetrads, majmin, mirex)

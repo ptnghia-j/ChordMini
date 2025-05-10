@@ -305,8 +305,8 @@ def main():
                         help='Use large vocabulary (170 chord types instead of standard 25)')
     parser.add_argument('--model_type', type=str, choices=['ChordNet', 'BTC'], default='ChordNet',
                         help='Type of model to use (ChordNet or BTC)')
-    parser.add_argument('--btc_checkpoint', type=str, default=None, # Use --load_checkpoint for BTC as well
-                        help='Path to BTC model checkpoint for finetuning (if model_type=BTC and --load_checkpoint not used)')
+    parser.add_argument('--initial_model_ckpt_path', type=str, default=None,
+                        help='Path to initial model checkpoint for both BTC and ChordNet models')
     parser.add_argument('--btc_config', type=str, default='./config/btc_config.yaml',
                         help='Path to the BTC model configuration file (if model_type=BTC)')
     parser.add_argument('--log_chord_details', action='store_true',
@@ -351,7 +351,7 @@ def main():
     if 'LOGITS_DIR' in os.environ: args.logits_dir = os.environ['LOGITS_DIR']
     if 'LABEL_DIR' in os.environ: args.label_dir = os.environ['LABEL_DIR'] # Single dir for CV
     if 'LOAD_CHECKPOINT' in os.environ: args.load_checkpoint = os.environ['LOAD_CHECKPOINT'] # Use LOAD_CHECKPOINT
-    if 'BTC_CHECKPOINT' in os.environ: args.btc_checkpoint = os.environ['BTC_CHECKPOINT'] # Keep for potential separate BTC loading
+    if 'INITIAL_MODEL_CKPT_PATH' in os.environ: args.initial_model_ckpt_path = os.environ['INITIAL_MODEL_CKPT_PATH'] # Path for initial model weights
     if 'MODEL_TYPE' in os.environ: args.model_type = os.environ['MODEL_TYPE']
     if 'FREEZE_FEATURE_EXTRACTOR' in os.environ: args.freeze_feature_extractor = os.environ['FREEZE_FEATURE_EXTRACTOR'].lower() == 'true'
     if 'SMALL_DATASET' in os.environ: args.small_dataset = float(os.environ['SMALL_DATASET'])
@@ -441,7 +441,7 @@ def main():
     model_scale = float(args.model_scale) if args.model_scale is not None else float(config.model.get('scale', 1.0))
     logger.info(f"Model scale: {model_scale}")
     logger.info(f"Load checkpoint: {args.load_checkpoint}")
-    logger.info(f"BTC checkpoint (alternative): {args.btc_checkpoint}")
+    logger.info(f"Initial model checkpoint path: {args.initial_model_ckpt_path}")
     if args.freeze_feature_extractor:
         logger.info("Feature extraction layers will be frozen during training")
 
@@ -661,8 +661,16 @@ def main():
 
     # Determine model type and pretrained path
     model_type = args.model_type
-    pretrained_path = args.load_checkpoint # Use the consistent argument name
     btc_config = None
+
+    # Determine the path for initial model weights
+    # First check if initial_model_ckpt_path is provided
+    pretrained_path = args.initial_model_ckpt_path
+
+    # If not, fall back to load_checkpoint if it's a valid file path (not a keyword)
+    if not pretrained_path and args.load_checkpoint and args.load_checkpoint not in ["auto", "never", "required"]:
+        pretrained_path = args.load_checkpoint
+        logger.info(f"Using --load_checkpoint ({pretrained_path}) as initial model weights path.")
 
     if model_type == 'BTC':
         # Load BTC Config
@@ -677,11 +685,6 @@ def main():
             logger.error(f"Error loading BTC configuration from {btc_config_path}: {e}")
             return
 
-        # If --load_checkpoint wasn't specified, maybe use --btc_checkpoint as fallback
-        if not pretrained_path and args.btc_checkpoint:
-            pretrained_path = args.btc_checkpoint # pretrained_path can be set by args.btc_checkpoint here
-            logger.info(f"Using --btc_checkpoint ({pretrained_path}) as load path.")
-
         if pretrained_path:
             logger.info(f"\n=== Loading BTC model from {pretrained_path} for training ===")
         else:
@@ -689,7 +692,7 @@ def main():
     elif pretrained_path:
         logger.info(f"\n=== Loading ChordNet model from {pretrained_path} for training ===")
     else:
-        logger.error(f"No checkpoint specified via --load_checkpoint. Please provide a checkpoint to load.")
+        logger.error(f"No checkpoint specified via --initial_model_ckpt_path. Please provide a checkpoint to load.")
         return
 
     # Create model instance

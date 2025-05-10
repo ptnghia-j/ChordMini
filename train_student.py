@@ -1015,6 +1015,22 @@ def main(rank=0, world_size=1):
                 model.load_state_dict(checkpoint['model_state_dict'])
                 logger.info("Model state loaded successfully")
 
+                # Load idx_to_chord mapping if available
+                if 'idx_to_chord' in checkpoint:
+                    if distributed_training:
+                        model.module.idx_to_chord = checkpoint['idx_to_chord']
+                    else:
+                        model.idx_to_chord = checkpoint['idx_to_chord']
+                    logger.info("Chord mapping loaded from checkpoint")
+                else:
+                    logger.warning("Checkpoint does not contain idx_to_chord mapping")
+                    # Set it from master_mapping anyway
+                    if distributed_training:
+                        model.module.idx_to_chord = master_mapping
+                    else:
+                        model.idx_to_chord = master_mapping
+                    logger.info("Using default chord mapping")
+
                 # Load optimizer state if available
                 if 'optimizer_state_dict' in checkpoint:
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
