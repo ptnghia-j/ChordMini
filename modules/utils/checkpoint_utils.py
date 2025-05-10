@@ -51,7 +51,7 @@ def load_checkpoint(filepath, device='cpu'):
 
 def apply_model_state(model, state_dict):
     """
-    Applies a state dictionary to a model.
+    Applies a state dictionary to a model, handling distributed vs non-distributed model differences.
 
     Args:
         model (torch.nn.Module): The model to apply the state to.
@@ -59,7 +59,23 @@ def apply_model_state(model, state_dict):
     """
     if model and state_dict:
         try:
+            # Check if we need to handle distributed model prefix mismatch
+            is_distributed_model = hasattr(model, 'module')
+            has_module_prefix = list(state_dict.keys())[0].startswith('module.') if state_dict else False
+
+            # Handle prefix mismatch between checkpoint and model
+            if is_distributed_model and not has_module_prefix:
+                # Model is distributed but checkpoint isn't - add 'module.' prefix
+                info("Adding 'module.' prefix to state dict keys for distributed model")
+                state_dict = {'module.' + k: v for k, v in state_dict.items()}
+            elif not is_distributed_model and has_module_prefix:
+                # Model is not distributed but checkpoint is - remove 'module.' prefix
+                info("Removing 'module.' prefix from state dict keys for non-distributed model")
+                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+            # Now load the state dict
             model.load_state_dict(state_dict)
+            info("Model state loaded successfully")
         except Exception as e:
             error(f"Error applying model state: {str(e)}. Ensure model architecture matches checkpoint.")
 

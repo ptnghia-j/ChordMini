@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: btc-large # Changed name
+  name: btc-dali
   namespace: csuf-titans
   labels:
     app: btc-training # Changed label
@@ -20,11 +20,11 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-A10 # Or other suitable GPU
-              - key: kubernetes.io/hostname      # new host pin
+                - NVIDIA-A10 
+              - key: kubernetes.io/hostname  
                 operator: In
                 values:
-                - gpu-11.nrp.mghpcc.org
+                - gpu-15.nrp.mghpcc.org
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -204,7 +204,7 @@ spec:
             - name: FOCAL_GAMMA
               value: "2.0"   # Focusing parameter for focal loss
             - name: FOCAL_ALPHA
-              value: "0.75"  # Class weight parameter for focal loss
+              value: "0.25"  # Class weight parameter for focal loss
             # Warmup settings (optional for BTC)
             - name: USE_WARMUP
               value: "true"  # Set to "true" to enable learning rate warm-up
@@ -246,7 +246,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never", "required"
             - name: SUB_DIR
-              value: "btc-large" # Subdirectory for BTC checkpoints
+              value: "btc-dali" # Subdirectory for BTC checkpoints
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint

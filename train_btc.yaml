@@ -1,16 +1,16 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: btc-mini # Changed name for BTC small job
+  name: btc-fma
   namespace: csuf-titans
   labels:
-    app: btc-training # Changed label for BTC
+    app: btc-training
 spec:
   backoffLimit: 2
   template:
     metadata:
       labels:
-        app: btc-training # Changed label for BTC
+        app: btc-training
     spec:
       affinity:
         nodeAffinity:
@@ -20,7 +20,7 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-GeForce-RTX-3090
+                - NVIDIA-A10
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -211,7 +211,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never", "required"
             - name: SUB_DIR
-              value: "btc-mini" # Subdirectory for BTC checkpoints (adjust based on DATASET_TYPE)
+              value: "btc-fma" # Subdirectory for BTC checkpoints (adjust based on DATASET_TYPE)
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint
@@ -416,7 +416,6 @@ spec:
 
               echo "=== BTC model training complete ==="
           resources:
-            # Match resources from train_student.yaml
             requests:
               cpu: "4"
               memory: "24Gi"
@@ -431,4 +430,4 @@ spec:
       volumes:
         - name: storage
           persistentVolumeClaim:
-            claimName: temporary-storage # Use the same volume as train_student.yaml
+            claimName: temporary-storage

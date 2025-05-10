@@ -25,88 +25,9 @@ from modules.utils import logger
 from modules.utils.hparams import HParams
 from modules.utils.chords import idx2voca_chord
 from modules.training.Tester import Tester
+from modules.utils.file_utils import count_files_in_subdirectories, resolve_path, load_normalization_from_checkpoint
 
-def count_files_in_subdirectories(directory, file_pattern):
-    """Count files in a directory and all its subdirectories matching a pattern."""
-    if not os.path.exists(directory):
-        return 0
-
-    count = 0
-    # Count files directly in the directory
-    for file in glob.glob(os.path.join(directory, file_pattern)):
-        if os.path.isfile(file):
-            count += 1
-
-    # Count files in subdirectories
-    for root, dirs, files in os.walk(directory):
-        for file in files:
-            if file.endswith(file_pattern.replace("*", "")):
-                count += 1
-
-    return count
-
-def resolve_path(path, storage_root=None, project_root=None):
-    """
-    Resolve a path that could be absolute, relative to storage_root, or relative to project_root.
-
-    Args:
-        path (str): The path to resolve
-        storage_root (str): The storage root path
-        project_root (str): The project root path
-
-    Returns:
-        str: The resolved absolute path
-    """
-    if not path:
-        return None
-
-    # If it's already absolute, return it directly
-    if os.path.isabs(path):
-        return path
-
-    # Try as relative to storage_root first
-    if storage_root:
-        storage_path = os.path.join(storage_root, path)
-        if os.path.exists(storage_path):
-            return storage_path
-
-    # Then try as relative to project_root
-    if project_root:
-        project_path = os.path.join(project_root, path)
-        if os.path.exists(project_path):
-            return project_path
-
-    # If neither exists but a storage_root was specified, prefer that resolution
-    if storage_root:
-        return os.path.join(storage_root, path)
-
-    # Otherwise default to project_root resolution
-    return os.path.join(project_root, path) if project_root else path
-
-def load_normalization_from_checkpoint(path, storage_root=None, project_root=None):
-    """Load mean and std from a teacher checkpoint, or return (0.0, 1.0) if unavailable."""
-    if not path:
-        logger.warning("No teacher checkpoint specified for normalization. Using defaults (0.0, 1.0).")
-        return 0.0, 1.0
-    resolved_path = resolve_path(path, storage_root, project_root)
-    if not os.path.exists(resolved_path):
-        logger.warning(f"Teacher checkpoint for normalization not found at {resolved_path}. Using defaults (0.0, 1.0).")
-        return 0.0, 1.0
-    try:
-        checkpoint = torch.load(resolved_path, map_location='cpu')
-        mean = checkpoint.get('mean', 0.0)
-        std = checkpoint.get('std', 1.0)
-        mean = float(mean.item()) if hasattr(mean, 'item') else float(mean)
-        std = float(std.item()) if hasattr(std, 'item') else float(std)
-        if std == 0:
-            logger.warning("Teacher checkpoint std is zero, using 1.0 instead.")
-            std = 1.0
-        logger.info(f"Loaded normalization from teacher checkpoint: mean={mean:.4f}, std={std:.4f}")
-        return mean, std
-    except Exception as e:
-        logger.error(f"Error loading normalization from teacher checkpoint: {e}")
-        logger.warning("Using default normalization parameters (mean=0.0, std=1.0).")
-        return 0.0, 1.0
+# Using utility functions from modules.utils.file_utils
 
 def main(rank=0, world_size=1):
     # Parse command line arguments
@@ -550,44 +471,6 @@ def main(rank=0, world_size=1):
     logger.info(f"Final Label Dirs: {label_dir}")
     logger.info(f"Final Logits Dirs: {logits_dir}")
 
-
-    # Override FMA paths if specified in config - This block seems redundant now
-    # if args.dataset_type in ['fma', 'combined', 'fma+maestro', 'fma+dali_synth']:
-    #     # Resolve primary paths from config, with CLI override for FMA specifically?
-    #     # This logic might need refinement if we want specific overrides per dataset type.
-    #     # For now, the combined list approach handles multiple sources.
-    #     pass # Keep the combined list logic above
-    # else:
-    #     # Handle single dataset type case (already covered by the logic above)
-    #     pass
-
-    # Count files for Maestro dataset - Redundant, counted above
-    # maestro_spec_count = count_files_in_subdirectories(maestro_spec_dir, "*.npy")
-    # maestro_label_count = count_files_in_subdirectories(maestro_label_dir, "*.lab")
-
-    # Count files for DALI dataset - Redundant, counted above
-    # dali_spec_count = count_files_in_subdirectories(dali_spec_dir, "*.npy")
-    # dali_label_count = count_files_in_subdirectories(dali_label_dir, "*.lab")
-
-    # Override logits directories if specified - Handled by resolve_path and list collection
-    # if args.logits_dir:
-    #     # This override might be ambiguous with multiple dataset types.
-    #     # The current logic uses type-specific defaults unless args.logits_dir overrides ALL.
-    #     # Consider if a per-type override is needed. For now, args.logits_dir applies globally if set.
-    #     if len(active_types) == 1: # Apply only if a single type is specified or if intended globally
-    #          logits_dir = [resolve_path(args.logits_dir, storage_root, project_root)] * len(logits_dir) if logits_dir else [resolve_path(args.logits_dir, storage_root, project_root)]
-    #          logger.warning(f"Overriding all logits directories with: {logits_dir[0]}")
-
-
-    # Handle different dataset combinations - This logic is replaced by the list collection above
-    # if args.dataset_type == 'combined':
-    #     # ...
-    # elif args.dataset_type == 'fma+maestro':
-    #     # ...
-    # # ... and so on ...
-    # else: # Single dataset type
-    #     ...
-
     # Use the mapping defined in chords.py
     master_mapping = idx2voca_chord()
     chord_mapping = {chord: idx for idx, chord in master_mapping.items()}
@@ -891,39 +774,6 @@ def main(rank=0, world_size=1):
         allocated = torch.cuda.memory_allocated() / (1024 * 1024 * 1024)
         reserved = torch.cuda.memory_reserved() / (1024 * 1024 * 1024)
         logger.info(f"CUDA memory stats (GB): allocated={allocated:.2f}, reserved={reserved:.2f}")
-
-    # --- REMOVE REDUNDANT NORMALIZATION CALCULATION ---
-    # The normalization dictionary is already created earlier using values from the teacher checkpoint.
-    # This block is redundant and overrides the intended values.
-    # try:
-    #     logger.info("Calculating global mean and std for normalization...")
-    #
-    #     # Create stats loader
-    #     stats_batch_size = min(16, config.training['batch_size'])
-    #     stats_loader = torch.utils.data.DataLoader(
-    #         synth_dataset,
-    #         batch_size=stats_batch_size,
-    #         sampler=torch.utils.data.RandomSampler(
-    #             synth_dataset,
-    #             replacement=True,
-    #             num_samples=min(1000, len(synth_dataset))
-    #         ),
-    #         num_workers=0,
-    #         pin_memory=False
-    #     )
-    #
-    #     mean, std = get_quick_dataset_stats(stats_loader, device) # This recalculates mean/std
-    #     logger.info(f"Using statistics: mean={mean:.4f}, std={std:.4f}")
-    # except Exception as e:
-    #     logger.error(f"Error calculating statistics: {e}")
-    #     mean, std = 0.0, 1.0
-    #     logger.warning("Using default mean=0.0, std=1.0 due to calculation error")
-    #
-    # # Create normalized tensors on device
-    # mean = torch.tensor(mean, device=device)
-    # std = torch.tensor(std, device=device)
-    # normalization = {'mean': mean, 'std': std} # This overrides the previously loaded normalization
-    # --- END REMOVAL ---
 
     # Final memory cleanup before training
     if torch.cuda.is_available():

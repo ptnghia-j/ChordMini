@@ -29,81 +29,10 @@ from modules.utils import logger
 from modules.utils.hparams import HParams
 from modules.utils.chords import idx2voca_chord, Chords
 from modules.training.Tester import Tester
+from modules.utils.file_utils import count_files_in_subdirectories, find_sample_files, resolve_path, load_normalization_from_checkpoint
 # REMOVED: from modules.utils.teacher_utils import load_btc_model, extract_logits_from_teacher, generate_teacher_predictions
 
-# --- Helper Functions (Copied/Adapted from train_finetune.py) ---
-
-def count_files_in_subdirectories(directory, file_pattern):
-    """Count files in a directory and all its subdirectories matching a pattern."""
-    if not directory or not os.path.exists(directory):
-        return 0
-    count = 0
-    # Use Path.rglob for recursive search
-    for file_path in Path(directory).rglob(file_pattern):
-        if file_path.is_file():
-            count += 1
-    return count
-
-def find_sample_files(directory, file_pattern, max_samples=5):
-    """Find sample files in a directory and all its subdirectories matching a pattern."""
-    if not directory or not os.path.exists(directory):
-        return []
-    samples = []
-    # Use Path.rglob for recursive search
-    for file_path in Path(directory).rglob(file_pattern):
-        if file_path.is_file():
-            samples.append(str(file_path))
-            if len(samples) >= max_samples:
-                break
-    return samples
-
-def resolve_path(path, storage_root=None, project_root=None):
-    """
-    Resolve a path that could be absolute, relative to storage_root, or relative to project_root.
-    """
-    if not path:
-        return None
-    if os.path.isabs(path):
-        return path
-    if storage_root:
-        storage_path = os.path.join(storage_root, path)
-        # Check existence for storage_root resolution
-        if os.path.exists(storage_path):
-            return storage_path
-    if project_root:
-        project_path = os.path.join(project_root, path)
-        # Check existence for project_root resolution
-        if os.path.exists(project_path):
-            return project_path
-    # Fallback: prefer storage_root if provided, otherwise project_root
-    if storage_root:
-        return os.path.join(storage_root, path)
-    return os.path.join(project_root, path) if project_root else path
-
-def load_normalization_from_checkpoint(path, storage_root=None, project_root=None):
-    """Load mean and std from a teacher checkpoint, or return (0.0, 1.0) if unavailable."""
-    if not path:
-        logger.warning("No teacher checkpoint specified for normalization. Using defaults (0.0, 1.0).")
-        return 0.0, 1.0
-    resolved_path = resolve_path(path, storage_root, project_root)
-    if not os.path.exists(resolved_path):
-        logger.warning(f"Teacher checkpoint for normalization not found at {resolved_path}. Using defaults (0.0, 1.0).")
-        return 0.0, 1.0
-    try:
-        checkpoint = torch.load(resolved_path, map_location='cpu')
-        mean = checkpoint.get('mean', 0.0)
-        std = checkpoint.get('std', 1.0)
-        mean = float(mean.item()) if hasattr(mean, 'item') else float(mean)
-        std = float(std.item()) if hasattr(std, 'item') else float(std)
-        if std == 0:
-            logger.warning("Teacher checkpoint std is zero, using 1.0 instead.")
-            std = 1.0
-        logger.info(f"Loaded normalization from teacher checkpoint: mean={mean:.4f}, std={std:.4f}")
-        return mean, std
-    except Exception as e:
-        logger.error(f"Error loading normalization from teacher checkpoint: {e}")
-        logger.warning("Using default normalization parameters (mean=0.0, std=1.0).")
-        return 0.0, 1.0
+# --- Using utility functions from modules.utils.file_utils ---
 
 def log_dataset_chord_mapping(label_dirs, chord_mapping, master_mapping, logger):
     """

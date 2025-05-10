@@ -10,6 +10,7 @@ import glob
 import gc
 import traceback
 import json
+import datetime
 from pathlib import Path
 from collections import Counter
 
@@ -25,153 +26,11 @@ from modules.utils import logger
 from modules.utils.hparams import HParams
 from modules.utils.chords import idx2voca_chord
 from modules.training.Tester import Tester
+from modules.utils.file_utils import count_files_in_subdirectories, find_sample_files, resolve_path, load_normalization_from_checkpoint
 
-# Add this function
-def load_normalization_from_checkpoint(path, storage_root=None, project_root=None):
-    """
-    Load normalization statistics (mean, std) from a PyTorch checkpoint file.
+# Using utility functions from modules.utils.file_utils
 
-    Args:
-        path (str): Path to the checkpoint file.
-        storage_root (str): Optional storage root path.
-        project_root (str): Optional project root path.
-
-    Returns:
-        tuple: (mean, std) or (None, None) if not found or error occurs.
-    """
-    resolved_path = resolve_path(path, storage_root, project_root)
-    if not resolved_path or not os.path.exists(resolved_path):
-        logger.error(f"Teacher checkpoint for normalization not found at: {resolved_path}")
-        return None, None
-
-    try:
-        logger.info(f"Loading normalization stats from teacher checkpoint: {resolved_path}")
-        checkpoint = torch.load(resolved_path, map_location='cpu') # Load to CPU to avoid GPU memory issues
-        mean = checkpoint.get('mean')
-        std = checkpoint.get('std')
-
-        if mean is not None and std is not None:
-            logger.info(f"Loaded normalization: mean={mean}, std={std}")
-            # Ensure they are floats or numpy arrays, not tensors
-            if isinstance(mean, torch.Tensor): mean = mean.item()
-            if isinstance(std, torch.Tensor): std = std.item()
-            return float(mean), float(std)
-        else:
-            logger.warning("Normalization stats (mean, std) not found in the checkpoint.")
-            return None, None
-    except Exception as e:
-        logger.error(f"Error loading normalization from checkpoint {resolved_path}: {e}")
-        return None, None
-
-class ListSampler:
-    def __init__(self, indices):
-        self.indices = indices
-
-    def __iter__(self):
-        return iter(self.indices)
-
-    def __len__(self):
-        return len(self.indices)
-
-def count_files_in_subdirectories(directory, file_pattern):
-    """Count files in a directory and all its subdirectories matching a pattern."""
-    if not os.path.exists(directory):
-        return 0
-
-    count = 0
-    # Count files directly in the directory
-    for file in glob.glob(os.path.join(directory, file_pattern)):
-        if os.path.isfile(file):
-            count += 1
-
-    # Count files in subdirectories
-    for root, dirs, files in os.walk(directory):
-        for file in files:
-            if file.endswith(file_pattern.replace("*", "")):
-                count += 1
-
-    return count
-
-def find_sample_files(directory, file_pattern, max_samples=5):
-    """Find sample files in a directory and all its subdirectories matching a pattern."""
-    if not os.path.exists(directory):
-        return []
-
-    samples = []
-    # Find files in all subdirectories
-    for root, dirs, files in os.walk(directory):
-        for file in files:
-            if file.endswith(file_pattern.replace("*", "")):
-                samples.append(os.path.join(root, file))
-                if len(samples) >= max_samples:
-                    return samples
-
-    return samples
-
-def resolve_path(path, storage_root=None, project_root=None):
-    """
-    Resolve a path that could be absolute, relative to storage_root, or relative to project_root.
-
-    Args:
-        path (str): The path to resolve
-        storage_root (str): The storage root path
-        project_root (str): The project root path
-
-    Returns:
-        str: The resolved absolute path
-    """
-    if not path:
-        return None
-
-    # If it's already absolute, return it directly
-    if os.path.isabs(path):
-        return path
-
-    # Try as relative to storage_root first
-    if storage_root:
-        storage_path = os.path.join(storage_root, path)
-        if os.path.exists(storage_path):
-            return storage_path
-
-    # Then try as relative to project_root
-    if project_root:
-        project_path = os.path.join(project_root, path)
-        if os.path.exists(project_path):
-            return project_path
-
-    # If neither exists but a storage_root was specified, prefer that resolution
-    if storage_root:
-        return os.path.join(storage_root, path)
-
-    # Otherwise default to project_root resolution
-    return os.path.join(project_root, path) if project_root else path
-
-def find_data_directory(primary_path, alt_path, file_type, description):
-    """Find directories containing data files with comprehensive fallback options."""
-    paths_to_check = [
-        primary_path,                          # Primary path from config/args
-        alt_path,                              # Alternative path from config
-        f"/mnt/storage/data/synth/{description}s",  # Common fallback location
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), f"data/synth/{description}s")  # Project fallback
-    ]
-
-    # Filter out None paths
-    paths_to_check = [p for p in paths_to_check if p]
-
-    for path in paths_to_check:
-        # Create directory if it doesn't exist
-        os.makedirs(path, exist_ok=True)
-
-        # Count files
-        count = count_files_in_subdirectories(path, file_type)
-        if count > 0:
-            sample_files = find_sample_files(path, file_type, 3)
-            logger.info(f"  {description.capitalize()}: {path} ({count} files)")
-            if sample_files:
-                logger.info(f"  Example files: {sample_files}")
-            return path, count
-
-    return paths_to_check[0] if paths_to_check else None, 0
+# Note: find_data_directory is available from modules.utils.file_utils if needed
 
 def main():
     # Parse command line arguments
@@ -424,15 +283,11 @@ def main():
     # Log training configuration
     logger.info("\n=== Training Configuration ===")
     logger.info(f"Model type: {args.model}")
-    # BTC doesn't use model scale
-    # model_scale = args.model_scale or config.model.get('scale', 1.0)
-    # logger.info(f"Model scale: {model_scale}")
+
 
     # Log knowledge distillation settings
-    # --- MODIFICATION START: Ensure use_kd is boolean ---
     use_kd = args.use_kd_loss or config.training.get('use_kd_loss', False)
     use_kd = str(use_kd).lower() == "true"
-    # --- MODIFICATION END ---
     kd_alpha = args.kd_alpha
     temperature = args.temperature
 
@@ -440,12 +295,6 @@ def main():
         logger.info("\n=== Knowledge Distillation Enabled ===")
         logger.info(f"KD alpha: {kd_alpha} (weighting between KD and CE loss)")
         logger.info(f"Temperature: {temperature} (for softening distributions)")
-        # --- MODIFICATION START: Log resolved logits dir later ---
-        # if args.logits_dir:
-        #     logger.info(f"Using teacher logits from directory: {args.logits_dir}")
-        # else:
-        #     logger.info("No logits directory specified - train_btc.py will look in standard locations")
-        # --- MODIFICATION END ---
     else:
         logger.info("Knowledge distillation is disabled, using standard loss")
 
@@ -540,37 +389,6 @@ def main():
     dali_label_dir = os.path.join(data_root, "dali_synth/labels")
     dali_logits_dir = os.path.join(data_root, "dali_synth/logits")
 
-    # --- REMOVAL START: Remove old find_data_directory calls and counts ---
-    # # Override FMA paths if specified in config
-    # if args.dataset_type in ['fma', 'combined', 'fma+maestro', 'fma+dali_synth']:
-    #     custom_fma_spec_dir, fma_spec_count = find_data_directory(spec_dir_config, alt_spec_dir, "*.npy", "FMA spectrogram")
-    #     custom_fma_label_dir, fma_label_count = find_data_directory(label_dir_config, alt_label_dir, "*.lab", "FMA label")
-    #     if fma_spec_count > 0 and fma_label_count > 0:
-    #         fma_spec_dir = custom_fma_spec_dir
-    #         fma_label_dir = custom_fma_label_dir
-    # else:
-    #     # Count files for FMA dataset
-    #     fma_spec_count = count_files_in_subdirectories(fma_spec_dir, "*.npy")
-    #     fma_label_count = count_files_in_subdirectories(fma_label_dir, "*.lab")
-    #
-    # # Count files for Maestro dataset
-    # maestro_spec_count = count_files_in_subdirectories(maestro_spec_dir, "*.npy")
-    # maestro_label_count = count_files_in_subdirectories(maestro_label_dir, "*.lab")
-    #
-    # # Count files for DALI dataset
-    # dali_spec_count = count_files_in_subdirectories(dali_spec_dir, "*.npy")
-    # dali_label_count = count_files_in_subdirectories(dali_label_dir, "*.lab")
-    #
-    # # Override logits directories if specified
-    # if args.logits_dir and use_kd:
-    #     custom_logits_dir, _ = find_data_directory(args.logits_dir, None, "*.npy", "logits")
-    #     fma_logits_dir = custom_logits_dir
-    #     # For simplicity, use the same custom logits dir for all datasets when explicitly specified
-    #     maestro_logits_dir = custom_logits_dir
-    #     dali_logits_dir = custom_logits_dir
-    # --- REMOVAL END ---
-
-    # --- ADDITION START: Adopt logic from train_student.py ---
     # Determine active dataset types
     active_types = []
     if args.dataset_type == 'combined':
@@ -602,7 +420,7 @@ def main():
             effective_fma_logits_dir = args.logits_dir or fma_logits_dir
             resolved_logits_dir = resolve_path(effective_fma_logits_dir, storage_root, project_root)
             logits_dirs_list.append(resolved_logits_dir)
-        
+
         fma_spec_count = count_files_in_subdirectories(resolved_spec_dir, "*_spec.npy")
         fma_label_count = count_files_in_subdirectories(resolved_label_dir, "*.lab")
         logger.info(f"  FMA: {fma_spec_count} specs, {fma_label_count} labels at {resolved_spec_dir}")
@@ -642,7 +460,7 @@ def main():
         effective_dali_label_dir = dali_label_dir
         if args.label_dir and (args.dataset_type == 'dali_synth' or args.dataset_type == 'combined'):
             effective_dali_label_dir = args.label_dir
-        
+
         resolved_spec_dir = resolve_path(effective_dali_spec_dir, storage_root, project_root)
         resolved_label_dir = resolve_path(effective_dali_label_dir, storage_root, project_root)
         spec_dirs_list.append(resolved_spec_dir)
@@ -674,126 +492,6 @@ def main():
     logger.info(f"\nFinal Spectrogram Dirs: {spec_dir}")
     logger.info(f"Final Label Dirs: {label_dir}")
     logger.info(f"Final Logits Dirs: {logits_dir}")
-    # --- ADDITION END ---
-
-
-    # --- REMOVAL START: Remove old dataset combination logic ---
-    # # Handle different dataset combinations
-    # if args.dataset_type == 'combined':
-    #     # Use all three datasets
-    #     logger.info(f"\n=== Combined Dataset Files (All Three Datasets) ===")
-    #     logger.info(f"FMA: {fma_spec_count} spectrograms, {fma_label_count} labels")
-    #     logger.info(f"Maestro: {maestro_spec_count} spectrograms, {maestro_label_count} labels")
-    #     logger.info(f"DALI: {dali_spec_count} spectrograms, {dali_label_count} labels")
-    #
-    #     # Final check - fail if we have no data from any dataset
-    #     total_spec_count = fma_spec_count + maestro_spec_count + dali_spec_count
-    #     total_label_count = fma_label_count + maestro_label_count + dali_label_count
-    #
-    #     if total_spec_count == 0 or total_label_count == 0:
-    #         raise RuntimeError(f"ERROR: Missing spectrogram or label files in combined mode. Found {total_spec_count} total spectrogram files and {total_label_count} total label files.")
-    #
-    #     # Use lists for spec_dir, label_dir, and logits_dir in combined mode
-    #     spec_dir = [fma_spec_dir, maestro_spec_dir, dali_spec_dir]
-    #     label_dir = [fma_label_dir, maestro_label_dir, dali_label_dir]
-    #     logits_dir = [fma_logits_dir, maestro_logits_dir, dali_logits_dir] if use_kd else None
-    #
-    # elif args.dataset_type == 'fma+maestro':
-    #     # Use FMA and Maestro datasets
-    #     logger.info(f"\n=== Combined Dataset Files (FMA + Maestro) ===")
-    #     logger.info(f"FMA: {fma_spec_count} spectrograms, {fma_label_count} labels")
-    #     logger.info(f"Maestro: {maestro_spec_count} spectrograms, {maestro_label_count} labels")
-    #
-    #     # Final check - fail if we have no data from either dataset
-    #     total_spec_count = fma_spec_count + maestro_spec_count
-    #     total_label_count = fma_label_count + maestro_label_count
-    #
-    #     if total_spec_count == 0 or total_label_count == 0:
-    #         raise RuntimeError(f"ERROR: Missing spectrogram or label files in fma+maestro mode. Found {total_spec_count} total spectrogram files and {total_label_count} total label files.")
-    #
-    #     # Use lists for spec_dir, label_dir, and logits_dir
-    #     spec_dir = [fma_spec_dir, maestro_spec_dir]
-    #     label_dir = [fma_label_dir, maestro_label_dir]
-    #     logits_dir = [fma_logits_dir, maestro_logits_dir] if use_kd else None
-    #
-    # elif args.dataset_type == 'fma+dali_synth':
-    #     # Use FMA and DALI datasets
-    #     logger.info(f"\n=== Combined Dataset Files (FMA + DALI) ===")
-    #     logger.info(f"FMA: {fma_spec_count} spectrograms, {fma_label_count} labels")
-    #     logger.info(f"DALI: {dali_spec_count} spectrograms, {dali_label_count} labels")
-    #
-    #     # Final check - fail if we have no data from either dataset
-    #     total_spec_count = fma_spec_count + dali_spec_count
-    #     total_label_count = fma_label_count + dali_label_count
-    #
-    #     if total_spec_count == 0 or total_label_count == 0:
-    #         raise RuntimeError(f"ERROR: Missing spectrogram or label files in fma+dali_synth mode. Found {total_spec_count} total spectrogram files and {total_label_count} total label files.")
-    #
-    #     # Use lists for spec_dir, label_dir, and logits_dir
-    #     spec_dir = [fma_spec_dir, dali_spec_dir]
-    #     label_dir = [fma_label_dir, dali_label_dir]
-    #     logits_dir = [fma_logits_dir, dali_logits_dir] if use_kd else None
-    #
-    # elif args.dataset_type == 'maestro+dali_synth':
-    #     # Use Maestro and DALI datasets
-    #     logger.info(f"\n=== Combined Dataset Files (Maestro + DALI) ===")
-    #     logger.info(f"Maestro: {maestro_spec_count} spectrograms, {maestro_label_count} labels")
-    #     logger.info(f"DALI: {dali_spec_count} spectrograms, {dali_label_count} labels")
-    #
-    #     # Final check - fail if we have no data from either dataset
-    #     total_spec_count = maestro_spec_count + dali_spec_count
-    #     total_label_count = maestro_label_count + dali_label_count
-    #
-    #     if total_spec_count == 0 or total_label_count == 0:
-    #         raise RuntimeError(f"ERROR: Missing spectrogram or label files in maestro+dali_synth mode. Found {total_spec_count} total spectrogram files and {total_label_count} total label files.")
-    #
-    #     # Use lists for spec_dir, label_dir, and logits_dir
-    #     spec_dir = [maestro_spec_dir, dali_spec_dir]
-    #     label_dir = [maestro_label_dir, dali_label_dir]
-    #     logits_dir = [maestro_logits_dir, dali_logits_dir] if use_kd else None
-    #
-    # elif args.dataset_type == 'dali_synth':
-    #     # DALI dataset mode
-    #     logger.info(f"\n=== DALI Dataset Files ===")
-    #     logger.info(f"DALI: {dali_spec_count} spectrograms, {dali_label_count} labels")
-    #
-    #     # Final check - fail if we don't have data
-    #     if dali_spec_count == 0 or dali_label_count == 0:
-    #         raise RuntimeError(f"ERROR: Missing DALI spectrogram or label files. Found {dali_spec_count} spectrogram files and {dali_label_count} label files.")
-    #
-    #     # Use DALI directories
-    #     spec_dir = dali_spec_dir
-    #     label_dir = dali_label_dir
-    #     logits_dir = dali_logits_dir if use_kd else None
-    #
-    # elif args.dataset_type == 'maestro':
-    #     # Maestro dataset mode
-    #     logger.info(f"\n=== Maestro Dataset Files ===")
-    #     logger.info(f"Maestro: {maestro_spec_count} spectrograms, {maestro_label_count} labels")
-    #
-    #     # Final check - fail if we don't have data
-    #     if maestro_spec_count == 0 or maestro_label_count == 0:
-    #         raise RuntimeError(f"ERROR: Missing Maestro spectrogram or label files. Found {maestro_spec_count} spectrogram files and {maestro_label_count} label files.")
-    #
-    #     # Use Maestro directories
-    #     spec_dir = maestro_spec_dir
-    #     label_dir = maestro_label_dir
-    #     logits_dir = maestro_logits_dir if use_kd else None
-    #
-    # else:
-    #     # FMA dataset mode (default)
-    #     logger.info(f"\n=== FMA Dataset Files ===")
-    #     logger.info(f"FMA: {fma_spec_count} spectrograms, {fma_label_count} labels")
-    #
-    #     # Final check - fail if we don't have data
-    #     if fma_spec_count == 0 or fma_label_count == 0:
-    #         raise RuntimeError(f"ERROR: Missing FMA spectrogram or label files. Found {fma_spec_count} spectrogram files and {fma_label_count} label files.")
-    #
-    #     # Use FMA directories
-    #     spec_dir = fma_spec_dir
-    #     label_dir = fma_label_dir
-    #     logits_dir = fma_logits_dir if use_kd else None
-    # --- REMOVAL END ---
 
     # Use the mapping defined in chords.py
     master_mapping = idx2voca_chord()
@@ -1293,16 +991,32 @@ def main():
 
                 # Advanced testing with mir_eval module
                 logger.info("\n=== MIR evaluation ===")
+
                 score_metrics = ['root', 'thirds', 'triads', 'sevenths', 'tetrads', 'majmin', 'mirex']
                 dataset_length = len(synth_dataset.samples)
 
                 if dataset_length < 3:
                     logger.warning("Dataset too small for MIR evaluation")
                 else:
-                    # Synchronize all processes before MIR evaluation
+                    # Synchronize all processes before MIR evaluation with timeout handling
                     if distributed_training:
                         logger.info(f"Rank {rank}: Synchronizing before MIR evaluation")
-                        dist.barrier()
+                        try:
+                            # Set a timeout for the barrier operation
+                            prev_timeout = os.environ.get('NCCL_BLOCKING_WAIT', None)
+                            os.environ['NCCL_BLOCKING_WAIT'] = '0'  # Non-blocking mode
+
+                            # Use a timeout for the barrier
+                            barrier_timeout = datetime.timedelta(seconds=60)
+                            dist.barrier(timeout=barrier_timeout)
+
+                            # Restore previous timeout setting
+                            if prev_timeout is not None:
+                                os.environ['NCCL_BLOCKING_WAIT'] = prev_timeout
+                            else:
+                                os.environ.pop('NCCL_BLOCKING_WAIT', None)
+                        except Exception as e:
+                            logger.warning(f"Rank {rank}: Barrier synchronization failed: {e}. Continuing anyway.")
 
                     # Split dataset into 3 parts for evaluation
                     all_samples = synth_dataset.samples
@@ -1431,9 +1145,24 @@ def main():
                                         average_score_dict3 = split_dict
                                         song_length_list3 = [1.0] * worker_split_size  # Placeholder
 
-                        # Synchronize after gathering results
+                        # Synchronize after gathering results with timeout handling
                         if distributed_training:
-                            dist.barrier()
+                            try:
+                                # Set a timeout for the barrier operation
+                                prev_timeout = os.environ.get('NCCL_BLOCKING_WAIT', None)
+                                os.environ['NCCL_BLOCKING_WAIT'] = '0'  # Non-blocking mode
+
+                                # Use a timeout for the barrier
+                                barrier_timeout = datetime.timedelta(seconds=60)
+                                dist.barrier(timeout=barrier_timeout)
+
+                                # Restore previous timeout setting
+                                if prev_timeout is not None:
+                                    os.environ['NCCL_BLOCKING_WAIT'] = prev_timeout
+                                else:
+                                    os.environ.pop('NCCL_BLOCKING_WAIT', None)
+                            except Exception as e:
+                                logger.warning(f"Rank {rank}: Post-gathering barrier synchronization failed: {e}. Continuing anyway.")
                     else:
                         # Non-distributed mode: evaluate all splits sequentially
                         valid_dataset1 = all_samples[:dataset_length//3]
