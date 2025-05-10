@@ -277,3 +277,6 @@ checkpoints/*.pth
 cache/features_production/
 cache/
 **/cache/
+
+# ignore all png files
+*.png
