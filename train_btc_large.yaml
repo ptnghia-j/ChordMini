@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: btc-dali
+  name: btc-kd-combined
   namespace: csuf-titans
   labels:
     app: btc-training # Changed label
@@ -20,11 +20,11 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-A10 
+                - NVIDIA-A10
               - key: kubernetes.io/hostname  
                 operator: In
                 values:
-                - gpu-15.nrp.mghpcc.org
+                - gpu-02.nrp.mghpcc.org
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -193,11 +193,11 @@ spec:
               value: "0.000001"    # Min learning rate for BTC (default 0)
             # Knowledge distillation settings (optional for BTC)
             - name: USE_KD_LOSS
-              value: "false" # Set to "true" to enable KD loss if teacher logits are available
+              value: "true" # Set to "true" to enable KD loss if teacher logits are available
             - name: KD_ALPHA
               value: "0.2"   # Weight for KD loss (0-1)
             - name: TEMPERATURE
-              value: "4.0"   # Temperature for softening distributions
+              value: "3.0"   # Temperature for softening distributions
             # Focal loss settings (optional for BTC)
             - name: USE_FOCAL_LOSS
               value: "true" # Set to "true" to enable focal loss
@@ -241,12 +241,12 @@ spec:
               value: "6"     # Prefetch batches for better throughput
             # Add dataset type environment variable with combined option
             - name: DATASET_TYPE
-              value: "dali_synth"  # Options: "fma", "maestro", "dali_synth", "combined", "fma+maestro", "fma+dali_synth", or "maestro+dali_synth"
+              value: "combined"  # Options: "fma", "maestro", "dali_synth", "combined", "fma+maestro", "fma+dali_synth", or "maestro+dali_synth"
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never", "required"
             - name: SUB_DIR
-              value: "btc-dali" # Subdirectory for BTC checkpoints
+              value: "btc-kd-combined" # Subdirectory for BTC checkpoints
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint
@@ -257,7 +257,7 @@ spec:
             - name: LAZY_INIT
               value: "false" # Controls dataset lazy initialization
             - name: SMALL_DATASET
-              value: "0.01"   # Set percentage of dataset to use (0.1 = 10%, null = full)
+              value: ""   # Set percentage of dataset to use (0.1 = 10%, null = full)
             - name: METADATA_CACHE
               value: "false" # Use metadata-only caching
           command:
@@ -483,15 +483,15 @@ spec:
           resources:
             requests:
               cpu: "4"
-              #memory: "196Gi"
+              memory: "196Gi"
               #memory: "128Gi"
-              memory: "64Gi"
+              #memory: "64Gi"
               nvidia.com/gpu: "2"
             limits:
               cpu: "18"
-              #memory: "296Gi"
+              memory: "260Gi"
               #memory: "160Gi"
-              memory: "128Gi"
+              #memory: "128Gi"
               nvidia.com/gpu: "2"
           volumeMounts:
             - name: storage

@@ -441,7 +441,9 @@ class CrossValidationDataset(Dataset):
                     print("Attempting sequential fallback...")
 
                 # Sequential fallback
-                for args in tqdm(args_list, desc=f"Loading {desc} data (sequential fallback)"):
+                for args in tqdm(args_list,
+                                desc=f"Loading {desc} data (sequential fallback, Fold {self.current_fold})",
+                                disable=not self.verbose):
                     try:
                         samples, skip_reason = _process_file_wrapper(args)
                         total_processed += 1
@@ -600,7 +602,12 @@ class CrossValidationDataset(Dataset):
             if self.verbose: print(f"Found {len(song_samples)} unique songs in {set_name} set.")
 
             total_segments = 0
-            for song_id, indices in song_samples.items():
+            # Add tqdm progress bar for song processing
+            song_items = song_samples.items()
+            if self.verbose and len(song_items) > 10:
+                song_items = tqdm(song_items, desc=f"Processing songs for {set_name} set", total=len(song_samples))
+
+            for song_id, indices in song_items:
                 # indices are relative to the samples_list (train_samples or val_samples)
                 num_frames_in_song = len(indices)
 
@@ -617,7 +624,12 @@ class CrossValidationDataset(Dataset):
                      continue
 
                 # Generate segments using stride for songs >= seq_len
-                for start_offset in range(0, num_frames_in_song - self.seq_len + 1, self.stride):
+                # Use tqdm for progress bar if verbose and enough segments to warrant it
+                start_offsets = range(0, num_frames_in_song - self.seq_len + 1, self.stride)
+                if self.verbose and len(start_offsets) > 1000:
+                    start_offsets = tqdm(start_offsets, desc=f"Generating segments for song {song_id}", leave=False)
+
+                for start_offset in start_offsets:
                     segment_start_sample_idx = indices[start_offset]
                     # End index is exclusive for slicing, but here represents the index AFTER the last frame
                     segment_end_sample_idx = segment_start_sample_idx + self.seq_len

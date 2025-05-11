@@ -34,10 +34,17 @@ from modules.utils.file_utils import count_files_in_subdirectories, find_sample_
 
 # --- Using utility functions from modules.utils.file_utils ---
 
-def log_dataset_chord_mapping(label_dirs, chord_mapping, master_mapping, logger):
+def log_dataset_chord_mapping(label_dirs, chord_mapping, master_mapping, logger, small_dataset_percentage=None):
     """
     Scans label files, processes unique raw labels, and logs their mapping
     to the final vocabulary index and label.
+
+    Args:
+        label_dirs: List of directories containing label files
+        chord_mapping: Dictionary mapping chord labels to indices
+        master_mapping: Dictionary mapping indices to chord labels
+        logger: Logger instance
+        small_dataset_percentage: If set, only scan a subset of files
     """
     logger.info("\n=== Analyzing Dataset Chord Label Mapping ===")
     unique_raw_labels = set()
@@ -61,7 +68,17 @@ def log_dataset_chord_mapping(label_dirs, chord_mapping, master_mapping, logger)
             logger.warning(f"No .lab or .txt files found in {label_dir}")
             continue
 
-        logger.info(f"Found {len(label_files)} label files in {label_dir}. Processing...")
+        # Apply small_dataset_percentage if specified
+        if small_dataset_percentage is not None and 0.0 < small_dataset_percentage < 1.0:
+            # Calculate how many files to sample
+            sample_size = max(1, int(len(label_files) * small_dataset_percentage))
+            # Use a fixed seed for reproducibility
+            random.seed(42)
+            # Sample a subset of files
+            label_files = random.sample(label_files, sample_size)
+            logger.info(f"Using small_dataset_percentage={small_dataset_percentage}, analyzing {sample_size} of {len(label_files)} label files")
+
+        logger.info(f"Processing {len(label_files)} label files from {label_dir}...")
 
         for label_path in tqdm(label_files, desc=f"Scanning {os.path.basename(label_dir)}", leave=False):
             try:
@@ -479,7 +496,9 @@ def main():
 
     # --- ADDED: Log dataset chord mapping analysis ---
     # Pass the single base label directory to the analysis function
-    log_dataset_chord_mapping([label_dir] if label_dir else [], chord_mapping, master_mapping, logger)
+    # Also pass small_dataset_percentage to limit the number of files scanned
+    log_dataset_chord_mapping([label_dir] if label_dir else [], chord_mapping, master_mapping, logger,
+                             small_dataset_percentage=args.small_dataset)
     # --- END ADDED ---
 
     # Resolve checkpoints directory path (already includes fold info by default)
@@ -505,7 +524,7 @@ def main():
         'device': device, # Pass the determined device
         'pin_memory': False, # Keep False for CV dataset internal loading
         'prefetch_factor': 1, # Keep 1 for CV dataset internal loading
-        'num_workers': 4, # Keep 0 for CV dataset internal loading
+        'num_workers': 12, # Keep 0 for CV dataset internal loading
         'require_teacher_logits': use_kd_loss,
         'use_cache': not args.disable_cache,
         'metadata_only': args.metadata_cache,

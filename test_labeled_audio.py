@@ -180,22 +180,40 @@ def load_model(model_file, config, device, model_type='ChordNet'): # Add model_t
                 logger.error(f"Failed to load model state dict with strict=False: {e2}")
                 raise
 
-        # Get normalization parameters with proper handling
-        mean = checkpoint.get('mean', 0.0)
-        std = checkpoint.get('std', 1.0)
+        # Simplified normalization parameter loading
+        logger.info(f"Checkpoint keys: {list(checkpoint.keys())}")
+
+        # First check for direct 'mean' and 'std' keys (common in BTC model checkpoints)
+        if 'mean' in checkpoint and 'std' in checkpoint:
+            mean = checkpoint['mean']
+            std = checkpoint['std']
+            logger.info(f"Found direct normalization parameters in checkpoint: mean={mean}, std={std}")
+        # Then check for normalization in the standard location (how StudentTrainer saves it)
+        elif 'normalization' in checkpoint and isinstance(checkpoint['normalization'], dict):
+            norm_dict = checkpoint['normalization']
+            mean = norm_dict.get('mean', 0.0)
+            std = norm_dict.get('std', 1.0)
+            logger.info(f"Found normalization parameters in checkpoint dictionary: mean={mean}, std={std}")
+        else:
+            # Use default values if normalization not found
+            logger.warning("Normalization parameters not found in checkpoint, using defaults (0.0, 1.0)")
+            mean = 0.0
+            std = 1.0
 
         # Convert tensors to scalar values if needed
         if isinstance(mean, torch.Tensor):
             mean = float(mean.item()) if hasattr(mean, 'item') else float(mean)
+            logger.info(f"Converted mean tensor to scalar: {mean}")
         if isinstance(std, torch.Tensor):
             std = float(std.item()) if hasattr(std, 'item') else float(std)
+            logger.info(f"Converted std tensor to scalar: {std}")
 
         # Ensure std is not zero
         if std == 0:
             logger.warning("Checkpoint std is zero, using 1.0 instead.")
             std = 1.0
 
-        logger.info(f"Using normalization parameters: mean={mean:.4f}, std={std:.4f}")
+        logger.info(f"Final normalization parameters: mean={mean:.4f}, std={std:.4f}")
 
         # Attach chord mapping
         idx_to_chord = idx2voca_chord()
@@ -238,21 +256,20 @@ def process_audio_file(audio_path, label_path, model, config, mean, std, device,
         feature, feature_per_second, song_length_second = audio_file_to_features(audio_path, config)
         feature = feature.T # Transpose to [time, features]
 
-        # Ensure mean and std are NumPy arrays for calculation with feature (NumPy array)
+        # Simplified normalization handling
+        # Convert tensors to numpy arrays or scalars
         if isinstance(mean, torch.Tensor):
-            mean = mean.cpu().numpy()
+            mean = mean.cpu().numpy() if mean.numel() > 1 else float(mean.item())
         if isinstance(std, torch.Tensor):
-            std = std.cpu().numpy()
+            std = std.cpu().numpy() if std.numel() > 1 else float(std.item())
 
-        # Ensure mean and std are scalars if they're arrays with a single value
-        if isinstance(mean, np.ndarray) and mean.size == 1:
-            mean = float(mean.item())
-        if isinstance(std, np.ndarray) and std.size == 1:
-            std = float(std.item())
-
-        # Ensure std is not zero
-        if std == 0 or (isinstance(std, np.ndarray) and (std == 0).any()):
-            logger.warning("Std contains zero values, using 1.0 instead")
+        # Ensure std is not zero (replace with 1.0 if it is)
+        if isinstance(std, np.ndarray):
+            if (std == 0).any():
+                logger.warning("Std contains zero values, using 1.0 instead")
+                std = 1.0
+        elif std == 0:
+            logger.warning("Std is zero, using 1.0 instead")
             std = 1.0
 
         logger.info(f"Normalizing features with mean={mean} and std={std}")

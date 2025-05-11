@@ -1,16 +1,16 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chordnet-from-scratch
+  name: chord-cv-kd-0.6
   namespace: csuf-titans
   labels:
-    app: chord-training
+    app: chord-cv-kd-training
 spec:
   backoffLimit: 2
   template:
     metadata:
       labels:
-        app: chord-training
+        app: chord-cv-kd-training
     spec:
       affinity:
         nodeAffinity:
@@ -20,11 +20,11 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-A10
+                - NVIDIA-A10 # Or other suitable GPU
               - key: kubernetes.io/hostname
                 operator: In
                 values:
-                - gpu-11.nrp.mghpcc.org
+                - gpu-13.nrp.mghpcc.org
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -73,10 +73,9 @@ spec:
             - name: MODEL_SCALE
               value: "1.0"  # Scale factor for model size (1.0 = standard, 2.0 = 2x larger)
             - name: MODEL_TYPE
-              value: "ChordNet"  # Model type: ChordNet or BTC
+              value: "BTC"  # Model type: ChordNet or BTC
             - name: INITIAL_MODEL_CKPT_PATH
-              value: ""  # Path to initial model checkpoint (works for both BTC and ChordNet)
-              #value: "/mnt/storage/checkpoints/btc_model_best.pth"  # Path to initial model checkpoint (works for both BTC and ChordNet)
+              value: "/mnt/storage/checkpoints/btc_model_best.pth"  # Path to initial model checkpoint (works for both BTC and ChordNet)
             # Learning rate scheduling options
             - name: LR_SCHEDULE
               value: "validation"  # Options: cosine, step, validation
@@ -87,29 +86,29 @@ spec:
               value: "0.000001"  # Minimum learning rate for schedulers
             # Knowledge distillation settings
             - name: USE_KD_LOSS
-              value: "false"  # Set to "true" to enable KD loss
+              value: "true"  # Set to "true" to enable KD loss
             - name: KD_ALPHA
-              value: "0.2"  # Weight for KD loss (0-1)
+              value: "0.5"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
               value: "3.0"  # Temperature for softening distributions
             - name: TEACHER_CHECKPOINT # MODIFIED: Was TEACHER_MODEL
               value: "/mnt/storage/BTC/test/btc_model_large_voca.pt"  # Path to teacher model for normalization stats
             # Focal loss settings
             - name: USE_FOCAL_LOSS
-              value: "true"  # Set to "true" to enable focal loss
+              value: "false"  # Set to "true" to enable focal loss
             - name: FOCAL_GAMMA
               value: "2.0"   # Focusing parameter for focal loss
             - name: FOCAL_ALPHA
-              value: "0.25"  # Class weight parameter for focal loss
+              value: "0.5"  # Class weight parameter for focal loss
             # Warmup settings
             - name: USE_WARMUP
               value: "true"  # Set to "true" to enable learning rate warm-up
             - name: WARMUP_START_LR
               value: "0.00009"  # Starting learning rate for warm-up
             - name: WARMUP_END_LR
-              value: "0.0003"  # Final learning rate after warm-up
+              value: "0.0001"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "10"  # Number of epochs for warm-up
+              value: "4"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
               value: "0.2"  # Set dropout probability (0-1)
@@ -125,11 +124,11 @@ spec:
             # These are examples, adjust paths as needed.
             # The python script (train_cv_kd.py) will pick these up via its os.environ.get() logic.
             - name: SPECTROGRAMS_DIR # ADDED: Example, ensure this is set
-              value: "LabeledDataset_augmented/spectrograms" # Relative to DATA_ROOT or absolute
+              value: "LabeledDataset_synth/spectrograms" # Relative to DATA_ROOT or absolute
             - name: LOGITS_DIR # ADDED: Example, ensure this is set
-              value: "LabeledDataset_augmented/logits" # Relative to DATA_ROOT or absolute
+              value: "LabeledDataset_synth/logits" # Relative to DATA_ROOT or absolute
             - name: LABEL_DIR # ADDED: Example, ensure this is set
-              value: "LabeledDataset_augmented/labels" # Relative to DATA_ROOT or absolute
+              value: "LabeledDataset/Labels" # Relative to DATA_ROOT or absolute
             - name: CACHE_DIR # ADDED: Example, ensure this is set
               value: "data_cache/cv_kd" # Relative to DATA_ROOT or absolute
             # ---- END: Ensure these data path ENV VARS are defined in your YAML ----
@@ -145,9 +144,9 @@ spec:
               value: "6"     # ! NO EFFECT if num_workers=0
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
-              value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist), or actual path
+              value: "auto"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist), or actual path
             - name: SUB_DIR
-              value: "chordnet-from-scratch"  # Make SUB_DIR specific to the KFOLD value above
+              value: "cv-kd-fold-0.6-2"  # Make SUB_DIR specific to the KFOLD value above
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
@@ -162,14 +161,14 @@ spec:
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: "0.01"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: "1.0"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
             # ---- BEGIN: Ensure these ENV VARS are defined in your YAML ----
             - name: EPOCHS # ADDED: Example, ensure this is set
               value: "100"
             - name: BATCH_SIZE # ADDED: Example, ensure this is set
-              value: "128"
+              value: "64"
             # ---- END: Ensure these ENV VARS are defined in your YAML ----
           command:
             - sh
@@ -424,16 +423,16 @@ spec:
           resources:
             limits:
               nvidia.com/gpu: "1"
-              memory: "128Gi"
-              cpu: "18"
+              memory: "64Gi"
+              cpu: "6"
             requests:
               nvidia.com/gpu: "1"
-              memory: "32Gi"
-              cpu: "4"
+              memory: "16Gi"
+              cpu: "2"
           volumeMounts:
             - name: storage
               mountPath: /mnt/storage
       volumes:
         - name: storage
           persistentVolumeClaim:
-            claimName: temporary-storage-1
+            claimName: temporary-storage

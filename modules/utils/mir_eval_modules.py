@@ -690,6 +690,9 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
     if device is None:
         device = next(model.parameters()).device
 
+    # Log normalization parameters for debugging
+    debug(f"MIR Eval received normalization parameters: mean={mean}, std={std}")
+
     # Ensure mean and std are on the correct device and are tensors
     if not isinstance(mean, torch.Tensor): mean = torch.tensor(mean)
     if not isinstance(std, torch.Tensor): std = torch.tensor(std)
@@ -935,7 +938,7 @@ def large_voca_score_calculation(valid_dataset, config, model, model_type, mean,
             # Get chord mapping from model or fallback
             idx_to_chord_map = getattr(model, 'idx_to_chord', None)
             if idx_to_chord_map is None:
-                print("Warning: model.idx_to_chord not found. Using default idx2voca_chord().")
+                # print("Warning: model.idx_to_chord not found. Using default idx2voca_chord().")
                 idx_to_chord_map = idx2voca_chord() # Assumes 170 classes
 
             # Convert prediction indices to chord names

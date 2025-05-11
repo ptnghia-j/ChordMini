@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-mini-large
+  name: chordnet-kd-combined
   namespace: csuf-titans
   labels:
     app: chord-student-training
@@ -21,10 +21,10 @@ spec:
                 operator: In
                 values:
                 - NVIDIA-A10
-              - key: kubernetes.io/hostname      # new host pin
+              - key: kubernetes.io/hostname 
                 operator: In
                 values:
-                - gpu-13.nrp.mghpcc.org
+                - gpu-15.nrp.mghpcc.org
       restartPolicy: Never
       tolerations:
         - key: "node.kubernetes.io/not-ready"
@@ -218,7 +218,7 @@ spec:
               value: "1.0"  # Default scale: 1.0 = base model, 0.5 = half-scale, 2.0 = double
             # Learning rate scheduling options - overrides student_config.yaml settings
             - name: LR_SCHEDULE
-              value: "validation"  # Changed from empty string to 'validation'
+              value: "cosine"  # Changed from empty string to 'validation'
             # Additional learning rate parameters - new additions
             - name: LEARNING_RATE
               value: "0.0001"  # Base learning rate
@@ -226,18 +226,18 @@ spec:
               value: "0.000001"  # Minimum learning rate for schedulers
             # Knowledge distillation settings
             - name: USE_KD_LOSS
-              value: "false"  # Set to "true" to enable KD loss
+              value: "true"  # Set to "true" to enable KD loss
             - name: KD_ALPHA
               value: "0.2"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
-              value: "2.0"  # Temperature for softening distributions
+              value: "3.0"  # Temperature for softening distributions
             # Focal loss settings
             - name: USE_FOCAL_LOSS
               value: "true"  # Set to "true" to enable focal loss
             - name: FOCAL_GAMMA
               value: "2.0"   # Focusing parameter for focal loss
             - name: FOCAL_ALPHA
-              value: "0.35"  # Class weight parameter for focal loss
+              value: "0.25"  # Class weight parameter for focal loss
             # Warmup settings
             - name: USE_WARMUP
               value: "true"  # Set to "true" to enable learning rate warm-up
@@ -246,7 +246,7 @@ spec:
             - name: WARMUP_END_LR
               value: "0.0003"  # Final learning rate after warm-up
             - name: WARMUP_EPOCHS
-              value: "7"  # Number of epochs for warm-up
+              value: "8"  # Number of epochs for warm-up
             # Dropout setting
             - name: DROPOUT
               value: "0.2"  # Set dropout probability (0-1)
@@ -274,12 +274,12 @@ spec:
               value: "6"     # (no effect worker=0) Prefetch 6 batches for better throughput
             # Add dataset type environment variable with combined option
             - name: DATASET_TYPE
-              value: "dali_synth"  # Options: "fma", "maestro", "dali_synth", "combined", "fma+maestro", "fma+dali_synth", or "maestro+dali_synth"
+              value: "combined"  # Options: "fma", "maestro", "dali_synth", "combined", "fma+maestro", "fma+dali_synth", or "maestro+dali_synth"
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist)
             - name: SUB_DIR
-              value: "student-md-large"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
+              value: "chordnet-kd-combined"  # This will be used to append to the save directory for checkpoints, can be empty or set to a specific subdirectory if needed
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
@@ -290,7 +290,7 @@ spec:
             - name: LAZY_INIT
               value: "false"  # Controls dataset lazy initialization (true/false)
             - name: SMALL_DATASET
-              value: "0.01"  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
+              value: ""  # Set percentage of dataset to use (0.1 = 10%, null = full dataset)
             - name: METADATA_CACHE
               value: "false"  # Use metadata-only caching to reduce memory usage
           command:
@@ -676,15 +676,15 @@ spec:
           resources:
             requests:
               cpu: "4"
-              #memory: "196Gi"
+              memory: "256Gi"
               #memory: "128Gi"
-              memory: "64Gi"
+              #memory: "64Gi"
               nvidia.com/gpu: "2"
             limits:
               cpu: "18"
-              #memory: "296Gi"
+              memory: "320Gi"
               #memory: "160Gi"
-              memory: "128Gi"
+              #memory: "128Gi"
               nvidia.com/gpu: "2"
           volumeMounts:
             - name: storage
