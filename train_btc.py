@@ -389,14 +389,29 @@ def main():
     dali_label_dir = os.path.join(data_root, "dali_synth/labels")
     dali_logits_dir = os.path.join(data_root, "dali_synth/logits")
 
+    # IMPORTANT: We're intentionally NOT using LabeledDataset_augmented here to match train_student.py behavior
+    # The issue is that SynthDataset is still scanning LabeledDataset_augmented even when not explicitly included
+
     # Determine active dataset types
     active_types = []
     if args.dataset_type == 'combined':
+        # Match train_student.py behavior - only use fma, maestro, dali_synth
+        # Explicitly NOT including 'labeled' or 'labeled_synth' to avoid LabeledDataset_augmented
         active_types = ['fma', 'maestro', 'dali_synth']
     elif '+' in args.dataset_type:
-        active_types = args.dataset_type.split('+')
+        # Split the dataset types and filter out any that might include 'labeled' or 'labeled_synth'
+        types = args.dataset_type.split('+')
+        active_types = [t for t in types if t not in ['labeled', 'labeled_synth']]
+        # If we filtered out any types, log a warning
+        if len(active_types) != len(types):
+            logger.warning(f"Filtered out 'labeled' and 'labeled_synth' from dataset types to avoid LabeledDataset_augmented")
     else:
-        active_types = [args.dataset_type]
+        # If the dataset type is 'labeled' or 'labeled_synth', use 'fma' instead
+        if args.dataset_type in ['labeled', 'labeled_synth']:
+            logger.warning(f"Replacing dataset type '{args.dataset_type}' with 'fma' to avoid LabeledDataset_augmented")
+            active_types = ['fma']
+        else:
+            active_types = [args.dataset_type]
 
     logger.info(f"Active dataset types: {active_types}")
 

@@ -378,7 +378,16 @@ class SynthDataset(Dataset):
 
         # --- Scan label directories ---
         for label_dir in self.label_dirs:
-            current_type = 'fma' # Default
+            # Initialize with None to force explicit type determination
+            current_type = None
+
+            # Skip LabeledDataset_augmented directory completely
+            if "LabeledDataset_augmented" in str(label_dir):
+                if self.verbose:
+                    print(f"SKIPPING LabeledDataset_augmented directory: {label_dir}")
+                continue
+
+            # Determine dataset type based on path
             if "maestro" in str(label_dir).lower():
                 current_type = 'maestro'
             elif "dali_synth" in str(label_dir).lower():
@@ -386,6 +395,14 @@ class SynthDataset(Dataset):
             # Check if this label_dir corresponds to the LabeledDataset structure
             elif self.dataset_type == 'labeled_synth' and "LabeledDataset/Labels" in str(label_dir):
                 current_type = 'labeled_synth'
+            # Only set to 'fma' if it's explicitly in the path or as a last resort
+            elif "fma" in str(label_dir).lower() or "logits/synth" in str(label_dir).lower():
+                current_type = 'fma'
+            else:
+                # If we can't determine the type, log a warning and skip this directory
+                if self.verbose:
+                    print(f"WARNING: Could not determine dataset type for {label_dir}, defaulting to 'fma'")
+                current_type = 'fma'
                 if self.verbose: print(f"Scanning LABELED_SYNTH labels base: {label_dir}")
                 # Scan within specific subdirectories
                 for subdir in self.labeled_synth_subdirs:
@@ -421,7 +438,16 @@ class SynthDataset(Dataset):
         # --- Scan logit directories (only if KD is potentially used) ---
         if self.logits_dirs:
             for logit_dir in self.logits_dirs:
-                current_type = 'fma' # Default
+                # Initialize with None to force explicit type determination
+                current_type = None
+
+                # Skip LabeledDataset_augmented directory completely
+                if "LabeledDataset_augmented" in str(logit_dir):
+                    if self.verbose:
+                        print(f"SKIPPING LabeledDataset_augmented directory: {logit_dir}")
+                    continue
+
+                # Determine dataset type based on path
                 if "maestro" in str(logit_dir).lower():
                     current_type = 'maestro'
                 elif "dali_synth" in str(logit_dir).lower():
@@ -429,6 +455,14 @@ class SynthDataset(Dataset):
                 # Check if this logit_dir corresponds to the LabeledDataset_synth structure
                 elif self.dataset_type == 'labeled_synth' and "LabeledDataset_synth/logits" in str(logit_dir):
                     current_type = 'labeled_synth'
+                # Only set to 'fma' if it's explicitly in the path or as a last resort
+                elif "fma" in str(logit_dir).lower() or "logits/synth" in str(logit_dir).lower():
+                    current_type = 'fma'
+                else:
+                    # If we can't determine the type, log a warning and skip this directory
+                    if self.verbose:
+                        print(f"WARNING: Could not determine dataset type for {logit_dir}, defaulting to 'fma'")
+                    current_type = 'fma'
                     if self.verbose: print(f"Scanning LABELED_SYNTH logits base: {logit_dir}")
                     # Scan within specific subdirectories
                     for subdir in self.labeled_synth_subdirs:
@@ -473,11 +507,19 @@ class SynthDataset(Dataset):
         spec_counts = {'fma': 0, 'maestro': 0, 'dali_synth': 0, 'labeled_synth': 0} # Added labeled_synth
 
         for spec_dir in self.spec_dirs:
-            current_type = 'fma' # Default
+            # Initialize with None to force explicit type determination
+            current_type = None
             use_maestro_logic = False
             use_dali_logic = False
             use_labeled_synth_logic = False
 
+            # Skip LabeledDataset_augmented directory completely
+            if "LabeledDataset_augmented" in str(spec_dir):
+                if self.verbose:
+                    print(f"SKIPPING LabeledDataset_augmented directory: {spec_dir}")
+                continue
+
+            # Determine dataset type based on path
             if "maestro" in str(spec_dir).lower():
                 current_type = 'maestro'
                 use_maestro_logic = True
@@ -488,6 +530,14 @@ class SynthDataset(Dataset):
             elif self.dataset_type == 'labeled_synth' and "LabeledDataset_synth/spectrograms" in str(spec_dir):
                 current_type = 'labeled_synth'
                 use_labeled_synth_logic = True
+            # Only set to 'fma' if it's explicitly in the path or as a last resort
+            elif "fma" in str(spec_dir).lower() or "logits/synth" in str(spec_dir).lower():
+                current_type = 'fma'
+            else:
+                # If we can't determine the type, log a warning and skip this directory
+                if self.verbose:
+                    print(f"WARNING: Could not determine dataset type for {spec_dir}, defaulting to 'fma'")
+                current_type = 'fma'
 
             if self.verbose:
                 print(f"Scanning {current_type.upper()} spectrograms from: {spec_dir}")

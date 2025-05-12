@@ -21,7 +21,7 @@ spec:
                 operator: In
                 values:
                 - NVIDIA-A10
-              - key: kubernetes.io/hostname  
+              - key: kubernetes.io/hostname
                 operator: In
                 values:
                 - gpu-02.nrp.mghpcc.org
@@ -242,6 +242,9 @@ spec:
             # Add dataset type environment variable with combined option
             - name: DATASET_TYPE
               value: "combined"  # Options: "fma", "maestro", "dali_synth", "combined", "fma+maestro", "fma+dali_synth", or "maestro+dali_synth"
+              # IMPORTANT: We're intentionally NOT using "labeled" or "labeled_synth" to avoid LabeledDataset_augmented
+              # The SynthDataset class has been modified to explicitly skip LabeledDataset_augmented directories
+              # The train_btc.py script has been modified to filter out 'labeled' and 'labeled_synth' from dataset types
             # Add checkpoint loading control option
             - name: LOAD_CHECKPOINT
               value: "never"  # Options: "auto" (load if exists), "never", "required"
@@ -257,7 +260,7 @@ spec:
             - name: LAZY_INIT
               value: "false" # Controls dataset lazy initialization
             - name: SMALL_DATASET
-              value: ""   # Set percentage of dataset to use (0.1 = 10%, null = full)
+              value: "0.02"   # Set percentage of dataset to use (0.1 = 10%, null = full)
             - name: METADATA_CACHE
               value: "false" # Use metadata-only caching
           command:
@@ -483,15 +486,15 @@ spec:
           resources:
             requests:
               cpu: "4"
-              memory: "196Gi"
+              #memory: "196Gi"
               #memory: "128Gi"
-              #memory: "64Gi"
+              memory: "64Gi"
               nvidia.com/gpu: "2"
             limits:
               cpu: "18"
-              memory: "260Gi"
+              #memory: "260Gi"
               #memory: "160Gi"
-              #memory: "128Gi"
+              memory: "128Gi"
               nvidia.com/gpu: "2"
           volumeMounts:
             - name: storage

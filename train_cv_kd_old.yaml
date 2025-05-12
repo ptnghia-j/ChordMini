@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: chord-cv-kd-0.6
+  name: chord-cv-kd-0.1
   namespace: csuf-titans
   labels:
     app: chord-cv-kd-training
@@ -88,7 +88,7 @@ spec:
             - name: USE_KD_LOSS
               value: "true"  # Set to "true" to enable KD loss
             - name: KD_ALPHA
-              value: "0.5"  # Weight for KD loss (0-1)
+              value: "0.1"  # Weight for KD loss (0-1)
             - name: TEMPERATURE
               value: "3.0"  # Temperature for softening distributions
             - name: TEACHER_CHECKPOINT # MODIFIED: Was TEACHER_MODEL
@@ -146,7 +146,7 @@ spec:
             - name: LOAD_CHECKPOINT
               value: "auto"  # Options: "auto" (load if exists), "never" (always start fresh), "required" (must exist), or actual path
             - name: SUB_DIR
-              value: "cv-kd-fold-0.6-2"  # Make SUB_DIR specific to the KFOLD value above
+              value: "cv-kd-fold-0.1-2"  # Make SUB_DIR specific to the KFOLD value above
             # Add reset epoch control option
             - name: RESET_EPOCH
               value: "true"  # Whether to reset epoch counter when loading a checkpoint (true/false)
