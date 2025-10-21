@@ -13,7 +13,7 @@ from scipy import signal, interpolate # Add scipy imports
 from modules.utils import logger
 from modules.utils.mir_eval_modules import idx2voca_chord # BTC typically uses large voca
 from modules.utils.hparams import HParams
-from modules.models.Transformer.btc_model import BTC_model # Import BTC model
+from modules.models.Transformer.btc_model import BTC_model # Import corrected BTC model
 
 # Explicitly disable MPS globally at the beginning
 if hasattr(torch, 'backends') and hasattr(torch.backends, 'mps'):
@@ -278,7 +278,14 @@ def main():
 
         # Check if model state dict is directly available or nested
         if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            # model.load_state_dict(checkpoint['model_state_dict'])
+            state_dict = checkpoint['model_state_dict']
+
+            # Remove 'module.' prefix if present (from DataParallel training)
+            if any(key.startswith('module.') for key in state_dict.keys()):
+                state_dict = {key.replace('module.', ''): value for key, value in state_dict.items()}
+
+            model.load_state_dict(state_dict)
         elif 'model' in checkpoint: # Handle older checkpoint format
              model.load_state_dict(checkpoint['model'])
         else:

@@ -194,8 +194,6 @@ $RECYCLE.BIN/
 
 .qodo
 
-#ignore checkpoints folder
-checkpoints/
 
 # Ignore checkpoints directory (alternatively, use Git LFS as shown above)
 # checkpoints/
