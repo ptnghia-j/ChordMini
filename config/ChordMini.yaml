@@ -1,0 +1,120 @@
+# ChordMini Pipeline Configuration
+# Unified config for both Pseudo-Labeling (Phase 1) and Continual Learning (Phase 2)
+
+# Audio / feature extraction (shared by both phases)
+mp3:
+  song_hz: 22050
+  inst_len: 10.0
+  skip_interval: 5.0
+
+feature:
+  n_bins: 144
+  bins_per_octave: 24
+  hop_length: 2048
+  sample_rate: 22050
+  hop_duration: 0.09288  # hop_length / sample_rate
+  large_voca: true
+
+# Model defaults (override via CLI --model_type, --n_group, etc.)
+model:
+  feature_size: 144
+  seq_len: 108
+  num_chords: 170
+  frame_duration: 0.09288
+
+  # BTC defaults
+  hidden_size: 128
+  num_layers: 8
+  num_heads: 4
+  total_key_depth: 128
+  total_value_depth: 128
+  filter_size: 128
+  input_dropout: 0.2
+  layer_dropout: 0.2
+  attention_dropout: 0.2
+  relu_dropout: 0.2
+
+  # ChordNet defaults
+  n_group: 12
+  f_layer: 5
+  f_head: 8
+  t_layer: 5
+  t_head: 8
+  d_layer: 5
+  d_head: 8
+  dropout: 0.2
+
+# Phase 1: Pseudo-Labeling
+pseudo_labeling:
+  batch_size: 256
+  num_epochs: 100
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  early_stopping_patience: 10
+  seq_len: 108
+  stride: 108
+
+  use_kd: false
+  kd_alpha: 0.5
+  temperature: 3.0
+  lr_schedule: cosine
+  use_warmup: true
+  warmup_epochs: 10
+  warmup_start_lr: 1.0e-4
+  warmup_end_lr: 3.0e-4
+
+  use_focal_loss: true
+  focal_gamma: 2.0
+
+  data:
+    spec_dir: './data/unlabeled/spectrograms'
+    label_dir: './data/unlabeled/labels'
+    logits_dir: null  # set if using KD
+    train_ratio: 0.8
+    val_ratio: 0.1
+
+  checkpoints:
+    save_dir: './checkpoints/pseudo_labeling'
+    pretrained: './checkpoints/pretrained'
+
+# Phase 2: Continual Learning
+continual_learning:
+  batch_size: 32
+  num_epochs: 50
+  learning_rate: 1.0e-5
+  weight_decay: 1.0e-5
+  early_stopping_patience: 10
+  seq_len: 108
+  stride: 54
+
+  kd_alpha: 0.3
+  temperature: 3.0
+  selective_kd: true
+  kd_confidence_threshold: 0.9
+  kd_min_confidence_threshold: 0.1
+
+  data:
+    audio_dir: './data/labeled/audio'
+    label_dir: './data/labeled/chordlab'
+    train_ratio: 0.7
+    val_ratio: 0.1
+
+  augmentation:
+    enabled: false
+    min_semitones: -5
+    max_semitones: 6
+
+  anti_forgetting:
+    freeze_encoder: false
+    ewc_lambda: 0.0
+    use_pod_loss: false
+    pod_alpha: 0.1
+
+  checkpoints:
+    student: null  # set to Phase 1 output
+    teacher: './checkpoints/btc_model_large_voca.pt'
+    save_dir: './checkpoints/continual_learning'
+
+misc:
+  seed: 42
+  num_workers: 0

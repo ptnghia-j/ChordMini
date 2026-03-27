@@ -1,1 +1,38 @@
+# macOS
 .DS_Store
+.qodo
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local caches
+.cache/
+
+# Generated outputs
+outputs/*
+!outputs/.gitkeep
+evaluation_visualizations/*
+!evaluation_visualizations/.gitkeep
+evaluation_results.json
+
+# Model artifacts
+checkpoints/*
+!checkpoints/.gitkeep
+!checkpoints/btc_model_best.pth
+!checkpoints/2e1d_model_best.pth
+!checkpoints/btc_model_large_voca.pt
+
+# Dataset contents
+data/labeled/audio/*
+!data/labeled/audio/.gitkeep
+data/labeled/chordlab/*
+!data/labeled/chordlab/.gitkeep
+data/unlabeled/*
+!data/unlabeled/.gitkeep
