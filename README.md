@@ -11,8 +11,7 @@ All commands below assume you are already inside this folder:
 cd ChordMini
 ```
 
-Run the grouped local entry points directly from this repository root.
-The repository folder name does not matter; the scripts discover the project root dynamically at runtime.
+All of the implementation details are in the `src` folder.
 
 ## Setup
 
@@ -30,7 +29,7 @@ MP3 loading working correctly with the current `librosa` and `audioread` stack.
 ## Included Checkpoints
 
 - `checkpoints/btc_model_best.pth`: BTC CL (full) checkpoint
-- `checkpoints/2e1d_model_best.pth`: ChordNet CL (full) checkpoint
+- `checkpoints/2e1d_model_best.pth`: ChordNet (2E1D) CL (full) checkpoint
 - `checkpoints/btc_model_large_voca.pt`: original BTC teacher (https://github.com/jayg996/BTC-ISMIR19)
 
 ## Data Layout
@@ -43,9 +42,10 @@ data/
 └── unlabeled/
 ```
 
-Phase 1 reads audio from `data/unlabeled` by default. If you want to reuse
-another audio collection, point `--audio_dir` at that directory; `.lab` files
-are not read in phase 1.
+The stage-1 examples below use `--audio_dir data/unlabeled`. Stage 1 does not
+default to that path automatically, so pass `--audio_dir` explicitly when using
+online audio mode. If you want to reuse another audio collection, point
+`--audio_dir` at that directory; `.lab` files are not read in stage 1.
 
 ### Training Data
 
@@ -57,9 +57,10 @@ are not read in phase 1.
 
 >  For the labeled dataset used in our chord-recognition experiments, access is restricted due to copyright constraints. The labeled audio and annotation files are therefore not included in this repository. Please contact the developer if you need access for research or reproduction purposes.
 
-## Phase 1: Pseudo-Label Training
+## Stage 1: Pseudo-Label Training
 
-Run BTC pseudo-label training from audio only, using the BTC teacher:
+Run BTC pseudo-label training from audio only, using the BTC teacher to
+generate pseudo-labels:
 
 ```bash
 python src/training_scripts/train_pseudo_labeling.py \
@@ -94,9 +95,84 @@ Expected best checkpoint:
 checkpoints/pseudo_labeling_btc/best_model.pth
 ```
 
-## Phase 2: Continual Learning
+Optional KD regularization in stage 1:
+
+- `--teacher_checkpoint` is used for online pseudo-label generation in audio-only stage 1.
+- `--use_kd` is optional and additionally enables KD loss against the teacher logits during student training.
+- The stage-1 KD defaults in [`config/ChordMini.yaml`](/Users/nghiaphan/Desktop/ChordMini/config/ChordMini.yaml) are `use_kd: false`, `kd_alpha: 0.5`, and `temperature: 3.0`.
+
+Example stage-1 run with pseudo-label generation plus KD enabled:
+
+```bash
+python src/training_scripts/train_pseudo_labeling.py \
+  --model_type BTC \
+  --audio_dir data/unlabeled \
+  --teacher_checkpoint checkpoints/btc_model_large_voca.pt \
+  --save_dir checkpoints/pseudo_labeling_btc_kd \
+  --batch_size 256 \
+  --num_epochs 100 \
+  --learning_rate 1e-4 \
+  --weight_decay 1e-5 \
+  --early_stopping_patience 10 \
+  --lr_schedule cosine \
+  --use_warmup \
+  --warmup_epochs 10 \
+  --warmup_start_lr 1e-4 \
+  --warmup_end_lr 3e-4 \
+  --min_learning_rate 1e-6 \
+  --seq_len 108 \
+  --stride 108 \
+  --train_ratio 0.8 \
+  --val_ratio 0.1 \
+  --use_kd \
+  --kd_alpha 0.5 \
+  --temperature 3.0 \
+  --use_focal_loss \
+  --focal_gamma 2.0 \
+  --seed 42 \
+  --num_workers 0
+```
+
+Resume a stopped stage-1 run from a trainer checkpoint in the same output directory:
+
+```bash
+python src/training_scripts/train_pseudo_labeling.py \
+  --model_type BTC \
+  --audio_dir data/unlabeled \
+  --teacher_checkpoint checkpoints/btc_model_large_voca.pt \
+  --save_dir checkpoints/pseudo_labeling_btc \
+  --resume_checkpoint checkpoints/pseudo_labeling_btc/checkpoint_epoch_10.pth \
+  --batch_size 256 \
+  --num_epochs 100 \
+  --learning_rate 1e-4 \
+  --weight_decay 1e-5 \
+  --early_stopping_patience 10 \
+  --lr_schedule cosine \
+  --use_warmup \
+  --warmup_epochs 10 \
+  --warmup_start_lr 1e-4 \
+  --warmup_end_lr 3e-4 \
+  --min_learning_rate 1e-6 \
+  --seq_len 108 \
+  --stride 108 \
+  --train_ratio 0.8 \
+  --val_ratio 0.1 \
+  --use_focal_loss \
+  --focal_gamma 2.0 \
+  --seed 42 \
+  --num_workers 0
+```
+
+When resuming, `--num_epochs` is the total target epoch count for the run.
+For example, resuming from `checkpoint_epoch_10.pth` with `--num_epochs 100`
+continues at epoch 11 and trains through epoch 100.
+
+## Stage 2: Continual Learning
 
 Fine-tune the pseudo-labeled student on labeled audio plus chord annotations:
+
+This assumes `checkpoints/pseudo_labeling_btc/best_model.pth` already exists
+from a completed stage-1 run.
 
 ```bash
 python src/training_scripts/train_continual_learning.py \
@@ -132,6 +208,38 @@ Important: this script writes the main output inside a split subfolder:
 checkpoints/continual_learning_btc/single_split/best_model.pth
 ```
 
+Resume a stopped stage-2 run from a saved trainer checkpoint:
+
+```bash
+python src/training_scripts/train_continual_learning.py \
+  --model_type BTC \
+  --teacher_checkpoint checkpoints/btc_model_large_voca.pt \
+  --audio_dir data/labeled/audio \
+  --label_dir data/labeled/chordlab \
+  --save_dir checkpoints/continual_learning_btc \
+  --resume_checkpoint checkpoints/continual_learning_btc/single_split/checkpoint_epoch_10.pth \
+  --batch_size 128 \
+  --num_epochs 50 \
+  --learning_rate 1e-5 \
+  --weight_decay 1e-5 \
+  --early_stopping_patience 10 \
+  --seq_len 108 \
+  --stride 54 \
+  --kd_alpha 0.3 \
+  --temperature 3.0 \
+  --selective_kd \
+  --kd_confidence_threshold 0.9 \
+  --kd_min_confidence_threshold 0.1 \
+  --use_focal_loss \
+  --focal_gamma 2.0 \
+  --train_ratio 0.7 \
+  --val_ratio 0.1 \
+  --seed 42 \
+  --num_workers 0
+```
+
+As with stage 1, `--num_epochs` stays the total target epoch count.
+
 ## Supervised/Baseline Training From Scratch
 
 Use `src/training_scripts/train_from_scratch.py` when you want to train directly from the labeled
@@ -160,6 +268,27 @@ Expected best checkpoint:
 ```text
 checkpoints/from_scratch_btc/single_split/best_model.pth
 ```
+
+Resume a stopped supervised run from a trainer checkpoint:
+
+```bash
+python src/training_scripts/train_from_scratch.py \
+  --model_type BTC \
+  --audio_dir data/labeled/audio \
+  --label_dir data/labeled/chordlab \
+  --save_dir checkpoints/from_scratch_btc \
+  --resume_checkpoint checkpoints/from_scratch_btc/single_split/checkpoint_epoch_10.pth \
+  --batch_size 8 \
+  --num_epochs 100 \
+  --early_stopping_patience 10 \
+  --num_workers 0 \
+  --max_songs 100 \
+  --no_kd
+```
+
+As with the other training entry points, `--num_epochs` is the total target
+epoch count. Resuming from `checkpoint_epoch_10.pth` with `--num_epochs 100`
+continues at epoch 11 and trains through epoch 100.
 
 ### Cross Validation
 
@@ -202,6 +331,8 @@ python src/training_scripts/train_from_scratch.py \
   --n_folds 5 \
   --run_all_folds
 ```
+
+Resume is supported for a single selected fold, but not with `--run_all_folds`.
 
 When cross validation is enabled, fold outputs are written like:
 

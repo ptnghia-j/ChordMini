@@ -61,6 +61,20 @@ class LinearWarmupScheduler:
         _set_optimizer_lrs(self.optimizer, lrs)
         return lrs[0]
 
+    def state_dict(self):
+        return {
+            'warmup_epochs': self.warmup_epochs,
+            'end_lrs': list(self.end_lrs),
+            'start_lrs': list(self.start_lrs),
+        }
+
+    def load_state_dict(self, state):
+        if not isinstance(state, dict):
+            return
+        self.warmup_epochs = max(0, int(state.get('warmup_epochs', self.warmup_epochs)))
+        self.end_lrs = [float(lr) for lr in state.get('end_lrs', self.end_lrs)]
+        self.start_lrs = [float(lr) for lr in state.get('start_lrs', self.start_lrs)]
+
 
 class CosineWarmupScheduler:
     """Per-batch cosine decay with an optional single warmup phase."""
@@ -112,6 +126,24 @@ class CosineWarmupScheduler:
         _set_optimizer_lrs(self.optimizer, lrs)
         return lrs[0]
 
+    def state_dict(self):
+        return {
+            'num_epochs': self.num_epochs,
+            'base_lrs': list(self.base_lrs),
+            'min_lrs': list(self.min_lrs),
+            'warmup_epochs': self.warmup_epochs,
+            'warmup_start_lrs': list(self.warmup_start_lrs),
+        }
+
+    def load_state_dict(self, state):
+        if not isinstance(state, dict):
+            return
+        self.num_epochs = max(1, int(state.get('num_epochs', self.num_epochs)))
+        self.base_lrs = [float(lr) for lr in state.get('base_lrs', self.base_lrs)]
+        self.min_lrs = [float(lr) for lr in state.get('min_lrs', self.min_lrs)]
+        self.warmup_epochs = max(0, int(state.get('warmup_epochs', self.warmup_epochs)))
+        self.warmup_start_lrs = [float(lr) for lr in state.get('warmup_start_lrs', self.warmup_start_lrs)]
+
 
 class ValidationBasedScheduler:
     """Reduce LR when validation accuracy stops improving."""
@@ -145,3 +177,24 @@ class ValidationBasedScheduler:
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = max(float(param_group['lr']) * self.factor, self.min_lr)
         return self.optimizer.param_groups[0]['lr']
+
+    def state_dict(self):
+        return {
+            'factor': self.factor,
+            'min_lr': self.min_lr,
+            'patience': self.patience,
+            'best_val_acc': self.best_val_acc,
+            'consecutive_no_improve': self.consecutive_no_improve,
+        }
+
+    def load_state_dict(self, state):
+        if not isinstance(state, dict):
+            return
+        self.factor = float(state.get('factor', self.factor))
+        self.min_lr = float(state.get('min_lr', self.min_lr))
+        self.patience = max(1, int(state.get('patience', self.patience)))
+        self.best_val_acc = float(state.get('best_val_acc', self.best_val_acc))
+        self.consecutive_no_improve = max(
+            0,
+            int(state.get('consecutive_no_improve', self.consecutive_no_improve)),
+        )

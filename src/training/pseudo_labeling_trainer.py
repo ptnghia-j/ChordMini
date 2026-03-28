@@ -6,7 +6,7 @@ Supports both Phase 1 input modes:
   - online unlabeled audio, where pseudo-labels and optional KD logits are
     generated at runtime from a frozen teacher
 
-For ChordNet only, validation/test accuracy mirrors the non-factored inference
+For ChordNet (2E1D) only, validation/test accuracy mirrors the non-factored inference
 path by using Gaussian smoothing and overlap-aware frame voting when the batch
 contains segment metadata.
 
@@ -21,11 +21,11 @@ import os
 import time
 
 import torch
-import torch.nn.functional as F
 
 from src.utils.logger import info, warning
 from src.utils.gradient_utils import safe_clip_grad_norm_
-from src.utils.checkpoint_utils import save_checkpoint, load_checkpoint
+from src.training.utils.checkpointing import TrainerCheckpointMixin
+from src.training.utils.losses import TrainerLossMixin
 from src.training.utils.lr_schedulers import (
     CosineWarmupScheduler,
     LinearWarmupScheduler,
@@ -33,6 +33,7 @@ from src.training.utils.lr_schedulers import (
 )
 from src.training.utils.trainer_common import (
     accumulate_batch_accuracy,
+    count_correct_predictions,
     finalize_vote_accuracy,
     normalize_features,
     teacher_logits_from_model,
@@ -41,7 +42,7 @@ from src.training.utils.trainer_common import (
 )
 
 
-class PseudoLabelingTrainer:
+class PseudoLabelingTrainer(TrainerCheckpointMixin, TrainerLossMixin):
     """
     OOP trainer for the pseudo-labeling phase.
 
@@ -147,6 +148,7 @@ class PseudoLabelingTrainer:
         # History
         self.train_losses = []
         self.val_losses = []
+        self.start_epoch = 1
 
         self.best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
 
@@ -274,10 +276,14 @@ class PseudoLabelingTrainer:
         if 'chord_idx' in batch:
             targets = batch['chord_idx'].to(self.device, non_blocking=True)
 
+        need_teacher_for_targets = targets is None
+        need_teacher_for_kd = bool(self.use_kd_loss)
+        need_teacher_logits = need_teacher_for_targets or need_teacher_for_kd
+
         teacher_logits = None
-        if 'teacher_logits' in batch:
+        if need_teacher_logits and 'teacher_logits' in batch:
             teacher_logits = batch['teacher_logits'].to(self.device, non_blocking=True)
-        elif self.teacher_model is not None:
+        elif need_teacher_logits and self.teacher_model is not None:
             teacher_logits = self._get_teacher_logits(raw_features)
 
         if targets is None:
@@ -285,52 +291,10 @@ class PseudoLabelingTrainer:
                 raise ValueError("Pseudo-labeling requires chord_idx targets or a teacher model.")
             targets = teacher_logits.argmax(dim=-1)
 
+        if not need_teacher_for_kd:
+            teacher_logits = None
+
         return targets, teacher_logits
-
-    # ------------------------------------------------------------------
-    # Loss computation
-    # ------------------------------------------------------------------
-
-    def _kd_loss(self, student_logits, teacher_logits):
-        """KL-divergence KD loss with temperature scaling."""
-        soft_targets = F.softmax(teacher_logits / self.temperature, dim=-1)
-        log_probs = F.log_softmax(student_logits / self.temperature, dim=-1)
-        loss = F.kl_div(log_probs, soft_targets, reduction='batchmean')
-        return loss * (self.temperature ** 2)
-
-    def _focal_loss(self, logits, targets):
-        """Focal loss to focus on hard examples."""
-        probs = F.softmax(logits, dim=-1)
-        batch_size = logits.size(0)
-        p_t = probs[torch.arange(batch_size, device=logits.device), targets]
-        focal_weight = (1 - p_t) ** self.focal_gamma
-        ce = F.cross_entropy(logits, targets, reduction='none')
-        return (focal_weight * ce).mean()
-
-    def compute_loss(self, logits, targets, teacher_logits=None):
-        """Compute combined CE/focal + optional KD loss."""
-        # Flatten if 3-D sequence output
-        if logits.dim() == 3 and targets.dim() == 2:
-            B, T, C = logits.shape
-            logits = logits.reshape(-1, C)
-            targets = targets.reshape(-1)
-            if teacher_logits is not None and teacher_logits.dim() == 3:
-                teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
-
-        # Standard loss
-        if self.use_focal_loss:
-            standard_loss = self._focal_loss(logits, targets)
-        else:
-            standard_loss = self.loss_fn(logits, targets)
-
-        # KD loss
-        if self.use_kd_loss and teacher_logits is not None and logits.shape == teacher_logits.shape:
-            kd = self._kd_loss(logits, teacher_logits)
-            loss = self.kd_alpha * kd + (1 - self.kd_alpha) * standard_loss
-        else:
-            loss = standard_loss
-
-        return torch.clamp(loss, min=0.0)
 
     # ------------------------------------------------------------------
     # Training loop
@@ -347,7 +311,11 @@ class PseudoLabelingTrainer:
         if self.lr_schedule_type == 'validation' and val_loader is None:
             warning("Validation-based LR scheduling requested without a validation loader; LR will stay fixed after warmup.")
 
-        for epoch in range(1, self.num_epochs + 1):
+        if self.start_epoch > self.num_epochs:
+            info(f"Checkpoint already reached epoch {self.start_epoch - 1}; nothing to resume.")
+            return
+
+        for epoch in range(self.start_epoch, self.num_epochs + 1):
             t0 = time.time()
             train_loss, train_acc = self._train_epoch(train_loader, epoch)
             elapsed = time.time() - t0
@@ -418,11 +386,9 @@ class PseudoLabelingTrainer:
                 total_loss += loss.item()
 
                 with torch.no_grad():
-                    flat_logits = logits.reshape(-1, logits.size(-1)) if logits.dim() == 3 else logits
-                    flat_targets = targets.reshape(-1) if targets.dim() == 2 else targets
-                    preds = flat_logits.argmax(dim=-1)
-                    correct += (preds == flat_targets).sum().item()
-                    total += flat_targets.numel()
+                    batch_correct, batch_total = count_correct_predictions(logits, targets)
+                    correct += batch_correct
+                    total += batch_total
 
             if batch_idx % 50 == 0:
                 info(f"  Epoch {epoch} | Batch {batch_idx}/{len(loader)} | Loss: {loss.item():.4f}")
@@ -439,63 +405,6 @@ class PseudoLabelingTrainer:
         metrics = self._evaluate_loader(loader)
         return metrics['loss'], metrics['accuracy']
 
-    def validate_step(self, batch):
-        """Single validation batch step.
-
-        Loader-level validation/testing should prefer ``_evaluate_loader`` so
-        ChordNet can aggregate votes across all overlapping windows of a song.
-        """
-        self.model.eval()
-        with torch.no_grad():
-            raw_features = batch['spectro'].to(self.device, non_blocking=True)
-            targets, teacher_logits = self._resolve_targets(batch, raw_features)
-            features = raw_features
-
-            if self.normalization is not None:
-                features = normalize_features(
-                    features,
-                    self.normalization['mean'],
-                    self.normalization['std'],
-                )
-
-            outputs = self.model(features)
-            logits = outputs[0] if isinstance(outputs, tuple) else outputs
-
-            if logits.dim() == 3:
-                logits_flat = logits.reshape(-1, logits.size(-1))
-                targets_flat = targets.reshape(-1)
-                teacher_flat = teacher_logits.reshape(-1, teacher_logits.size(-1)) if teacher_logits is not None and teacher_logits.dim() == 3 else teacher_logits
-            else:
-                logits_flat = logits
-                targets_flat = targets
-                teacher_flat = teacher_logits
-
-            loss = self.compute_loss(logits_flat, targets_flat, teacher_flat)
-
-            if self._use_chordnet_eval_defaults(batch):
-                vote_accumulator = {}
-                target_accumulator = {}
-                _, _, _ = accumulate_batch_accuracy(
-                    self.model,
-                    batch,
-                    logits,
-                    targets,
-                    vote_accumulator,
-                    target_accumulator,
-                )
-                correct, total = finalize_vote_accuracy(vote_accumulator, target_accumulator)
-            else:
-                preds = logits_flat.argmax(dim=-1)
-                correct = (preds == targets_flat).sum().item()
-                total = targets_flat.numel()
-
-        return {
-            'loss': loss.item(),
-            'accuracy': correct / total if total > 0 else 0.0,
-            'correct': correct,
-            'total': total,
-        }
-
     def evaluate_loader(self, loader):
         """Public loader-level evaluation helper used by test loops."""
         return self._evaluate_loader(loader)
@@ -504,27 +413,25 @@ class PseudoLabelingTrainer:
     # Checkpointing & early stopping
     # ------------------------------------------------------------------
 
-    def _save_best(self, val_acc, val_loss, epoch):
-        if val_acc > self.best_val_acc:
-            self.best_val_acc = val_acc
-            self.early_stop_counter = 0
-            save_checkpoint(
-                self.best_model_path,
-                epoch=epoch,
-                model_state_dict=self.model.state_dict(),
-                optimizer_state_dict=self.optimizer.state_dict(),
-                accuracy=val_acc,
-                loss=val_loss,
-                normalization=self.normalization,
-                idx_to_chord=self.idx_to_chord,
-            )
-            info(f"  Saved best model (acc={val_acc:.4f})")
-            return True
-        self.early_stop_counter += 1
-        return False
-
     def _should_stop(self):
         return self.early_stop_counter >= self.early_stopping_patience
+
+    def _get_additional_checkpoint_state(self):
+        state = {}
+        if self.batch_scheduler is not None and hasattr(self.batch_scheduler, 'state_dict'):
+            state['batch_scheduler_state'] = self.batch_scheduler.state_dict()
+        if self.validation_scheduler is not None and hasattr(self.validation_scheduler, 'state_dict'):
+            state['validation_scheduler_state'] = self.validation_scheduler.state_dict()
+        return state
+
+    def _restore_additional_checkpoint_state(self, checkpoint):
+        batch_state = checkpoint.get('batch_scheduler_state')
+        if self.batch_scheduler is not None and batch_state and hasattr(self.batch_scheduler, 'load_state_dict'):
+            self.batch_scheduler.load_state_dict(batch_state)
+
+        validation_state = checkpoint.get('validation_scheduler_state')
+        if self.validation_scheduler is not None and validation_state and hasattr(self.validation_scheduler, 'load_state_dict'):
+            self.validation_scheduler.load_state_dict(validation_state)
 
     def _adjust_lr(self):
         for pg in self.optimizer.param_groups:
@@ -533,24 +440,3 @@ class PseudoLabelingTrainer:
             if new_lr < old_lr:
                 pg['lr'] = new_lr
                 info(f"  LR reduced: {old_lr:.6f} -> {new_lr:.6f}")
-
-    def _save_checkpoint(self, epoch, loss):
-        path = os.path.join(self.checkpoint_dir, f'checkpoint_epoch_{epoch}.pth')
-        save_checkpoint(
-            path,
-            epoch=epoch,
-            model_state_dict=self.model.state_dict(),
-            optimizer_state_dict=self.optimizer.state_dict(),
-            loss=loss,
-            normalization=self.normalization,
-        )
-
-    def load_best_model(self):
-        """Load the best saved model back into self.model."""
-        ckpt = load_checkpoint(self.best_model_path, device=self.device)
-        if ckpt and 'model_state_dict' in ckpt:
-            self.model.load_state_dict(ckpt['model_state_dict'])
-            info(f"Loaded best model from {self.best_model_path} (acc={ckpt.get('accuracy', '?')})")
-            return True
-        warning(f"Could not load best model from {self.best_model_path}")
-        return False

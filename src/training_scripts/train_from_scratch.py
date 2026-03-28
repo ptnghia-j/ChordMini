@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 """
-Train BTC or ChordNet from scratch on labeled audio.
+Train BTC or ChordNet (2E1D) from scratch on labeled audio.
 
 This is the supervised-from-scratch counterpart to ``train_continual_learning.py``.
 It uses the same labeled-audio dataset and trainer stack, but initializes a fresh
@@ -14,7 +13,6 @@ from pathlib import Path
 
 import torch
 import numpy as np
-from torch.utils.data import DataLoader, Subset
 
 _SRC_DIR = Path(__file__).resolve().parents[1]
 if str(_SRC_DIR) not in sys.path:
@@ -22,9 +20,8 @@ if str(_SRC_DIR) not in sys.path:
 
 from utils.cli import bootstrap_cli
 
-_PROJECT_ROOT = bootstrap_cli(__file__)
+bootstrap_cli(__file__)
 
-from src.data import AudioChordDataset, create_cv_folds, create_train_val_test_split
 from src.models import (
     create_btc_model,
     create_chordnet_model,
@@ -32,9 +29,17 @@ from src.models import (
     get_chordnet_config,
     load_model,
 )
-from src.training import ContinualLearningTrainer
-from src.utils import HParams, get_config_value, get_device, idx2voca_chord, info, project_path
-from src.utils.dataloader import build_dataloader_kwargs
+from src.training_scripts.utils import (
+    build_continual_learning_trainer,
+    build_labeled_audio_dataset,
+    build_labeled_dataloaders,
+    build_labeled_split_indices,
+    build_optional_teacher,
+    checkpoint_dir_for_labeled_training,
+    evaluate_test_split,
+    apply_optional_pitch_shift_augmentation,
+)
+from src.utils import HParams, get_config_value, get_device, idx2voca_chord, info, project_path, set_random_seed
 
 
 def parse_args():
@@ -45,6 +50,8 @@ def parse_args():
     p.add_argument('--model_type', type=str, choices=['BTC', 'ChordNet'], default='BTC')
     p.add_argument('--teacher_checkpoint', type=str, default=None,
                    help='Optional BTC teacher checkpoint for KD during supervised training.')
+    p.add_argument('--resume_checkpoint', type=str, default=None,
+                   help='Resume a previous supervised run from a trainer checkpoint.')
     # ChordNet overrides
     p.add_argument('--n_group', type=int, default=None)
     p.add_argument('--f_layer', type=int, default=None)
@@ -64,8 +71,6 @@ def parse_args():
     p.add_argument('--seq_len', type=int, default=108)
     p.add_argument('--stride', type=int, default=54)
     p.add_argument('--num_workers', type=int, default=0)
-    p.add_argument('--prefetch_factor', type=int, default=2)
-    p.add_argument('--disable_persistent_workers', action='store_true')
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--max_songs', type=int, default=None)
     # KD
@@ -76,11 +81,6 @@ def parse_args():
     p.add_argument('--use_focal_loss', action='store_true')
     p.add_argument('--focal_gamma', type=float, default=2.0)
     p.add_argument('--focal_alpha', type=str, default=None)
-    # Anti-forgetting-compatible knobs
-    p.add_argument('--freeze_encoder', action='store_true')
-    p.add_argument('--ewc_lambda', type=float, default=0.0)
-    p.add_argument('--use_pod_loss', action='store_true')
-    p.add_argument('--pod_alpha', type=float, default=0.1)
     p.add_argument('--selective_kd', default=True, action=argparse.BooleanOptionalAction)
     p.add_argument('--kd_confidence_threshold', type=float, default=0.9)
     p.add_argument('--kd_min_confidence_threshold', type=float, default=0.1)
@@ -94,9 +94,12 @@ def parse_args():
     p.add_argument('--val_ratio', type=float, default=0.1)
     # Augmentation
     p.add_argument('--enable_augmentation', action='store_true')
-    p.add_argument('--augmentation_min_semitones', type=int, default=-5)
-    p.add_argument('--augmentation_max_semitones', type=int, default=6)
-    return p.parse_args()
+    args = p.parse_args()
+
+    if args.resume_checkpoint and not os.path.exists(args.resume_checkpoint):
+        p.error(f"Resume checkpoint not found: {args.resume_checkpoint}")
+
+    return args
 
 
 def build_model_config(args, config):
@@ -145,114 +148,72 @@ def create_model(args, config, device):
         model = create_chordnet_model(model_config)
     return model.to(device)
 
-
-def build_dataset(args, config, chord_to_idx):
-    return AudioChordDataset(
-        audio_dir=args.audio_dir, label_dir=args.label_dir, config=config,
-        seq_len=args.seq_len, stride=args.stride, chord_mapping=chord_to_idx,
-        device='cpu', verbose=True, max_songs=args.max_songs, random_seed=args.seed)
-
-
 def run_training(args, config, device, chord_to_idx, fold_index=None):
-    torch.manual_seed(args.seed + (0 if fold_index is None else fold_index))
-    np.random.seed(args.seed + (0 if fold_index is None else fold_index))
+    set_random_seed(args.seed + (0 if fold_index is None else fold_index))
 
     idx_to_chord = idx2voca_chord()
+    current_fold = args.fold if fold_index is None else fold_index
 
-    student = create_model(args, config, device)
-    info(f"Initialized {args.model_type} from scratch" + (f" for fold {fold_index}" if fold_index is not None else ""))
+    if args.resume_checkpoint:
+        student, s_mean, s_std = load_model(args.resume_checkpoint, args.model_type, config, device, args)
+        info(
+            f"Loaded {args.model_type} resume checkpoint"
+            + (f" for fold {current_fold}" if args.use_cv else "")
+        )
+    else:
+        student = create_model(args, config, device)
+        s_mean, s_std = 0.0, 1.0
+        info(
+            f"Initialized {args.model_type} from scratch"
+            + (f" for fold {current_fold}" if fold_index is not None else "")
+        )
 
-    if args.freeze_encoder:
-        frozen, trainable = 0, 0
-        for name, param in student.named_parameters():
-            if 'fc' in name or 'component' in name:
-                param.requires_grad = True
-                trainable += 1
-            else:
-                param.requires_grad = False
-                frozen += 1
-        info(f"Frozen {frozen}, trainable {trainable}")
+    teacher, t_mean, t_std = build_optional_teacher(args, config, device)
 
-    teacher, t_mean, t_std = None, 0.0, 1.0
-    if not args.no_kd and args.teacher_checkpoint and os.path.exists(args.teacher_checkpoint):
-        teacher, t_mean, t_std = load_model(args.teacher_checkpoint, 'BTC', config, device)
-        teacher.eval()
-
-    dataset = build_dataset(args, config, chord_to_idx)
+    dataset = build_labeled_audio_dataset(args, config, chord_to_idx)
     if not dataset:
         info("ERROR: No data")
         return None
     info(f"Dataset: {len(dataset)} segments from {len(dataset.samples)} songs")
 
-    current_fold = args.fold if fold_index is None else fold_index
-    if args.use_cv:
-        folds = create_cv_folds(dataset, n_folds=args.n_folds, seed=args.seed)
-        train_idx, val_idx = folds[current_fold]
-        test_idx = []
-    else:
-        train_idx, val_idx, test_idx = create_train_val_test_split(
-            dataset, args.train_ratio, args.val_ratio, args.seed)
+    train_idx, val_idx, test_idx = build_labeled_split_indices(args, dataset, current_fold)
 
-    if args.enable_augmentation:
-        semitones = list(range(args.augmentation_min_semitones, args.augmentation_max_semitones + 1))
-        train_idx = dataset.add_augmented_segments_for_indices(train_idx, semitones)
+    train_idx = apply_optional_pitch_shift_augmentation(args, dataset, train_idx)
 
-    loader_kwargs = build_dataloader_kwargs(
+    train_loader, val_loader, loader_kwargs = build_labeled_dataloaders(
+        args=args,
+        dataset=dataset,
+        train_idx=train_idx,
+        val_idx=val_idx,
+        batch_size=args.batch_size,
         device=device,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-        persistent_workers=not args.disable_persistent_workers,
     )
-
-    train_loader = DataLoader(Subset(dataset, train_idx), batch_size=args.batch_size,
-                              shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(Subset(dataset, val_idx), batch_size=args.batch_size,
-                            shuffle=False, **loader_kwargs)
 
     trainable_params = [p for p in student.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate,
                                   weight_decay=args.weight_decay)
     normalization = {
-        'mean': torch.tensor(0.0, device=device),
-        'std': torch.tensor(1.0, device=device),
+        'mean': torch.tensor(s_mean, device=device),
+        'std': torch.tensor(s_std, device=device),
     }
 
-    ckpt_dir = os.path.join(args.save_dir, f"fold_{current_fold}" if args.use_cv else "single_split")
+    ckpt_dir = checkpoint_dir_for_labeled_training(args.save_dir, args.use_cv, current_fold)
 
-    focal_alpha = args.focal_alpha
-    if focal_alpha is not None and focal_alpha != 'auto':
-        try:
-            focal_alpha = float(focal_alpha)
-        except ValueError:
-            focal_alpha = None
-
-    trainer = ContinualLearningTrainer(
+    trainer = build_continual_learning_trainer(
+        args=args,
         model=student,
         optimizer=optimizer,
-        teacher_model=teacher,
+        teacher=teacher,
         teacher_mean=t_mean,
         teacher_std=t_std,
-        kd_alpha=args.kd_alpha,
-        temperature=args.temperature,
         device=device,
-        num_epochs=args.num_epochs,
         checkpoint_dir=ckpt_dir,
         idx_to_chord=idx_to_chord,
         normalization=normalization,
-        early_stopping_patience=args.early_stopping_patience,
-        use_focal_loss=args.use_focal_loss,
-        focal_gamma=args.focal_gamma,
-        focal_alpha=focal_alpha,
-        lr_decay_factor=0.9,
-        min_lr=1e-6,
-        selective_kd=args.selective_kd,
-        kd_confidence_threshold=args.kd_confidence_threshold,
-        kd_min_confidence_threshold=args.kd_min_confidence_threshold,
-        ewc_lambda=args.ewc_lambda,
-        original_params=None,
-        use_pod_loss=args.use_pod_loss,
-        pod_alpha=args.pod_alpha,
     )
+
+    if args.resume_checkpoint:
+        trainer.resume_from_checkpoint(args.resume_checkpoint)
 
     info("=" * 60)
     info(f"Scratch Training | Model: {args.model_type} | KD: {'OFF' if (args.no_kd or teacher is None) else 'ON'}")
@@ -274,11 +235,8 @@ def run_training(args, config, device, chord_to_idx, fold_index=None):
         'test_accuracy': None,
         'fold': current_fold if args.use_cv else None,
     }
-    if test_idx:
-        test_loader = DataLoader(Subset(dataset, test_idx), batch_size=args.batch_size,
-                                 shuffle=False, **loader_kwargs)
-        metrics = trainer.evaluate_loader(test_loader)
-        info(f"Test Accuracy: {metrics['accuracy']:.4f}" if metrics['total'] else "No test data")
+    metrics = evaluate_test_split(trainer, dataset, test_idx, args.batch_size, loader_kwargs)
+    if metrics is not None:
         result['test_accuracy'] = float(metrics['accuracy']) if metrics['total'] else None
 
     info(f"Done. Checkpoints: {ckpt_dir}")
@@ -316,11 +274,12 @@ def main():
 
     if args.run_all_folds and not args.use_cv:
         raise SystemExit("--run_all_folds requires --use_cv")
+    if args.run_all_folds and args.resume_checkpoint:
+        raise SystemExit("--resume_checkpoint is not supported together with --run_all_folds")
     if args.use_cv and not (0 <= args.fold < args.n_folds):
         raise SystemExit(f"--fold must be in [0, {args.n_folds - 1}]")
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    set_random_seed(args.seed)
 
     device = get_device()
     info(f"Device: {device}")

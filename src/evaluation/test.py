@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Run ChordMini checkpoint inference on audio and write .lab outputs.
 
@@ -9,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import random
 import sys
 from pathlib import Path
 
@@ -25,7 +23,7 @@ if str(_SRC_DIR) not in sys.path:
 
 from utils.cli import bootstrap_cli
 
-_PROJECT_ROOT = bootstrap_cli(__file__)
+bootstrap_cli(__file__)
 
 from src.evaluation.utils.common import (
     extract_norm_stats as _extract_norm_stats,
@@ -33,7 +31,7 @@ from src.evaluation.utils.common import (
 )
 from src.evaluation.utils.inference import predict_sliding_windows
 from src.models import load_model
-from src.utils import HParams, error, get_config_value as _cfg, get_device, idx2voca_chord, info, logging_verbosity, project_path, warning
+from src.utils import HParams, error, get_config_value as _cfg, get_device, idx2voca_chord, info, logging_verbosity, project_path, set_random_seed, warning
 
 
 DEFAULT_CONFIG = str(project_path('config', 'ChordMini.yaml', start=__file__))
@@ -178,9 +176,7 @@ def main():
     args = parse_args()
     logging_verbosity(2 if args.verbose else 1)
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    random.seed(args.seed)
+    set_random_seed(args.seed, include_python_random=True)
 
     if not os.path.exists(args.audio_dir):
         error(f'Audio directory not found: {args.audio_dir}')

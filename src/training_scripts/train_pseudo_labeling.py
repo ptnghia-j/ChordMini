@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Phase 1: pseudo-labeling training.
 
@@ -7,7 +6,7 @@ Supports two input modes:
 2. Online unlabeled audio mode, where CQT features, pseudo-labels, and
    optional KD logits are all generated at runtime from a frozen teacher.
 
-ChordNet validation/test accuracy automatically uses the same default inference
+ChordNet (2E1D) validation/test accuracy automatically uses the same default inference
 setup as ``test_labeled_audio.py`` (Gaussian smoothing + overlap-aware voting)
 when segment metadata is available.
 
@@ -21,7 +20,6 @@ import sys
 from pathlib import Path
 
 import torch
-import numpy as np
 from torch.utils.data import DataLoader, Subset
 
 _SRC_DIR = Path(__file__).resolve().parents[1]
@@ -30,7 +28,7 @@ if str(_SRC_DIR) not in sys.path:
 
 from utils.cli import bootstrap_cli
 
-_PROJECT_ROOT = bootstrap_cli(__file__)
+bootstrap_cli(__file__)
 
 from src.data import SynthDataset, UnlabeledAudioDataset
 from src.models import (
@@ -46,6 +44,7 @@ from src.utils import (
     idx2voca_chord,
     info,
     project_path,
+    set_random_seed,
 )
 from src.utils.dataloader import build_dataloader_kwargs
 
@@ -59,6 +58,8 @@ def parse_args():
     p.add_argument('--logits_dir', type=str, default=None)
     p.add_argument('--model_type', type=str, choices=['BTC', 'ChordNet'], default='BTC')
     p.add_argument('--checkpoint', type=str, default=None)
+    p.add_argument('--resume_checkpoint', type=str, default=None,
+                   help='Resume a previous PL run from a trainer checkpoint.')
     p.add_argument('--teacher_checkpoint', type=str, default=None,
                    help='Frozen BTC teacher checkpoint for online pseudo-labeling/KD.')
     # ChordNet overrides
@@ -95,10 +96,6 @@ def parse_args():
     p.add_argument('--seq_len', type=int, default=108)
     p.add_argument('--stride', type=int, default=108)
     p.add_argument('--num_workers', type=int, default=0)
-    p.add_argument('--prefetch_factor', type=int, default=2,
-                   help='Batches prefetched per worker when num_workers > 0.')
-    p.add_argument('--disable_persistent_workers', action='store_true',
-                   help='Disable persistent DataLoader workers when num_workers > 0.')
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--max_files', type=int, default=None)
     # KD
@@ -119,10 +116,13 @@ def parse_args():
     if args.audio_dir and not (args.teacher_checkpoint or args.checkpoint):
         p.error("Online audio mode requires --teacher_checkpoint or --checkpoint.")
 
+    if args.resume_checkpoint and not os.path.exists(args.resume_checkpoint):
+        p.error(f"Resume checkpoint not found: {args.resume_checkpoint}")
+
     return args
 
 
-def load_model(args, model_config, device):
+def load_model(args, model_config, device, checkpoint_path=None):
     if args.model_type == 'BTC':
         model = create_btc_model(model_config)
     else:
@@ -130,12 +130,12 @@ def load_model(args, model_config, device):
     model = model.to(device)
 
     mean, std = 0.0, 1.0
-    if args.checkpoint and os.path.exists(args.checkpoint):
-        info(f"Loading checkpoint: {args.checkpoint}")
-        ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        info(f"Loading checkpoint: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         sd, mean, std = extract_state_dict_and_stats(ckpt)
         model.load_state_dict(sd, strict=False)
-        info(f"Loaded {args.model_type} from {args.checkpoint}")
+        info(f"Loaded {args.model_type} from {checkpoint_path}")
 
     return model, float(mean), float(std)
 
@@ -164,8 +164,7 @@ def build_config(args):
 
 def main():
     args = parse_args()
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    set_random_seed(args.seed)
 
     device = get_device()
     info(f"Device: {device}")
@@ -174,7 +173,8 @@ def main():
     chord_to_idx = {v: k for k, v in idx_to_chord.items()}
 
     model_config = build_config(args)
-    model, mean, std = load_model(args, model_config, device)
+    model_checkpoint = args.resume_checkpoint or args.checkpoint
+    model, mean, std = load_model(args, model_config, device, checkpoint_path=model_checkpoint)
     online_mode = args.audio_dir is not None
     teacher_model = None
     teacher_mean = None
@@ -182,9 +182,6 @@ def main():
 
     info("Loading dataset...")
     if online_mode:
-        if args.num_workers != 0:
-            info("Online pseudo-labeling with full-sequence teacher inference requires num_workers=0; overriding the requested value.")
-            args.num_workers = 0
         teacher_checkpoint = args.teacher_checkpoint or args.checkpoint
         teacher_model, teacher_mean, teacher_std = load_teacher_model(
             teacher_checkpoint, args.seq_len, device)
@@ -196,9 +193,6 @@ def main():
             verbose=True,
             max_files=args.max_files,
             random_seed=args.seed,
-            teacher_model=teacher_model,
-            teacher_mean=teacher_mean,
-            teacher_std=teacher_std,
         )
         mean, std = teacher_mean, teacher_std
     else:
@@ -228,8 +222,6 @@ def main():
     loader_kwargs = build_dataloader_kwargs(
         device=device,
         num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-        persistent_workers=not args.disable_persistent_workers,
     )
 
     train_loader = DataLoader(Subset(dataset, train_idx), batch_size=args.batch_size,
@@ -259,6 +251,9 @@ def main():
         warmup_end_lr=args.warmup_end_lr,
         lr_decay_factor=args.lr_decay_factor,
         min_lr=args.min_learning_rate)
+
+    if args.resume_checkpoint:
+        trainer.resume_from_checkpoint(args.resume_checkpoint)
 
     info("=" * 60)
     mode_name = 'online-audio' if online_mode else 'pre-extracted'

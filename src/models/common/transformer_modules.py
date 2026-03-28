@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import math
 
 
 def _gen_bias_mask(max_length):

@@ -1,7 +1,7 @@
-"""ChordMini ChordNet model.
+"""
+ChordNet (2E1D) model.
 
-The architecture matches the non-factored ChordNet implementation used outside
-``ChordMini``. Validation/test-time prediction also supports the same temporal
+Validation/test-time prediction also supports the same temporal
 smoothing interface, including Gaussian smoothing with ``kernel_size=9``.
 """
 import torch
@@ -101,15 +101,6 @@ class ChordNet(nn.Module):
             if pre != cur:
                 warnings.warn(f"Output layer mismatch: checkpoint={pre}, model={cur}")
         return super().load_state_dict(state_dict, strict)
-
-    def predict_per_frame(self, x):
-        """Alias for ``predict(x, per_frame=True)``."""
-        return self.predict(x, per_frame=True)
-
-    def predict_frames(self, x):
-        """Alias for ``predict(x, per_frame=True)``."""
-        return self.predict(x, per_frame=True)
-
 
 def create_chordnet_model(config: ModelConfig):
     """Factory: instantiate ChordNet from ModelConfig."""

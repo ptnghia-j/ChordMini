@@ -17,6 +17,21 @@ def to_stat_tensor(value, device):
     return torch.as_tensor(value, device=device, dtype=torch.float32)
 
 
+def flatten_logits_and_targets(logits, targets, teacher_logits=None):
+    if logits.dim() == 3 and targets.dim() == 2:
+        logits = logits.reshape(-1, logits.size(-1))
+        targets = targets.reshape(-1)
+        if teacher_logits is not None and teacher_logits.dim() == 3:
+            teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
+    return logits, targets, teacher_logits
+
+
+def count_correct_predictions(logits, targets):
+    flat_logits, flat_targets, _ = flatten_logits_and_targets(logits, targets)
+    predictions = flat_logits.argmax(dim=-1)
+    return (predictions == flat_targets).sum().item(), flat_targets.numel()
+
+
 def normalize_features(features, mean=None, std=None):
     if mean is None or std is None:
         return features
@@ -66,10 +81,8 @@ def accumulate_batch_accuracy(model, batch, logits, targets, vote_accumulator=No
         )
         return 0, 0, True
 
-    flat_logits = logits.reshape(-1, logits.size(-1)) if logits.dim() == 3 else logits
-    flat_targets = targets.reshape(-1) if targets.dim() == 2 else targets
-    predictions = flat_logits.argmax(dim=-1)
-    return (predictions == flat_targets).sum().item(), flat_targets.numel(), False
+    correct, total = count_correct_predictions(logits, targets)
+    return correct, total, False
 
 
 def finalize_vote_accuracy(vote_accumulator, target_accumulator):
@@ -80,7 +93,9 @@ def finalize_vote_accuracy(vote_accumulator, target_accumulator):
 
 __all__ = [
     'accumulate_batch_accuracy',
+    'count_correct_predictions',
     'finalize_vote_accuracy',
+    'flatten_logits_and_targets',
     'normalize_features',
     'teacher_logits_from_model',
     'to_stat_tensor',

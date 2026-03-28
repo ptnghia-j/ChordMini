@@ -1,5 +1,5 @@
 # ChordMini Pipeline Configuration
-# Unified config for both Pseudo-Labeling (Phase 1) and Continual Learning (Phase 2)
+# Unified config for both Pseudo-Labeling (Stage 1) and Continual Learning (Stage 2)
 
 # Audio / feature extraction (shared by both phases)
 mp3:
@@ -44,7 +44,7 @@ model:
   d_head: 8
   dropout: 0.2
 
-# Phase 1: Pseudo-Labeling
+# Stage 1: Pseudo-Labeling
 pseudo_labeling:
   batch_size: 256
   num_epochs: 100
@@ -77,7 +77,7 @@ pseudo_labeling:
     save_dir: './checkpoints/pseudo_labeling'
     pretrained: './checkpoints/pretrained'
 
-# Phase 2: Continual Learning
+# Stage 2: Continual Learning
 continual_learning:
   batch_size: 32
   num_epochs: 50
@@ -104,14 +104,8 @@ continual_learning:
     min_semitones: -5
     max_semitones: 6
 
-  anti_forgetting:
-    freeze_encoder: false
-    ewc_lambda: 0.0
-    use_pod_loss: false
-    pod_alpha: 0.1
-
   checkpoints:
-    student: null  # set to Phase 1 output
+    student: null  # set to Stage 1 output
     teacher: './checkpoints/btc_model_large_voca.pt'
     save_dir: './checkpoints/continual_learning'
 

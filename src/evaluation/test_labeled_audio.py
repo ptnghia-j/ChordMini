@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Evaluate ChordMini BTC or ChordNet checkpoints on labeled audio.
 
@@ -80,6 +79,7 @@ from src.utils import (
     get_config_value,
     logging_verbosity,
     project_path,
+    set_random_seed,
     warning,
 )
 
@@ -250,9 +250,7 @@ def main():
 
     _resolve_audio_label_dirs(args, DEFAULT_AUDIO_DIR, DEFAULT_LABEL_DIR)
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    random.seed(args.seed)
+    set_random_seed(args.seed, include_python_random=True)
 
     device = get_device()
     info(f'Using device: {device}')

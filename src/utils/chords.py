@@ -9,7 +9,6 @@ Provides:
 import re
 import logging
 import numpy as np
-from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +25,11 @@ ENHARMONIC_MAP = {
 
 PREFERRED_SPELLING_MAP = {
     'Bb': 'A#', 'Db': 'C#', 'Eb': 'D#', 'Gb': 'F#', 'Ab': 'G#',
+}
+
+ENHARMONIC_NORMALIZE_MAP = {
+    'Db': 'C#', 'Eb': 'D#', 'Gb': 'F#', 'Ab': 'G#', 'Bb': 'A#',
+    'B#': 'C', 'Cb': 'B', 'E#': 'F', 'Fb': 'E',
 }
 
 QUALITY_NORM_MAP = {
@@ -240,6 +244,73 @@ def _parse_chord_string(chord_label):
         final_q = 'maj'
 
     return final_root, final_q, final_bass
+
+
+def normalize_enharmonic_label(label):
+    if not label or label in ('N', 'X'):
+        return label
+    if '/' in label:
+        base, bass = label.rsplit('/', 1)
+        for flat, sharp in ENHARMONIC_NORMALIZE_MAP.items():
+            if bass.startswith(flat):
+                bass = sharp + bass[len(flat):]
+                break
+        base = normalize_enharmonic_label(base)
+        return f"{base}/{bass}"
+    for flat, sharp in ENHARMONIC_NORMALIZE_MAP.items():
+        if label.startswith(flat):
+            return sharp + label[len(flat):]
+    return label
+
+
+def transpose_chord_label(chord_label, semitones):
+    if chord_label in ('N', 'X', ''):
+        return chord_label
+    try:
+        if '/' in chord_label:
+            chord_part, bass_part = chord_label.rsplit('/', 1)
+        else:
+            chord_part, bass_part = chord_label, None
+
+        if ':' in chord_part:
+            root, quality = chord_part.split(':', 1)
+        else:
+            match = re.match(r'^([A-Ga-g][#b]?)', chord_part)
+            if match:
+                root = match.group(1)
+                quality = chord_part[len(root):] or 'maj'
+            else:
+                return chord_label
+
+        base_notes = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
+        root_upper = root[0].upper() + root[1:]
+        if root_upper[0] not in base_notes:
+            return chord_label
+        pitch_class = base_notes[root_upper[0]]
+        if len(root_upper) > 1:
+            pitch_class += 1 if root_upper[1] == '#' else (-1 if root_upper[1] == 'b' else 0)
+        new_pitch_class = (pitch_class + semitones) % 12
+        new_root = PREFERRED_SPELLING_MAP.get(PITCH_CLASS[new_pitch_class], PITCH_CLASS[new_pitch_class])
+
+        new_bass = None
+        if bass_part:
+            if bass_part[0].isdigit() or (bass_part[0] in '#b' and len(bass_part) > 1 and bass_part[1].isdigit()):
+                new_bass = bass_part
+            else:
+                bass_upper = bass_part[0].upper() + bass_part[1:]
+                if bass_upper[0] in base_notes:
+                    bass_pitch_class = base_notes[bass_upper[0]]
+                    if len(bass_upper) > 1:
+                        bass_pitch_class += 1 if bass_upper[1] == '#' else (-1 if bass_upper[1] == 'b' else 0)
+                    new_bass_pc = (bass_pitch_class + semitones) % 12
+                    new_bass = PREFERRED_SPELLING_MAP.get(PITCH_CLASS[new_bass_pc], PITCH_CLASS[new_bass_pc])
+
+        result = f"{new_root}:{quality}" if quality and quality != 'maj' else new_root
+        if new_bass:
+            result += f"/{new_bass}"
+        return result
+    except Exception:
+        return chord_label
 
 
 class Chords:

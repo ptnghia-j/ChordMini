@@ -31,6 +31,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from src.data.utils import estimate_normalization_from_dataset, song_level_split_indices
 from src.utils.chords import Chords, idx2voca_chord
 
 
@@ -326,19 +327,7 @@ class SynthDataset(Dataset):
 
     def get_normalization_params(self, n_samples=200):
         """Estimate dataset mean and std from a random sample of segments."""
-        n_samples = min(n_samples, len(self))
-        indices = np.random.choice(len(self), n_samples, replace=False)
-        features = []
-        for idx in indices:
-            try:
-                batch = self[idx]
-                features.append(batch['spectro'].numpy())
-            except Exception:
-                continue
-        if features:
-            all_feats = np.concatenate(features, axis=0)
-            return float(np.mean(all_feats)), float(np.std(all_feats))
-        return 0.0, 1.0
+        return estimate_normalization_from_dataset(self, sample_count=n_samples)
 
     def split_indices(self, train_ratio=0.8, val_ratio=0.1, seed=42):
         """
@@ -347,24 +336,10 @@ class SynthDataset(Dataset):
         Returns:
             Tuple of (train_indices, val_indices, test_indices) as lists of ints.
         """
-        rng = np.random.RandomState(seed)
-        song_ids = np.arange(len(self.songs))
-        rng.shuffle(song_ids)
-
-        n_train = int(len(song_ids) * train_ratio)
-        n_val = int(len(song_ids) * val_ratio)
-
-        train_songs = set(song_ids[:n_train].tolist())
-        val_songs = set(song_ids[n_train:n_train + n_val].tolist())
-        test_songs = set(song_ids[n_train + n_val:].tolist())
-
-        train_idx, val_idx, test_idx = [], [], []
-        for seg_idx, (song_idx, _) in enumerate(self.segments):
-            if song_idx in train_songs:
-                train_idx.append(seg_idx)
-            elif song_idx in val_songs:
-                val_idx.append(seg_idx)
-            else:
-                test_idx.append(seg_idx)
-
-        return train_idx, val_idx, test_idx
+        return song_level_split_indices(
+            segment_song_indices=[song_idx for song_idx, _ in self.segments],
+            num_songs=len(self.songs),
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            seed=seed,
+        )

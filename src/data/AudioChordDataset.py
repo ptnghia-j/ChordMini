@@ -6,15 +6,22 @@ training/evaluation and CQT features are extracted on demand instead of relying
 on a separate pre-extraction step. The dataset expects a flat directory of
 audio files whose stems match ``.lab`` files in ``label_dir``.
 
-Supports optional pitch-shifting augmentation via ``pyrubberband``.
+    Supports optional pitch-shifting augmentation via ``pyrubberband``.
+    When enabled, augmented copies span the 12 transposition classes.
 """
 import os
-import torch
-import numpy as np
+
 import librosa
+import numpy as np
+import torch
 from torch.utils.data import Dataset
 
-from src.utils.chords import Chords, idx2voca_chord, PITCH_CLASS, PREFERRED_SPELLING_MAP
+from src.data.utils import (
+    estimate_normalization_from_dataset,
+    song_level_cv_fold_indices,
+    song_level_split_indices,
+)
+from src.utils.chords import Chords, idx2voca_chord, normalize_enharmonic_label, transpose_chord_label
 from src.utils.config_utils import get_config_value
 from src.utils.audio_io import suppress_stderr as _suppress_stderr
 
@@ -110,6 +117,14 @@ class AudioChordDataset(Dataset):
             print(f"Loaded {len(self.samples)} songs with matching labels")
         self._create_segments()
 
+    @staticmethod
+    def _duration_seconds(audio_path):
+        with _suppress_stderr():
+            try:
+                return float(librosa.get_duration(path=audio_path))
+            except TypeError:
+                return float(librosa.get_duration(filename=audio_path))
+
     def _parse_lab(self, path):
         labels = []
         with open(path) as f:
@@ -124,20 +139,22 @@ class AudioChordDataset(Dataset):
         self.song_segments = []
         for song_idx, sample in enumerate(self.samples):
             try:
-                with _suppress_stderr():
-                    y, _ = librosa.load(sample['audio_path'], sr=self.sample_rate)
-                num_frames = int(len(y) / self.hop_length) + 1
-                for start in range(0, max(1, num_frames - self.seq_len + 1), self.stride):
-                    end = min(start + self.seq_len, num_frames)
-                    if end - start >= self.seq_len // 2:
-                        self.song_segments.append({
-                            'song_idx': song_idx, 'start_frame': start,
-                            'end_frame': end, 'num_frames': num_frames,
-                            'pitch_shift': 0,
-                        })
+                duration = self._duration_seconds(sample['audio_path'])
+                num_frames = max(1, int(np.ceil(duration * self.sample_rate / self.hop_length)))
             except Exception as e:
                 if self.verbose:
                     print(f"Error processing {sample['audio_path']}: {e}")
+                continue
+
+            for start in range(0, max(1, num_frames - self.seq_len + 1), self.stride):
+                end = min(start + self.seq_len, num_frames)
+                if end - start < self.seq_len // 2:
+                    continue
+                self.song_segments.append({
+                    'song_idx': song_idx, 'start_frame': start,
+                    'end_frame': end, 'num_frames': num_frames,
+                    'pitch_shift': 0,
+                })
 
         if self.verbose:
             print(f"Created {len(self.song_segments)} segments from {len(self.samples)} songs")
@@ -155,26 +172,7 @@ class AudioChordDataset(Dataset):
                            bins_per_octave=self.bins_per_octave,
                            hop_length=self.hop_length,
                            fmin=librosa.note_to_hz('C1'))
-        return np.log(np.abs(cqt) + 1e-6).T
-
-    _ENHARMONIC = {'Db': 'C#', 'Eb': 'D#', 'Gb': 'F#', 'Ab': 'G#', 'Bb': 'A#',
-                    'B#': 'C', 'Cb': 'B', 'E#': 'F', 'Fb': 'E'}
-
-    def _normalize_enharmonic(self, chord):
-        if not chord or chord in ('N', 'X'):
-            return chord
-        if '/' in chord:
-            base, bass = chord.rsplit('/', 1)
-            for flat, sharp in self._ENHARMONIC.items():
-                if bass.startswith(flat):
-                    bass = sharp + bass[len(flat):]
-                    break
-            base = self._normalize_enharmonic(base)
-            return f"{base}/{bass}"
-        for flat, sharp in self._ENHARMONIC.items():
-            if chord.startswith(flat):
-                return sharp + chord[len(flat):]
-        return chord
+        return np.log(np.abs(cqt) + 1e-6).T.astype(np.float32, copy=False)
 
     def _chord_labels_for_segment(self, chord_labels, start_frame, end_frame):
         labels = []
@@ -187,64 +185,16 @@ class AudioChordDataset(Dataset):
                     break
             if chord in self.chord_to_idx:
                 labels.append(self.chord_to_idx[chord])
-            else:
-                norm = self._normalize_enharmonic(chord)
-                if norm in self.chord_to_idx:
-                    labels.append(self.chord_to_idx[norm])
-                else:
-                    idx = self.chord_parser.get_chord_idx(chord)
-                    labels.append(idx if idx is not None else self.chord_to_idx.get('N', 169))
+                continue
+
+            normalized = normalize_enharmonic_label(chord)
+            if normalized in self.chord_to_idx:
+                labels.append(self.chord_to_idx[normalized])
+                continue
+
+            idx = self.chord_parser.get_chord_idx(chord)
+            labels.append(idx if idx is not None else self.chord_to_idx.get('N', 169))
         return labels
-
-    def _transpose_chord(self, chord_label, semitones):
-        if chord_label in ('N', 'X', ''):
-            return chord_label
-        try:
-            if '/' in chord_label:
-                chord_part, bass_part = chord_label.rsplit('/', 1)
-            else:
-                chord_part, bass_part = chord_label, None
-
-            if ':' in chord_part:
-                root, quality = chord_part.split(':', 1)
-            else:
-                import re
-                m = re.match(r'^([A-Ga-g][#b]?)', chord_part)
-                if m:
-                    root = m.group(1)
-                    quality = chord_part[len(root):] or 'maj'
-                else:
-                    return chord_label
-
-            base_notes = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
-            root_upper = root[0].upper() + root[1:]
-            if root_upper[0] not in base_notes:
-                return chord_label
-            pc = base_notes[root_upper[0]]
-            if len(root_upper) > 1:
-                pc += 1 if root_upper[1] == '#' else (-1 if root_upper[1] == 'b' else 0)
-            new_pc = (pc + semitones) % 12
-            new_root = PREFERRED_SPELLING_MAP.get(PITCH_CLASS[new_pc], PITCH_CLASS[new_pc])
-
-            new_bass = None
-            if bass_part:
-                if bass_part[0].isdigit() or (bass_part[0] in '#b' and len(bass_part) > 1 and bass_part[1].isdigit()):
-                    new_bass = bass_part
-                else:
-                    bu = bass_part[0].upper() + bass_part[1:]
-                    if bu[0] in base_notes:
-                        bpc = base_notes[bu[0]]
-                        if len(bu) > 1:
-                            bpc += 1 if bu[1] == '#' else (-1 if bu[1] == 'b' else 0)
-                        nbpc = (bpc + semitones) % 12
-                        new_bass = PREFERRED_SPELLING_MAP.get(PITCH_CLASS[nbpc], PITCH_CLASS[nbpc])
-
-            result = f"{new_root}:{quality}" if quality and quality != 'maj' else new_root
-            if new_bass:
-                result += f"/{new_bass}"
-            return result
-        except Exception:
-            return chord_label
 
     def __len__(self):
         return len(self.song_segments)
@@ -257,15 +207,17 @@ class AudioChordDataset(Dataset):
         feature = self._extract_features(sample['audio_path'],
                                           seg['start_frame'], seg['end_frame'],
                                           pitch_shift=ps)
+        chord_labels = sample['chord_labels']
         if ps != 0:
-            transposed = [(s, e, self._transpose_chord(l, ps)) for s, e, l in sample['chord_labels']]
-            labels = self._chord_labels_for_segment(transposed, seg['start_frame'], seg['end_frame'])
-        else:
-            labels = self._chord_labels_for_segment(sample['chord_labels'],
-                                                     seg['start_frame'], seg['end_frame'])
+            chord_labels = [(s, e, transpose_chord_label(l, ps)) for s, e, l in chord_labels]
+        labels = self._chord_labels_for_segment(
+            chord_labels,
+            seg['start_frame'],
+            seg['end_frame'],
+        )
 
-        ft = torch.tensor(feature, dtype=torch.float32)
-        lt = torch.tensor(labels, dtype=torch.long)
+        ft = torch.from_numpy(feature)
+        lt = torch.as_tensor(labels, dtype=torch.long)
 
         if ft.shape[0] < self.seq_len:
             pad = self.seq_len - ft.shape[0]
@@ -284,15 +236,12 @@ class AudioChordDataset(Dataset):
             'pitch_shift': ps,
         }
 
-    def get_song_ids(self):
-        return [s['song_id'] for s in self.samples]
-
     def add_augmented_segments_for_indices(self, train_indices, semitones_range=None):
         """Add pitch-shifted copies of training segments (call after split)."""
         if not PYRUBBERBAND_AVAILABLE:
             return train_indices
         if semitones_range is None:
-            semitones_range = list(range(-5, 7))
+            semitones_range = self.augmentation_semitones
         semitones_range = [s for s in semitones_range if s != 0]
         if not semitones_range:
             return train_indices
@@ -305,51 +254,24 @@ class AudioChordDataset(Dataset):
         return new_indices
 
     def get_normalization_params(self):
-        if not self.song_segments:
-            return 0.0, 1.0
-        n = min(100, len(self.song_segments))
-        idxs = np.random.choice(len(self.song_segments), n, replace=False)
-        feats = []
-        for i in idxs:
-            try:
-                feats.append(self[i]['spectro'].numpy())
-            except Exception:
-                continue
-        if feats:
-            all_f = np.concatenate(feats, axis=0)
-            return float(np.mean(all_f)), float(np.std(all_f))
-        return 0.0, 1.0
+        return estimate_normalization_from_dataset(self, sample_count=100)
 
 
 def create_train_val_test_split(dataset, train_ratio=0.7, val_ratio=0.1, seed=42):
-    np.random.seed(seed)
-    ids = list(range(len(dataset.samples)))
-    np.random.shuffle(ids)
-    n_train = int(len(ids) * train_ratio)
-    n_val = int(len(ids) * val_ratio)
-    if n_val == 0 and len(ids) >= 3:
-        n_val = 1
-        n_train = min(n_train, len(ids) - n_val - 1)
-    train_s = set(ids[:n_train])
-    val_s = set(ids[n_train:n_train + n_val])
-    train_i = [i for i, seg in enumerate(dataset.song_segments) if seg['song_idx'] in train_s]
-    val_i = [i for i, seg in enumerate(dataset.song_segments) if seg['song_idx'] in val_s]
-    test_i = [i for i, seg in enumerate(dataset.song_segments)
-              if seg['song_idx'] not in train_s and seg['song_idx'] not in val_s]
-    return train_i, val_i, test_i
+    return song_level_split_indices(
+        segment_song_indices=[seg['song_idx'] for seg in dataset.song_segments],
+        num_songs=len(dataset.samples),
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        seed=seed,
+        ensure_val_if_possible=True,
+    )
 
 
 def create_cv_folds(dataset, n_folds=5, seed=42):
-    np.random.seed(seed)
-    ids = list(range(len(dataset.samples)))
-    np.random.shuffle(ids)
-    fold_size = len(ids) // n_folds
-    folds = []
-    for fi in range(n_folds):
-        start = fi * fold_size
-        val_songs = set(ids[start:] if fi == n_folds - 1 else ids[start:start + fold_size])
-        train_songs = set(ids) - val_songs
-        train_i = [i for i, seg in enumerate(dataset.song_segments) if seg['song_idx'] in train_songs]
-        val_i = [i for i, seg in enumerate(dataset.song_segments) if seg['song_idx'] in val_songs]
-        folds.append((train_i, val_i))
-    return folds
+    return song_level_cv_fold_indices(
+        segment_song_indices=[seg['song_idx'] for seg in dataset.song_segments],
+        num_songs=len(dataset.samples),
+        n_folds=n_folds,
+        seed=seed,
+    )

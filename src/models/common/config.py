@@ -1,11 +1,10 @@
 """
-Unified model configuration for BTC and ChordNet architectures.
+Unified model configuration for BTC and ChordNet (2E1D) architectures.
 
 Provides a single ModelConfig dataclass with sensible defaults that both
 model architectures can consume, plus factory functions for common configs.
 """
-from dataclasses import dataclass, field, asdict
-from typing import Optional
+from dataclasses import dataclass
 
 
 @dataclass
@@ -78,10 +77,6 @@ class ModelConfig:
             'd_head': self.d_head,
             'dropout': self.dropout,
         }
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
 
 def get_btc_config() -> ModelConfig:
     """Default BTC model config matching config/btc_config.yaml."""
