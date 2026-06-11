@@ -2,6 +2,23 @@
 
 This project explores a two-stage training pipeline for chord recognition with knowledge distillation as a regularizer.
 It includes the pure-transformer ChordNet architecture with dual encoders (frequency and temporal) and a smoothing pipeline for prediction.
+The repository contains the implementation of the paper:
+
+**BibTeX:**
+```bibtex
+@misc{phan2026enhancingautomaticchordrecognition,
+      title={Enhancing Automatic Chord Recognition via Pseudo-Labeling and Knowledge Distillation}, 
+      author={Nghia Phan and Rong Jin and Gang Liu and Xiao Dong},
+      year={2026},
+      eprint={2602.19778},
+      archivePrefix={arXiv},
+      primaryClass={cs.SD},
+      url={https://arxiv.org/abs/2602.19778}, 
+}
+```
+
+**Plain text (for non-LaTeX users):**
+> Nghia Phan, Rong Jin, Gang Liu, and Xiao Dong. "Enhancing Automatic Chord Recognition via Pseudo-Labeling and Knowledge Distillation." arXiv preprint arXiv:2602.19778, 2026. https://arxiv.org/abs/2602.19778
 
 Web application for testing chord recognition models with music audio (youtube/local) available at: https://github.com/ptnghia-j/ChordMiniApp and cloud-hosted/online version: https://www.chordmini.me
 
